@@ -14,9 +14,10 @@ producing the key material.
 
 | File | Purpose |
 |------|---------|
-| `otp.md` | The manual. Written to be printed and handed to students: the full encrypt/decrypt walkthrough, the rules that make OTP secure, key generation by hand, communication protocols, authentication, and a printable tabula recta. |
-| `otp_generator.py` | Generates pad sets as pocket-sized PDFs (A6, or two-up A7) from the operating system's cryptographic randomness. |
+| `otp.md` | The manual. Written to be printed and handed to students: the full encrypt/decrypt walkthrough, the rules that make OTP secure, key generation by hand, communication protocols, authentication, a printable tabula recta, and exercises with an answer key. |
+| `otp_generator.py` | Generates pad sets as pocket-sized PDFs (A6, or two-up A7) from the operating system's cryptographic randomness. Also produces training pads and blank worksheets. |
 | `sample_codewords.txt` | Example codeword list — one codeword per pad set, one per line. |
+| `tests/` | Test suite (run by CI): guards the generator's randomness against bias and re-verifies every worked number printed in the manual. |
 
 ## The manual
 
@@ -29,10 +30,18 @@ Suggested classroom flow:
 
 1. Work through the **Example transmission** section together, by hand, with the numbers.
 2. Introduce the **tabula recta** (Tools section) and repeat the exercise letters-only.
-3. Generate a small training set (`--pages 20`), pair students up, and run full
-   two-way exchanges: encrypt, transmit by voice, authenticate, decrypt, destroy.
-4. Finish with **Critical technicalities** and **Common Mistakes** — the rules
+3. Set the **Exercises** appendix — three graded problems with an answer key,
+   including a garbled-decrypt repair. Print worksheets for them (`--worksheets`).
+4. Generate a small training set (`--pages 20 --training`), pair students up, and
+   run full two-way exchanges: encrypt, transmit by voice, authenticate, decrypt,
+   destroy. Training pads are watermarked so they can never be mistaken for live
+   material.
+5. Finish with **Critical technicalities** and **Common Mistakes** — the rules
    mean more after students have felt the procedure.
+
+To produce the manual itself as a PDF handout: `pandoc otp.md -o otp.pdf`
+(any Markdown-to-PDF route works; the tabula recta needs a monospace font,
+which code blocks get by default).
 
 ## The generator
 
@@ -54,6 +63,16 @@ This produces one PDF per set, named after its codeword (`WALRUS.pdf`, ...).
 **Print each PDF twice** — that is your A and B copy. The two printouts are the
 pad pair; the digital file is a liability to be destroyed after printing.
 
+For classroom material in one go — a marked training set plus worksheets:
+
+```
+python3 otp_generator.py --codewords sample_codewords.txt --sets 1 --pages 20 --training --worksheets 10 --output ./classroom
+```
+
+No A6 paper? Print the pad PDFs on A4 with your print dialog set to 4 pages
+per sheet and cut twice — the result is four A6 pages per A4 sheet. Worksheets
+are A5: two per A4 sheet, one cut.
+
 ### Options
 
 | Flag | Default | Meaning |
@@ -66,6 +85,8 @@ pad pair; the digital file is a liability to be destroyed after printing.
 | `--fontsize` | 9 | Font size in points |
 | `--a7` | off | Two pad pages per landscape A6 sheet; cut along the dashed line |
 | `--no-auth` | off | Omit the AUTH group from page headers |
+| `--training` | off | Watermark every page as TRAINING material (the manual requires practice pads to be unmistakably marked) |
+| `--worksheets` | 0 | Also generate N blank A5 worksheet pages as `WORKSHEETS.pdf` — M/K/C rows in five-letter group cells. They contain no key material, so print as many copies as you need. `--codewords` is optional when only worksheets are requested. |
 
 ### Anatomy of a page
 
