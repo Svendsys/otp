@@ -206,41 +206,32 @@ And the padding just repeats the key from the same position.
 
 The ciphertext in the padding region is raw key, and unused truly-random key is uniformly distributed — exactly as uniform as (message + key). So a passive observer can't tell where message ends and padding begins even if the convention is public, and length stays hidden.
 
-**But note what that sentence says, and be careful with it.** A *passive* observer learns nothing. An *active* one — anyone who can intercept and substitute rather than merely listen — is handed the key for the whole padding region, because they know the plaintext there is A. Combined with malleability (see Critical technicalities), that means an attacker can replace everything after your genuine text with anything they like, leave the auth group and your real words untouched, and keep the group count the same. Nothing about the result looks wrong, and the auth check still passes: it proves the *sender* held the pad, not that the message was not extended.
+**One caveat, and then we move on.** That sentence is about a *passive* observer. Someone who can intercept and substitute in real time is in a different position: they know the plaintext in the padding region is A, which hands them the key there, and OTP is malleable (see Critical technicalities). So they can overwrite the padding with text of their own, leave the auth group and your real words untouched, and keep the group count identical — and the auth check still passes, because it proves the *sender* held the pad, not that the message was not extended.
 
-The fix is an **end-of-text group**: a short letter run, agreed at the handover, that you write at the true end of your message before the padding begins. **The message ends at the first occurrence of that group. Anything after it is never acted on.** Our worked example becomes `ACTIVATENAUGHTFIREXXXXX` followed by A-padding to the end of the page.
+Note this is not caused by padding with A. Padding with X has the same hole; any padding whose plaintext is predictable does, and predictability is what makes padding cheap in the first place.
 
-Be careful about *why* this works, because two more obvious rules do not:
+For most people this is theoretical — it needs an adversary sitting on your channel able to alter traffic in flight, not merely listen. If that is genuinely in your threat model, the answer is an end-of-text group agreed at the handover: a letter run your own traffic can never produce, written at the true end of the message, with the receiver acting on nothing past its first occurrence. Otherwise, read the padding as the end of the message and carry on.
 
-- **"The message ends at the first A" is unusable.** A is an ordinary letter. Our own example message, `ACTIVATENAUGHTFIRE`, begins with one — that rule truncates it to nothing before it starts.
-- **"The message ends where the trailing run of As begins" does not survive the attack it is meant to stop.** The attacker holds the key for the whole padding region, so they can write text there *followed by* a fresh run of As. The result looks exactly like a longer genuine message, and that rule accepts every word of it.
+### How much to pad
 
-The end-of-text group works because the attacker cannot move it. They know the plaintext is A only *after* your genuine text, so everything they can write lands after your marker — and the receiver has already stopped. To shift the marker itself they would have to know where it is, and the whole point of the padding is that they do not. Blind tampering with the message region corrupts it into garbage, which is visible.
+Padding to the end of the page is the simplest rule, and it is what the example above does. It is rarely the right one, because **it makes your page size your transmission length for every message you ever send.** The default A6 page holds 665 characters — 133 groups, whether the message was a paragraph or "MEET AT NOON". Read aloud that is close to nine minutes on the air, and transmission time is exactly what direction-finding wants.
 
-Two conditions make it sound, and both are the sender's job:
+The important thing is that **padding less costs you nothing in key.** A partly used page is still a spent page: the remainder burns with it and is never saved for later. So the only thing full-page padding buys is length hiding, and the only thing it costs is air time. Those can be traded directly.
 
-- **Pick a group your traffic will never contain.** `XXXXX` is the conventional choice and the default assumed here. Remember the plaintext is a continuous letter stream with no spaces, so a marker like `ENDIT` is a trap — `SENDITEMS` contains it.
-- **Sanitize against it.** Whatever marker you agree, it must not be producible by your own text. This is the same discipline as the rest of your sanitization convention, and it belongs in the same conversation at the handover.
+The useful middle is to **pad up to a fixed length, agreed at the handover** — round every transmission up to the next 10 groups, say, or the next 25. All your short messages then look identical to each other, and an observer learns only which bucket you landed in, never the message itself. Pick the step from your traffic: a 10-group step suits terse tactical messages, a 25-group step hides more but costs more air time.
 
-This is the one place where the padding convention, which is otherwise pure gain, costs something — and it costs one group per message once the rule is in place.
+Note that padding by some arbitrary small amount is *not* the same thing. If you simply add a handful of characters, the transmission length still tracks the message length and an observer reads it off to within a few groups. Fuzzing a length is not hiding it — the hiding comes from many different messages sharing one length, which is what a fixed step gives you and an arbitrary one does not.
 
-### What this costs you on the air
-
-Padding to the end of the page is what hides your message length. It also means **your page size is your transmission length, for every message you ever send.** A short message on a big page is still a full page of groups.
-
-The default A6 page holds 665 characters — **133 groups, every single time**. Read aloud at a workable pace that is close to nine minutes on the air for a message that might have been "MEET AT NOON". Transmission time is the thing direction-finding needs, so this is not merely tedious.
-
-You have three ways to spend that, and you should choose deliberately rather than inherit one:
-
-| Choice | Length hidden? | On the air |
+| Approach | What an observer learns | On the air |
 |---|---|---|
-| Pad to the end of the page | Yes | Always one full page of groups |
-| Send only the groups you used | No — length is exposed | As short as the message |
-| Print smaller pages (`--chars`) | Yes | One page, but a page you sized |
+| Pad to the end of the page | Nothing | Always one full page |
+| Pad up to a fixed step | Which bucket only | Message, rounded up |
+| Pad by an arbitrary bit | Length, near enough | Message, plus a bit |
+| No padding | Exact length | Shortest possible |
 
-The third is usually the right answer, and it is why `--chars` exists. Size the page to your traffic: `--chars 250` gives 50-group transmissions with room for about forty words, which suits short tactical messages far better than the paper-filling default. The cost is paper — the same key volume needs more sheets, because you are no longer filling each one.
+Under a fixed step the page size stops being your transmission length and goes back to being what it should be: a ceiling on how long a single message can get, and a question about paper. The default is a generous ceiling, which is a good thing to have. `--chars` is there if you want a smaller one anyway.
 
-Whichever you pick, **it is a handover agreement, not a per-message decision.** Both ends must know whether a short transmission is a short message or a truncated one. And note the second row costs key either way: a partly used page is still a spent page, and the remainder is destroyed with it, never saved for later.
+Whichever you pick, **it is a handover agreement, not a per-message decision.** Both ends must know the step, so that a short transmission reads as a short message rather than a truncated one.
 
 # Critical technicalities
 
@@ -532,17 +523,17 @@ Key:      OLHTX TKFGI HZHUB YMUBP KUBWF
 
 ## Exercise 4 — The complete message
 
-This one is a real message, run the way the Authentication section requires: the first plaintext group is the page's auth group, and the text ends with the agreed end-of-text group `XXXXX`.
+The first three left the auth group out to keep the arithmetic visible. This one is a real message, run the way the Authentication section requires: the first plaintext group is the page's auth group, and the digit convention applies.
 
 Your copy of the page prints `AUTH KDWNP` in its header. You receive:
 
 ```
-Received: OKMHA JNUBJ ZNSPG WSZBD PPLVO AEVAT WYNKE EYVAR
+Received: OKMHA ONECU EUONM NNXIF WJZRX RFTWT DVNOR
 
-Key:      EHQUL CZJYU LVKWY IFCEG SSLST ARTWT DVNOR HBYDU
+Key:      EHQUL CZJYU LVKWY IFCEG SSLST ARTWT DVNOR
 ```
 
-Authenticate it, decrypt it, and then answer the only question that counts: **what do you act on?** Read the whole decrypt before you decide.
+Authenticate it first — if that check fails you stop there, and everything after it is wasted effort. Then decrypt and restore the spacing.
 
 ## Answers
 
@@ -573,17 +564,12 @@ ORCHARD GATE AT NINE PM. Two lessons ride along. First, the diagnostic: where th
 **Exercise 4.** The decrypt is:
 
 ```
-KDWNP HOLDP OSITI ONXXX XXADV ANCEA TDAWN XXXXX
+KDWNP MOVEA TZERO FIVEZ EROZE ROAAA AAAAA
 ```
 
-The first group is `KDWNP`, matching the `AUTH` printed on your page: the sender held the twin pad. Then `HOLDPOSITION`, then `XXXXX`.
+The first group is `KDWNP`, matching the `AUTH` printed on your page. That is the whole authentication step: the sender holds the twin pad, and you are on the right page. Strip it, and the message is `MOVEATZEROFIVEZEROZERO` — **MOVE AT 0500**, digits spelled out by convention, then eight characters of padding.
 
-**You act on HOLD POSITION, and on nothing else.** Everything from that first `XXXXX` onward — `ADVANCEATDAWN`, and the second `XXXXX` dressed up to look like a proper ending — is discarded without a second thought.
-
-This is the extension attack from the De-briefing, and notice how little of it looks wrong. The auth group verified. The real order is present and untouched. The group count is plausible, the padding convention appears to be honoured, and the appended order is exactly the sort of thing you might be expecting. An attacker who could see your traffic knew the plaintext in the padding region was A, which handed them the key there, and they wrote whatever they liked with it.
-
-Three defences failed to catch this and one caught it. The auth group did not — it proves origin, not integrity. The group count did not — the attacker kept it identical. Plausibility did not — that is the attacker's job. Only the end-of-text rule caught it, applied mechanically, without weighing how reasonable the extra text looked. That is why it is a rule and not a judgement call.
-
+Two things to notice. The last eight ciphertext characters are identical to the key, exactly as in Exercise 1 — the A-padding shortcut doing its work. And the auth group cost you one group of key to buy something real: had you reached for the wrong page, `KDWNP` would not have appeared, and you would have known at once rather than puzzling over a page of garbage.
 
 # Glossary
 
@@ -597,13 +583,12 @@ Three defences failed to catch this and one caught it. The auth group did not �
 - **Crib dragging** - Sliding a crib along combined ciphertexts to break a reused key
 - **CSPRNG** - Cryptographically secure PRNG, such as the random source of a modern operating system
 - **Dummy traffic** - Scheduled messages containing nothing but padding, sent to keep the traffic pattern constant
-- **End-of-text group** - A short letter run, agreed at the handover, written at the true end of a message before the padding begins. The receiver acts on nothing past the first occurrence. This is what stops an active attacker extending a message through the padding region, and it must be a run your own text can never produce — `XXXXX` by convention
 - **Group** - A block of five characters, the standard unit for writing and transmitting ciphertext
 - **Key** - The random letters printed on pad pages; also called key material
 - **mod** - The modulo operator
 - **OTP** - One time pad
 - **Pad** - A set of key pages, existing as an identical pair (copies A and B). Loose leaves rather than a bound booklet — pages are used and destroyed one at a time
-- **Page** - The unit of key material within a pad; used for at most one message, then destroyed. Under the padding convention its size is also your transmission length for every message — see the De-briefing before accepting the default
+- **Page** - The unit of key material within a pad; used for at most one message, then destroyed. A partly used page is still a spent page — the remainder burns with it, so padding less costs air time, not key
 - **Plaintext** - The readable message, before encryption or after decryption
 - **PRNG** - Pseudo-random number generator; deterministic, and therefore not OTP-grade key material on its own
 - **Safety word** - A memorized signal present in every genuine message, whose absence means the sender is under duress
