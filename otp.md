@@ -27,7 +27,7 @@ Now we'll write a secret message:
 Activate Nåughtfire.
 ```
 
-Before we can apply our encryption we have to sanitize the message by removing spaces, punctuation, case, and substitute weird Scandinavian letters. How we're going to substitute for å is just a matter of convention, I will simply replace with 'a', but you could replace with two a's for example, or 'au'. That is not part of the encryption scheme.
+Before we can apply our encryption we have to sanitize the message by removing spaces, punctuation, case, and substitute weird Scandinavian letters. How we're going to substitute for å is just a matter of convention, I will simply replace with 'a', but you could replace with two a's for example, or 'au'. The same goes for the rest of the family — æ becomes AE and ø becomes OE are the natural choices. Whatever you pick, it is not part of the encryption scheme, it just has to be agreed.
 
 Digits are handled by convention too, and real field messages are full of them — times, grid references, counts. Our convention is to spell each digit out as a word, digit by digit: 350 becomes THREE FIVE ZERO, never THREEHUNDREDFIFTY. Digit words survive garbled transmission far better than compact notations, and a single garbled character can't silently turn one number into another. For critical figures, repeat them: MEET AT ONE FIVE ZERO ZERO REPEAT ONE FIVE ZERO ZERO. Like the å rule, this must be agreed before the first message is ever sent — sender and receiver have to sanitize identically or the receiver ends up guessing.
 
@@ -309,7 +309,7 @@ The scheme is simple; humans under stress are not. Training exists to make the p
 
 - **Accuracy before speed.** Drill full encrypt/decrypt cycles until they are error-free, and let speed arrive on its own. Speed acquired first just produces fast errors.
 - **Drill the conventions until they are reflex**: sanitization, digit spelling, padding, the auth group, the message header. Both ends of a channel must be drilled on the *same* conventions — on the receiving end, a convention mismatch is indistinguishable from garble.
-- **Practice error recovery.** Make deliberate mistakes in training and learn to read the symptoms: a single wrong addition garbles exactly one letter, while a skipped key character garbles everything from that point on. If a decrypt collapses partway through, don't guess — find where it diverged, re-align against the key, and re-check character by character.
+- **Practice error recovery.** Make deliberate mistakes in training and learn to read the symptoms: a single wrong addition garbles exactly one letter, while a skipped key character garbles everything from that point on. If a decrypt collapses partway through, don't guess — find where it diverged, re-align against the key, and re-check character by character. (Exercise 3 in the Exercises section is a ready-made drill for exactly this.)
 - **Train the hygiene, not just the math.** Work on a single sheet on a hard surface, keep plaintext away from key material, burn the worksheet with the page. A habit only exists if it survives practice.
 - **Use clearly marked training pads.** Mark them TRAINING in large letters, and never let training material and live material share a pocket, a drawer, or an envelope. In every other respect, treat the training procedure as live — that is the point of it.
 - **Finish with two-person exercises**: the full cycle over a real channel — encrypt, transmit by voice or paper, receive, authenticate, decrypt, destroy. Most failures live in the seams between people, and only a two-person drill finds them.
@@ -450,6 +450,66 @@ Every one of these has broken real systems. Most of them feel harmless in the mo
 - **Acting on unauthenticated messages.** Ciphertext can be altered in transit by someone with no key at all. No auth group, no action — and garble near critical content is a red flag, not a shrug.
 - **Improvising through desync.** The ends disagree about which page is next, and someone starts guessing. Page numbers travel in clear in the header precisely so that this never happens.
 - **Talking.** The strongest cipher in the world does not survive an operator who mentions it. The existence of the channel, the schedule, the codeword — all of it is as secret as the pads.
+
+# Exercises
+
+Three exercises, in rising order of difficulty. Work them by hand — numbers or tabula recta, your choice — ideally on a printed worksheet (the generator can produce those). One observation before you begin: these keys are printed in a manual, which means they are compromised by definition. That is not a flaw in the exercises, it is the first lesson — a key's secrecy is a property of its custody, not of its letters. Practice keys are for practice.
+
+## Exercise 1 — Encrypt
+
+Sanitize and encrypt this message. It contains a digit, so the digit convention applies, and the key is longer than the message, so the padding convention applies too.
+
+```
+Message:  Bring 3 shovels.
+
+Key:      BMYTT QEMUX YPOFK NSLIX ADACL
+```
+
+## Exercise 2 — Decrypt
+
+You have received the following. Decrypt it and restore the spacing.
+
+```
+Received: CCTDC GZYDZ EYOTT DKCGF XFENM
+
+Key:      JVPYO JRGVM LRKMP QDOMN TFENM
+```
+
+## Exercise 3 — The garbled decrypt
+
+This transmission was received complete — every group verified against the sender's repetition — yet something is wrong with it. Decrypt it, read the symptom, diagnose what the sender did, and repair it.
+
+```
+Received: CCJAX KNLGZ MHSUC OCBGB PKUBW
+
+Key:      OLHTX TKFGI HZHUB YMUBP KUBWF
+```
+
+## Answers
+
+**Exercise 1.** Sanitized and padded: `BRING THREE SHOVE LSAAA AAAAA`. Encrypted:
+
+```
+CDGGZ JLDYB QWCAO YKLIX ADACL
+```
+
+Look at the last seven characters of the ciphertext against the key: identical. That is the A-padding shortcut from the De-briefing doing its work — and, as promised there, an observer cannot tell where your message ends and raw key begins.
+
+**Exercise 2.** `THEFO XISIN THEHE NHOUS EAAAA` — that is, THE FOX IS IN THE HENHOUSE, with four characters of padding.
+
+**Exercise 3.** A straight decrypt gives:
+
+```
+ORCHA RDGAR FILAB QQHFM FQTFR
+```
+
+Clean text for nine letters, nonsense from the tenth — the signature of a key misalignment, not a transmission error (garble on the air corrupts isolated letters, not everything after a point). The sender's eye slipped at the tenth letter and reused the ninth key character, shifting every remaining key character back by one. Repair it by decrypting from the tenth letter onward with the key shifted one position back:
+
+```
+ORCHA RDGAT EATNI NEPMA AAAAA
+```
+
+ORCHARD GATE AT NINE PM. Two lessons ride along. First, the diagnostic: where the garble *starts* tells you where the slip happened, and a one-position realignment that instantly restores clean text confirms the diagnosis. Second, notice that the sender's slip made one key character encrypt two letters — even honest mistakes create small key reuse, which is one more reason the page burns after one message no matter how the message went. Realigning is legitimate receiver-side detective work — nothing extra is transmitted — but a repaired message is still a suspect message, and the authentication rules apply to it with full force.
 
 # Glossary
 
