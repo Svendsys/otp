@@ -48,7 +48,6 @@ class Settings:
     training: bool = False
     font_size: float = 9.0
     paper: str = "A4"
-    printer: str = ""
 
     @property
     def imposed(self) -> bool:

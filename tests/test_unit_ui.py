@@ -393,8 +393,10 @@ class TestRunJobFlow:
     def test_confirm_screen_states_two_copies(self):
         app, _, screen = self._run()
         text = "\n".join(screen.frame(app).rendered())
-        assert "2 COPIES: A AND B" in text
+        assert "PAD PAIR: A AND B" in text
         assert "SILENT-OSPREY" in text
+        # Live vs training must be stated positively, never by omission.
+        assert "LIVE KEY MATERIAL" in text
 
     def test_full_sequence_prints_a_then_b_then_wipes(self):
         app, cups, screen = self._run()

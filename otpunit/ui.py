@@ -244,6 +244,10 @@ def codeword_menu(on_choose):
     """Roll / browse / type -- the three ways to land on a codeword."""
 
     def browse(app):
+        # Browsing narrows the space: one category is ~18 nouns against 642,
+        # and human choice within it is not uniform. Two pads from the same
+        # cell both named after birds is an attribution signal. ROLL RANDOM
+        # is the default for that reason.
         def pick_category(app, category):
             def pick_noun(app, noun):
                 return on_choose(app, cw.join(app.vocabulary.random_modifier(), noun))
@@ -293,24 +297,25 @@ class RunJob(Screen):
     def frame(self, app):
         spec = self.spec
         if self.stage == "confirm":
-            lines = [spec.kind.value.upper()]
-            # The codeword runs to 17 characters, so it gets a line of its own
-            # rather than sharing one with a label.
-            if spec.codeword:
-                lines.append(spec.codeword)
             if spec.kind is jobs_mod.JobKind.PAD_PAIR:
                 settings = spec.settings
-                lines += [
+                lines = [
+                    "PAD PAIR: A AND B",
+                    # The codeword runs to 17 characters, so it gets a line
+                    # of its own rather than sharing one with a label.
+                    spec.codeword,
                     f"{settings.pages} PAGES  {settings.format_label}",
                     # Sheets, not pages: it is what tells you whether there
                     # is enough paper in the tray for both copies.
                     f"{settings.sheets * 2} SHEETS TOTAL",
-                    f"AUTH {settings.auth_size if settings.with_auth else 'OFF'}"
-                    + ("  TRAINING" if settings.training else ""),
-                    "2 COPIES: A AND B",
+                    f"AUTH {settings.auth_size if settings.with_auth else 'OFF'}",
+                    # Always stated, never blank. The absence of a word is
+                    # not a signal an operator can rely on at the last
+                    # checkpoint before a thousand pages of key material.
+                    "*** TRAINING ***" if settings.training else "LIVE KEY MATERIAL",
                 ]
             else:
-                lines.append(f"{spec.count} COPIES")
+                lines = [spec.kind.value.upper(), f"{spec.count} COPIES"]
             return Frame(title="CONFIRM", lines=lines, footer="OK START  HOLD CANCEL")
 
         if self.stage == "generating":
@@ -523,7 +528,7 @@ def settings_menu():
                        lambda a, v: _apply(a, paper=v),
                        render=lambda v: PAPER_LABELS[v])
 
-    menu = Menu([
+    menu = SettingsMenu([
         ("PAGES", set_pages),
         ("PAPER", set_paper),
         ("FORMAT", set_format),
@@ -535,18 +540,45 @@ def settings_menu():
     return menu
 
 
+class SettingsMenu(Menu):
+    """
+    A menu that says when a change has not been written to the card.
+
+    This matters because the unit tells the operator to power-cycle after
+    every pad job, and an unsaved TRAINING setting reverts to LIVE on the
+    next boot -- so the next "training" batch would print unwatermarked and
+    be indistinguishable from live key material.
+    """
+
+    def labels(self, app):
+        out = [label for label, _ in self.items]
+        if not getattr(app, "settings_saved", True):
+            out[-1] = "SAVE SETTINGS  *"
+        return out
+
+    def frame(self, app):
+        frame = super().frame(app)
+        if not getattr(app, "settings_saved", True):
+            frame.title = "SETTINGS  * UNSAVED"
+        return frame
+
+
 def _apply(app, **changes):
-    app.settings = replace(app.settings, **changes)
-    problems = app.settings.validate()
+    candidate = replace(app.settings, **changes)
+    problems = candidate.validate()
     if problems:
-        return Message("INVALID", [problems[0][:21]])
+        # Do not commit a value the unit cannot use.
+        return Message("INVALID", wrap(problems[0]))
+    app.settings = candidate
+    app.settings_saved = False
     return None
 
 
 def _save(app):
     ok = save(app.settings, app.config_path)
-    return Message("SETTINGS", ["SAVED" if ok else "COULD NOT WRITE",
-                                "" if ok else "BOOT PART READ-ONLY"])
+    app.settings_saved = ok
+    return Message("SETTINGS", ["SAVED"] if ok else
+                   ["COULD NOT WRITE", "BOOT PART READ-ONLY"])
 
 
 # --- top level ----------------------------------------------------------
@@ -625,6 +657,8 @@ class App:
         self.stack: list[Screen] = []
         self.running = True
         self.shutdown_requested = False
+        # Settings start matching whatever was loaded from the card.
+        self.settings_saved = True
 
     def render(self, screen=None) -> None:
         target = screen or (self.stack[-1] if self.stack else None)

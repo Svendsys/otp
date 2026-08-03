@@ -89,12 +89,19 @@ Run through this once before trusting the unit with anything:
 - [ ] `PRINT TEST PAGE` produces a sharp page with even shading bands
 - [ ] A 12-page pad pair prints two stacks
 - [ ] Both stacks are **identical** — hold two matching pages up to a window
+- [ ] Each pad's page numbers run 1..N with no repeats and no gaps
 - [ ] Cut one sheet and check the crop marks line up with the cut
 - [ ] `PRINT TABULA RECTA` and `PRINT MANUAL` both produce output
+- [ ] The confirm screen says `LIVE KEY MATERIAL` or `*** TRAINING ***` —
+      never neither
 - [ ] `swapon --show` prints nothing
 - [ ] After a job, `ls /var/spool/cups` is empty and `findmnt /var/spool/cups`
       or `/run/cups` shows tmpfs
-- [ ] Power-cycle: no trace of the job survives
+- [ ] **`findmnt /` reports `overlay`.** This is the single most load-bearing
+      step in the design and the easiest to forget: the panel looks identical
+      before and after you enable it, so nothing else will tell you. Until it
+      does, everything a session writes stays on the card.
+- [ ] Power-cycle, then confirm the job left no trace
 
 ## Developing without hardware
 

@@ -76,6 +76,13 @@ the whole stack at once and every sheet therefore needs identical geometry.
 For the same reason, **do not enable scaling or N-up in any print dialog or
 queue default** — it will move the cut line away from the crop marks.
 
+**Cut the two copies separately.** The unit prints copy A, waits for you to
+lift it off the tray, then prints copy B. Keep them apart and mark them —
+nothing on the paper says which is which, by design, since the two are
+identical. If sheets cross between the stacks you get one pad with a
+duplicated page and a missing one, which passes a page count and fails
+authentication weeks later. Fan each pad and check 1..N before sealing it.
+
 Set `PAPER` to `A6 SHEETS` if you really do have A6 paper loaded.
 
 ## Diagnosing

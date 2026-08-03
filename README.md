@@ -95,7 +95,22 @@ are A5: two per A4 sheet, one cut.
 | `--tabula` | 0 | Also generate N tabula recta cards as `TABULA_RECTA.pdf` — the manual's 26×26 table, pocket-sized to go in the envelope with the pad. No key material. |
 | `--auth-size` | 5 | Letters in the AUTH group. The letters are always CSPRNG output; only the length is adjustable. |
 | `--random-codewords` | 0 | Generate N random `<MODIFIER>-<NOUN>` codewords instead of reading a file |
-| `--stdout` | off | Write the single generated PDF to stdout instead of a file, so key material never reaches the filesystem: `otp_generator.py --random-codewords 1 --pages 100 --a4 --stdout \| lp` |
+| `--stdout` | off | Write the single generated PDF to stdout instead of a file: `otp_generator.py --random-codewords 1 --pages 100 --a4 --stdout \| lp`. See the caveat below — this keeps key material out of *this program's* output, not out of your spooler. |
+
+### What `--stdout` does and does not do
+
+It stops the generator writing a PDF file. Everything downstream of the pipe
+still applies, and on an ordinary desktop that means quite a lot: CUPS always
+spools the job to `/var/spool/cups`, and `PreserveJobFiles` defaults to 24
+hours, so the whole pad sits on disk for a day after printing. `job.cache`
+keeps job history indefinitely, `page_log` records a line per page, and your
+swap and hibernation files are live. `--random-codewords` also prints the
+codeword to stderr, which means terminal scrollback.
+
+The print unit survives all of that because it forces the CUPS spool onto
+tmpfs, runs without swap, and forgets everything at power-off. A laptop does
+none of those things. If the pads are protecting anything real, read
+[Generation hygiene](#generation-hygiene) — or build the unit.
 
 ### Printing on A4
 
@@ -112,6 +127,18 @@ The tiling is in the PDF rather than left to the print dialog, because a
 guillotine cuts the whole stack at once and every sheet therefore needs
 identical geometry. For the same reason, do not add scaling or N-up in your
 print dialog — it will move the cut line away from the crop marks.
+
+**Cut copy A and copy B separately.** The two copies are deliberately
+identical, which means once their sheets touch you cannot tell them apart.
+Cutting both stacks in one pass risks a sheet crossing over, and the result
+is not a harmless mix — one pad ends up with page 0007 twice and no 0008,
+its twin the mirror image. That passes the page count the manual tells you
+to check at handover, and surfaces weeks later as a failed authentication
+that is indistinguishable from tampering. It also puts a duplicated key page
+in someone's pocket, which is the one thing a one-time pad must never have.
+
+Mark each stack before you cut it, keep them apart, and before sealing each
+envelope fan the pad and confirm the page numbers run 1..N with no repeats.
 
 ### Anatomy of a page
 
@@ -151,8 +178,12 @@ follow with a laptop and easy to follow with a dedicated box:
   each job, which is unavoidable short of writing raw to `/dev/usb/lp0` and
   only PostScript and PCL printers accept that; so its spool, temp and cache
   directories are all forced onto tmpfs and purged after every job.
-- **The codeword never leaves the process.** It is not used as the CUPS job
-  title, because job names persist in CUPS's own records.
+- **The codeword is not sent to the printer.** It is neither the CUPS job
+  title, because job names persist in CUPS's own records, nor part of the
+  PDF metadata — page content is compressed but the document Info dictionary
+  is not, so a `strings` pass over a stored job would otherwise read it. The
+  PDF also carries no timestamp, so a captured job cannot date the pad. The
+  codeword does appear on the printed page, which is the point of it.
 - **No swap**, so nothing holding key material can be paged to disk.
 - **Volatile logs**, no core dumps, and job metadata only.
 - **Read-only root with a RAM overlay** — see [docs/IMAGE.md](docs/IMAGE.md).

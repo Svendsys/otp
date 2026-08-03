@@ -287,6 +287,25 @@ class GenerationCancelled(Exception):
     """Raised when a should_cancel callback asks for generation to stop."""
 
 
+def new_canvas(output, pagesize, title: str = "OTP"):
+    """
+    A canvas whose metadata gives nothing away.
+
+    PDF page content is Flate-compressed, but the document Info dictionary is
+    not -- a `strings` pass over a spooled job or a printer's stored copy
+    reads it directly. So the title must never carry the codeword, and the
+    timestamps must not date the pad. `invariant=1` pins CreationDate and
+    ModDate to a fixed value and makes the trailer /ID deterministic, which
+    also keeps copies A and B of a pair byte-identical.
+    """
+    c = canvas.Canvas(output, pagesize=pagesize, invariant=1)
+    c.setTitle(title)
+    c.setAuthor("")
+    c.setSubject("")
+    c.setCreator("")
+    return c
+
+
 def _printing_progress(codeword: str, stream=None):
     """The CLI's progress reporter: a line every hundred pad pages."""
     def report(done: int, total: int):
@@ -316,8 +335,7 @@ def generate_set_pdf_a6(
     """
     if progress is None:
         progress = _printing_progress(codeword)
-    c = canvas.Canvas(output, pagesize=A6)
-    c.setTitle(f"OTP TRAINING \u2014 {codeword}" if training else f"OTP \u2014 {codeword}")
+    c = new_canvas(output, A6)
 
     for page_num in range(1, num_pages + 1):
         if should_cancel is not None and should_cancel():
@@ -359,8 +377,7 @@ def generate_set_pdf_a7(
         progress = _printing_progress(codeword)
     # Landscape A6: 148mm wide x 105mm tall
     landscape_a6 = (SHEET_HEIGHT, SHEET_WIDTH)
-    c = canvas.Canvas(output, pagesize=landscape_a6)
-    c.setTitle(f"OTP TRAINING \u2014 {codeword}" if training else f"OTP \u2014 {codeword}")
+    c = new_canvas(output, landscape_a6)
 
     sheet_w, sheet_h = landscape_a6
     half_width = sheet_w / 2
@@ -454,8 +471,7 @@ def generate_set_pdf_a4(
         (half_w, 0),        # bottom-right pile 4
     ]
 
-    c = canvas.Canvas(output, pagesize=page_size)
-    c.setTitle(f"OTP TRAINING — {codeword}" if training else f"OTP — {codeword}")
+    c = new_canvas(output, page_size)
 
     done = 0
     for sheet in range(sheets):
@@ -512,8 +528,7 @@ def generate_worksheets_pdf(output, num_pages: int):
     `output` is a path or a writable binary stream.
     """
     page_w, page_h = A5  # 148mm x 210mm
-    c = canvas.Canvas(output, pagesize=A5)
-    c.setTitle("OTP WORKSHEETS")
+    c = new_canvas(output, A5, "OTP WORKSHEETS")
 
     margin = 8 * mm
     label_w = 6 * mm
@@ -589,8 +604,7 @@ def generate_tabula_recta_pdf(output, page_size=A6, copies: int = 1):
     """
     letters = [chr(65 + i) for i in range(26)]
     page_w, page_h = page_size
-    c = canvas.Canvas(output, pagesize=page_size)
-    c.setTitle("OTP TABULA RECTA")
+    c = new_canvas(output, page_size, "OTP TABULA RECTA")
 
     margin = 5 * mm
     title_h = 6 * mm

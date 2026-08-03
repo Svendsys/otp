@@ -129,11 +129,9 @@ def _draw_test_page(sink) -> None:
     """
     from reportlab.lib.pagesizes import A6
     from reportlab.lib.units import mm
-    from reportlab.pdfgen import canvas
 
     width, height = A6
-    c = canvas.Canvas(sink, pagesize=A6)
-    c.setTitle("OTP PRINTER TEST")
+    c = gen.new_canvas(sink, A6, "OTP PRINTER TEST")
     c.setFont("Courier-Bold", 11)
     c.drawCentredString(width / 2, height - 14 * mm, "OTP PRINT UNIT")
     c.setFont("Courier", 8)
@@ -185,9 +183,10 @@ class PadPairJob:
         letter = "AB"[self.copies_done] if self.spec.copies > 1 else ""
         # Deliberately NOT the codeword. The job title becomes the IPP
         # job-name, which CUPS records in /var/cache/cups/job.cache (kept
-        # forever by default) and, if page logging is on, in page_log. The
-        # codeword is the one field that ties this machine to a pad it
-        # produced, so it must never leave this process.
+        # forever by default) and, if page logging is on, in page_log.
+        # The document metadata is scrubbed for the same reason -- see
+        # otp_generator.new_canvas. Both matter: fixing only the envelope
+        # left the codeword sitting in the PDF's /Title.
         title = f"OTP {letter}".strip() if self.spec.carries_key_material \
             else self.spec.kind.value.upper()
         # Pad pages and tabula cards are A6; worksheets and the manual are

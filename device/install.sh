@@ -149,6 +149,19 @@ set_cups_file TempDir /run/cups/tmp
 set_cups_file CacheDir /run/cups/cache
 set_cups_file PageLog ""
 set_cups_file AccessLog ""
+# ErrorLog defaults to /var/log/cups/error_log, which is NOT covered by
+# making the journal volatile -- cupsd is a separate unit writing its own
+# file handle. Send it to syslog so it lands in the RAM-backed journal.
+set_cups_file ErrorLog syslog
+
+# ipp-usb keeps its own per-device logs keyed by manufacturer, model and
+# serial. That is the same artifact printers.conf is excluded for, arriving
+# by a different door, so point its directory at tmpfs too.
+install -d /etc/systemd/system/ipp-usb.service.d
+cat > /etc/systemd/system/ipp-usb.service.d/otp-unit.conf <<'EOF'
+[Service]
+LogsDirectory=ipp-usb
+EOF
 
 # These go in cupsd.conf itself. CUPS has no Include directive and no
 # cupsd.conf.d mechanism -- cupsdReadConfiguration() opens exactly
@@ -169,11 +182,14 @@ set_cupsd PreserveJobHistory No
 set_cupsd PreserveJobFiles No
 set_cupsd MaxJobs 1
 
+# Written in one go: appending here would duplicate on every rerun.
 cat > /etc/tmpfiles.d/otp-unit-cups.conf <<'EOF'
 d /run/cups 0710 root lp -
 d /run/cups/spool 0710 root lp -
 d /run/cups/tmp 1770 root lp -
 d /run/cups/cache 0770 root lp -
+d /run/ipp-usb 0750 root root -
+L+ /var/log/ipp-usb - - - - /run/ipp-usb
 EOF
 systemd-tmpfiles --create /etc/tmpfiles.d/otp-unit-cups.conf 2>/dev/null || true
 
@@ -195,18 +211,31 @@ fi
 # tmpfs over /etc/cups at boot and repopulates it, so the print queue is
 # rebuilt fresh every power-on.
 #
-# printers.conf is deliberately excluded. It holds the queue's DeviceURI,
-# i.e. the make, model and serial of the last printer used. Snapshotting it
-# on a rerun would bake that into the root filesystem and restore it on
-# every boot thereafter -- turning the one artifact this mechanism exists to
-# forget into the one that survives longest.
+# The template is built by WHITELIST, not blacklist. Everything that names
+# a printer has to stay out of it, and a blacklist kept missing things:
+# cupsd renames the old printers.conf to printers.conf.O on every save, and
+# writes a per-queue PPD to ppd/<queue>.ppd whose NickName is the model. A
+# snapshot taken on a rerun would bake those into the read-only root and lay
+# them back over /etc/cups on every boot -- making the one artifact this
+# mechanism exists to forget the one that survives longest.
 install -d "$PREFIX/cups-etc"
-rm -rf "${PREFIX:?}/cups-etc/"*
-cp -a /etc/cups/. "$PREFIX/cups-etc/" 2>/dev/null || true
-rm -f "$PREFIX/cups-etc/printers.conf" \
-      "$PREFIX/cups-etc/classes.conf" \
-      "$PREFIX/cups-etc/subscriptions.conf"
-rm -rf "$PREFIX/cups-etc/ssl"
+rm -rf "${PREFIX:?}/cups-etc"
+install -d "$PREFIX/cups-etc"
+for keep in cupsd.conf cups-files.conf snmp.conf client.conf; do
+    [ -f "/etc/cups/$keep" ] && install -m 0644 "/etc/cups/$keep" "$PREFIX/cups-etc/$keep"
+done
+# The mime rules are static package data, not device state.
+for keep in /etc/cups/*.types /etc/cups/*.convs; do
+    [ -f "$keep" ] && install -m 0644 "$keep" "$PREFIX/cups-etc/"
+done
+
+# The tmpfs only MASKS what is already on the root filesystem, so anything a
+# previous life left in /etc/cups stays on the card forever, invisible under
+# the mount point. Remove it now, while it is still reachable.
+rm -f /etc/cups/printers.conf /etc/cups/printers.conf.O \
+      /etc/cups/classes.conf /etc/cups/classes.conf.O \
+      /etc/cups/subscriptions.conf /etc/cups/subscriptions.conf.O
+rm -rf /etc/cups/ppd
 
 systemctl daemon-reload
 systemctl enable otp-unit-etc-cups.service

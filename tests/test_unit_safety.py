@@ -283,15 +283,58 @@ class TestManualIsHandledWhenAbsent:
 
 
 class TestCodewordNeverLeavesTheProcess:
-    def test_the_cups_job_title_is_not_the_codeword(self):
+    """
+    The codeword must be absent from BOTH the job envelope and the document.
+
+    Checking only the envelope is what let the codeword sit in the PDF's
+    /Title for a whole review round: page content is Flate-compressed, but
+    the document Info dictionary is not, so a `strings` pass over a spooled
+    job or a printer's stored copy reads it straight out.
+    """
+
+    def _submit_a_pair(self, codeword="RUSTED-BADGER", **settings):
         cups = Cups()
-        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "RUSTED-BADGER",
-                            config.Settings(pages=1))
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, codeword,
+                            config.Settings(pages=1, **settings))
         job = jobs.PadPairJob(spec, cups)
         job.generate(progress=lambda d, t: None)
         job.print_next_copy()
         job.print_next_copy()
-        titles = [s["title"] for s in cups.submitted]
-        assert titles == ["OTP A", "OTP B"]
-        for title in titles:
-            assert "RUSTED" not in title and "BADGER" not in title
+        return cups
+
+    def test_the_cups_job_title_is_not_the_codeword(self):
+        cups = self._submit_a_pair()
+        assert [s["title"] for s in cups.submitted] == ["OTP A", "OTP B"]
+
+    def test_the_pdf_sent_to_the_printer_does_not_contain_the_codeword(self):
+        cups = self._submit_a_pair()
+        for submission in cups.submitted:
+            assert b"RUSTED" not in submission["data"]
+            assert b"BADGER" not in submission["data"]
+
+    def test_the_pdf_is_not_dated(self):
+        # A timestamp in the metadata dates the pad, and lets a captured
+        # printer job be correlated with its twin.
+        cups = self._submit_a_pair()
+        data = cups.submitted[0]["data"]
+        assert b"D:2000" in data, "reportlab's invariant date should be pinned"
+        for year in (b"D:2024", b"D:2025", b"D:2026", b"D:2027"):
+            assert year not in data
+
+    def test_training_state_does_not_reach_the_printer(self):
+        cups = self._submit_a_pair(training=True)
+        # The watermark is drawn into the compressed page stream; what must
+        # not leak is an uncompressed metadata marker.
+        assert b"/Title (OTP)" in cups.submitted[0]["data"]
+
+    def test_every_job_kind_scrubs_its_metadata(self):
+        for kind in (jobs.JobKind.WORKSHEETS, jobs.JobKind.TABULA,
+                     jobs.JobKind.TEST_PAGE):
+            spec = jobs.JobSpec(kind, "", config.Settings(), count=1)
+            data = bytes(jobs.generate(spec))
+            assert b"D:2000" in data, kind
+
+    def test_both_copies_remain_byte_identical(self):
+        # Pinning the metadata must not have introduced per-copy variation.
+        cups = self._submit_a_pair()
+        assert cups.submitted[0]["data"] == cups.submitted[1]["data"]
