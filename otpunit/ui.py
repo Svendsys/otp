@@ -312,6 +312,9 @@ class RunJob(Screen):
         # Which stage the abandon prompt was reached from, so declining it
         # returns where the operator was rather than to a fixed guess.
         self.abandon_from = "waiting"
+        # Whether the last queue query came back unanswerable, so the
+        # waiting screen can say which of the two situations it is.
+        self.queue_unknown = False
 
     def _total_pages(self) -> int:
         """Units the progress callback counts in, for this job kind."""
@@ -370,12 +373,32 @@ class RunJob(Screen):
             # identical whether copy A or copy B was still queued, so an
             # operator could not tell what giving up would cost them.
             outstanding = "A" if self.job and self.job.copies_done < 2 else "B"
-            what = (f"COPY {outstanding} IS STILL"
-                    if self.spec.carries_key_material else "THE JOB IS STILL")
+            subject = (f"COPY {outstanding}"
+                       if self.spec.carries_key_material else "THE JOB")
+            if self.queue_unknown:
+                # "STILL PRINTING" would be a guess, not a report. An
+                # unanswerable query is deliberately counted as busy, so
+                # claiming the queue is still working sends the operator to
+                # the only other exit -- which destroys the pair.
+                return Frame(
+                    title="NO ANSWER",
+                    lines=["CANNOT ASK THE", "PRINT QUEUE.", "",
+                           "DOWN IF IT IS DONE"],
+                    footer="OK RETRY  HOLD STOP",
+                )
             return Frame(
                 title="STILL PRINTING",
-                lines=[what, "IN THE QUEUE.", "", "OK TO CHECK AGAIN"],
+                lines=[f"{subject} IS STILL", "IN THE QUEUE.", "",
+                       "OK TO CHECK AGAIN"],
                 footer="HOLD TO GIVE UP",
+            )
+
+        if self.stage == "confirm_continue":
+            return Frame(
+                title="IS IT DONE?",
+                lines=["CHECK THE PRINTER", "AND THE TRAY.", "",
+                       "IS THIS COPY DONE?"],
+                footer="OK=YES   HOLD=NO",
             )
 
         if self.stage == "confirm_abandon":
@@ -474,7 +497,28 @@ class RunJob(Screen):
                 self.abandon_from = "waiting"
                 self.stage = "confirm_abandon"
                 return self
+            # When the queue cannot be asked at all, retrying forever is not
+            # a way out: the only other exit destroys the key. Offer the
+            # operator -- who is standing at the printer and can see the
+            # tray -- a non-destructive way to say the copy landed.
+            #
+            # On DOWN, deliberately, and not on OK. This screen invites
+            # repeated OK, and an operator drumming on it must never be able
+            # to walk through the override and spool copy B over copy A.
+            # DOWN is otherwise unused here, and no amount of OK reaches it.
+            if press is Press.DOWN and self.queue_unknown:
+                self.stage = "confirm_continue"
+                return self
             if press is Press.OK:
+                return self._advance(app)
+            return self
+
+        if self.stage == "confirm_continue":
+            if press is Press.OK:
+                return self._proceed(app)
+            if press is Press.BACK:
+                # "No, keep waiting" re-queries rather than parking on a
+                # stale answer, so a cupsd that comes back is picked up.
                 return self._advance(app)
             return self
 
@@ -574,9 +618,15 @@ class RunJob(Screen):
         # early interleaves the two copies in one tray, and purging early
         # cancels the rest of copy B and destroys the key, leaving a
         # truncated half-pair that can never be regenerated.
-        if self.cups_busy(app):
+        state = self.queue_state(app)
+        self.queue_unknown = state == "unknown"
+        if state != "idle":
             self.stage = "waiting"
             return self
+        return self._proceed(app)
+
+    def _proceed(self, app):
+        """Take the transition, having established the queue is clear."""
         if not self.job.done:
             self.stage = "swap"
             return self
@@ -584,22 +634,33 @@ class RunJob(Screen):
         self.stage = "done"
         return self
 
-    def cups_busy(self, app) -> bool:
+    def queue_state(self, app) -> str:
         """
-        Whether the queue still holds work.
+        "busy", "idle", or "unknown" -- and the third is not the second.
 
-        An unanswerable query counts as BUSY, not as drained. Treating a
-        wedged cupsd as an empty queue would let both transitions through at
-        once: copy B spooled while A is still printing, then the spool
-        purged and the panel reporting PAIR COMPLETE over an interleaved,
-        truncated pair. Waiting costs one more OK press, and BACK is always
-        available.
+        active_jobs returns None for a wedged cupsd, a missing lpstat and an
+        unknown destination alike. Folding that into "idle" would let both
+        transitions through at once: copy B spooled while A is still
+        printing, then the spool purged and the panel reporting PAIR
+        COMPLETE over an interleaved, truncated pair.
+
+        Folding it into "busy" and leaving it there is not safe either,
+        which is what the separate value is for. If the query never
+        recovers, an operator whose pair printed perfectly is parked on a
+        screen whose only exit destroys it. The caller offers a manual way
+        on instead; see the confirm_continue stage.
         """
         try:
             queued = app.cups.active_jobs(app.queue)
         except Exception:
-            return True
-        return queued is None or queued > 0
+            return "unknown"
+        if queued is None:
+            return "unknown"
+        return "busy" if queued > 0 else "idle"
+
+    def cups_busy(self, app) -> bool:
+        """Whether the queue holds work, counting an unanswerable query."""
+        return self.queue_state(app) != "idle"
 
 
 def gen_cancelled():

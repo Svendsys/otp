@@ -124,8 +124,8 @@ class TestTheUnitCannotBeBricked:
         scripted presses, so a whole-app walk never gets past a job start.
         Drive RunJob directly instead.
         """
-        stages = ("confirm", "printing", "waiting", "swap",
-                  "cancelled", "abandoned", "error", "done")
+        stages = ("confirm", "printing", "waiting", "confirm_continue",
+                  "swap", "cancelled", "abandoned", "error", "done")
         for stage in stages:
             cups = Cups(busy=1 if stage == "waiting" else 0)
             app = make_app([])
@@ -622,6 +622,117 @@ class TestSwapAsksBeforeDestroying:
         assert screen.stage == "confirm_abandon"
         screen.press(app, Press.BACK)
         assert screen.stage == "waiting"
+
+
+class TestAnUnanswerableQueueHasANonDestructiveExit:
+    """
+    active_jobs returns None when the queue cannot be asked at all -- a
+    wedged cupsd, a missing lpstat, a destination that has gone away. That
+    is deliberately counted as busy, because treating it as drained would
+    spool copy B over copy A and then purge the spool.
+
+    But counting it as busy and stopping there is its own trap. If the
+    query never recovers, `waiting` never clears, and the only other exit
+    is the abandon prompt -- so an operator whose pair printed perfectly is
+    offered nothing but destroying it. There has to be a way to say "I can
+    see the tray, it is done" that does not zero the key.
+    """
+
+    def _stuck(self, pages=2):
+        class Mute(Cups):
+            def active_jobs(self, name="OTP"):
+                return None            # cannot ask, not "nothing queued"
+
+        cups = Mute()
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "SILENT-OSPREY",
+                            config.Settings(pages=pages))
+        app, screen = make_app([]), ui.RunJob(spec)
+        app.cups = cups
+        screen.press(app, Press.OK)    # generate and submit copy A
+        screen.press(app, Press.OK)    # cannot ask -> waiting
+        assert screen.stage == "waiting"
+        return app, screen, cups
+
+    def test_an_unanswerable_queue_still_blocks_the_transition(self):
+        # The conservative half must not have been lost in the fix.
+        _, screen, cups = self._stuck()
+        assert screen.queue_unknown
+        assert len(cups.submitted) == 1, "copy B must not be spooled over A"
+
+    def test_the_panel_does_not_claim_the_job_is_printing(self):
+        app, screen, _ = self._stuck()
+        frame = screen.frame(app)
+        text = " ".join([frame.title] + list(frame.lines))
+        assert "STILL PRINTING" not in text
+        assert "CANNOT ASK" in text
+
+    def test_down_offers_a_way_on_that_does_not_destroy_the_key(self):
+        app, screen, _ = self._stuck()
+        buffer = screen.job._buffer
+        screen.press(app, Press.DOWN)
+        assert screen.stage == "confirm_continue"
+        assert any(buffer), "asking must not itself zero the key"
+
+    def test_drumming_on_ok_can_never_reach_the_override(self):
+        # The override exists because `waiting` is otherwise a trap, but it
+        # must not be reachable by the impatience the screen invites: OK
+        # here means "check again", and walking it through to `swap` would
+        # spool copy B over a copy A that may still be printing.
+        app, screen, cups = self._stuck()
+        for _ in range(12):
+            screen.press(app, Press.OK)
+        assert screen.stage == "waiting"
+        assert len(cups.submitted) == 1
+        assert cups.purged == 0
+
+    def test_confirming_prints_copy_b_rather_than_discarding_it(self):
+        app, screen, cups = self._stuck()
+        screen.press(app, Press.DOWN)        # -> confirm_continue
+        screen.press(app, Press.OK)          # yes, copy A is done
+        assert screen.stage == "swap"
+        screen.press(app, Press.OK)          # print copy B
+        assert len(cups.submitted) == 2
+        assert cups.purged == 0, "a completed pair must not be purged away"
+
+    def test_declining_re_queries_so_a_recovered_cupsd_is_picked_up(self):
+        app, screen, cups = self._stuck()
+        screen.press(app, Press.DOWN)        # -> confirm_continue
+        cups.active_jobs = lambda name="OTP": 0      # cupsd comes back idle
+        screen.press(app, Press.BACK)        # "no, keep waiting"
+        assert screen.stage == "swap", "a recovered queue must be noticed"
+        assert not screen.queue_unknown
+
+    def test_declining_while_still_mute_returns_to_waiting(self):
+        app, screen, _ = self._stuck()
+        screen.press(app, Press.DOWN)
+        screen.press(app, Press.BACK)
+        assert screen.stage == "waiting"
+        assert screen.queue_unknown
+
+    def test_giving_up_is_still_available_and_still_asks(self):
+        app, screen, _ = self._stuck()
+        buffer = screen.job._buffer
+        screen.press(app, Press.BACK)
+        assert screen.stage == "confirm_abandon"
+        assert any(buffer), "the key must survive an unconfirmed press"
+        screen.press(app, Press.OK)
+        assert screen.stage == "abandoned"
+        assert not any(buffer)
+
+    def test_a_busy_queue_is_not_treated_as_unanswerable(self):
+        # The two must stay distinguishable, or the manual override would
+        # be offered while copy A is genuinely still printing.
+        cups = Cups(busy=3)
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "X-Y",
+                            config.Settings(pages=1))
+        app, screen = make_app([]), ui.RunJob(spec)
+        app.cups = cups
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "waiting"
+        assert not screen.queue_unknown
+        screen.press(app, Press.DOWN)
+        assert screen.stage == "waiting", "no override while genuinely busy"
 
 
 class TestQueueSetupNeverEscapes:

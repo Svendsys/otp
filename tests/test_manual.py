@@ -121,3 +121,36 @@ class TestExercises:
         assert fixed == plain
         # realignment: from the tenth letter, key shifted one position back
         assert decrypt(ct[:9], key[:9]) + decrypt(ct[9:], key[8:24]) == plain
+
+    def test_exercise_4_authenticates_and_stops_at_the_marker(self):
+        """
+        The exercise that teaches the extension attack has to actually BE
+        one, and its printed answer has to be the real decrypt rather than
+        prose someone typed. Both halves are checked here: the arithmetic,
+        and the property the answer claims.
+        """
+        sec = self._section()
+        ct = degroup(re.search(r"Received: (OKMHA.+)", sec).group(1))
+        key = degroup(re.search(r"Key:      (EHQUL.+)", sec).group(1))
+        printed = degroup(re.search(r"\n(KDWNP HOLDP.+)", sec).group(1))
+        auth = re.search(r"AUTH (\w+)", sec).group(1)
+
+        plain = decrypt(ct, key)
+        assert plain == printed, "the printed answer must be the real decrypt"
+
+        # The auth group verifies -- which is the point: it does NOT save you.
+        assert plain[:5] == auth
+
+        end = plain.index("XXXXX", 5)
+        assert plain[5:end] == "HOLDPOSITION", "what is acted on"
+        # ...and there is genuinely something plausible after it, or the
+        # exercise would not be demonstrating anything.
+        assert "ADVANCEATDAWN" in plain[end:]
+        # The attacker kept the group count identical, so length is no tell.
+        assert len(plain) % 5 == 0 and len(plain) == len(ct)
+
+    def test_the_manual_does_not_still_teach_the_broken_rule(self):
+        # "The message ends at the first padding character" truncates the
+        # manual's own example message, which begins with A.
+        assert "ends at the first padding character" not in MD
+        assert "ACTIVATENAUGHTFIRE"[0] == "A", "why that rule was unusable"
