@@ -51,14 +51,40 @@ jobs:
             || sudo mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc
           mountpoint /proc/sys/fs/binfmt_misc
 
-      - name: Register arm64 binfmt with the fix-binary flag
-        run: docker run --privileged --rm tonistiigi/binfmt --install arm64
-
+      # --no-install-recommends is load-bearing, not tidiness. qemu-user
+      # RECOMMENDS qemu-user-binfmt, which registers its own handler:
+      #
+      #   interpreter /usr/libexec/qemu-binfmt/aarch64-binfmt-P
+      #   flags: PO
+      #
+      # No F flag, so it cannot work inside the build container -- and
+      # because it is registered last it takes precedence over the one that
+      # can. That entry, pulled in by a Recommends nobody asked for, is
+      # what broke the previous two runs. It also explains the failing
+      # grep in build-docker.sh, which looks for /usr/bin/qemu-aarch64 and
+      # never sees that wrapper path.
       - name: Install the qemu interpreter on the host PATH
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-user
+          sudo apt-get install -y --no-install-recommends qemu-user
           which qemu-aarch64
+          dpkg -l | grep -q qemu-user-binfmt && {
+            echo "qemu-user-binfmt got installed anyway; it will clobber the F entry" >&2
+            exit 1
+          } || true
+
+      # Registered LAST, so nothing can overwrite it, and with exactly one
+      # handler for the magic so there is no precedence question at all.
+      - name: Register arm64 binfmt with the fix-binary flag
+        run: |
+          if [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            echo "removing pre-existing registration"
+            echo -1 | sudo tee /proc/sys/fs/binfmt_misc/qemu-aarch64 >/dev/null
+          fi
+          docker run --privileged --rm tonistiigi/binfmt --install arm64
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+          # The F flag is the whole point. Assert it rather than hope.
+          grep -q '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-aarch64
 
       # Reproduce pi-gen's own check before spending half an hour on it.
       # build.sh runs `arch-test arm64` inside the build container, and
