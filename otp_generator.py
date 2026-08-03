@@ -32,10 +32,11 @@ unmistakably marked: --training watermarks TRAINING across every page.
 """
 
 import argparse
+import math
 import os
 import sys
 from reportlab.lib.units import mm
-from reportlab.lib.pagesizes import A5, A6
+from reportlab.lib.pagesizes import A4, A5, A6, LETTER
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
@@ -49,6 +50,24 @@ A6_GROUPS_PER_ROW = 7
 A6_CHARS_PER_ROW = A6_GROUPS_PER_ROW * GROUP_SIZE  # 35
 A7_GROUPS_PER_ROW = 5
 A7_CHARS_PER_ROW = A7_GROUPS_PER_ROW * GROUP_SIZE  # 25
+
+# Header geometry, shared by the drawing code and the fit calculations
+HEADER_MARGIN_H = 4 * mm
+HEADER_GAP = 2 * mm
+
+# Crop marks for the guillotine, on imposed sheets. Inset because a laser
+# leaves the outer few millimetres of a sheet unprinted -- 4.23mm on an HP
+# LaserJet Pro M12w and most of its class -- so a mark that starts at the
+# paper's edge is a mark that never appears. 5mm clears that band on every
+# printer in docs/PRINTERS.md.
+CROP_INSET = 5 * mm
+CROP_TICK = 7 * mm
+
+# Two-word codewords (RUSTED-BADGER) do not fit the A7 header at the body font
+# size, so the codeword shrinks to fit. It is a label, not key material — the
+# AUTH group and page number always stay at full size because those are read
+# letter by letter.
+CODEWORD_MIN_FONT = 5.5
 
 
 def get_random_bytes(n: int) -> bytes:
@@ -84,6 +103,65 @@ def load_codewords(filepath: str) -> list[str]:
     return words
 
 
+CODEWORDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codewords")
+
+
+def _read_words(path: str) -> list[str]:
+    with open(path, "r") as f:
+        return [line.strip().upper() for line in f if line.strip()]
+
+
+def load_vocabulary(base_dir: str = None):
+    """
+    Load the bundled codeword vocabulary.
+
+    Returns (modifiers, {category: nouns}). Codewords are <MODIFIER>-<NOUN>
+    so that two sets are very unlikely to collide, while both halves stay
+    concrete enough to carry from a handover to a radio.
+    """
+    base = base_dir or CODEWORDS_DIR
+    modifiers = _read_words(os.path.join(base, "modifiers.txt"))
+    noun_dir = os.path.join(base, "nouns")
+    nouns = {
+        name[:-4]: _read_words(os.path.join(noun_dir, name))
+        for name in sorted(os.listdir(noun_dir)) if name.endswith(".txt")
+    }
+    return modifiers, nouns
+
+
+def random_choice(seq):
+    """
+    Uniform choice from the OS CSPRNG, by rejection sampling.
+
+    Deliberately not the `random` module: everything that picks anything in
+    this program draws from the same source as the key material.
+    """
+    n = len(seq)
+    if n == 0:
+        raise ValueError("cannot choose from an empty sequence")
+    limit = (2 ** 32 // n) * n
+    while True:
+        value = int.from_bytes(get_random_bytes(4), "big")
+        if value < limit:
+            return seq[value % n]
+
+
+def random_codewords(count: int, base_dir: str = None) -> list[str]:
+    """Generate `count` distinct <MODIFIER>-<NOUN> codewords."""
+    modifiers, nouns = load_vocabulary(base_dir)
+    flat_nouns = [word for words in nouns.values() for word in words]
+    total = len(modifiers) * len(flat_nouns)
+    if count > total:
+        raise ValueError(f"asked for {count} codewords but only {total} exist")
+    seen, out = set(), []
+    while len(out) < count:
+        word = f"{random_choice(modifiers)}-{random_choice(flat_nouns)}"
+        if word not in seen:
+            seen.add(word)
+            out.append(word)
+    return out
+
+
 def draw_pad_page(
     c: canvas.Canvas,
     codeword: str,
@@ -98,9 +176,10 @@ def draw_pad_page(
     box_height: float,
     with_auth: bool = True,
     training: bool = False,
+    auth_size: int = GROUP_SIZE,
 ):
     """Draw a single pad page within the given bounding box."""
-    margin_h = 4 * mm
+    margin_h = HEADER_MARGIN_H
     margin_top = 5 * mm
     margin_bottom = 4 * mm
 
@@ -109,16 +188,22 @@ def draw_pad_page(
     content_width = right - left
 
     # Key material: body plus an optional AUTH group, reserved for
-    # authentication and excluded from the key body (see otp.md)
-    extra = GROUP_SIZE if with_auth else 0
+    # authentication and excluded from the key body (see otp.md).
+    # The AUTH group's length is configurable; the key body's five-letter
+    # grouping is not — five-letter groups are the manual's convention.
+    extra = auth_size if with_auth else 0
     key_chars = generate_random_letters(chars_per_page + extra)
     body_chars = key_chars[:chars_per_page]
     auth_group = key_chars[chars_per_page:] if with_auth else None
 
-    # Header
+    # Header. The codeword shrinks to fit if it must; AUTH and the page
+    # number stay at font_size, since those get read character by character.
     y = box_bottom + box_height - margin_top
-    c.setFont("Courier-Bold", font_size)
+    a7_box = box_width < SHEET_WIDTH
+    cw_size = fit_codeword_size(codeword, font_size, a7_box, with_auth, auth_size)
+    c.setFont("Courier-Bold", cw_size or CODEWORD_MIN_FONT)
     c.drawString(left, y, codeword)
+    c.setFont("Courier-Bold", font_size)
     if auth_group:
         c.drawCentredString(box_left + box_width / 2, y, f"AUTH {auth_group}")
     c.drawRightString(right, y, f"{page_num:04d}")
@@ -207,20 +292,63 @@ def draw_pad_page(
             group_idx += 1
 
 
+class GenerationCancelled(Exception):
+    """Raised when a should_cancel callback asks for generation to stop."""
+
+
+def new_canvas(output, pagesize, title: str = "OTP"):
+    """
+    A canvas whose metadata gives nothing away.
+
+    PDF page content is Flate-compressed, but the document Info dictionary is
+    not -- a `strings` pass over a spooled job or a printer's stored copy
+    reads it directly. So the title must never carry the codeword, and the
+    timestamps must not date the pad. `invariant=1` pins CreationDate and
+    ModDate to a fixed value and makes the trailer /ID deterministic, which
+    also keeps copies A and B of a pair byte-identical.
+    """
+    c = canvas.Canvas(output, pagesize=pagesize, invariant=1)
+    c.setTitle(title)
+    c.setAuthor("")
+    c.setSubject("")
+    c.setCreator("")
+    return c
+
+
+def _printing_progress(codeword: str, stream=None):
+    """The CLI's progress reporter: a line every hundred pad pages."""
+    def report(done: int, total: int):
+        if done % 100 == 0:
+            print(f"  [{codeword}] {done}/{total} pages generated",
+                  file=stream if stream is not None else sys.stdout)
+    return report
+
+
 def generate_set_pdf_a6(
-    output_path: str,
+    output,
     codeword: str,
     num_pages: int,
     chars_per_page: int,
     font_size: float,
     with_auth: bool = True,
     training: bool = False,
+    auth_size: int = GROUP_SIZE,
+    progress=None,
+    should_cancel=None,
 ):
-    """Generate OTP set as A6 pages (one pad page per sheet)."""
-    c = canvas.Canvas(output_path, pagesize=A6)
-    c.setTitle(f"OTP TRAINING \u2014 {codeword}" if training else f"OTP \u2014 {codeword}")
+    """
+    Generate OTP set as A6 pages (one pad page per sheet).
+
+    `output` is a path or a writable binary stream \u2014 the stream form keeps key
+    material out of the filesystem entirely (see otpunit.jobs).
+    """
+    if progress is None:
+        progress = _printing_progress(codeword)
+    c = new_canvas(output, A6)
 
     for page_num in range(1, num_pages + 1):
+        if should_cancel is not None and should_cancel():
+            raise GenerationCancelled(f"cancelled at page {page_num} of {num_pages}")
         draw_pad_page(
             c, codeword, page_num, chars_per_page, font_size,
             groups_per_row=A6_GROUPS_PER_ROW,
@@ -229,35 +357,44 @@ def generate_set_pdf_a6(
             box_width=SHEET_WIDTH, box_height=SHEET_HEIGHT,
             with_auth=with_auth,
             training=training,
+            auth_size=auth_size,
         )
         c.showPage()
-
-        if page_num % 100 == 0:
-            print(f"  [{codeword}] {page_num}/{num_pages} pages generated")
+        progress(page_num, num_pages)
 
     c.save()
 
 
 def generate_set_pdf_a7(
-    output_path: str,
+    output,
     codeword: str,
     num_pages: int,
     chars_per_page: int,
     font_size: float,
     with_auth: bool = True,
     training: bool = False,
+    auth_size: int = GROUP_SIZE,
+    progress=None,
+    should_cancel=None,
 ):
-    """Generate OTP set as A7 — two pad pages side by side on landscape A6."""
+    """
+    Generate OTP set as A7 — two pad pages side by side on landscape A6.
+
+    `output` is a path or a writable binary stream.
+    """
+    if progress is None:
+        progress = _printing_progress(codeword)
     # Landscape A6: 148mm wide x 105mm tall
     landscape_a6 = (SHEET_HEIGHT, SHEET_WIDTH)
-    c = canvas.Canvas(output_path, pagesize=landscape_a6)
-    c.setTitle(f"OTP TRAINING \u2014 {codeword}" if training else f"OTP \u2014 {codeword}")
+    c = new_canvas(output, landscape_a6)
 
     sheet_w, sheet_h = landscape_a6
     half_width = sheet_w / 2
 
     page_num = 1
     while page_num <= num_pages:
+        if should_cancel is not None and should_cancel():
+            raise GenerationCancelled(f"cancelled at page {page_num} of {num_pages}")
         # Left half
         draw_pad_page(
             c, codeword, page_num, chars_per_page, font_size,
@@ -267,6 +404,7 @@ def generate_set_pdf_a7(
             box_width=half_width, box_height=sheet_h,
             with_auth=with_auth,
             training=training,
+            auth_size=auth_size,
         )
 
         # Right half (if it exists)
@@ -279,6 +417,7 @@ def generate_set_pdf_a7(
                 box_width=half_width, box_height=sheet_h,
                 with_auth=with_auth,
                 training=training,
+                auth_size=auth_size,
             )
 
         # Cut line: dashed vertical line down the middle
@@ -290,24 +429,128 @@ def generate_set_pdf_a7(
         c.restoreState()
 
         c.showPage()
-
-        if page_num % 100 == 0 or (page_num + 1) % 100 == 0:
-            print(f"  [{codeword}] {min(page_num + 1, num_pages)}/{num_pages} pages generated")
+        progress(min(page_num + 1, num_pages), num_pages)
 
         page_num += 2
 
     c.save()
 
 
-def generate_worksheets_pdf(output_path: str, num_pages: int):
+def generate_set_pdf_a4(
+    output,
+    codeword: str,
+    num_pages: int,
+    chars_per_page: int,
+    font_size: float,
+    with_auth: bool = True,
+    training: bool = False,
+    auth_size: int = GROUP_SIZE,
+    progress=None,
+    should_cancel=None,
+    page_size=A4,
+):
+    """
+    Generate OTP set as four A6 pad pages per A4 sheet, for guillotine work.
+
+    Imposed **cut-and-stack**, not in reading order. Four A6 pages tile onto
+    A4 exactly, so the whole printed stack is cut twice -- once down the
+    middle, once across -- giving four piles. Each pile is already in page
+    order, so the pad is assembled by dropping them on top of one another:
+    top-left pile, then top-right, then bottom-left, then bottom-right.
+
+    Reading order would be the obvious layout and the wrong one: it would
+    leave four piles that have to be interleaved page by page.
+
+    The tiling is exact rather than driver-scaled. That matters because a
+    guillotine cuts the whole stack at once, so every sheet has to have
+    identical geometry -- fit-to-page scaling would drift the cut line.
+    """
+    if progress is None:
+        progress = _printing_progress(codeword)
+    # Quartering whatever sheet is in the tray, rather than assuming A6
+    # exactly, keeps the cut lines dead centre on Letter as well as A4.
+    page_w, page_h = page_size
+    half_w, half_h = page_w / 2, page_h / 2
+    # Cut-and-stack: position p carries pages p*sheets+1 .. (p+1)*sheets.
+    sheets = -(-num_pages // 4)
+    positions = [
+        (0, half_h),        # top-left     pile 1
+        (half_w, half_h),   # top-right    pile 2
+        (0, 0),             # bottom-left  pile 3
+        (half_w, 0),        # bottom-right pile 4
+    ]
+
+    c = new_canvas(output, page_size)
+
+    done = 0
+    for sheet in range(sheets):
+        if should_cancel is not None and should_cancel():
+            raise GenerationCancelled(f"cancelled at sheet {sheet + 1} of {sheets}")
+        for slot, (box_left, box_bottom) in enumerate(positions):
+            page_num = slot * sheets + sheet + 1
+            if page_num > num_pages:
+                continue
+            draw_pad_page(
+                c, codeword, page_num, chars_per_page, font_size,
+                groups_per_row=A6_GROUPS_PER_ROW,
+                chars_per_row=A6_CHARS_PER_ROW,
+                box_left=box_left, box_bottom=box_bottom,
+                box_width=half_w, box_height=half_h,
+                with_auth=with_auth,
+                training=training,
+                auth_size=auth_size,
+            )
+            done += 1
+        _draw_crop_marks(c, page_w, page_h)
+        c.showPage()
+        progress(min(done, num_pages), num_pages)
+
+    c.save()
+
+
+def _draw_crop_marks(c: canvas.Canvas, page_w: float, page_h: float):
+    """
+    Ticks near the sheet edges marking the two cuts.
+
+    Edge ticks rather than full rules: a line across the sheet would run
+    through the key area, and the blade only needs something collinear with
+    the cut to line up on.
+
+    They are inset rather than run to the paper's edge. A laser cannot mark
+    the outer few millimetres of a sheet -- the HP LaserJet Pro M12w and
+    most of its class reserve 4.23mm (one sixth of an inch) on every edge --
+    so ticks spanning 0 to 4mm landed entirely inside the band that never
+    receives toner, and the marks the whole cut-and-stack layout depends on
+    simply did not appear. Starting at CROP_INSET puts them on paper.
+
+    Being inset costs nothing: the tick sits ON the cut line, so any part of
+    it defines where the blade goes. Both cuts run along the boundary
+    between tiled pages, which is 4mm clear of any content on either side,
+    so the ticks cannot collide with key material at any length.
+    """
+    c.saveState()
+    c.setStrokeGray(0.45)
+    c.setLineWidth(0.4)
+    inset, tick = CROP_INSET, CROP_TICK
+    # Vertical cut, marked bottom and top
+    c.line(page_w / 2, inset, page_w / 2, inset + tick)
+    c.line(page_w / 2, page_h - inset - tick, page_w / 2, page_h - inset)
+    # Horizontal cut, marked left and right
+    c.line(inset, page_h / 2, inset + tick, page_h / 2)
+    c.line(page_w - inset - tick, page_h / 2, page_w - inset, page_h / 2)
+    c.restoreState()
+
+
+def generate_worksheets_pdf(output, num_pages: int):
     """
     Generate blank A5 worksheets: blocks of M/K/C rows in five-letter
     group cells. Worksheets carry no key material, so unlike pads they
     can be printed in any quantity.
+
+    `output` is a path or a writable binary stream.
     """
     page_w, page_h = A5  # 148mm x 210mm
-    c = canvas.Canvas(output_path, pagesize=A5)
-    c.setTitle("OTP WORKSHEETS")
+    c = new_canvas(output, A5, "OTP WORKSHEETS")
 
     margin = 8 * mm
     label_w = 6 * mm
@@ -332,6 +575,13 @@ def generate_worksheets_pdf(output_path: str, num_pages: int):
         c.setFont("Courier-Bold", 9)
         c.drawString(margin, header_y, "OTP WORKSHEET")
         c.drawRightString(page_w - margin, header_y, "PAGE ________")
+        # The rows are labelled for encryption. Two of the manual's three
+        # exercises are decrypts, where the ciphertext goes in the top row
+        # and the plaintext comes out of the shaded one -- say so, or a
+        # student follows the labels straight into the wrong arithmetic.
+        c.setFont("Courier", 5.5)
+        c.drawCentredString(page_w / 2, header_y - 5.5 * mm,
+                            "ENCRYPT M+K=C   DECRYPT: PUT C IN THE TOP ROW, C-K=M")
         c.setLineWidth(0.3)
         c.line(margin, header_y - 2 * mm, page_w - margin, header_y - 2 * mm)
 
@@ -371,27 +621,211 @@ def generate_worksheets_pdf(output_path: str, num_pages: int):
     c.save()
 
 
-def max_codeword_len(font_size: float, a7: bool, with_auth: bool) -> int:
+def generate_tabula_recta_pdf(output, page_size=A6, copies: int = 1):
     """
-    Longest codeword that fits the page header without colliding with
-    the centered AUTH group or the right-aligned page number.
+    Generate the 26x26 tabula recta as a card, sized to fill the page.
+
+    This is the table from the manual's Tools section: row = key letter,
+    column = message letter, intersection = ciphertext. It replaces the
+    number conversion and modulo arithmetic once the concept has landed
+    (see otp.md, Tabula Recta). It carries no key material, so unlike pads
+    it can be printed in any quantity.
     """
-    margin_h = 4 * mm
-    gap = 2 * mm
+    letters = [chr(65 + i) for i in range(26)]
+    page_w, page_h = page_size
+    c = new_canvas(output, page_size, "OTP TABULA RECTA")
+
+    margin = 5 * mm
+    title_h = 6 * mm
+    footer_h = 5 * mm
+
+    # 27 cells each way: one header row/column plus the 26 shift alphabets.
+    content_w = page_w - 2 * margin
+    content_h = page_h - 2 * margin - title_h - footer_h
+    cell_w = content_w / 27
+    cell_h = content_h / 27
+
+    # Courier glyphs are 0.6 em wide; leave a little air on both axes.
+    font_size = min(cell_w / 0.75, cell_h * 0.72)
+
+    for _ in range(copies):
+        c.setFont("Courier-Bold", min(9.0, font_size * 1.3))
+        c.drawString(margin, page_h - margin - title_h * 0.7, "TABULA RECTA")
+        c.setFont("Courier", min(5.5, font_size))
+        c.drawRightString(page_w - margin, page_h - margin - title_h * 0.7,
+                          "ROW=KEY  COL=MSG")
+
+        top = page_h - margin - title_h
+        left = margin
+
+        # Shade the header row and column so the axes stay findable at speed
+        c.setFillGray(0.85)
+        c.rect(left, top - cell_h, content_w, cell_h, fill=1, stroke=0)
+        c.rect(left, top - 27 * cell_h, cell_w, 27 * cell_h, fill=1, stroke=0)
+        c.setFillGray(0)
+
+        # Alternating band shading across the body, matching the pad pages
+        c.setFillGray(0.93)
+        for row in range(26):
+            if row % 2 == 1:
+                y = top - (row + 2) * cell_h
+                c.rect(left + cell_w, y, content_w - cell_w, cell_h, fill=1, stroke=0)
+        c.setFillGray(0)
+
+        c.setLineWidth(0.25)
+        c.setStrokeGray(0.6)
+        for i in range(28):
+            x = left + i * cell_w
+            c.line(x, top, x, top - 27 * cell_h)
+            y = top - i * cell_h
+            c.line(left, y, left + 27 * cell_w, y)
+
+        c.setFont("Courier-Bold", font_size)
+        for col, letter in enumerate(letters):
+            x = left + (col + 1.5) * cell_w
+            c.drawCentredString(x, top - cell_h * 0.72, letter)
+        for row, letter in enumerate(letters):
+            y = top - (row + 1.72) * cell_h
+            c.drawCentredString(left + cell_w * 0.5, y, letter)
+
+        c.setFont("Courier", font_size)
+        for row in range(26):
+            y = top - (row + 2.72) * cell_h + cell_h
+            for col in range(26):
+                x = left + (col + 1.5) * cell_w
+                c.drawCentredString(x, y, letters[(row + col) % 26])
+
+        c.setFont("Courier-Bold", min(5.5, font_size))
+        c.drawCentredString(page_w / 2, margin * 0.6,
+                            "ENCRYPT: KEY ROW, MSG COLUMN — DECRYPT: KEY ROW, FIND CT, READ COLUMN")
+        c.showPage()
+
+    c.save()
+
+
+def codeword_space(
+    font_size: float,
+    a7: bool,
+    with_auth: bool,
+    auth_size: int = GROUP_SIZE,
+) -> float:
+    """
+    Horizontal room the codeword has in the page header, in points.
+
+    The AUTH group and page number are always drawn at `font_size`, so the
+    space available to the codeword does not depend on the codeword's own
+    size — which is what lets it shrink independently.
+    """
     box_width = (SHEET_HEIGHT / 2) if a7 else SHEET_WIDTH
-    content_width = box_width - 2 * margin_h
-    char_w = stringWidth("X", "Courier-Bold", font_size)
-    pagenum_w = stringWidth("0000", "Courier-Bold", font_size)
+    content_width = box_width - 2 * HEADER_MARGIN_H
     if with_auth:
-        auth_w = stringWidth("AUTH XXXXX", "Courier-Bold", font_size)
-        codeword_space = (content_width - auth_w) / 2 - gap
-    else:
-        codeword_space = content_width - pagenum_w - gap
-    return max(0, int(codeword_space // char_w))
+        auth_w = stringWidth("AUTH " + "X" * auth_size, "Courier-Bold", font_size)
+        return (content_width - auth_w) / 2 - HEADER_GAP
+    pagenum_w = stringWidth("0000", "Courier-Bold", font_size)
+    return content_width - pagenum_w - HEADER_GAP
 
 
-def calc_max_chars(font_size: float, a7: bool = False) -> int:
-    """Calculate maximum characters that fit on one pad page."""
+def max_codeword_len(
+    font_size: float,
+    a7: bool,
+    with_auth: bool,
+    auth_size: int = GROUP_SIZE,
+) -> int:
+    """
+    Longest codeword that fits the page header *at font_size*, without
+    colliding with the centered AUTH group or the right-aligned page number.
+
+    Longer codewords are not necessarily rejected: draw_pad_page shrinks the
+    codeword down to CODEWORD_MIN_FONT before giving up. Use
+    fit_codeword_size() for the "will this print at all" question.
+    """
+    char_w = stringWidth("X", "Courier-Bold", font_size)
+    return max(0, int(codeword_space(font_size, a7, with_auth, auth_size) // char_w))
+
+
+def fit_codeword_size(
+    codeword: str,
+    font_size: float,
+    a7: bool = False,
+    with_auth: bool = True,
+    auth_size: int = GROUP_SIZE,
+) -> float | None:
+    """
+    Largest size at or below `font_size` at which `codeword` fits the header,
+    or None if it will not fit even at CODEWORD_MIN_FONT.
+    """
+    if not codeword:
+        return font_size
+    # Courier is monospaced and scales linearly, so one measurement suffices.
+    width_at_1pt = stringWidth(codeword, "Courier-Bold", 1)
+    space = codeword_space(font_size, a7, with_auth, auth_size)
+    size = min(font_size, space / width_at_1pt)
+    return size if size >= CODEWORD_MIN_FONT else None
+
+
+def max_auth_size(font_size: float, a7: bool = False, box_width: float = None) -> int:
+    """
+    Longest AUTH group that clears the right-aligned page number.
+
+    codeword_space budgets the codeword against the AUTH group, but nothing
+    budgeted AUTH itself: at --auth-size 40 the last AUTH letter overprints
+    the first digit of the page number. Those are the two fields deliberately
+    kept at full size because they are read character by character.
+    """
+    if box_width is None:
+        box_width = (SHEET_HEIGHT / 2) if a7 else SHEET_WIDTH
+    content_width = box_width - 2 * HEADER_MARGIN_H
+    pagenum_w = stringWidth("0000", "Courier-Bold", font_size)
+    label_w = stringWidth("AUTH ", "Courier-Bold", font_size)
+    char_w = stringWidth("X", "Courier-Bold", font_size)
+    # AUTH is centred, so it has to clear the page number on both sides.
+    room = content_width - 2 * (pagenum_w + HEADER_GAP) - label_w
+    return max(0, int(room // char_w))
+
+
+def max_body_font_size(a7: bool = False, box_width: float = None) -> float:
+    """
+    Largest body font size at which a row of groups still fits across the page.
+
+    calc_max_chars only measures height. Without this, a larger --fontsize
+    drives the inter-group gap negative and the groups are drawn overlapping
+    one another -- letters superimposed, inside the content box, with no
+    visual tell at the margins. A pad like that is unreadable and both
+    copies are equally corrupt, so it fails silently at the far end.
+    """
+    if box_width is None:
+        box_width = (SHEET_HEIGHT / 2) if a7 else SHEET_WIDTH
+    groups = A7_GROUPS_PER_ROW if a7 else A6_GROUPS_PER_ROW
+    content_width = box_width - 2 * HEADER_MARGIN_H
+    width_per_point = stringWidth("X" * GROUP_SIZE, "Courier", 1) * groups
+    return content_width / width_per_point
+
+
+def max_fitted_codeword_len(
+    font_size: float,
+    a7: bool,
+    with_auth: bool,
+    auth_size: int = GROUP_SIZE,
+) -> int:
+    """
+    Longest codeword that can be printed at all, allowing for shrinking down
+    to CODEWORD_MIN_FONT. The AUTH group and page number stay at font_size,
+    so only the codeword's own width shrinks.
+    """
+    char_w = stringWidth("X", "Courier-Bold", CODEWORD_MIN_FONT)
+    return max(0, int(codeword_space(font_size, a7, with_auth, auth_size) // char_w))
+
+
+def calc_max_chars(font_size: float, a7: bool = False, box_height: float = None) -> int:
+    """
+    Calculate maximum characters that fit on one pad page.
+
+    `box_height` overrides the assumed page height for imposed layouts. It
+    matters for Letter: a quarter-sheet is 139.7mm tall against A6's 148mm,
+    so measuring against A6 lets a large --chars value push the last key rows
+    off the bottom of the box -- below the guillotine line, or overprinting
+    the footer.
+    """
     margin_top = 5 * mm
     margin_bottom = 4 * mm
     header_space = 4 * mm
@@ -404,6 +838,8 @@ def calc_max_chars(font_size: float, a7: bool = False) -> int:
     else:
         page_height = SHEET_HEIGHT
         chars_per_row = A6_CHARS_PER_ROW
+    if box_height is not None:
+        page_height = box_height
 
     available = page_height - margin_top - margin_bottom - header_space - footer_space
     min_spacing = font_size * 0.38 * mm
@@ -420,18 +856,70 @@ def main():
     parser.add_argument("--chars", type=int, default=None, help="Key chars per pad page (default: 665 for A6, 375 for A7)")
     parser.add_argument("--fontsize", type=float, default=None, help="Font size in pt (default: 9)")
     parser.add_argument("--a7", action="store_true", help="Two pad pages per A6 sheet (cut to get A7)")
+    parser.add_argument("--a4", action="store_true",
+                        help="Four A6 pad pages per A4 sheet, imposed cut-and-stack "
+                             "with crop marks (guillotine the stack twice, then pile "
+                             "the four stacks in order)")
+    parser.add_argument("--letter", action="store_true",
+                        help="Like --a4 but on US Letter")
     parser.add_argument("--no-auth", action="store_true", help="Omit the AUTH group from page headers")
     parser.add_argument("--training", action="store_true", help="Watermark every page as TRAINING material")
     parser.add_argument("--worksheets", type=int, default=0,
                         help="Also generate N A5 worksheet pages as WORKSHEETS.pdf")
+    parser.add_argument("--tabula", type=int, default=0, metavar="N",
+                        help="Also generate N A6 tabula recta cards as TABULA_RECTA.pdf")
+    parser.add_argument("--auth-size", type=int, default=GROUP_SIZE,
+                        help=f"Letters in the AUTH group (default: {GROUP_SIZE})")
+    parser.add_argument("--random-codewords", type=int, default=0, metavar="N",
+                        help="Generate N random <MODIFIER>-<NOUN> codewords instead of "
+                             "reading --codewords, and print them to stderr")
+    parser.add_argument("--stdout", action="store_true",
+                        help="Write the single generated PDF to stdout instead of a file, "
+                             "so key material never reaches the filesystem "
+                             "(e.g. otp_generator.py ... --stdout | lp)")
     args = parser.parse_args()
     with_auth = not args.no_auth
-    generating_sets = args.codewords is not None
+    auth_size = args.auth_size
+    generating_sets = args.codewords is not None or args.random_codewords > 0
 
     if args.worksheets < 0:
         parser.error("--worksheets must be 0 or more")
-    if not generating_sets and args.worksheets == 0:
-        parser.error("nothing to do \u2014 provide --codewords for pad sets and/or --worksheets N")
+    if args.tabula < 0:
+        parser.error("--tabula must be 0 or more")
+    if auth_size < 1:
+        parser.error("--auth-size must be at least 1")
+    if args.codewords and args.random_codewords:
+        parser.error("use either --codewords or --random-codewords, not both")
+    # --random-codewords N implies N sets; resolve it before anything counts them
+    if args.random_codewords:
+        args.sets = args.random_codewords
+    if not generating_sets and args.worksheets == 0 and args.tabula == 0:
+        parser.error("nothing to do \u2014 provide --codewords for pad sets and/or "
+                     "--worksheets N and/or --tabula N")
+
+    # --stdout emits one PDF, so it cannot disambiguate multiple outputs
+    if args.stdout:
+        requested = (args.sets if generating_sets else 0) + \
+                    (1 if args.worksheets else 0) + (1 if args.tabula else 0)
+        if requested != 1:
+            parser.error("--stdout writes a single PDF: use exactly one of "
+                         "--sets 1, --worksheets N, or --tabula N")
+
+    if args.chars is not None and args.chars < 1:
+        parser.error("--chars must be at least 1")
+    # The page number is a fixed-width four-digit field that both ends drill
+    # against; past 9999 it silently becomes five digits and stops being one.
+    if args.pages > 9999:
+        parser.error("--pages cannot exceed 9999: the page number is a "
+                     "four-digit field on the page and in the message header")
+    if args.fontsize is not None and (not math.isfinite(args.fontsize)
+                                      or args.fontsize <= 0):
+        parser.error("--fontsize must be a positive number")
+    if args.a7 and (args.a4 or args.letter):
+        parser.error("--a7 lays out on A6 sheets; it cannot be combined with "
+                     "--a4 or --letter")
+    if args.a4 and args.letter:
+        parser.error("use either --a4 or --letter, not both")
 
     # Defaults based on format
     if args.a7:
@@ -445,99 +933,196 @@ def main():
         chars_per_page = args.chars or 665
         chars_per_row = A6_CHARS_PER_ROW
         groups_per_row = A6_GROUPS_PER_ROW
-        format_label = "A6"
+        if args.a4:
+            format_label = "A6 (4-up on A4, cut-and-stack)"
+        elif args.letter:
+            format_label = "A6 (4-up on Letter, cut-and-stack)"
+        else:
+            format_label = "A6"
 
-    os.makedirs(args.output, exist_ok=True)
+    # With --stdout the PDF owns the stdout stream, so all chatter goes to
+    # stderr; otherwise print() as before so the CLI output is unchanged.
+    stream = sys.stderr if args.stdout else sys.stdout
+
+    def log(*parts):
+        print(*parts, file=stream)
+
+    if not args.stdout:
+        os.makedirs(args.output, exist_ok=True)
 
     if generating_sets:
         if args.sets < 1:
-            print("ERROR: --sets must be at least 1")
+            log("ERROR: --sets must be at least 1")
             sys.exit(1)
         if args.pages < 1:
-            print("ERROR: --pages must be at least 1")
+            log("ERROR: --pages must be at least 1")
             sys.exit(1)
 
-        codewords = load_codewords(args.codewords)
+        if args.random_codewords:
+            codewords = random_codewords(args.random_codewords)
+            log(f"Random codewords: {' '.join(codewords)}")
+        else:
+            codewords = load_codewords(args.codewords)
         if len(codewords) < args.sets:
-            print(f"ERROR: Need {args.sets} codewords but file only contains {len(codewords)}")
+            log(f"ERROR: Need {args.sets} codewords but file only contains {len(codewords)}")
             sys.exit(1)
 
         # Codewords become filenames, and each set must be unique
         seen = set()
         for word in codewords[:args.sets]:
             if word in seen:
-                print(f"ERROR: Duplicate codeword '{word}' \u2014 its set would overwrite the previous PDF")
+                log(f"ERROR: Duplicate codeword '{word}' \u2014 its set would overwrite the previous PDF")
                 sys.exit(1)
             seen.add(word)
-            if not all(ch.isalnum() or ch in "-_" for ch in word):
-                print(f"ERROR: Codeword '{word}' is unsafe as a filename (use A-Z, 0-9, '-', '_')")
+            # ASCII only. str.isalnum() is true for every Unicode letter,
+            # but the Courier used on the page is a WinAnsi font: reportlab
+            # substitutes silently, so 中文-BADGER and 日本-BADGER both print
+            # the same header while remaining distinct filenames.
+            if not all((ch.isascii() and ch.isalnum()) or ch in "-_" for ch in word):
+                log(f"ERROR: Codeword '{word}' is unsafe as a filename (use A-Z, 0-9, '-', '_')")
                 sys.exit(1)
 
-        # Codewords must fit the page header beside the AUTH group and page number
-        codeword_limit = max_codeword_len(font_size, args.a7, with_auth)
+        # Imposed layouts get a quarter of the sheet, which on Letter is
+        # shorter and wider than A6 -- measure against the box the pages
+        # actually land in, not against A6.
+        box_height = box_width = None
+        if args.a4 or args.letter:
+            sheet_size = LETTER if args.letter else A4
+            box_height, box_width = sheet_size[1] / 2, sheet_size[0] / 2
+
+        # AUTH first: an oversized AUTH group squeezes the codeword's budget
+        # to almost nothing, so checking the codeword first would blame it
+        # for a fault that is really the AUTH size.
+        auth_limit = max_auth_size(font_size, args.a7, box_width)
+        if with_auth and auth_size > auth_limit:
+            log(f"ERROR: an AUTH group of {auth_size} would overprint the page "
+                f"number on {format_label}. Maximum is {auth_limit}.")
+            sys.exit(1)
+
+        # Codewords must fit the page header beside the AUTH group and page
+        # number. They shrink to fit, so the limit is what fits at the smallest
+        # legible size \u2014 not what fits at the body font size.
+        codeword_limit = max_fitted_codeword_len(font_size, args.a7, with_auth, auth_size)
         for word in codewords[:args.sets]:
-            if len(word) > codeword_limit:
-                print(f"ERROR: Codeword '{word}' is too long for the {format_label} header "
-                      f"at {font_size}pt (max {codeword_limit} characters)")
+            if fit_codeword_size(word, font_size, args.a7, with_auth, auth_size) is None:
+                log(f"ERROR: Codeword '{word}' is too long for the {format_label} header "
+                    f"(max {codeword_limit} characters)")
                 sys.exit(1)
 
-        max_chars = calc_max_chars(font_size, args.a7)
+        # Width first. calc_max_chars only measures height, so without this
+        # a larger --fontsize drives the inter-group gap negative and the
+        # groups print superimposed on one another -- inside the content
+        # box, so nothing overflows visibly, and both copies are equally
+        # unreadable.
+        max_font = max_body_font_size(args.a7, box_width)
+        if font_size > max_font:
+            # Round DOWN: printing the true maximum to one decimal would
+            # round up, and an operator retyping the number from the error
+            # message would hit the same error again.
+            usable = math.floor(max_font * 10) / 10
+            log(f"ERROR: {font_size}pt is too wide for {format_label} — "
+                f"the five-letter groups would overlap. Maximum is {usable}pt.")
+            sys.exit(1)
+
+        max_chars = calc_max_chars(font_size, args.a7, box_height)
         if chars_per_page > max_chars:
-            print(f"ERROR: {chars_per_page} chars won't fit on {format_label} at {font_size}pt. Maximum is {max_chars}.")
+            log(f"ERROR: {chars_per_page} chars won't fit on {format_label} at {font_size}pt. Maximum is {max_chars}.")
             sys.exit(1)
 
         num_rows = -(-chars_per_page // chars_per_row)
 
-        print(f"Format: {format_label}")
-        print(f"Generating {args.sets} OTP sets, {args.pages} pad pages each, {chars_per_page} chars/page")
-        print(f"Auth group in header: {'yes' if with_auth else 'no'}")
-        print(f"Training pads: {'yes' if args.training else 'no'}")
-        print(f"Font: Courier {font_size}pt")
-        print(f"Layout: {num_rows} rows of {groups_per_row}x{GROUP_SIZE} groups ({chars_per_row} chars/row)")
-        print(f"Max chars per pad page at this font size: {max_chars}")
+        log(f"Format: {format_label}")
+        log(f"Generating {args.sets} OTP sets, {args.pages} pad pages each, {chars_per_page} chars/page")
+        log(f"Auth group in header: {'yes' if with_auth else 'no'}")
+        log(f"Training pads: {'yes' if args.training else 'no'}")
+        log(f"Font: Courier {font_size}pt")
+        log(f"Layout: {num_rows} rows of {groups_per_row}x{GROUP_SIZE} groups ({chars_per_row} chars/row)")
+        log(f"Max chars per pad page at this font size: {max_chars}")
         if args.a7:
             num_sheets = -(-args.pages // 2)
-            print(f"Paper: {num_sheets} A6 sheets per set (cut vertically to separate)")
-        print(f"Output: {args.output}")
-        print()
+            log(f"Paper: {num_sheets} A6 sheets per set (cut vertically to separate)")
+        log(f"Output: {'<stdout>' if args.stdout else args.output}")
+        log()
+
+        if args.a7:
+            generate = generate_set_pdf_a7
+        elif args.a4 or args.letter:
+            sheet = LETTER if args.letter else A4
+            def generate(out, *rest, **kwargs):
+                return generate_set_pdf_a4(out, *rest, page_size=sheet, **kwargs)
+        else:
+            generate = generate_set_pdf_a6
 
         for i in range(args.sets):
             codeword = codewords[i]
-            filename = f"{codeword}.pdf"
-            filepath = os.path.join(args.output, filename)
-
-            print(f"Set {i + 1}/{args.sets}: {codeword}")
-            if args.a7:
-                generate_set_pdf_a7(filepath, codeword, args.pages, chars_per_page, font_size,
-                                    with_auth, args.training)
+            log(f"Set {i + 1}/{args.sets}: {codeword}")
+            if args.stdout:
+                generate(sys.stdout.buffer, codeword, args.pages, chars_per_page,
+                         font_size, with_auth, args.training, auth_size,
+                         progress=_printing_progress(codeword, stream))
+                log("  Written to stdout")
             else:
-                generate_set_pdf_a6(filepath, codeword, args.pages, chars_per_page, font_size,
-                                    with_auth, args.training)
-            print(f"  Saved: {filepath}")
-            print()
+                filepath = os.path.join(args.output, f"{codeword}.pdf")
+                generate(filepath, codeword, args.pages, chars_per_page,
+                         font_size, with_auth, args.training, auth_size)
+                log(f"  Saved: {filepath}")
+            log()
 
     if args.worksheets:
-        worksheet_path = os.path.join(args.output, "WORKSHEETS.pdf")
-        print(f"Worksheets: {args.worksheets} A5 pages")
-        generate_worksheets_pdf(worksheet_path, args.worksheets)
-        print(f"  Saved: {worksheet_path}")
-        print()
+        log(f"Worksheets: {args.worksheets} A5 pages")
+        if args.stdout:
+            generate_worksheets_pdf(sys.stdout.buffer, args.worksheets)
+            log("  Written to stdout")
+        else:
+            worksheet_path = os.path.join(args.output, "WORKSHEETS.pdf")
+            generate_worksheets_pdf(worksheet_path, args.worksheets)
+            log(f"  Saved: {worksheet_path}")
+        log()
 
-    print("=" * 50)
-    print("DONE")
-    print()
+    if args.tabula:
+        log(f"Tabula recta: {args.tabula} A6 cards")
+        if args.stdout:
+            generate_tabula_recta_pdf(sys.stdout.buffer, A6, args.tabula)
+            log("  Written to stdout")
+        else:
+            tabula_path = os.path.join(args.output, "TABULA_RECTA.pdf")
+            generate_tabula_recta_pdf(tabula_path, A6, args.tabula)
+            log(f"  Saved: {tabula_path}")
+        log()
+
+    log("=" * 50)
+    log("DONE")
+    log()
     if generating_sets:
-        print("Each PDF contains one complete set.")
-        print("PRINT EACH PDF TWICE to get your A and B copies.")
+        log("Each PDF contains one complete set.")
+        if args.stdout:
+            # The bytes went down the pipe and are gone. Re-running produces
+            # DIFFERENT key material -- two pads wearing one codeword, which
+            # is the failure the whole pair convention exists to prevent.
+            # Collate=True is not optional. Without it cups-filters
+            # interleaves the copies -- page 1, page 1, page 2, page 2 --
+            # so instead of two pads you get one stack that has to be
+            # dealt out by hand, and any slip mixes the two pads of a set.
+            log("You piped one copy. A pad set is two IDENTICAL copies, so")
+            log("ask the printer for both from this one job:")
+            log("  ... --stdout | lp -n 2 -o Collate=True")
+            log("Collate=True keeps them as two pads rather than")
+            log("interleaving them into one stack. Re-running would make")
+            log("a DIFFERENT pad, not the twin.")
+        else:
+            log("PRINT EACH PDF TWICE to get your A and B copies.")
         if args.a7:
-            print("Cut each sheet vertically along the dashed line")
-            print("to separate into A7 pad pages.")
-        print("Store both copies in a sealed envelope labeled")
-        print("with the codeword. Destroy this digital data")
-        print("and wipe the generation machine when finished.")
+            log("Cut each sheet vertically along the dashed line")
+            log("to separate into A7 pad pages.")
+        log("Store both copies in a sealed envelope labeled")
+        log("with the codeword. Destroy this digital data")
+        log("and wipe the generation machine when finished.")
     if args.worksheets:
-        print("Worksheets contain no key material \u2014 print as many")
-        print("copies as you need.")
+        log("Worksheets contain no key material \u2014 print as many")
+        log("copies as you need.")
+    if args.tabula:
+        log("Tabula recta cards contain no key material \u2014 print as many")
+        log("copies as you need.")
 
 
 if __name__ == "__main__":

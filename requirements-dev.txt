@@ -1,0 +1,8 @@
+# Development and CI dependencies.
+#
+# The print unit itself installs everything from apt (see device/packages.txt)
+# so that a freshly flashed image needs no network on first boot. This file is
+# only for running the test suite on a development machine.
+reportlab
+pytest
+pypdf

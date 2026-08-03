@@ -126,12 +126,24 @@ class TestCliValidation:
         assert "unsafe as a filename" in r.stdout
 
     def test_codeword_too_long_for_a7_header(self, tmp_path):
+        # The codeword shrinks to fit, so the limit is what still renders at
+        # CODEWORD_MIN_FONT — 18 characters on A7. This one is past it.
         words = tmp_path / "words.txt"
-        words.write_text("EXTRAORDINARILY\n")
+        words.write_text("EXTRAORDINARILYLONGCODEWORD\n")
         r = run(["--codewords", str(words), "--sets", "1", "--pages", "1",
                  "--a7", "--output", str(tmp_path)], cwd=tmp_path)
         assert r.returncode != 0
         assert "too long" in r.stdout
+
+    def test_two_word_codeword_fits_a7_by_shrinking(self, tmp_path):
+        # 13 characters exceeds the 11 that fit at 9pt, but prints fine
+        # smaller — this is what makes <MODIFIER>-<NOUN> codewords possible.
+        words = tmp_path / "words.txt"
+        words.write_text("RUSTED-BADGER\n")
+        r = run(["--codewords", str(words), "--sets", "1", "--pages", "2",
+                 "--a7", "--output", str(tmp_path)], cwd=tmp_path)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert is_pdf(tmp_path / "RUSTED-BADGER.pdf")
 
     def test_missing_codeword_file(self, tmp_path):
         r = run(["--codewords", str(tmp_path / "nope.txt"), "--sets", "1",

@@ -4,3 +4,13 @@ __pycache__/
 # Generated pads are key material — never commit them
 output/
 pads/
+
+# Rendered at image-build time by image/render-manual.sh
+assets/*.pdf
+
+# pi-gen checkout and build output
+image/pi-gen/
+image/deploy/
+*.img
+*.img.xz
+*.deb

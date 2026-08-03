@@ -206,6 +206,33 @@ And the padding just repeats the key from the same position.
 
 The ciphertext in the padding region is raw key, and unused truly-random key is uniformly distributed — exactly as uniform as (message + key). So a passive observer can't tell where message ends and padding begins even if the convention is public, and length stays hidden.
 
+**One caveat, and then we move on.** That sentence is about a *passive* observer. Someone who can intercept and substitute in real time is in a different position: they know the plaintext in the padding region is A, which hands them the key there, and OTP is malleable (see Critical technicalities). So they can overwrite the padding with text of their own, leave the auth group and your real words untouched, and keep the group count identical — and the auth check still passes, because it proves the *sender* held the pad, not that the message was not extended.
+
+Note this is not caused by padding with A. Padding with X has the same hole; any padding whose plaintext is predictable does, and predictability is what makes padding cheap in the first place.
+
+For most people this is theoretical — it needs an adversary sitting on your channel able to alter traffic in flight, not merely listen. If that is genuinely in your threat model, the answer is an end-of-text group agreed at the handover: a letter run your own traffic can never produce, written at the true end of the message, with the receiver acting on nothing past its first occurrence. Otherwise, read the padding as the end of the message and carry on.
+
+### How much to pad
+
+Padding to the end of the page is the simplest rule, and it is what the example above does. It is rarely the right one, because **it makes your page size your transmission length for every message you ever send.** The default A6 page holds 665 characters — 133 groups, whether the message was a paragraph or "MEET AT NOON". Read aloud that is close to nine minutes on the air, and transmission time is exactly what direction-finding wants.
+
+The important thing is that **padding less costs you nothing in key.** A partly used page is still a spent page: the remainder burns with it and is never saved for later. So the only thing full-page padding buys is length hiding, and the only thing it costs is air time. Those can be traded directly.
+
+The useful middle is to **pad up to a fixed length, agreed at the handover** — round every transmission up to the next 10 groups, say, or the next 25. All your short messages then look identical to each other, and an observer learns only which bucket you landed in, never the message itself. Pick the step from your traffic: a 10-group step suits terse tactical messages, a 25-group step hides more but costs more air time.
+
+Note that padding by some arbitrary small amount is *not* the same thing. If you simply add a handful of characters, the transmission length still tracks the message length and an observer reads it off to within a few groups. Fuzzing a length is not hiding it — the hiding comes from many different messages sharing one length, which is what a fixed step gives you and an arbitrary one does not.
+
+| Approach | What an observer learns | On the air |
+|---|---|---|
+| Pad to the end of the page | Nothing | Always one full page |
+| Pad up to a fixed step | Which bucket only | Message, rounded up |
+| Pad by an arbitrary bit | Length, near enough | Message, plus a bit |
+| No padding | Exact length | Shortest possible |
+
+Under a fixed step the page size stops being your transmission length and goes back to being what it should be: a ceiling on how long a single message can get, and a question about paper. The default is a generous ceiling, which is a good thing to have. `--chars` is there if you want a smaller one anyway.
+
+Whichever you pick, **it is a handover agreement, not a per-message decision.** Both ends must know the step, so that a short transmission reads as a short message rather than a truncated one.
+
 # Critical technicalities
 
 There are a few details that are absolutely essential to be aware of for secure OTP communication. Never compromise on these points, they are fundamental to the OTP scheme itself. Be aware that following these requirements is not in itself a guarantee against compromise. 
@@ -322,9 +349,18 @@ The handover is the single most sensitive event in the life of a channel. There 
 
 - Generate as close to the handover as practical, so the pads spend minimum time in storage before the copies split up.
 - Each copy travels sealed in an opaque envelope, labeled with the codeword only — no names, no addresses. Make the seal tamper-evident: sign across the flap, or seal it in a way you can verify later. The seal's job is to make "someone opened this" impossible to hide.
-- At the handover, verify together: right codeword, right page count, both copies intact. Agree explicitly on which direction the set will serve — who sends on it — and on every convention of the channel: sanitization, header format, schedule, safety word. This is the one moment you have a secure face-to-face channel. Everything that must ever be agreed, agree now.
+- At the handover, verify together: right codeword, right page count, both copies intact — and **fan each pad and check the page numbers run 1 to N with no repeats and no gaps.** A page count alone is not enough. If the pads were cut from a stack, a single sheet crossing between the two piles gives one pad a duplicated page and a missing one, which passes a count and leaves a repeated key page in play. Check the two copies match, too: hold a matching page from each up to the light. Agree explicitly on which direction the set will serve — who sends on it — and on every convention of the channel: sanitization, header format, schedule, safety word. This is the one moment you have a secure face-to-face channel. Everything that must ever be agreed, agree now.
 - Nothing written leaves the handover except the pads themselves. The association between a codeword and a person is carried in heads.
 - If custody was ever uncertain on the way — a bag out of sight, a border search, an unexplained delay — the set is retired, unused. A pad you are not sure of is worse than no pad, because it produces confidence without security.
+
+## When Generation Goes Wrong
+Printing a pad is the one step where a mechanical failure can quietly produce key material that looks correct and is not. The rules are short.
+
+- **An interrupted print means start over.** If a copy jams, runs out of paper, or is cancelled part-way, destroy *both* copies and generate a new set. Do not reprint the missing pages: a printer that jams often reprints the page it was on, and a pad with one page repeated is the exact failure a one-time pad cannot survive. Half a pair is not half a pad — it is nothing, because its twin does not exist.
+- **A codeword may be reused after a failed job.** The abandoned pad and the new one share nothing but a name, and codewords only have to be unique among the sets actually in service. Reuse it if you like — but never let both leave the room.
+- **Two pads must never carry the same codeword in service.** If you are ever unsure whether a codeword is already in use on a live channel, pick another. The envelope label is the only thing tying a page in the hand to its twin.
+- **Watch the page count, weeks ahead.** A pad ends. Re-keying needs another face-to-face handover, so the time to arrange the next set is while the current one still has pages, not when it runs out. Treat the last twenty pages as a warning, not as stock.
+- **Destroying a retired set is a real job.** A thousand-page pad is a ream of paper. Burning it takes longer than you think and does not go unnoticed; plan where and how before you need to, and do not start a fire you cannot finish. The rule is the same as for a single page — reduce it to ash, and crush the ash — but the scale is not.
 
 ## Transmission & Reception
 Here is the liberating part: the ciphertext needs no protection. All the secrecy lives in the pad, so the transmission channel can be anything that carries letters — radio, telephone, a letter, a classified ad, a note in a dead drop. Assume every transmission is recorded by the adversary and proceed anyway; that assumption is already built into the scheme.
@@ -356,7 +392,7 @@ Human error is the most likely path of failure. The mathematics of OTP does not 
 ## Protecting Our Network
 - **Compartmentalize by channel.** Every channel has its own pads and its own codeword. No pad, page, or key material is ever shared, copied, or "borrowed" between channels. The capture of one channel must tell the adversary nothing about the others.
 - **Codewords, not names.** A captured pad should reveal a codeword and nothing else — not who holds the twin, not where, not why. The codeword-to-person mapping lives in memory, in as few heads as possible.
-- **Guard the generation point.** Whoever generates pads touches every channel at birth, which makes the generation machine the most valuable object in the network. It stays offline, dedicated to the task, physically controlled, and wiped when the batch is done — and the printer counts as part of the machine.
+- **Guard the generation point.** Whoever generates pads touches every channel at birth, which makes the generation machine the most valuable object in the network. It stays offline, dedicated to the task, physically controlled, and wiped when the batch is done — and the printer counts as part of the machine. A dedicated appliance makes this easier to actually do than a laptop does: the print unit included with this kit boots into nothing but the pad printer, and holds key material only in RAM — no swap, no spool on the card, no file at any point. Two caveats it is worth knowing rather than assuming. Its radios are disabled but a wired or USB network adapter is not, so "offline" is something you arrange physically, not something the image guarantees. And it only forgets what it did once its read-only overlay is switched on, which is a step you take after first boot — until then it is an ordinary computer with an ordinary disk. Its printer remembers regardless, which is why the unit tells you to power-cycle that too.
 - **Keep traffic discipline network-wide.** Schedules and dummy traffic (see Schedules & Signals) keep the network's rhythm constant whether it is idle or busy. The adversary should learn nothing from volume.
 
 ## Protecting Our Cell
@@ -453,7 +489,7 @@ Every one of these has broken real systems. Most of them feel harmless in the mo
 
 # Exercises
 
-Three exercises, in rising order of difficulty. Work them by hand — numbers or tabula recta, your choice — ideally on a printed worksheet (the generator can produce those). One observation before you begin: these keys are printed in a manual, which means they are compromised by definition. That is not a flaw in the exercises, it is the first lesson — a key's secrecy is a property of its custody, not of its letters. Practice keys are for practice.
+Four exercises, in rising order of difficulty. The first three drill the mechanics and leave the auth group out to keep the arithmetic visible; the fourth is a complete message as you would actually send and receive one, and it is the one that matters most. Work them by hand — numbers or tabula recta, your choice — ideally on a printed worksheet (the generator can produce those). One observation before you begin: these keys are printed in a manual, which means they are compromised by definition. That is not a flaw in the exercises, it is the first lesson — a key's secrecy is a property of its custody, not of its letters. Practice keys are for practice.
 
 ## Exercise 1 — Encrypt
 
@@ -485,6 +521,20 @@ Received: CCJAX KNLGZ MHSUC OCBGB PKUBW
 Key:      OLHTX TKFGI HZHUB YMUBP KUBWF
 ```
 
+## Exercise 4 — The complete message
+
+The first three left the auth group out to keep the arithmetic visible. This one is a real message, run the way the Authentication section requires: the first plaintext group is the page's auth group, and the digit convention applies.
+
+Your copy of the page prints `AUTH KDWNP` in its header. You receive:
+
+```
+Received: OKMHA ONECU EUONM NNXIF WJZRX RFTWT DVNOR
+
+Key:      EHQUL CZJYU LVKWY IFCEG SSLST ARTWT DVNOR
+```
+
+Authenticate it first — if that check fails you stop there, and everything after it is wasted effort. Then decrypt and restore the spacing.
+
 ## Answers
 
 **Exercise 1.** Sanitized and padded: `BRING THREE SHOVE LSAAA AAAAA`. Encrypted:
@@ -511,9 +561,20 @@ ORCHA RDGAT EATNI NEPMA AAAAA
 
 ORCHARD GATE AT NINE PM. Two lessons ride along. First, the diagnostic: where the garble *starts* tells you where the slip happened, and a one-position realignment that instantly restores clean text confirms the diagnosis. Second, notice that the sender's slip made one key character encrypt two letters — even honest mistakes create small key reuse, which is one more reason the page burns after one message no matter how the message went. Realigning is legitimate receiver-side detective work — nothing extra is transmitted — but a repaired message is still a suspect message, and the authentication rules apply to it with full force.
 
+**Exercise 4.** The decrypt is:
+
+```
+KDWNP MOVEA TZERO FIVEZ EROZE ROAAA AAAAA
+```
+
+The first group is `KDWNP`, matching the `AUTH` printed on your page. That is the whole authentication step: the sender holds the twin pad, and you are on the right page. Strip it, and the message is `MOVEATZEROFIVEZEROZERO` — **MOVE AT 0500**, digits spelled out by convention, then eight characters of padding.
+
+Two things to notice. The last eight ciphertext characters are identical to the key, exactly as in Exercise 1 — the A-padding shortcut doing its work. And the auth group cost you one group of key to buy something real: had you reached for the wrong page, `KDWNP` would not have appeared, and you would have known at once rather than puzzling over a page of garbage.
+
 # Glossary
 
-- **Auth group** - A five-letter group of key material reserved on each page for authentication, never used for encryption
+- **Auth group** - A group of key material reserved on each page for authentication, never used for encryption. Five letters by default; the generator can produce other lengths, but both ends must agree, and shorter means weaker — a three-letter group is guessable at 1 in 17,576 rather than 1 in 11.9 million
+- **A-padding** - Filling the rest of the page's key with the letter A so every message is the same length. Hides length from a passive observer; see Preparation for the rule it requires against an active one
 - **Channel** - A one-way sender-to-receiver link, secured by one pad set
 - **Cipher** - A cryptographic algorithm or scheme
 - **Ciphertext** - The encrypted output from a cipher
@@ -526,8 +587,8 @@ ORCHARD GATE AT NINE PM. Two lessons ride along. First, the diagnostic: where th
 - **Key** - The random letters printed on pad pages; also called key material
 - **mod** - The modulo operator
 - **OTP** - One time pad
-- **Pad** - A booklet of key pages, existing as an identical pair (copies A and B)
-- **Page** - The unit of key material within a pad; used for at most one message, then destroyed
+- **Pad** - A set of key pages, existing as an identical pair (copies A and B). Loose leaves rather than a bound booklet — pages are used and destroyed one at a time
+- **Page** - The unit of key material within a pad; used for at most one message, then destroyed. A partly used page is still a spent page — the remainder burns with it, so padding less costs air time, not key
 - **Plaintext** - The readable message, before encryption or after decryption
 - **PRNG** - Pseudo-random number generator; deterministic, and therefore not OTP-grade key material on its own
 - **Safety word** - A memorized signal present in every genuine message, whose absence means the sender is under duress

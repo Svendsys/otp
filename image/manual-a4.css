@@ -1,0 +1,114 @@
+/* A4 layout for otp.md -- the desk copy.
+ *
+ * Same structure as the A5 sheet, with room to breathe: the tabula recta
+ * has ~190mm of text width here, so the monospace can go back up to a
+ * comfortable size instead of the 6pt A5 needs.
+ */
+
+@page {
+  size: A4;
+  margin: 20mm 18mm 20mm 18mm;
+  @bottom-center {
+    content: counter(page);
+    font-family: serif;
+    font-size: 9pt;
+    color: #555;
+  }
+}
+
+body {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 10.5pt;
+  line-height: 1.45;
+  hyphens: auto;
+  text-align: justify;
+  max-width: 100%;
+}
+
+h1 {
+  font-size: 19pt;
+  margin: 0 0 8pt;
+  page-break-before: always;
+  border-bottom: 1pt solid #000;
+  padding-bottom: 3pt;
+}
+
+h1:first-of-type {
+  page-break-before: avoid;
+}
+
+h2 { font-size: 15pt; margin: 14pt 0 5pt; }
+h3 { font-size: 12pt; margin: 11pt 0 3pt; }
+h4 { font-size: 11pt; margin: 9pt 0 3pt; font-style: italic; }
+
+h1, h2, h3, h4 { page-break-after: avoid; }
+p, li { orphans: 2; widows: 2; }
+
+pre {
+  font-family: "DejaVu Sans Mono", "Courier New", monospace;
+  font-size: 8.5pt;
+  line-height: 1.25;
+  white-space: pre;
+  overflow: visible;
+  background: #f4f4f4;
+  border-left: 3pt solid #bbb;
+  padding: 5pt 7pt;
+  margin: 8pt 0;
+  page-break-inside: avoid;
+}
+
+code {
+  font-family: "DejaVu Sans Mono", "Courier New", monospace;
+  font-size: 9.5pt;
+  background: #f0f0f0;
+  padding: 0 2pt;
+}
+
+pre code {
+  font-size: inherit;
+  background: none;
+  padding: 0;
+}
+
+table {
+  border-collapse: collapse;
+  font-size: 9.5pt;
+  margin: 8pt 0;
+  page-break-inside: avoid;
+}
+
+th, td {
+  border: 0.5pt solid #999;
+  padding: 3pt 5pt;
+  text-align: left;
+}
+
+th { background: #eee; }
+
+blockquote {
+  margin: 8pt 0 8pt 14pt;
+  padding-left: 10pt;
+  border-left: 3pt solid #ccc;
+  font-style: italic;
+}
+
+img {
+  max-width: 100%;
+  page-break-inside: avoid;
+}
+
+hr {
+  border: none;
+  border-top: 0.5pt solid #999;
+  margin: 12pt 0;
+}
+
+#TOC, nav#TOC {
+  font-size: 10pt;
+  page-break-after: always;
+}
+
+#TOC ul, nav#TOC ul {
+  list-style: none;
+  padding-left: 12pt;
+}

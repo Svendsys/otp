@@ -1,0 +1,45 @@
+name: Build image
+
+# Deliberately not on every push: the pi-gen build takes roughly half an
+# hour and needs ~10GB of disk. Run it by hand, or on a tag to attach an
+# image to a release.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Register arm64 binfmt
+        run: docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+      - name: Install manual rendering tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc python3-weasyprint
+
+      - name: Build
+        run: ./image/build.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: otp-print-unit-image
+          path: image/deploy/*.img.xz
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: image/deploy/*.img.xz

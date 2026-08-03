@@ -1,0 +1,48 @@
+# OTP print unit settings.
+#
+# This file lives on the boot partition because the root filesystem is a
+# read-only overlay -- anything written to / is discarded at power-off.
+# The unit rewrites this file when you choose "SAVE SETTINGS" on the panel;
+# editing it by hand works too.
+#
+# Note what is NOT here: the last codeword used. It is the one field that
+# would tie this machine to a pad it produced, and the envelope labels are
+# the real register.
+
+# Pad pages per set.
+pages = 100
+
+# Paper in the tray.
+#   A4      four A6 pad pages per sheet, imposed for a guillotine (default)
+#   LETTER  the same, on US Letter
+#   A6      one pad page per sheet, for real A6 paper
+#
+# The 4-up imposition is cut-and-stack: guillotine the whole printed stack
+# once down the middle and once across, then pile the four stacks in order
+# -- top-left, top-right, bottom-left, bottom-right -- and the pad is in
+# page order. Crop marks at the sheet edges show where to cut.
+paper = A4
+
+# Two pad pages per A6 sheet instead of one, cut along the dashed line.
+# Not combinable with the 4-up imposition above.
+a7 = no
+
+# The AUTH group: five key letters per page reserved for authentication and
+# never used for encryption (see otp.md, Authentication). The letters are
+# always CSPRNG output; only the length is adjustable.
+#
+# Five is what the manual's procedure assumes -- it says the first *group*
+# of every message is the auth group, and a group is five letters. Change
+# this only if both ends have agreed to, and know that shorter is weaker:
+# three letters is guessable at 1 in 17,576 against 1 in 11.9 million at
+# five. Setting with_auth = no produces pads on which the manual's own rule
+# ("no auth group, no action") means no message may ever be acted on.
+with_auth = yes
+auth_size = 5
+
+# Watermark every page TRAINING. The manual requires practice material to be
+# unmistakably marked so it can never be confused with live key material.
+training = no
+
+# Key body font size in points.
+font_size = 9.0

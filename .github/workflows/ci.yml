@@ -14,6 +14,52 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install reportlab pytest
+        run: pip install -r requirements-dev.txt
+      # Bounded: a UI regression can make the suite spin rather than fail
+      # -- FakeButtons returns None forever at poll_seconds=0, so a screen
+      # that stops honouring BACK loops instead of raising. Unbounded, that
+      # is a runner burning for six hours and a job that never reports.
       - name: Run tests
-        run: pytest -q
+        run: timeout 600 pytest -q
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned, not apt's. The runner image's shellcheck floats, and the
+      # versions genuinely disagree: 0.9.0 emits SC2015 where 0.11.0 does
+      # not, so a local run can be clean while CI fails on the same commit.
+      # Bump this deliberately, with the scripts fixed in the same commit.
+      - name: Check the provisioning and image scripts
+        env:
+          SHELLCHECK_VERSION: v0.9.0
+        run: |
+          curl -fsSL --retry 3 \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJf - --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          ./shellcheck --version
+          ./shellcheck device/install.sh image/build.sh image/render-manual.sh
+
+  simulator:
+    # The unit's whole interface runs without hardware, so CI can drive a
+    # pad pair end to end: roll a codeword, confirm, generate, print copy A,
+    # swap, print copy B, wipe.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Drive a pad pair through the simulator
+        run: |
+          printf 'k\nk\nk\nk\nk\nk\nk\n' | timeout 120 python3 -m otpunit --sim > out.txt
+          grep -q "PAIR COMPLETE" out.txt
+          grep -q "POWER-CYCLE PRINTER" out.txt
+      - name: A back press at the root menu must not exit
+        run: |
+          # An empty screen stack ends run(), which on the real unit means a
+          # dark panel and three dead buttons until someone pulls the power.
+          printf 'K\nK\nK\nk\n' | timeout 60 python3 -m otpunit --sim > back.txt
+          grep -q "CODEWORD" back.txt
