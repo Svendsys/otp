@@ -78,7 +78,14 @@ class Settings:
         return "A7 2-UP" if self.a7 else "A6"
 
     def validate(self) -> list[str]:
-        """Return human-readable problems, empty if the settings are usable."""
+        """
+        Return human-readable problems, empty if the settings are usable.
+
+        Must never raise: this runs on a config file the unit's own header
+        invites the operator to edit by hand, and load() calls it before the
+        panel exists. Anything that would divide by or index into a bad
+        value has to be gated behind the check that rejects it.
+        """
         problems = []
         if self.pages < 1:
             problems.append("pages must be at least 1")
@@ -92,10 +99,32 @@ class Settings:
         if self.paper not in PAPER_CHOICES:
             problems.append("unknown paper size")
         if self.font_size <= 0:
+            # Return here: calc_max_chars divides by a font-size-derived
+            # spacing, so font_size == 0 would raise instead of reporting.
             problems.append("font size must be positive")
-        if self.chars_per_page > gen.calc_max_chars(self.font_size, self.a7):
+            return problems
+        if self.font_size > gen.max_body_font_size(self.a7, self._box_width()):
+            problems.append("font size too large for the page width")
+        if self.chars_per_page > gen.calc_max_chars(
+                self.font_size, self.a7, self._box_height()):
             problems.append("chars per page exceed the format")
         return problems
+
+    def _box_width(self):
+        """Width of the box a pad page is drawn into, for fit checks."""
+        if self.a7:
+            return None                      # calc uses the A7 default
+        if self.paper == "LETTER":
+            return gen.LETTER[0] / 2
+        if self.paper == "A4":
+            return gen.A4[0] / 2
+        return None
+
+    def _box_height(self):
+        """Height of that box. A Letter quarter is shorter than A6."""
+        if self.a7 or not self.imposed:
+            return None
+        return (gen.LETTER if self.paper == "LETTER" else gen.A4)[1] / 2
 
 
 def _parse(text: str) -> dict:

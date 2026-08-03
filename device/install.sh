@@ -46,7 +46,15 @@ CONFIG_TXT="$BOOT_DIR/config.txt"
 
 if [ "$SKIP_APT" -eq 0 ]; then
     log "Installing packages"
+    # Process substitution hides grep's exit status from both `set -e` and
+    # pipefail, so an unreadable manifest would leave PACKAGES empty and
+    # turn the install below into a bare `apt-get install` that exits 0
+    # having installed nothing.
     mapfile -t PACKAGES < <(grep -vE '^\s*(#|$)' "$REPO_DIR/device/packages.txt")
+    if [ "${#PACKAGES[@]}" -eq 0 ]; then
+        echo "ERROR: no packages read from device/packages.txt" >&2
+        exit 1
+    fi
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends "${PACKAGES[@]}"
@@ -57,6 +65,11 @@ fi
 
 log "Installing the unit to $PREFIX"
 install -d "$PREFIX" "$PREFIX/assets"
+# Replace, do not merge. `cp -a src dest/` onto an existing directory leaves
+# whatever was there before, so a module deleted upstream stays installed
+# and importable -- which on the edit-rerun-reboot loop is exactly the case
+# that misleads.
+rm -rf "${PREFIX:?}/otpunit" "${PREFIX:?}/codewords"
 cp -a "$REPO_DIR/otpunit" "$PREFIX/"
 cp -a "$REPO_DIR/codewords" "$PREFIX/"
 install -m 0644 "$REPO_DIR/otp_generator.py" "$PREFIX/otp_generator.py"
@@ -147,8 +160,13 @@ set_cups_file() {
 set_cups_file RequestRoot /run/cups/spool
 set_cups_file TempDir /run/cups/tmp
 set_cups_file CacheDir /run/cups/cache
-set_cups_file PageLog ""
-set_cups_file AccessLog ""
+# /dev/null, NOT an empty value. cups-files.conf(5) says a blank filename
+# disables the log, but CUPS 2.4's parser yields NULL rather than "" for a
+# valueless directive, logs "Missing value for PageLog", and -- because
+# FatalErrors defaults to config -- cupsd then refuses to start at all.
+# CUPS special-cases /dev/ paths to skip rotation, so this is the safe form.
+set_cups_file PageLog /dev/null
+set_cups_file AccessLog /dev/null
 # ErrorLog defaults to /var/log/cups/error_log, which is NOT covered by
 # making the journal volatile -- cupsd is a separate unit writing its own
 # file handle. Send it to syslog so it lands in the RAM-backed journal.
@@ -183,6 +201,17 @@ set_cupsd PreserveJobFiles No
 set_cupsd MaxJobs 1
 
 # Written in one go: appending here would duplicate on every rerun.
+# Prove the daemon will actually load what we just wrote. cupsd only reports
+# a bad directive at startup, and otp-unit.service only Wants= cups, so
+# without this the unit boots looking healthy and fails at print time.
+if command -v cupsd >/dev/null; then
+    if ! cupsd -t -c /etc/cups/cupsd.conf -s /etc/cups/cups-files.conf >/dev/null 2>&1; then
+        echo "ERROR: the generated CUPS configuration is invalid:" >&2
+        cupsd -t -c /etc/cups/cupsd.conf -s /etc/cups/cups-files.conf >&2 || true
+        exit 1
+    fi
+fi
+
 cat > /etc/tmpfiles.d/otp-unit-cups.conf <<'EOF'
 d /run/cups 0710 root lp -
 d /run/cups/spool 0710 root lp -

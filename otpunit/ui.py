@@ -34,21 +34,33 @@ def wrap(text: str, width: int = 21, lines: int = 4) -> list[str]:
     with no ellipsis, which turns a long driver error into a sentence that
     stops mid-word and reads as if that were the whole message.
     """
+    # ASCII only: Pillow's default bitmap font is latin-1, and drawing a
+    # U+2026 raises inside the display driver, where nothing catches it.
+    ellipsis = ">"
     words, out, row = text.split(), [], ""
-    for word in words:
+    tail_dropped = False
+    for index, word in enumerate(words):
         candidate = f"{row} {word}".strip()
         if len(candidate) <= width:
             row = candidate
             continue
         if row:
             out.append(row)
-        row = word if len(word) <= width else word[:width - 1] + "…"
         if len(out) == lines:
+            # This word and everything after it never made it onto the panel.
+            tail_dropped = True
             break
-    if row and len(out) < lines:
-        out.append(row)
-    if len(out) == lines and len("".join(words)) > len("".join(out).replace(" ", "")):
-        out[-1] = out[-1][:width - 1] + "…"
+        # An over-long word is marked where it is cut; that is not the same
+        # as losing the tail, and must not also mark the final row.
+        row = word if len(word) <= width else word[:width - 1] + ellipsis
+    else:
+        if row and len(out) < lines:
+            out.append(row)
+        elif row:
+            tail_dropped = True
+
+    if tail_dropped and out and not out[-1].endswith(ellipsis):
+        out[-1] = out[-1][:width - 1].rstrip() + ellipsis
     return out[:lines]
 
 
@@ -339,8 +351,9 @@ class RunJob(Screen):
         if self.stage == "waiting":
             return Frame(
                 title="STILL PRINTING",
-                lines=["THE PRINTER IS STILL", "WORKING THROUGH THE",
-                       "QUEUE. WAIT FOR IT.", "", "OK TO CHECK AGAIN"],
+                lines=["THE QUEUE IS NOT", "EMPTY YET.", "",
+                       "OK TO CHECK AGAIN"],
+                footer="HOLD TO GIVE UP",
             )
 
         if self.stage == "abandoned":
@@ -364,13 +377,17 @@ class RunJob(Screen):
                          footer="OK TO RETURN")
 
         if self.stage == "error":
-            lines = wrap(self.error, lines=3)
             # If copy A is already on the tray, the operator is holding live
             # key material for a pad that can never be completed. Say so --
             # silently discarding the key and returning to the menu leaves
-            # them with a half-pair they may not realise is dangerous.
-            if self.spec.carries_key_material and self.job and self.job.copies_done:
-                lines = lines[:2] + ["DESTROY PRINTED PAGES"]
+            # them with a half-pair they may not realise is dangerous. Wrap
+            # to the space that leaves, rather than wrapping to three lines
+            # and then discarding the third.
+            warn = bool(self.spec.carries_key_material
+                        and self.job and self.job.copies_done)
+            lines = wrap(self.error or "UNKNOWN ERROR", lines=2 if warn else 4)
+            if warn:
+                lines.append("DESTROY PRINTED PAGES")
             return Frame(title="ERROR", lines=lines, footer="OK TO RETURN")
 
         # 21 columns is the whole panel: every string here has to fit.
@@ -399,8 +416,23 @@ class RunJob(Screen):
                 return self._print_copy(app)
             return self
 
-        if self.stage in ("printing", "waiting"):
+        if self.stage == "printing":
             if press in (Press.OK, Press.BACK):
+                return self._advance(app)
+            return self
+
+        if self.stage == "waiting":
+            # BACK is an unconditional way out. Without one this stage is a
+            # trap: lp returns as soon as a job is spooled, so the queue is
+            # busy on every pad pair, and CUPS' default ErrorPolicy holds a
+            # job in the queue indefinitely after a jam -- which three
+            # buttons cannot clear. An operator stuck here has live key
+            # material and no option but to pull the power.
+            if press is Press.BACK:
+                self._wipe()
+                self.stage = "abandoned"
+                return self
+            if press is Press.OK:
                 return self._advance(app)
             return self
 
@@ -450,11 +482,13 @@ class RunJob(Screen):
         try:
             self.job.generate(progress=progress, should_cancel=should_cancel)
         except gen_cancelled():
-            self.job.finish()
+            self._wipe()
             self.stage = "cancelled"
             return self
         except Exception as exc:
-            self.job.finish()
+            # _wipe(), never finish() directly: a purge failure here would
+            # otherwise escape press() and take the whole UI down.
+            self._wipe()
             self.stage = "error"
             self.error = f"GENERATE FAILED: {exc}"
             return self
@@ -471,25 +505,28 @@ class RunJob(Screen):
         return self
 
     def _advance(self, app):
+        # lp returns as soon as a job is spooled, so "the tray is clear" is
+        # the operator's guess about paper, not a statement about the queue.
+        # Both transitions have to wait for it to drain: starting copy B
+        # early interleaves the two copies in one tray, and purging early
+        # cancels the rest of copy B and destroys the key, leaving a
+        # truncated half-pair that can never be regenerated.
+        if self.cups_busy(app):
+            self.stage = "waiting"
+            return self
         if not self.job.done:
             self.stage = "swap"
             return self
-        # lp returns as soon as a job is spooled, so "the tray is clear" is
-        # the operator's guess. Purging while copy B is still queued would
-        # cancel the rest of it and destroy the key, leaving a truncated
-        # half of a pair that can never be regenerated.
-        try:
-            if self.cups_busy(app):
-                self.stage = "waiting"
-                return self
-        except Exception:
-            pass
         self._wipe()
         self.stage = "done"
         return self
 
     def cups_busy(self, app) -> bool:
-        return app.cups.active_jobs(app.queue) > 0
+        """Never let a failed query strand the operator: assume drained."""
+        try:
+            return app.cups.active_jobs(app.queue) > 0
+        except Exception:
+            return False
 
 
 def gen_cancelled():
@@ -694,11 +731,21 @@ class App:
         # failed: an operator who dismisses a printer error still needs a
         # route to SETTINGS and SHUT DOWN.
         self.stack = [main_menu()]
-        try:
-            device = self.cups.devices()[0]
-            self.queue = self.cups.ensure_queue(device)
-        except (IndexError, printer_mod.PrinterError) as exc:
-            self.stack.append(Message("PRINTER", wrap(str(exc))))
+        # Try every device, not just the first. Driverless endpoints sort
+        # first because they need no driver, but when one fails to set up
+        # the usb:// entry for the same printer is usually right behind it
+        # -- stopping at [0] turned the preferred path into a single point
+        # of failure.
+        last_error = None
+        for device in self.cups.devices():
+            try:
+                self.queue = self.cups.ensure_queue(device)
+                break
+            except printer_mod.PrinterError as exc:
+                last_error = exc
+        else:
+            self.stack.append(Message(
+                "PRINTER", wrap(str(last_error) if last_error else "no printer found")))
 
         while self.running and self.stack:
             self.render()

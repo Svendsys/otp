@@ -115,6 +115,41 @@ class TestTheUnitCannotBeBricked:
         # Into PRINT PAD PAIR -> TYPE IT IN, the deepest reachable flow.
         assert escapes([Press.OK, Press.DOWN, Press.DOWN, Press.OK])
 
+    def test_no_job_stage_traps_the_operator(self):
+        """
+        Every RunJob stage must have an exit, including the ones only a
+        misbehaving printer can reach.
+
+        The App-level search above cannot see these: generation drains the
+        scripted presses, so a whole-app walk never gets past a job start.
+        Drive RunJob directly instead.
+        """
+        stages = ("confirm", "printing", "waiting", "swap",
+                  "cancelled", "abandoned", "error", "done")
+        for stage in stages:
+            cups = Cups(busy=1 if stage == "waiting" else 0)
+            app = make_app([])
+            app.cups = cups
+            screen = ui.RunJob(jobs.JobSpec(jobs.JobKind.PAD_PAIR, "X-Y",
+                                            config.Settings(pages=1)))
+            if stage != "confirm":
+                screen.press(app, Press.OK)      # generate + copy A
+                screen.stage = stage
+                if screen.job is None:
+                    screen.job = jobs.PadPairJob(screen.spec, cups)
+
+            # Not a trap if some press either leaves the screen or moves it
+            # to a different stage. Standing still on every button is what
+            # strands an operator with no keyboard.
+            moved = False
+            for press in (Press.BACK, Press.OK):
+                before = screen.stage
+                if screen.press(app, press) in (None, ui.HOME) or screen.stage != before:
+                    moved = True
+                    break
+                screen.stage = stage
+            assert moved, f"stage {stage!r} has no exit"
+
     def test_shutdown_can_be_declined(self):
         confirm = ui.Message("SHUT DOWN", ["POWER OFF?"],
                              on_ok=lambda a: a.request_shutdown())
@@ -143,19 +178,32 @@ class TestThePairIsNeverSilentlyLost:
                             config.Settings(pages=pages))
         return ui.RunJob(spec)
 
-    def test_the_spool_is_not_purged_while_copy_b_is_still_queued(self):
+    def test_neither_transition_proceeds_while_the_queue_is_busy(self):
         """
-        lp returns once a job is spooled, so "the tray is clear" is a guess.
-        Purging then would cancel the rest of copy B and destroy the key,
+        lp returns once a job is spooled, so "the tray is clear" is the
+        operator's guess about paper, not about the queue.
+
+        Starting copy B early interleaves the two copies in one tray;
+        purging early cancels the rest of copy B and destroys the key,
         leaving a truncated half-pair that cannot be regenerated.
         """
         cups = Cups(busy=3)
-        app, screen = make_app([]), self._job(Cups(busy=3))
+        app, screen = make_app([]), self._job(cups)
         app.cups = cups
-        screen.press(app, Press.OK)        # generate + copy A
-        screen.press(app, Press.OK)        # -> swap
+
+        screen.press(app, Press.OK)        # generate + submit copy A
+        screen.press(app, Press.OK)        # tray "clear" -- but A is queued
+        assert screen.stage == "waiting"
+        assert len(cups.submitted) == 1, "copy B must not start early"
+
+        cups.busy = 0
+        screen.press(app, Press.OK)
+        assert screen.stage == "swap"
         screen.press(app, Press.OK)        # -> copy B
-        screen.press(app, Press.OK)        # operator says tray is clear
+        assert len(cups.submitted) == 2
+
+        cups.busy = 2
+        screen.press(app, Press.OK)
         assert screen.stage == "waiting"
         assert cups.purged == 0, "must not purge with jobs still queued"
 
@@ -163,6 +211,28 @@ class TestThePairIsNeverSilentlyLost:
         screen.press(app, Press.OK)
         assert screen.stage == "done"
         assert cups.purged == 1
+
+    def test_waiting_always_has_a_way_out(self):
+        """
+        A queue that never drains must not trap the operator.
+
+        CUPS' default ErrorPolicy holds a job in the queue indefinitely
+        after a jam, and three buttons cannot run cupsenable. Without an
+        unconditional exit the operator has live key material on screen and
+        no option but to pull the power.
+        """
+        cups = Cups(busy=1)                # never drains
+        app, screen = make_app([]), self._job(cups)
+        app.cups = cups
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "waiting"
+
+        screen.press(app, Press.BACK)
+        assert screen.stage == "abandoned"
+        assert cups.purged == 1, "giving up must still wipe"
+        assert "DESTROY" in "\n".join(screen.frame(app).rendered())
+        assert screen.press(app, Press.OK) is ui.HOME
 
     def test_a_failure_after_copy_a_tells_the_operator_to_destroy_it(self):
         class Failing(Cups):
@@ -244,6 +314,28 @@ class TestConfigIsTrusted:
         assert loaded.validate() == [], "load() must never return a bad config"
         assert loaded.a7 is True, "the sane fields should survive"
         assert loaded.pages == config.Settings().pages
+
+    def test_load_never_raises_on_any_hand_edited_value(self, tmp_path):
+        # load() runs before the panel exists, so anything it raises is a
+        # crash loop into systemd's start limit: dark panel, no message.
+        # font_size = 0 used to divide by zero inside validate().
+        path = tmp_path / "c.conf"
+        for line in ("font_size = 0", "font_size = -1", "font_size = 999",
+                     "pages = -1", "auth_size = -700", "paper = A3",
+                     "a7 = maybe", "pages = ", "nonsense"):
+            path.write_text(line + "\n")
+            loaded = config.load(str(path))
+            assert loaded.validate() == [], line
+
+    def test_a_font_too_wide_for_the_page_is_rejected(self):
+        # The panel cannot reach this, but the config file can.
+        assert config.Settings(font_size=20).validate()
+        assert config.Settings(font_size=9).validate() == []
+
+    def test_letter_quarter_is_measured_against_letter(self):
+        # A Letter quarter is shorter than A6; measuring against A6 let key
+        # rows fall below the guillotine line.
+        assert config.Settings(paper="LETTER", font_size=18).validate()
 
     def test_a_writable_path_needs_no_remount(self, tmp_path, monkeypatch):
         calls = []

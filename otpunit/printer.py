@@ -39,6 +39,17 @@ class Device:
         """Driverless-capable: lpadmin -m everywhere needs an IPP URI."""
         return self.uri.startswith(("ipp://", "ipps://", "ippusb://", "dnssd://"))
 
+    @property
+    def usb_id(self) -> str:
+        """
+        The usb:// form of this device, if it has one.
+
+        ipp-usb publishes a loopback endpoint whose URI names no make or
+        model, so a device discovered that way cannot be matched to a PPD on
+        its own -- the usb:// entry for the same printer carries the name.
+        """
+        return self.uri if self.uri.startswith("usb://") else ""
+
 
 class PrinterError(RuntimeError):
     pass
@@ -61,7 +72,13 @@ class Cups:
                               timeout=Cups.TIMEOUT)
 
     def _text(self, argv) -> str:
-        result = self._run(argv)
+        # A wedged cupsd hits Cups.TIMEOUT and raises. Queries are advisory,
+        # so treat that as "nothing to report" -- letting it escape turns a
+        # slow printer into a crash loop with no panel message.
+        try:
+            result = self._run(argv)
+        except Exception:
+            return ""
         if result.returncode != 0:
             return ""
         return result.stdout.decode("utf-8", "replace")
@@ -71,7 +88,12 @@ class Cups:
     # accepts -- driverless setup requires an IPP connection and rejects a
     # raw usb:// URI outright -- so both kinds have to be collected, and
     # the IPP one preferred when the same printer offers both.
-    IPP_SCHEMES = ("ipp://", "ipps://", "ippusb://", "dnssd://")
+    # Only ipp-usb's own loopback endpoint, never the network. A printer
+    # across the LAN must not be picked up by a unit whose whole point is
+    # being offline -- disabling the radios does not cover wired or USB
+    # ethernet, and install.sh converts Pis that may have either.
+    LOCAL_IPP = ("ippusb://", "ipp://localhost", "ipp://127.0.0.1",
+                 "ipps://localhost", "ipps://127.0.0.1")
 
     def devices(self) -> list[Device]:
         """Locally attached printers CUPS can currently see."""
@@ -82,7 +104,7 @@ class Cups:
                 continue
             _kind, uri = parts
             uri = uri.strip()
-            if uri.startswith("usb://") or uri.startswith(self.IPP_SCHEMES):
+            if uri.startswith("usb://") or uri.startswith(self.LOCAL_IPP):
                 found.append(Device(uri=uri, description=_pretty(uri)))
         # An IPP endpoint needs no driver at all, so try those first.
         found.sort(key=lambda d: not d.is_ipp)
@@ -171,7 +193,12 @@ class Cups:
 
     def purge(self, name: str = QUEUE) -> None:
         """Empty the spool. Belt and braces: the spool is already on tmpfs."""
-        self._run([CANCEL, "-x", "-a", name])
+        try:
+            self._run([CANCEL, "-x", "-a", name])
+        except Exception:
+            # Best effort. The spool is tmpfs and dies with the power, so a
+            # failed purge is not worth propagating into the UI.
+            pass
 
 
 def _pretty(uri: str) -> str:

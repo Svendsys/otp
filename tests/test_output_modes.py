@@ -294,6 +294,50 @@ class TestNewCliFlags:
                      "--output", str(tmp_path)], cwd=tmp_path)
             assert r.returncode == 0, r.stdout + r.stderr
 
+    def test_font_too_wide_is_rejected(self, tmp_path):
+        # calc_max_chars only measures height. Above ~13pt on A6 the
+        # inter-group gap goes negative and the five-letter groups print
+        # superimposed -- inside the content box, so nothing overflows
+        # visibly and both copies of the pair are equally unreadable.
+        r = run(["--random-codewords", "1", "--pages", "1", "--fontsize", "14",
+                 "--output", str(tmp_path)], cwd=tmp_path)
+        assert r.returncode != 0
+        assert b"would overlap" in r.stdout
+
+    def test_the_largest_usable_font_is_still_accepted(self, tmp_path):
+        r = run(["--random-codewords", "1", "--pages", "1", "--fontsize", "13",
+                 "--output", str(tmp_path)], cwd=tmp_path)
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    def test_groups_never_overlap_at_any_accepted_font_size(self):
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        for a7 in (False, True):
+            limit = g.max_body_font_size(a7)
+            groups = g.A7_GROUPS_PER_ROW if a7 else g.A6_GROUPS_PER_ROW
+            width = (g.SHEET_HEIGHT / 2) if a7 else g.SHEET_WIDTH
+            content = width - 2 * g.HEADER_MARGIN_H
+            used = stringWidth("X" * g.GROUP_SIZE, "Courier", limit) * groups
+            assert used <= content + 1e-6, (a7, used, content)
+
+    def test_chars_must_be_positive(self, tmp_path):
+        # A negative value slices the key string from the end, producing a
+        # blank pad and a silently shortened AUTH group.
+        for bad in ("-500", "0"):
+            r = run(["--random-codewords", "1", "--pages", "1", "--chars", bad,
+                     "--output", str(tmp_path)], cwd=tmp_path)
+            assert r.returncode != 0, bad
+            assert b"--chars must be at least 1" in r.stderr
+
+    def test_non_ascii_codewords_are_rejected(self, tmp_path):
+        # str.isalnum() accepts every Unicode letter, but Courier is a
+        # WinAnsi font: two distinct codewords would print one header.
+        words = tmp_path / "w.txt"
+        words.write_text("中文-BADGER\n", encoding="utf-8")
+        r = run(["--codewords", str(words), "--sets", "1", "--pages", "1",
+                 "--output", str(tmp_path)], cwd=tmp_path)
+        assert r.returncode != 0
+        assert b"unsafe as a filename" in r.stdout
+
     def test_a4_and_letter_conflict(self, tmp_path):
         r = run(["--random-codewords", "1", "--a4", "--letter"], cwd=tmp_path)
         assert r.returncode != 0

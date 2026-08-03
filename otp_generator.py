@@ -734,6 +734,24 @@ def fit_codeword_size(
     return size if size >= CODEWORD_MIN_FONT else None
 
 
+def max_body_font_size(a7: bool = False, box_width: float = None) -> float:
+    """
+    Largest body font size at which a row of groups still fits across the page.
+
+    calc_max_chars only measures height. Without this, a larger --fontsize
+    drives the inter-group gap negative and the groups are drawn overlapping
+    one another -- letters superimposed, inside the content box, with no
+    visual tell at the margins. A pad like that is unreadable and both
+    copies are equally corrupt, so it fails silently at the far end.
+    """
+    if box_width is None:
+        box_width = (SHEET_HEIGHT / 2) if a7 else SHEET_WIDTH
+    groups = A7_GROUPS_PER_ROW if a7 else A6_GROUPS_PER_ROW
+    content_width = box_width - 2 * HEADER_MARGIN_H
+    width_per_point = stringWidth("X" * GROUP_SIZE, "Courier", 1) * groups
+    return content_width / width_per_point
+
+
 def max_fitted_codeword_len(
     font_size: float,
     a7: bool,
@@ -838,6 +856,10 @@ def main():
             parser.error("--stdout writes a single PDF: use exactly one of "
                          "--sets 1, --worksheets N, or --tabula N")
 
+    if args.chars is not None and args.chars < 1:
+        parser.error("--chars must be at least 1")
+    if args.fontsize is not None and args.fontsize <= 0:
+        parser.error("--fontsize must be positive")
     if args.a7 and (args.a4 or args.letter):
         parser.error("--a7 lays out on A6 sheets; it cannot be combined with "
                      "--a4 or --letter")
@@ -897,7 +919,11 @@ def main():
                 log(f"ERROR: Duplicate codeword '{word}' \u2014 its set would overwrite the previous PDF")
                 sys.exit(1)
             seen.add(word)
-            if not all(ch.isalnum() or ch in "-_" for ch in word):
+            # ASCII only. str.isalnum() is true for every Unicode letter,
+            # but the Courier used on the page is a WinAnsi font: reportlab
+            # substitutes silently, so 中文-BADGER and 日本-BADGER both print
+            # the same header while remaining distinct filenames.
+            if not all((ch.isascii() and ch.isalnum()) or ch in "-_" for ch in word):
                 log(f"ERROR: Codeword '{word}' is unsafe as a filename (use A-Z, 0-9, '-', '_')")
                 sys.exit(1)
 
@@ -914,9 +940,22 @@ def main():
         # Imposed layouts get a quarter of the sheet, which on Letter is
         # shorter than A6 -- measure against the box the pages actually land
         # in, not against A6.
-        box_height = None
+        box_height = box_width = None
         if args.a4 or args.letter:
-            box_height = (LETTER if args.letter else A4)[1] / 2
+            sheet_size = LETTER if args.letter else A4
+            box_height, box_width = sheet_size[1] / 2, sheet_size[0] / 2
+
+        # Width first. calc_max_chars only measures height, so without this
+        # a larger --fontsize drives the inter-group gap negative and the
+        # groups print superimposed on one another -- inside the content
+        # box, so nothing overflows visibly, and both copies are equally
+        # unreadable.
+        max_font = max_body_font_size(args.a7, box_width)
+        if font_size > max_font:
+            log(f"ERROR: {font_size}pt is too wide for {format_label} — "
+                f"the five-letter groups would overlap. Maximum is {max_font:.1f}pt.")
+            sys.exit(1)
+
         max_chars = calc_max_chars(font_size, args.a7, box_height)
         if chars_per_page > max_chars:
             log(f"ERROR: {chars_per_page} chars won't fit on {format_label} at {font_size}pt. Maximum is {max_chars}.")
