@@ -14,6 +14,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install reportlab pytest
+        run: pip install -r requirements-dev.txt
       - name: Run tests
         run: pytest -q
