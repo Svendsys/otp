@@ -20,13 +20,25 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           df -h /
 
-      - name: Register arm64 binfmt
-        run: docker run --privileged --rm tonistiigi/binfmt --install arm64
-
-      - name: Install manual rendering tools
+      # NOT tonistiigi/binfmt. pi-gen's build-docker.sh runs `which
+      # qemu-aarch64` on the HOST and exits 1 if it is missing, so a
+      # registration that only exists inside a container does not satisfy
+      # it. It also greps binfmt_misc for that exact interpreter path, and
+      # registers its own entry if it does not match -- so installing the
+      # Debian packages covers both checks, and two mechanisms fighting
+      # over the same handler covers neither.
+      #
+      # qemu-user-static is deliberately not enough on its own: it ships
+      # qemu-aarch64-static, and pi-gen looks for the non-static name.
+      - name: Install qemu for arm64 emulation
         run: |
           sudo apt-get update
-          sudo apt-get install -y pandoc python3-weasyprint
+          sudo apt-get install -y qemu-user qemu-user-binfmt binfmt-support
+          which qemu-aarch64
+          ls /proc/sys/fs/binfmt_misc/qemu-aarch64* || true
+
+      - name: Install manual rendering tools
+        run: sudo apt-get install -y pandoc weasyprint
 
       - name: Build
         run: ./image/build.sh

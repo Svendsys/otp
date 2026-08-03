@@ -18,7 +18,7 @@ OUT_DIR="$REPO_DIR/assets"
 for tool in pandoc weasyprint; do
     command -v "$tool" >/dev/null || {
         echo "ERROR: $tool not found. Install with:" >&2
-        echo "  sudo apt-get install -y pandoc python3-weasyprint" >&2
+        echo "  sudo apt-get install -y pandoc weasyprint" >&2
         exit 1
     }
 done

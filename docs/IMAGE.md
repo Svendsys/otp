@@ -19,7 +19,7 @@ Requirements:
 - `pandoc` and `weasyprint`, to render the manual. The PDFs are not checked
   into the repository, so a fresh clone always renders them:
   ```bash
-  sudo apt-get install -y pandoc python3-weasyprint
+  sudo apt-get install -y pandoc weasyprint
   ```
 - On **x86** hosts, arm64 emulation. Both halves are needed — registering
   binfmt is not enough on its own, because pi-gen's `build-docker.sh` looks
