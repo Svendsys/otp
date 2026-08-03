@@ -114,14 +114,6 @@ class Cups:
         # Driverless endpoints first: they need no driver at all.
         return local_ipp + discovered + usb
 
-    def queues(self) -> list[str]:
-        names = []
-        for line in self._text([LPSTAT, "-p"]).splitlines():
-            match = re.match(r"printer (\S+)", line)
-            if match:
-                names.append(match.group(1))
-        return names
-
     def ensure_queue(self, device: Device, name: str = QUEUE) -> str:
         """
         Create or repoint the print queue.

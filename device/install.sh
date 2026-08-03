@@ -69,6 +69,14 @@ install -d "$PREFIX" "$PREFIX/assets"
 # whatever was there before, so a module deleted upstream stays installed
 # and importable -- which on the edit-rerun-reboot loop is exactly the case
 # that misleads.
+#
+# Guarded: if the clone itself lives at $PREFIX, this would delete the
+# source it is about to copy from and abort the install half-done.
+if [ "$REPO_DIR" = "$PREFIX" ]; then
+    echo "ERROR: the repository is checked out at $PREFIX, which this script" >&2
+    echo "       installs into. Move it elsewhere and rerun." >&2
+    exit 1
+fi
 rm -rf "${PREFIX:?}/otpunit" "${PREFIX:?}/codewords"
 cp -a "$REPO_DIR/otpunit" "$PREFIX/"
 cp -a "$REPO_DIR/codewords" "$PREFIX/"
@@ -137,6 +145,24 @@ EOF
 
 
 # --- CUPS ---------------------------------------------------------------
+
+# On a rerun of a provisioned unit -- the documented edit/rerun/reboot loop
+# -- otp-unit-etc-cups.service has already laid a tmpfs over /etc/cups.
+# Everything below would then write to, read from and delete through that
+# tmpfs: the hardening would vanish at reboot, the template would be
+# snapshotted from the live queue, and the on-card printers.conf would
+# survive masked and unreachable. Unmount first and let the service remount
+# it at next boot.
+if mountpoint -q /etc/cups 2>/dev/null; then
+    log "Unmounting the /etc/cups tmpfs so the real directory is what we edit"
+    systemctl stop otp-unit-etc-cups.service 2>/dev/null || true
+    mountpoint -q /etc/cups && umount /etc/cups || true
+fi
+if mountpoint -q /etc/cups 2>/dev/null; then
+    echo "ERROR: /etc/cups is still a mount point. Provisioning it now would" >&2
+    echo "       write into a tmpfs and be lost at reboot. Reboot and rerun." >&2
+    exit 1
+fi
 
 log "Hardening CUPS"
 # CUPS always spools a job to disk; that is unavoidable short of writing raw
@@ -258,9 +284,6 @@ for keep in /etc/cups/*.types /etc/cups/*.convs; do
     [ -f "$keep" ] && install -m 0644 "$keep" "$PREFIX/cups-etc/"
 done
 
-# The tmpfs only MASKS what is already on the root filesystem, so anything a
-# previous life left in /etc/cups stays on the card forever, invisible under
-# the mount point. Remove it now, while it is still reachable.
 rm -f /etc/cups/printers.conf /etc/cups/printers.conf.O \
       /etc/cups/classes.conf /etc/cups/classes.conf.O \
       /etc/cups/subscriptions.conf /etc/cups/subscriptions.conf.O

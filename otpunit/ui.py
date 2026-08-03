@@ -34,8 +34,12 @@ def wrap(text: str, width: int = 21, lines: int = 4) -> list[str]:
     with no ellipsis, which turns a long driver error into a sentence that
     stops mid-word and reads as if that were the whole message.
     """
-    # ASCII only: Pillow's default bitmap font is latin-1, and drawing a
-    # U+2026 raises inside the display driver, where nothing catches it.
+    # ASCII only, INPUT INCLUDED. Pillow's default bitmap font is latin-1,
+    # and drawing anything outside it raises inside the display driver.
+    # The text here is often a CUPS error, which arrives via
+    # stderr.decode(..., "replace") -- so a truncated or localised message
+    # carries U+FFFD or accented characters straight to the panel.
+    text = text.encode("ascii", "replace").decode("ascii")
     ellipsis = ">"
     words, out, row = text.split(), [], ""
     tail_dropped = False
@@ -349,11 +353,24 @@ class RunJob(Screen):
             )
 
         if self.stage == "waiting":
+            # Say WHICH copy is outstanding. The frame was previously
+            # identical whether copy A or copy B was still queued, so an
+            # operator could not tell what giving up would cost them.
+            outstanding = "A" if self.job and self.job.copies_done < 2 else "B"
+            what = (f"COPY {outstanding} IS STILL"
+                    if self.spec.carries_key_material else "THE JOB IS STILL")
             return Frame(
                 title="STILL PRINTING",
-                lines=["THE QUEUE IS NOT", "EMPTY YET.", "",
-                       "OK TO CHECK AGAIN"],
+                lines=[what, "IN THE QUEUE.", "", "OK TO CHECK AGAIN"],
                 footer="HOLD TO GIVE UP",
+            )
+
+        if self.stage == "confirm_abandon":
+            return Frame(
+                title="GIVE UP?",
+                lines=["THIS DESTROYS THE KEY", "AND CANCELS PRINTING.",
+                       "THE PAIR CANNOT BE", "FINISHED OR REMADE."],
+                footer="OK=YES   HOLD=NO",
             )
 
         if self.stage == "abandoned":
@@ -430,12 +447,23 @@ class RunJob(Screen):
             # job in the queue indefinitely after a jam -- which three
             # buttons cannot clear. An operator stuck here has live key
             # material and no option but to pull the power.
+            #
+            # It asks first, though. This screen invites repeated OK, and a
+            # tap held a beat too long would otherwise purge the queue and
+            # zero the key with no confirmation at all.
             if press is Press.BACK:
-                self._wipe()
-                self.stage = "abandoned"
+                self.stage = "confirm_abandon"
                 return self
             if press is Press.OK:
                 return self._advance(app)
+            return self
+
+        if self.stage == "confirm_abandon":
+            if press is Press.OK:
+                self._wipe()
+                self.stage = "abandoned"
+            elif press is Press.BACK:
+                self.stage = "waiting"
             return self
 
         if self.stage in ("done", "error", "cancelled", "abandoned"):
@@ -462,10 +490,17 @@ class RunJob(Screen):
         app.render(self)
         self.job = jobs_mod.PadPairJob(self.spec, app.cups, app.queue)
         cancelled = []
+        last_drawn = [0]
 
-        def progress(done, _total):
+        def progress(done, total):
+            # Redraw on a fraction of the total, not on `done % 10`. The
+            # imposed layouts report per SHEET, so a ten-page A4 job counts
+            # 4, 8, 10 and a modulo-10 test fires exactly once -- at the very
+            # end, after the panel has sat at 0/10 for the whole job.
             self.done_pages = done
-            if done % 10 == 0:
+            step = max(1, total // 50)
+            if done == 1 or done >= total or done - last_drawn[0] >= step:
+                last_drawn[0] = done
                 app.render(self)
 
         def should_cancel():
@@ -502,8 +537,14 @@ class RunJob(Screen):
         except Exception as exc:
             self.stage = "error"
             self.error = str(exc)
+            _drain(app)
             return self
         self.stage = "printing"
+        # Submitting a multi-megabyte PDF blocks the loop, so presses made
+        # while it ran are still queued. Replayed against the next screen
+        # they advance the flow the operator could not see -- at worst
+        # abandoning a pair they were only being impatient about.
+        _drain(app)
         return self
 
     def _advance(self, app):
@@ -545,6 +586,19 @@ def gen_cancelled():
     import otp_generator
 
     return otp_generator.GenerationCancelled
+
+
+def _drain(app) -> None:
+    """
+    Discard presses banked while the loop was blocked.
+
+    Anything long enough to bank presses -- generating, spooling -- leaves
+    the operator pressing at a frozen panel. Those presses were aimed at
+    what was on screen, not at whatever comes next, so replaying them is
+    always wrong; on this device it can mean abandoning a job.
+    """
+    while app.buttons.wait(timeout=0) is not None:
+        pass
 
 
 # --- settings -----------------------------------------------------------

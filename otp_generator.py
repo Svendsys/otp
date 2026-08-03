@@ -493,7 +493,7 @@ def generate_set_pdf_a4(
                 auth_size=auth_size,
             )
             done += 1
-        _draw_crop_marks(c, page_w, page_h)
+        pass  # MUTANT: crop marks deleted
         c.showPage()
         progress(min(done, num_pages), num_pages)
 
@@ -886,6 +886,11 @@ def main():
 
     if args.chars is not None and args.chars < 1:
         parser.error("--chars must be at least 1")
+    # The page number is a fixed-width four-digit field that both ends drill
+    # against; past 9999 it silently becomes five digits and stops being one.
+    if args.pages > 9999:
+        parser.error("--pages cannot exceed 9999: the page number is a "
+                     "four-digit field on the page and in the message header")
     if args.fontsize is not None and (not math.isfinite(args.fontsize)
                                       or args.fontsize <= 0):
         parser.error("--fontsize must be a positive number")

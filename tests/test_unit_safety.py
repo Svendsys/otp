@@ -228,11 +228,32 @@ class TestThePairIsNeverSilentlyLost:
         screen.press(app, Press.OK)
         assert screen.stage == "waiting"
 
+        # Giving up asks first: this screen invites repeated OK, and a tap
+        # held a beat too long would otherwise purge the queue and zero the
+        # key with no confirmation.
         screen.press(app, Press.BACK)
+        assert screen.stage == "confirm_abandon"
+        assert cups.purged == 0, "nothing destroyed until confirmed"
+        assert "CANNOT BE" in "\n".join(screen.frame(app).rendered())
+
+        screen.press(app, Press.BACK)               # decline
+        assert screen.stage == "waiting"
+        assert cups.purged == 0
+
+        screen.press(app, Press.BACK)
+        screen.press(app, Press.OK)                 # confirm
         assert screen.stage == "abandoned"
         assert cups.purged == 1, "giving up must still wipe"
         assert "DESTROY" in "\n".join(screen.frame(app).rendered())
         assert screen.press(app, Press.OK) is ui.HOME
+
+    def test_the_waiting_screen_says_which_copy_is_outstanding(self):
+        cups = Cups(busy=1)
+        app, screen = make_app([]), self._job(cups)
+        app.cups = cups
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert "COPY A" in "\n".join(screen.frame(app).rendered())
 
     def test_a_failure_after_copy_a_tells_the_operator_to_destroy_it(self):
         class Failing(Cups):
@@ -283,6 +304,44 @@ class TestCancellationIsReal:
         assert screen.stage == "cancelled"
         assert cups.submitted == [], "a cancelled job must print nothing"
         assert cups.purged == 1, "and must not leave key material behind"
+
+    def test_the_panel_moves_during_an_imposed_job(self):
+        """
+        The imposed layouts report progress per SHEET, so a `done % 10`
+        redraw test fired once -- at the very end, after the panel had sat
+        at 0/10 for the whole job.
+        """
+        cups = Cups()
+        app = make_app([], cups=cups)
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "RUSTED-BADGER",
+                            config.Settings(pages=10, paper="A4"))
+        screen = ui.RunJob(spec)
+        screen.press(app, Press.OK)
+        generating = [f for f in app.display.frames if f.title == "GENERATING"]
+        assert len(generating) >= 3, "the operator must see it move"
+        shown = [f.lines[1] for f in generating]
+        assert shown[0] != shown[-1]
+
+    def test_presses_banked_during_spooling_are_discarded(self):
+        # submit() blocks on a multi-megabyte PDF. Presses made at the
+        # frozen panel were aimed at what was on screen, not at what comes
+        # next; replaying them can abandon a pair. Driven at _print_copy
+        # directly, because a scripted press cannot be timed to land
+        # between generation finishing and spooling starting.
+        cups = Cups()
+        app = make_app([], cups=cups)
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "X-Y", config.Settings(pages=1))
+        screen = ui.RunJob(spec)
+        screen.press(app, Press.OK)               # generate + copy A
+
+        screen.press(app, Press.OK)               # tray clear -> swap prompt
+        assert screen.stage == "swap"
+
+        app.buttons.push(Press.BACK, Press.OK, Press.UP)
+        screen.press(app, Press.OK)               # -> spool copy B
+        assert app.buttons._script == [], "banked presses must be discarded"
+        assert screen.stage == "printing"
+        assert len(cups.submitted) == 2
 
     def test_presses_made_during_generation_do_not_replay_afterwards(self):
         """

@@ -177,6 +177,29 @@ class TestDisplayFailuresDoNotEscape:
         assert "T" in stream.getvalue()
 
 
+class TestPanelTextIsAlwaysDrawable:
+    """
+    Pillow's default bitmap font is latin-1, and drawing anything outside
+    it raises inside the display driver where nothing catches it. Panel
+    text often comes from a CUPS error, decoded with errors="replace", so
+    a truncated or localised message carries U+FFFD or accents.
+    """
+
+    def test_wrap_output_is_always_ascii(self):
+        from otpunit.ui import wrap
+        for text in ("lp: Erreur – impression impossible",
+                     "bad �� bytes", "café printer",
+                     "中文", "… leading ellipsis"):
+            rows = wrap(text, 21, 4)
+            assert all(row.isascii() for row in rows), (text, rows)
+
+    def test_a_latin1_font_can_encode_every_row(self):
+        from otpunit.ui import wrap
+        for text in ("lp: Erreur – impossible", "bad � bytes"):
+            for row in wrap(text, 21, 4):
+                row.encode("latin-1")      # must not raise
+
+
 class TestRealGpiozero:
     """Only runs where gpiozero is installed; skipped otherwise."""
 

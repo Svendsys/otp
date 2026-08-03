@@ -332,6 +332,15 @@ The handover is the single most sensitive event in the life of a channel. There 
 - Nothing written leaves the handover except the pads themselves. The association between a codeword and a person is carried in heads.
 - If custody was ever uncertain on the way — a bag out of sight, a border search, an unexplained delay — the set is retired, unused. A pad you are not sure of is worse than no pad, because it produces confidence without security.
 
+## When Generation Goes Wrong
+Printing a pad is the one step where a mechanical failure can quietly produce key material that looks correct and is not. The rules are short.
+
+- **An interrupted print means start over.** If a copy jams, runs out of paper, or is cancelled part-way, destroy *both* copies and generate a new set. Do not reprint the missing pages: a printer that jams often reprints the page it was on, and a pad with one page repeated is the exact failure a one-time pad cannot survive. Half a pair is not half a pad — it is nothing, because its twin does not exist.
+- **A codeword may be reused after a failed job.** The abandoned pad and the new one share nothing but a name, and codewords only have to be unique among the sets actually in service. Reuse it if you like — but never let both leave the room.
+- **Two pads must never carry the same codeword in service.** If you are ever unsure whether a codeword is already in use on a live channel, pick another. The envelope label is the only thing tying a page in the hand to its twin.
+- **Watch the page count, weeks ahead.** A pad ends. Re-keying needs another face-to-face handover, so the time to arrange the next set is while the current one still has pages, not when it runs out. Treat the last twenty pages as a warning, not as stock.
+- **Destroying a retired set is a real job.** A thousand-page pad is a ream of paper. Burning it takes longer than you think and does not go unnoticed; plan where and how before you need to, and do not start a fire you cannot finish. The rule is the same as for a single page — reduce it to ash, and crush the ash — but the scale is not.
+
 ## Transmission & Reception
 Here is the liberating part: the ciphertext needs no protection. All the secrecy lives in the pad, so the transmission channel can be anything that carries letters — radio, telephone, a letter, a classified ad, a note in a dead drop. Assume every transmission is recorded by the adversary and proceed anyway; that assumption is already built into the scheme.
 
@@ -533,7 +542,7 @@ ORCHARD GATE AT NINE PM. Two lessons ride along. First, the diagnostic: where th
 - **Key** - The random letters printed on pad pages; also called key material
 - **mod** - The modulo operator
 - **OTP** - One time pad
-- **Pad** - A booklet of key pages, existing as an identical pair (copies A and B)
+- **Pad** - A set of key pages, existing as an identical pair (copies A and B). Loose leaves rather than a bound booklet — pages are used and destroyed one at a time
 - **Page** - The unit of key material within a pad; used for at most one message, then destroyed
 - **Plaintext** - The readable message, before encryption or after decryption
 - **PRNG** - Pseudo-random number generator; deterministic, and therefore not OTP-grade key material on its own
