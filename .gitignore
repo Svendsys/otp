@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Generated pads are key material — never commit them
+output/
+pads/
