@@ -156,7 +156,13 @@ EOF
 if mountpoint -q /etc/cups 2>/dev/null; then
     log "Unmounting the /etc/cups tmpfs so the real directory is what we edit"
     systemctl stop otp-unit-etc-cups.service 2>/dev/null || true
-    mountpoint -q /etc/cups && umount /etc/cups || true
+    # Stopping the service may already have taken the mount down, so this is
+    # a genuine recheck rather than a redundant one. A umount that still
+    # fails is not reported here: the guard below turns it into an
+    # actionable message instead of a bare "umount: target is busy".
+    if mountpoint -q /etc/cups 2>/dev/null; then
+        umount /etc/cups || true
+    fi
 fi
 if mountpoint -q /etc/cups 2>/dev/null; then
     echo "ERROR: /etc/cups is still a mount point. Provisioning it now would" >&2

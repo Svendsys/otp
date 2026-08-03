@@ -22,11 +22,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Pinned, not apt's. The runner image's shellcheck floats, and the
+      # versions genuinely disagree: 0.9.0 emits SC2015 where 0.11.0 does
+      # not, so a local run can be clean while CI fails on the same commit.
+      # Bump this deliberately, with the scripts fixed in the same commit.
       - name: Check the provisioning and image scripts
+        env:
+          SHELLCHECK_VERSION: v0.9.0
         run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
-          shellcheck device/install.sh image/build.sh image/render-manual.sh
+          curl -fsSL --retry 3 \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJf - --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          ./shellcheck --version
+          ./shellcheck device/install.sh image/build.sh image/render-manual.sh
 
   simulator:
     # The unit's whole interface runs without hardware, so CI can drive a
