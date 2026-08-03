@@ -12,19 +12,30 @@ WorkingDirectory=/opt/otp-unit
 Environment=PYTHONPATH=/opt/otp-unit
 Environment=PYTHONDONTWRITEBYTECODE=1
 Restart=on-failure
-RestartSec=2
+# Above systemd's default 5-starts-in-10s burst limit, so a display that is
+# slow to appear on the I2C bus cannot put the unit permanently into failed.
+RestartSec=15
 
-# The unit generates key material into RAM and pipes it to lp. None of it
-# should ever be able to reach a filesystem, so take away the ability --
-# a bug then fails loudly instead of quietly leaving a pad on the SD card.
+# Narrow what the process can write. Note the deliberate limits of this:
+# /boot/firmware is the one partition that survives a power cycle, and it is
+# writable here only so settings can be saved -- it is not a place key
+# material may go. PrivateTmp gives isolation, not RAM: systemd keeps its
+# backing storage on the host's /tmp and /var/tmp, so TMPDIR is pointed at
+# the unit's own tmpfs runtime directory instead.
+RuntimeDirectory=otp-unit
+Environment=TMPDIR=/run/otp-unit
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/run/cups /boot/firmware
+# The leading '-' matters: without it, a missing path fails namespace setup
+# and the service never starts at all (226/NAMESPACE).
+ReadWritePaths=-/boot/firmware
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
+# A core dump would be a complete copy of the pad currently in memory.
+LimitCORE=0
 
 # Needs the console for the OLED and GPIO, and poweroff for a clean shutdown.
 SupplementaryGroups=lp gpio i2c

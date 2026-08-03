@@ -51,7 +51,18 @@ class SimulatedCups(Cups):
 def build(args):
     if args.sim:
         return ConsoleDisplay(), KeyboardButtons(), SimulatedCups()
-    return Ssd1306Display(rotate=args.rotate), GpioButtons(), Cups()
+
+    # A display that is not on the bus yet must not take the unit down. With
+    # Restart=on-failure this would otherwise burn through systemd's start
+    # limit in seconds and leave the service permanently failed, with no
+    # panel to say why.
+    try:
+        display = Ssd1306Display(rotate=args.rotate)
+    except Exception as exc:
+        print(f"OLED unavailable ({exc}); falling back to console output",
+              file=sys.stderr)
+        display = ConsoleDisplay(stream=sys.stderr)
+    return display, GpioButtons(), Cups()
 
 
 def main(argv=None):

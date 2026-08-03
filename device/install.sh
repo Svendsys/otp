@@ -104,10 +104,22 @@ install -d /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/otp-unit.conf <<'EOF'
 # Logs live in RAM and die with the power. The unit logs job metadata only
 # -- never codewords or key material -- but a persistent journal would
-# still record which pads this machine produced and when.
+# still record when this machine produced pads.
 [Journal]
 Storage=volatile
 RuntimeMaxUse=16M
+EOF
+
+log "Disabling core dumps"
+# The process holds several megabytes of key material while a job runs. A
+# segfault would hand the whole address space to systemd-coredump, which has
+# its own storage path (/var/lib/systemd/coredump) and does not care that
+# the journal is volatile -- a compressed copy of the pad, on the SD card.
+install -d /etc/systemd/coredump.conf.d
+cat > /etc/systemd/coredump.conf.d/otp-unit.conf <<'EOF'
+[Coredump]
+Storage=none
+ProcessSizeMax=0
 EOF
 
 
@@ -115,38 +127,53 @@ EOF
 
 log "Hardening CUPS"
 # CUPS always spools a job to disk; that is unavoidable short of writing raw
-# to /dev/usb/lp0, which only PostScript and PCL printers accept. So the
-# spool is moved to tmpfs, where it lives in RAM, never reaches the SD card,
-# and vanishes on power-off.
+# to /dev/usb/lp0, which only PostScript and PCL printers accept. So every
+# directory it writes to is moved to tmpfs, where it lives in RAM, never
+# reaches the SD card, and vanishes on power-off.
+#
+# CacheDir matters as much as the spool: job.cache records a job's name for
+# every job in history. PageLog and AccessLog are blanked outright -- page
+# logging records one line per printed page.
 install -d /etc/cups
-cat > /etc/cups/cups-files.conf.d-otp <<'EOF'
-RequestRoot /run/cups/spool
-TempDir /run/cups/tmp
-EOF
-if [ -f /etc/cups/cups-files.conf ]; then
-    sed -i -e 's|^RequestRoot .*|RequestRoot /run/cups/spool|' \
-           -e 's|^TempDir .*|TempDir /run/cups/tmp|' /etc/cups/cups-files.conf
-    grep -q '^RequestRoot' /etc/cups/cups-files.conf || \
-        echo 'RequestRoot /run/cups/spool' >> /etc/cups/cups-files.conf
-    grep -q '^TempDir' /etc/cups/cups-files.conf || \
-        echo 'TempDir /run/cups/tmp' >> /etc/cups/cups-files.conf
-fi
-rm -f /etc/cups/cups-files.conf.d-otp
+set_cups_file() {
+    local key="$1" value="$2" file=/etc/cups/cups-files.conf
+    [ -f "$file" ] || touch "$file"
+    if grep -qE "^#?[[:space:]]*${key}[[:space:]]" "$file"; then
+        sed -i -E "s|^#?[[:space:]]*${key}[[:space:]].*|${key} ${value}|" "$file"
+    else
+        printf '%s %s\n' "$key" "$value" >> "$file"
+    fi
+}
+set_cups_file RequestRoot /run/cups/spool
+set_cups_file TempDir /run/cups/tmp
+set_cups_file CacheDir /run/cups/cache
+set_cups_file PageLog ""
+set_cups_file AccessLog ""
 
-install -d /etc/cups/cupsd.conf.d
-cat > /etc/cups/cupsd.conf.d/otp-unit.conf <<'EOF'
-# Keep nothing. A finished job is a liability, not a convenience.
-PreserveJobHistory No
-PreserveJobFiles No
-MaxJobs 1
-# Nothing should reach this daemon from anywhere but this machine.
-Listen /run/cups/cups.sock
-EOF
+# These go in cupsd.conf itself. CUPS has no Include directive and no
+# cupsd.conf.d mechanism -- cupsdReadConfiguration() opens exactly
+# cups-files.conf and cupsd.conf -- so a drop-in file is read by nothing and
+# the defaults stand. The defaults are the opposite of what is wanted here:
+# PreserveJobHistory is Yes and PreserveJobFiles is 86400, meaning the
+# spooled document, i.e. the entire pad, is kept for a day after printing.
+set_cupsd() {
+    local key="$1" value="$2" file=/etc/cups/cupsd.conf
+    [ -f "$file" ] || touch "$file"
+    if grep -qE "^#?[[:space:]]*${key}[[:space:]]" "$file"; then
+        sed -i -E "s|^#?[[:space:]]*${key}[[:space:]].*|${key} ${value}|" "$file"
+    else
+        printf '%s %s\n' "$key" "$value" >> "$file"
+    fi
+}
+set_cupsd PreserveJobHistory No
+set_cupsd PreserveJobFiles No
+set_cupsd MaxJobs 1
 
 cat > /etc/tmpfiles.d/otp-unit-cups.conf <<'EOF'
 d /run/cups 0710 root lp -
 d /run/cups/spool 0710 root lp -
 d /run/cups/tmp 1770 root lp -
+d /run/cups/cache 0770 root lp -
 EOF
 systemd-tmpfiles --create /etc/tmpfiles.d/otp-unit-cups.conf 2>/dev/null || true
 
@@ -164,11 +191,22 @@ if [ ! -f "$BOOT_DIR/otp-unit.conf" ]; then
         "$BOOT_DIR/otp-unit.conf"
 fi
 
-# A template of /etc/cups is kept aside because the overlay root makes /etc
-# read-only: otp-unit-etc-cups.service lays a tmpfs over /etc/cups at boot
-# and repopulates it, so the print queue is rebuilt fresh every power-on.
+# A template of /etc/cups is kept aside: otp-unit-etc-cups.service lays a
+# tmpfs over /etc/cups at boot and repopulates it, so the print queue is
+# rebuilt fresh every power-on.
+#
+# printers.conf is deliberately excluded. It holds the queue's DeviceURI,
+# i.e. the make, model and serial of the last printer used. Snapshotting it
+# on a rerun would bake that into the root filesystem and restore it on
+# every boot thereafter -- turning the one artifact this mechanism exists to
+# forget into the one that survives longest.
 install -d "$PREFIX/cups-etc"
+rm -rf "${PREFIX:?}/cups-etc/"*
 cp -a /etc/cups/. "$PREFIX/cups-etc/" 2>/dev/null || true
+rm -f "$PREFIX/cups-etc/printers.conf" \
+      "$PREFIX/cups-etc/classes.conf" \
+      "$PREFIX/cups-etc/subscriptions.conf"
+rm -rf "$PREFIX/cups-etc/ssl"
 
 systemctl daemon-reload
 systemctl enable otp-unit-etc-cups.service

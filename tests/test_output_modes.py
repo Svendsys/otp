@@ -79,16 +79,19 @@ class TestInMemoryGeneration:
         assert buf.getvalue()[:5] == b"%PDF-"
         assert set(tmp_path.rglob("*")) == before, "generation must not create files"
 
-    def test_both_copies_of_a_pair_are_identical(self):
-        """A pad pair is one PDF printed twice, never generated twice."""
-        buf = io.BytesIO()
-        g.generate_set_pdf_a6(buf, "FROZEN-LANTERN", 3, 665, 9, progress=lambda d, t: None)
-        pdf = buf.getvalue()
-        assert pdf == buf.getvalue()
+    def test_two_runs_never_share_key_material(self):
+        """
+        Regenerating is not a way to reprint a pad.
 
-        other = io.BytesIO()
-        g.generate_set_pdf_a6(other, "FROZEN-LANTERN", 3, 665, 9, progress=lambda d, t: None)
-        assert other.getvalue() != pdf, "separate runs must not share key material"
+        The pair must come from one generation submitted twice; two runs
+        under one codeword produce two different pads that look identical
+        from the outside and fail authentication on first use.
+        """
+        first, second = io.BytesIO(), io.BytesIO()
+        for sink in (first, second):
+            g.generate_set_pdf_a6(sink, "FROZEN-LANTERN", 3, 665, 9,
+                                  progress=lambda d, t: None)
+        assert first.getvalue() != second.getvalue()
 
 
 def page_numbers_by_slot(data: bytes):
@@ -275,6 +278,21 @@ class TestNewCliFlags:
         r = run(["--random-codewords", "1", "--a4", "--a7"], cwd=tmp_path)
         assert r.returncode != 0
         assert b"cannot be combined" in r.stderr
+
+    def test_letter_rejects_a_layout_that_would_overflow_the_quarter(self, tmp_path):
+        # A Letter quarter is 139.7mm tall against A6's 148mm. Measuring
+        # against A6 let the last key rows fall below the guillotine line.
+        r = run(["--random-codewords", "1", "--pages", "4", "--chars", "1225",
+                 "--fontsize", "10", "--letter", "--output", str(tmp_path)],
+                cwd=tmp_path)
+        assert r.returncode != 0
+        assert b"won't fit" in r.stdout
+
+    def test_letter_and_a4_defaults_still_fit(self, tmp_path):
+        for flag in ("--a4", "--letter"):
+            r = run(["--random-codewords", "1", "--pages", "4", flag,
+                     "--output", str(tmp_path)], cwd=tmp_path)
+            assert r.returncode == 0, r.stdout + r.stderr
 
     def test_a4_and_letter_conflict(self, tmp_path):
         r = run(["--random-codewords", "1", "--a4", "--letter"], cwd=tmp_path)

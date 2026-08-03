@@ -735,8 +735,16 @@ def max_fitted_codeword_len(
     return max(0, int(codeword_space(font_size, a7, with_auth, auth_size) // char_w))
 
 
-def calc_max_chars(font_size: float, a7: bool = False) -> int:
-    """Calculate maximum characters that fit on one pad page."""
+def calc_max_chars(font_size: float, a7: bool = False, box_height: float = None) -> int:
+    """
+    Calculate maximum characters that fit on one pad page.
+
+    `box_height` overrides the assumed page height for imposed layouts. It
+    matters for Letter: a quarter-sheet is 139.7mm tall against A6's 148mm,
+    so measuring against A6 lets a large --chars value push the last key rows
+    off the bottom of the box -- below the guillotine line, or overprinting
+    the footer.
+    """
     margin_top = 5 * mm
     margin_bottom = 4 * mm
     header_space = 4 * mm
@@ -749,6 +757,8 @@ def calc_max_chars(font_size: float, a7: bool = False) -> int:
     else:
         page_height = SHEET_HEIGHT
         chars_per_row = A6_CHARS_PER_ROW
+    if box_height is not None:
+        page_height = box_height
 
     available = page_height - margin_top - margin_bottom - header_space - footer_space
     min_spacing = font_size * 0.38 * mm
@@ -887,7 +897,13 @@ def main():
                     f"(max {codeword_limit} characters)")
                 sys.exit(1)
 
-        max_chars = calc_max_chars(font_size, args.a7)
+        # Imposed layouts get a quarter of the sheet, which on Letter is
+        # shorter than A6 -- measure against the box the pages actually land
+        # in, not against A6.
+        box_height = None
+        if args.a4 or args.letter:
+            box_height = (LETTER if args.letter else A4)[1] / 2
+        max_chars = calc_max_chars(font_size, args.a7, box_height)
         if chars_per_page > max_chars:
             log(f"ERROR: {chars_per_page} chars won't fit on {format_label} at {font_size}pt. Maximum is {max_chars}.")
             sys.exit(1)

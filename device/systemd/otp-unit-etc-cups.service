@@ -3,6 +3,11 @@ Description=Lay a tmpfs over /etc/cups so print queues never persist
 DefaultDependencies=no
 Before=cups.service
 After=local-fs.target
+# DefaultDependencies=no drops the implicit shutdown ordering, so it has to
+# be stated: without it ExecStop runs at an arbitrary point during shutdown
+# and unmounts a still-busy /etc/cups.
+Conflicts=shutdown.target
+Before=shutdown.target
 ConditionPathIsDirectory=/opt/otp-unit/cups-etc
 
 [Service]

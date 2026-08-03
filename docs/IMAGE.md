@@ -16,13 +16,24 @@ Docker build. Output lands in `image/deploy/` as an `.img.xz`.
 Requirements:
 
 - Docker
-- On **x86** hosts, `binfmt_misc` registered for arm64 so the chroot can run
-  ARM binaries:
+- `pandoc` and `weasyprint`, to render the manual. The PDFs are not checked
+  into the repository, so a fresh clone always renders them:
   ```bash
+  sudo apt-get install -y pandoc python3-weasyprint
+  ```
+- On **x86** hosts, arm64 emulation. Both halves are needed — registering
+  binfmt is not enough on its own, because pi-gen's `build-docker.sh` looks
+  for the interpreter binary on the *host* `PATH`:
+  ```bash
+  sudo apt-get install -y qemu-user-static qemu-user-binfmt
   docker run --privileged --rm tonistiigi/binfmt --install arm64
   ```
 - On **Apple Silicon**, nothing extra — the build is native.
 - Roughly 10GB of free disk and half an hour.
+
+The build uses pi-gen's **`arm64` branch**, not `master`. pi-gen hardcodes
+`export ARCH=armhf` after sourcing its config, so setting `ARCH` in the
+config has no effect and `master` only ever produces 32-bit images.
 
 Flash it:
 
@@ -60,7 +71,17 @@ This is what turns the Pi into an appliance rather than a computer that runs
 one program. Afterwards the root filesystem is read-only with a RAM overlay:
 nothing a session touches survives a power-cycle, and pulling the plug
 cannot corrupt the card. Settings still persist — they live on the boot
-partition, which the unit remounts briefly when you choose SAVE SETTINGS.
+partition, which is outside the overlay.
+
+**Until you do this, the image boots with a writable root.** Every test
+print before that point leaves whatever CUPS and systemd wrote on the SD
+card permanently. It is a manual step because you want to confirm the unit
+works before making the filesystem read-only — but it is not optional if you
+want the reset-on-power-cycle property.
+
+Note that `enable_overlayfs` leaves `/boot` writable; making it read-only is
+a separate `enable_bootro`, and raspi-config refuses to run it once the
+overlay is active. Do that one first if you want it.
 
 To change the software afterwards, disable the overlay
 (`sudo raspi-config nonint disable_overlayfs`), make the change, re-enable
@@ -78,11 +99,19 @@ to be read:
 - **Purges swap.** Key material lives in a buffer that gets zeroed after
   printing; with swap enabled the kernel could page that buffer to the SD
   card first, and zeroing RAM would not touch the copy on disk.
-- Makes the journal volatile.
-- Moves the CUPS spool to tmpfs and sets `PreserveJobFiles No`.
+- Makes the journal volatile and disables core dumps — a crash mid-job would
+  otherwise write the whole pad to `/var/lib/systemd/coredump`.
+- Moves everything CUPS writes to tmpfs: spool, temp **and cache**, plus
+  blanking `PageLog` and `AccessLog`. The cache matters because `job.cache`
+  records every job's name, and page logging writes a line per printed page.
+- Sets `PreserveJobHistory No` and `PreserveJobFiles No` **in
+  `cupsd.conf` itself**. CUPS has no `Include` directive and no
+  `cupsd.conf.d`, so a drop-in file would be silently ignored — and the
+  defaults are the opposite of what is wanted here: history is kept forever
+  and the spooled document, the entire pad, is kept for 24 hours.
 - Mounts a tmpfs over `/etc/cups` at boot from a baked-in template, so the
-  print queue is rebuilt from whatever is plugged in and no record of past
-  printers survives.
+  print queue is rebuilt from whatever is plugged in. The template excludes
+  `printers.conf`, which holds the last printer's make, model and serial.
 
 ## Why pi-gen and not rpi-image-gen
 

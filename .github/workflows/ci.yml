@@ -44,4 +44,10 @@ jobs:
         run: |
           printf 'k\nk\nk\nk\nk\nk\nk\n' | timeout 120 python3 -m otpunit --sim > out.txt
           grep -q "PAIR COMPLETE" out.txt
-          grep -q "KEY WIPED FROM RAM" out.txt
+          grep -q "POWER-CYCLE PRINTER" out.txt
+      - name: A back press at the root menu must not exit
+        run: |
+          # An empty screen stack ends run(), which on the real unit means a
+          # dark panel and three dead buttons until someone pulls the power.
+          printf 'K\nK\nK\nk\n' | timeout 60 python3 -m otpunit --sim > back.txt
+          grep -q "CODEWORD" back.txt

@@ -34,6 +34,11 @@ class Device:
         name = re.sub(r"\s+", " ", name).strip()
         return name[:20]
 
+    @property
+    def is_ipp(self) -> bool:
+        """Driverless-capable: lpadmin -m everywhere needs an IPP URI."""
+        return self.uri.startswith(("ipp://", "ipps://", "ippusb://", "dnssd://"))
+
 
 class PrinterError(RuntimeError):
     pass
@@ -46,9 +51,14 @@ class Cups:
         # Injectable so tests can drive this against recorded output.
         self._run = run or self._subprocess_run
 
+    # A wedged cupsd must not block the UI forever holding key material
+    # resident, with no way out but pulling the power.
+    TIMEOUT = 120
+
     @staticmethod
     def _subprocess_run(argv, stdin: bytes | None = None):
-        return subprocess.run(argv, input=stdin, capture_output=True)
+        return subprocess.run(argv, input=stdin, capture_output=True,
+                              timeout=Cups.TIMEOUT)
 
     def _text(self, argv) -> str:
         result = self._run(argv)
@@ -56,19 +66,26 @@ class Cups:
             return ""
         return result.stdout.decode("utf-8", "replace")
 
+    # ipp-usb publishes a local IPP endpoint for printers that speak
+    # IPP-over-USB. That endpoint is the only URI `lpadmin -m everywhere`
+    # accepts -- driverless setup requires an IPP connection and rejects a
+    # raw usb:// URI outright -- so both kinds have to be collected, and
+    # the IPP one preferred when the same printer offers both.
+    IPP_SCHEMES = ("ipp://", "ipps://", "ippusb://", "dnssd://")
+
     def devices(self) -> list[Device]:
-        """USB printers CUPS can currently see."""
+        """Locally attached printers CUPS can currently see."""
         found = []
         for line in self._text([LPINFO, "-v"]).splitlines():
             parts = line.split(None, 1)
             if len(parts) != 2:
                 continue
-            kind, uri = parts
-            if kind != "direct" and not uri.startswith("usb://"):
-                continue
-            if not uri.startswith("usb://") and "usb" not in uri:
-                continue
-            found.append(Device(uri=uri.strip(), description=_pretty(uri)))
+            _kind, uri = parts
+            uri = uri.strip()
+            if uri.startswith("usb://") or uri.startswith(self.IPP_SCHEMES):
+                found.append(Device(uri=uri, description=_pretty(uri)))
+        # An IPP endpoint needs no driver at all, so try those first.
+        found.sort(key=lambda d: not d.is_ipp)
         return found
 
     def queues(self) -> list[str]:
@@ -83,13 +100,17 @@ class Cups:
         """
         Create or repoint the print queue.
 
-        Tries driverless first, which covers anything made since roughly
-        2017 and everything reachable through ipp-usb. Older host-based
-        lasers fall back to a PPD matched on the IEEE-1284 device ID.
+        Driverless setup is only attempted for IPP URIs: CUPS rejects
+        `-m everywhere` against a usb:// device with "IPP Everywhere driver
+        requires an IPP connection", and would leave no queue behind. Older
+        host-based lasers get a PPD matched on their USB device ID instead.
         """
-        result = self._run([LPADMIN, "-p", name, "-E", "-v", device.uri, "-m", "everywhere"])
-        if result.returncode == 0:
-            return name
+        if device.is_ipp:
+            result = self._run([LPADMIN, "-p", name, "-E", "-v", device.uri,
+                                "-m", "everywhere"])
+            if result.returncode == 0:
+                return name
+
         model = self._match_ppd(device)
         if model:
             result = self._run([LPADMIN, "-p", name, "-E", "-v", device.uri, "-m", model])

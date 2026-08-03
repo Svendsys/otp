@@ -7,6 +7,7 @@ job without a fourth switch to wire up.
 from __future__ import annotations
 
 import queue
+import select
 import sys
 import termios
 import tty
@@ -53,7 +54,10 @@ class FakeButtons(Buttons):
     def wait(self, timeout: float | None = None) -> Press | None:
         if not self._script:
             self.exhausted = True
-            return Press.QUIT
+            # timeout=0 means "is anything pending?" -- answering QUIT there
+            # would make a non-blocking drain loop see an endless supply of
+            # presses. Only the blocking form ends a scripted run.
+            return None if timeout == 0 else Press.QUIT
         return self._script.pop(0)
 
 
@@ -68,12 +72,21 @@ class KeyboardButtons(Buttons):
     }
 
     def wait(self, timeout: float | None = None) -> Press | None:
-        import select
-
         # Piped stdin has no terminal to put into raw mode. Falling back to
         # line reads keeps --sim scriptable, which is what lets a demo or a
         # smoke test drive the panel without a person at the keyboard.
         if not sys.stdin.isatty():
+            # A non-blocking poll (timeout=0) is how the job screen discards
+            # presses banked while generation blocked the loop. A script has
+            # no banked presses -- every line is a deliberate step, and all
+            # of them are readable the instant the pipe opens -- so report
+            # nothing pending rather than swallowing the rest of the script.
+            if timeout == 0:
+                return None
+            if timeout is not None:
+                ready, _, _ = select.select([sys.stdin], [], [], timeout)
+                if not ready:
+                    return None
             line = sys.stdin.readline()
             if not line:
                 return Press.QUIT

@@ -6,13 +6,21 @@ and no third copy. So the PDF is generated exactly once into memory and
 submitted twice from the same buffer -- generating it twice would produce
 two different pads wearing the same codeword.
 
-Key material lives in a bytearray, never a file, and is zeroed when the job
-ends. That only holds because the unit runs without swap; otherwise the
-kernel could page the buffer to the SD card behind our backs.
+Key material lives in a bytearray and never becomes a file. finish() zeroes
+that buffer -- but be precise about what this does and does not achieve. It
+is one of several copies: reportlab builds intermediate strings, BytesIO
+holds another, and subprocess is handed an immutable `bytes` that Python
+cannot overwrite. Those remain resident until the memory is reused.
+
+So zeroing is hygiene, not a wipe. What actually protects the pad is that
+none of it can reach disk -- no swap, spool on tmpfs, no core dumps -- and
+that powering the unit off ends it. Do not let the panel or the docs claim
+more than that.
 """
 from __future__ import annotations
 
 import io
+import os
 from dataclasses import dataclass
 from enum import Enum
 
@@ -31,6 +39,14 @@ class JobKind(Enum):
 
 
 MANUAL_PDF = "/opt/otp-unit/assets/otp-manual-a5.pdf"
+
+
+def manual_available() -> bool:
+    """
+    The manual is rendered at image-build time and is absent from a source
+    checkout, so the menu has to be able to ask before offering it.
+    """
+    return os.path.isfile(MANUAL_PDF)
 
 
 @dataclass
@@ -56,9 +72,17 @@ def zero(buffer: bytearray) -> None:
         buffer[i] = 0
 
 
+def _silent(done: int, total: int) -> None:
+    """
+    The generator's default progress reporter prints the codeword to stdout,
+    which on the unit means the journal. Never let that default apply here.
+    """
+
+
 def generate(spec: JobSpec, progress=None, should_cancel=None) -> bytearray:
     """Render a job to PDF bytes in memory. Never touches the filesystem."""
     settings = spec.settings or Settings()
+    progress = progress or _silent
     sink = io.BytesIO()
 
     if spec.kind is JobKind.PAD_PAIR:
@@ -85,6 +109,8 @@ def generate(spec: JobSpec, progress=None, should_cancel=None) -> bytearray:
     elif spec.kind is JobKind.TEST_PAGE:
         _draw_test_page(sink)
     elif spec.kind is JobKind.MANUAL:
+        if not manual_available():
+            raise FileNotFoundError("MANUAL NOT INSTALLED")
         with open(MANUAL_PDF, "rb") as handle:
             return bytearray(handle.read())
     else:
@@ -157,7 +183,13 @@ class PadPairJob:
         if self.copies_done >= self.spec.copies:
             raise RuntimeError("all copies already submitted")
         letter = "AB"[self.copies_done] if self.spec.copies > 1 else ""
-        title = f"{self.spec.codeword or self.spec.kind.value}{' ' + letter if letter else ''}"
+        # Deliberately NOT the codeword. The job title becomes the IPP
+        # job-name, which CUPS records in /var/cache/cups/job.cache (kept
+        # forever by default) and, if page logging is on, in page_log. The
+        # codeword is the one field that ties this machine to a pad it
+        # produced, so it must never leave this process.
+        title = f"OTP {letter}".strip() if self.spec.carries_key_material \
+            else self.spec.kind.value.upper()
         # Pad pages and tabula cards are A6; worksheets and the manual are
         # already laid out for their own paper, so leave those to the driver.
         if self.spec.kind in (JobKind.PAD_PAIR, JobKind.TABULA, JobKind.TEST_PAGE):

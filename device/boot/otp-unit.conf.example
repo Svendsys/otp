@@ -37,8 +37,5 @@ auth_size = 5
 # unmistakably marked so it can never be confused with live key material.
 training = no
 
-# Print a cover sheet naming the codeword and copy letter, for the envelope.
-cover_sheet = yes
-
 # Key body font size in points.
 font_size = 9.0

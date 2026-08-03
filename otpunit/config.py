@@ -1,9 +1,12 @@
 """Print unit settings.
 
-The unit runs on an overlay root filesystem, so anything written to / is
-discarded at power-off. Settings that should survive a reboot therefore live
-on the boot partition, which is mounted read-only and remounted briefly for
-a write.
+With the overlay root enabled, anything written to / is discarded at
+power-off. Settings that should survive a reboot therefore live on the boot
+partition, which is outside the overlay.
+
+Note that raspi-config's enable_overlayfs leaves /boot writable -- making it
+read-only is a separate step most operators will not have taken -- so the
+remount below is a fallback for those who have, not the normal path.
 
 Deliberately not persisted: the last codeword used. It is the one field that
 would link the unit to a pad it produced, and the envelope labels are the
@@ -12,7 +15,8 @@ real register.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, asdict, fields
+import subprocess
+from dataclasses import dataclass, asdict, fields, replace
 
 import otp_generator as gen
 
@@ -42,7 +46,6 @@ class Settings:
     with_auth: bool = True
     auth_size: int = gen.GROUP_SIZE
     training: bool = False
-    cover_sheet: bool = True
     font_size: float = 9.0
     paper: str = "A4"
     printer: str = ""
@@ -82,8 +85,15 @@ class Settings:
             problems.append("pages must be at least 1")
         if self.with_auth and self.auth_size < 1:
             problems.append("auth size must be at least 1")
+        # A negative auth_size shortens the draw in draw_pad_page instead of
+        # lengthening it, which silently prints fewer key letters than the
+        # page is laid out for -- and at -chars_per_page, blank pages.
+        if self.auth_size < 0:
+            problems.append("auth size cannot be negative")
         if self.paper not in PAPER_CHOICES:
             problems.append("unknown paper size")
+        if self.font_size <= 0:
+            problems.append("font size must be positive")
         if self.chars_per_page > gen.calc_max_chars(self.font_size, self.a7):
             problems.append("chars per page exceed the format")
         return problems
@@ -118,11 +128,33 @@ def _parse(text: str) -> dict:
 
 
 def load(path: str = CONFIG_PATH) -> Settings:
+    """
+    Read settings, falling back to a default for any field that is not
+    usable. The file says "safe to edit by hand", so it will be -- and a
+    hand-edited `auth_size = -700` must not silently produce blank pad
+    pages. Never raises: a bad config must not stop the unit booting.
+    """
     try:
         with open(path, "r") as handle:
-            return Settings(**_parse(handle.read()))
+            values = _parse(handle.read())
     except OSError:
         return Settings()
+
+    try:
+        settings = Settings(**values)
+    except TypeError:
+        return Settings()
+    if not settings.validate():
+        return settings
+
+    # Something is out of range. Keep the fields that are individually sane
+    # rather than discarding the whole file.
+    settings = Settings()
+    for key, value in values.items():
+        candidate = replace(settings, **{key: value})
+        if not candidate.validate():
+            settings = candidate
+    return settings
 
 
 def render(settings: Settings) -> str:
@@ -149,17 +181,32 @@ def save(settings: Settings, path: str = CONFIG_PATH, remount: bool = True) -> b
         _write(settings, path)
         return True
     except OSError:
-        if not remount:
-            return False
+        pass
+    if not remount:
+        return False
+
+    # Only reached when the partition is genuinely read-only. Remount, write,
+    # and put it back exactly as it was -- the previous version's `finally`
+    # was attached to the wrong `try`, so a write that failed for an
+    # unrelated reason (a full boot partition, say) left the filesystem
+    # remounted read-only as a side effect.
+    if not _remount(directory, "rw"):
+        return False
     try:
-        os.system(f"mount -o remount,rw {directory}")
         _write(settings, path)
         return True
     except OSError:
         return False
     finally:
-        if remount:
-            os.system(f"mount -o remount,ro {directory}")
+        _remount(directory, "ro")
+
+
+def _remount(directory: str, mode: str) -> bool:
+    """subprocess, not os.system: the path comes from --config, and a shell
+    has no business seeing it. Returns whether the remount succeeded."""
+    result = subprocess.run(["mount", "-o", f"remount,{mode}", directory],
+                            capture_output=True)
+    return result.returncode == 0
 
 
 def _write(settings: Settings, path: str) -> None:

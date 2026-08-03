@@ -16,22 +16,44 @@ python3-lgpio
 i2c-tools
 
 # Printing. ipp-usb covers driverless IPP-over-USB, which is most printers
-# made since roughly 2017; printer-driver-all carries the older host-based
-# lasers (brlaser for Brother, foo2zjs, Gutenprint, hplip).
+# made since roughly 2017.
 cups
 cups-client
 cups-filters
 ipp-usb
-printer-driver-all
 ghostscript
 
-# The Foomatic PPD database. printer-driver-all ships the foo2zjs *binaries*
-# but not the PPDs that drive them, and host-based lasers are exactly the
-# ones that need a Foomatic PPD rather than a driverless queue. Without
-# this, an HP LaserJet Pro M12w has a driver on disk and no way to use it.
-foomatic-db
-foomatic-db-engine
+# Drivers, listed individually rather than via printer-driver-all. That
+# metapackage carries every driver under Recommends and nothing under
+# Depends, so with --no-install-recommends it installs an empty package and
+# the unit ends up with no drivers at all.
+# HP LaserJet Pro M12a/M12w and the rest of the ZjStream family
+printer-driver-foo2zjs
+# Brother HL-2030/2140/L2300 and relatives
+printer-driver-brlaser
+# Broad coverage, including many PCL lasers
+printer-driver-gutenprint
+# HP's own raster driver
+printer-driver-hpcups
+# PostScript HP models
+printer-driver-postscript-hp
+# Samsung and Xerox SPL
+printer-driver-splix
+# Minolta PagePro
+printer-driver-min12xxw
+
+# The Foomatic PPD database, precompiled. Driver binaries are useless
+# without a PPD to drive them, and host-based lasers are exactly the
+# printers that need one rather than a driverless queue -- without this an
+# HP LaserJet Pro M12w has a driver on disk and no way to use it.
+# NOT foomatic-db: the compressed-ppds package Conflicts/Replaces it, and
+# asking apt for both makes the whole install unsatisfiable.
 foomatic-db-compressed-ppds
+foomatic-db-engine
+
+# Needed by raspi-config's enable_overlayfs, which it would otherwise try to
+# apt-get at the exact moment the unit has no network by design.
+overlayroot
 
 # Entropy. The Pi has a hardware RNG; rng-tools feeds it to the kernel pool
 # so the CSPRNG is seeded early rather than at some point after boot.

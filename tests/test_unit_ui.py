@@ -416,7 +416,11 @@ class TestRunJobFlow:
         assert screen.stage == "done"
         assert cups.purged == 1
         text = "\n".join(screen.frame(app).rendered())
-        assert "KEY WIPED" in text
+        # Not "KEY WIPED": the buffer is zeroed, but reportlab's
+        # intermediates and the immutable bytes given to the subprocess are
+        # not and cannot be. Power-off is the real wipe, so that is what the
+        # panel must tell the operator to do.
+        assert "KEY WIPED" not in text
         assert "POWER-CYCLE PRINTER" in text
 
     def test_cancelling_at_confirm_prints_nothing(self):
@@ -425,13 +429,19 @@ class TestRunJobFlow:
         assert screen.press(app, Press.BACK) is None
         assert cups.submitted == []
 
-    def test_abandoning_between_copies_wipes(self):
+    def test_abandoning_between_copies_wipes_and_warns(self):
         app, cups, screen = self._run()
         app.cups = cups
         screen.press(app, Press.OK)
         screen.press(app, Press.OK)             # swap prompt
-        assert screen.press(app, Press.BACK) is None
+        screen.press(app, Press.BACK)           # abandon
         assert cups.purged == 1
+        # Copy A is already on the tray and the key is now gone, so the pair
+        # can never be completed. The operator must be told those sheets are
+        # live key material rather than dropped back at the menu.
+        text = "\n".join(screen.frame(app).rendered())
+        assert "DESTROY" in text
+        assert screen.press(app, Press.OK) is ui.HOME
 
     def test_printer_failure_surfaces_on_the_panel(self):
         class Failing(RecordingCups):
@@ -552,12 +562,31 @@ class TestPrinterDiscovery:
     def test_finds_usb_devices(self):
         cups = self._cups(
             "direct usb://Brother/HL-2030?serial=X\n"
-            "network ipp://192.168.1.5/ipp/print\n"
             "file cups-pdf:/\n"
+            "serial serial:/dev/ttyS0\n"
         )
         devices = cups.devices()
         assert len(devices) == 1
         assert devices[0].uri.startswith("usb://Brother")
+
+    def test_finds_the_ipp_usb_endpoint_too(self):
+        # ipp-usb publishes a local IPP endpoint, and that is the ONLY kind
+        # of URI `lpadmin -m everywhere` accepts. Filtering it out is what
+        # made the driverless path unreachable.
+        cups = self._cups(
+            "direct usb://HP/LaserJet%20Pro%20M12w?serial=X\n"
+            "network ipp://localhost:60000/ipp/print\n"
+        )
+        devices = cups.devices()
+        assert len(devices) == 2
+        # The driverless endpoint must be offered first.
+        assert devices[0].is_ipp
+        assert not devices[1].is_ipp
+
+    def test_is_ipp_classification(self):
+        assert printer.Device("ipp://localhost:60000/ipp/print", "").is_ipp
+        assert printer.Device("ippusb://HP/x", "").is_ipp
+        assert not printer.Device("usb://HP/LaserJet?serial=1", "").is_ipp
 
     def test_device_label_is_panel_sized(self):
         device = printer.Device("usb://Brother/HL-2030?serial=X", "Brother HL-2030")
@@ -672,13 +701,25 @@ class TestPpdMatching:
         assert printer._tokens("HP-LaserJet_Pro_M12w") == \
             ["hp", "laserjet", "pro", "m", "12", "w"]
 
-    def test_driverless_is_tried_before_a_ppd(self):
+    def test_driverless_is_used_for_an_ipp_endpoint(self):
+        cups = self._cups(driverless_ok=True)
+        device = printer.Device("ipp://localhost:60000/ipp/print", "")
+        assert cups.ensure_queue(device) == printer.QUEUE
+        used = [argv for argv in cups.calls if argv[0] == printer.LPADMIN][-1]
+        assert used[used.index("-m") + 1] == "everywhere"
+
+    def test_driverless_is_never_attempted_for_a_usb_uri(self):
+        # CUPS rejects `-m everywhere` against usb:// with "IPP Everywhere
+        # driver requires an IPP connection" AND deletes the half-made
+        # queue, so trying it is worse than useless.
         cups = self._cups(driverless_ok=True)
         device = printer.Device("usb://HP/LaserJet%20Pro%20M12w?serial=X", "")
-        assert cups.ensure_queue(device) == printer.QUEUE
-        assert not any("-m" in argv and printer.LPINFO in argv[0] for argv in cups.calls)
+        cups.ensure_queue(device)
+        models = [argv[argv.index("-m") + 1] for argv in cups.calls
+                  if argv[0] == printer.LPADMIN and "-m" in argv]
+        assert "everywhere" not in models
 
-    def test_falls_back_to_the_ppd_when_driverless_fails(self):
+    def test_usb_printer_gets_its_ppd(self):
         cups = self._cups(driverless_ok=False)
         device = printer.Device("usb://HP/LaserJet%20Pro%20M12w?serial=X", "")
         assert cups.ensure_queue(device) == printer.QUEUE

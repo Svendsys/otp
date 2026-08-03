@@ -19,6 +19,38 @@ from .hw.display import Frame
 
 VERSION = "1.0"
 
+# Returned by a screen to unwind the whole stack back to the main menu.
+# Without this, any flow that pushes screens on the way to a job (picking a
+# codeword, typing one in) has no route home: a screen can only pop itself,
+# and the screens underneath it may not be reachable in any button sequence.
+HOME = object()
+
+
+def wrap(text: str, width: int = 21, lines: int = 4) -> list[str]:
+    """
+    Break a message across panel rows on word boundaries.
+
+    Slicing text into fixed 21-character chunks drops whatever does not fit
+    with no ellipsis, which turns a long driver error into a sentence that
+    stops mid-word and reads as if that were the whole message.
+    """
+    words, out, row = text.split(), [], ""
+    for word in words:
+        candidate = f"{row} {word}".strip()
+        if len(candidate) <= width:
+            row = candidate
+            continue
+        if row:
+            out.append(row)
+        row = word if len(word) <= width else word[:width - 1] + "…"
+        if len(out) == lines:
+            break
+    if row and len(out) < lines:
+        out.append(row)
+    if len(out) == lines and len("".join(words)) > len("".join(out).replace(" ", "")):
+        out[-1] = out[-1][:width - 1] + "…"
+    return out[:lines]
+
 
 class Screen:
     """Base screen. Subclasses render a Frame and handle presses."""
@@ -67,19 +99,28 @@ class Menu(Screen):
 
 
 class Message(Screen):
-    """A static screen dismissed with OK."""
+    """
+    A static screen dismissed with OK.
 
-    def __init__(self, title, lines, on_ok=None):
+    BACK always just dismisses. It must never trigger on_ok: the only
+    consequential Message is the shutdown confirmation, and a screen that
+    powers the unit off whichever button you press is not a confirmation.
+    """
+
+    def __init__(self, title, lines, on_ok=None, footer="OK TO CONTINUE"):
         self.title = title
         self.lines = lines
         self.on_ok = on_ok
+        self.footer = footer
 
     def frame(self, app):
-        return Frame(title=self.title, lines=self.lines, footer="OK TO CONTINUE")
+        return Frame(title=self.title, lines=self.lines, footer=self.footer)
 
     def press(self, app, press):
-        if press in (Press.OK, Press.BACK):
+        if press is Press.OK:
             return self.on_ok(app) if self.on_ok else None
+        if press is Press.BACK:
+            return None
         return self
 
 
@@ -114,11 +155,19 @@ class Chooser(Screen):
 
 class TextEntry(Screen):
     """
-    A-Z entry on three buttons: UP/DOWN change the letter, OK advances,
-    BACK (long OK) finishes. For reproducing a codeword agreed elsewhere.
+    A-Z entry on three buttons: UP/DOWN change the letter, OK commits it and
+    moves on, BACK (long OK) finishes the word.
+
+    The alphabet carries a trailing backspace symbol. Selecting it and
+    pressing OK deletes the previous letter, and deleting past the start
+    leaves the screen. Without that there is no way out at all: BACK means
+    "done" here, so every press either stays put or pushes another screen,
+    and the operator is left in the letter picker with no route back to the
+    menu and no keyboard to escape with.
     """
 
-    ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    DELETE = "<"
+    ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" + DELETE
 
     def __init__(self, title, on_done, maxlen=8):
         self.title = title
@@ -128,26 +177,35 @@ class TextEntry(Screen):
 
     @property
     def value(self) -> str:
-        return "".join(self.letters)
+        return "".join(ch for ch in self.letters if ch != self.DELETE)
 
     def frame(self, app):
+        shown = "".join(self.letters)
         cursor = " " * (len(self.letters) - 1) + "^"
         return Frame(
             title=self.title,
-            lines=[self.value, cursor, "", "UP/DN LETTER  OK NEXT"],
+            lines=[shown, cursor, "", f"UP/DN PICK  '{self.DELETE}'=DEL"],
             footer="HOLD OK WHEN DONE",
         )
 
     def press(self, app, press):
         current = self.ALPHABET.index(self.letters[-1])
+        size = len(self.ALPHABET)
         if press is Press.UP:
-            self.letters[-1] = self.ALPHABET[(current - 1) % 26]
+            self.letters[-1] = self.ALPHABET[(current - 1) % size]
         elif press is Press.DOWN:
-            self.letters[-1] = self.ALPHABET[(current + 1) % 26]
+            self.letters[-1] = self.ALPHABET[(current + 1) % size]
         elif press is Press.OK:
+            if self.letters[-1] == self.DELETE:
+                self.letters.pop()
+                if not self.letters:
+                    return None          # deleted past the start: leave
+                return self
             if len(self.letters) < self.maxlen:
                 self.letters.append("A")
         elif press is Press.BACK:
+            if not self.value:
+                return None
             return self.on_done(app, self.value)
         return self
 
@@ -273,6 +331,21 @@ class RunJob(Screen):
                 footer="HOLD TO ABANDON",
             )
 
+        if self.stage == "waiting":
+            return Frame(
+                title="STILL PRINTING",
+                lines=["THE PRINTER IS STILL", "WORKING THROUGH THE",
+                       "QUEUE. WAIT FOR IT.", "", "OK TO CHECK AGAIN"],
+            )
+
+        if self.stage == "abandoned":
+            return Frame(
+                title="ABANDONED",
+                lines=["KEY DISCARDED", "", "DESTROY ANY PAGES",
+                       "ALREADY PRINTED"],
+                footer="OK TO RETURN",
+            )
+
         if self.stage == "printing":
             letter = "AB"[max(0, self.job.copies_done - 1)] if self.spec.copies > 1 else ""
             return Frame(title="PRINTING",
@@ -280,12 +353,27 @@ class RunJob(Screen):
                                 self.spec.codeword or ""],
                          footer="OK WHEN TRAY IS CLEAR")
 
-        if self.stage == "error":
-            return Frame(title="ERROR", lines=[self.error[:21], self.error[21:42]],
+        if self.stage == "cancelled":
+            return Frame(title="CANCELLED", lines=["NOTHING WAS PRINTED",
+                                                   "KEY DISCARDED"],
                          footer="OK TO RETURN")
 
+        if self.stage == "error":
+            lines = wrap(self.error, lines=3)
+            # If copy A is already on the tray, the operator is holding live
+            # key material for a pad that can never be completed. Say so --
+            # silently discarding the key and returning to the menu leaves
+            # them with a half-pair they may not realise is dangerous.
+            if self.spec.carries_key_material and self.job and self.job.copies_done:
+                lines = lines[:2] + ["DESTROY PRINTED PAGES"]
+            return Frame(title="ERROR", lines=lines, footer="OK TO RETURN")
+
         # 21 columns is the whole panel: every string here has to fit.
-        lines = ["PAIR COMPLETE", "KEY WIPED FROM RAM", "", "POWER-CYCLE PRINTER"] \
+        # Deliberately not "KEY WIPED FROM RAM". The buffer is zeroed, but
+        # reportlab's intermediates and the immutable bytes handed to the
+        # subprocess are not and cannot be, so copies remain resident until
+        # the memory is reused. Power-off is the real wipe; say that.
+        lines = ["PAIR COMPLETE", "", "POWER-CYCLE PRINTER", "THEN THIS UNIT"] \
             if self.spec.carries_key_material else ["DONE"]
         return Frame(title="FINISHED", lines=lines, footer="OK TO RETURN")
 
@@ -299,41 +387,69 @@ class RunJob(Screen):
 
         if self.stage == "swap":
             if press is Press.BACK:
-                self.job.finish()
-                return None
+                self._wipe()
+                self.stage = "abandoned"
+                return self
             if press is Press.OK:
                 return self._print_copy(app)
             return self
 
-        if self.stage == "printing":
+        if self.stage in ("printing", "waiting"):
             if press in (Press.OK, Press.BACK):
                 return self._advance(app)
             return self
 
-        if self.stage in ("done", "error"):
+        if self.stage in ("done", "error", "cancelled", "abandoned"):
             if press in (Press.OK, Press.BACK):
-                if self.job:
-                    self.job.finish()
-                return None
+                self._wipe()
+                # HOME, not None: the stack below may include codeword
+                # screens the operator cannot navigate out of, and dropping
+                # one frame would leave them mid-flow with a finished job.
+                return HOME
         return self
+
+    def _wipe(self):
+        """Wipe once, and never let a wipe failure escape and kill the UI."""
+        if self.job is None:
+            return
+        try:
+            self.job.finish()
+        except Exception:
+            pass
+        self.job = None
 
     def _generate(self, app):
         self.stage = "generating"
         app.render(self)
         self.job = jobs_mod.PadPairJob(self.spec, app.cups, app.queue)
+        cancelled = []
 
         def progress(done, _total):
             self.done_pages = done
             if done % 10 == 0:
                 app.render(self)
 
+        def should_cancel():
+            # Generation blocks the event loop, so presses made during it
+            # would otherwise queue up and replay afterwards -- skipping the
+            # swap prompt and spooling both copies of a pair back to back.
+            # Draining here both honours the advertised cancel and stops
+            # those presses arriving late.
+            while True:
+                press = app.buttons.wait(timeout=0)
+                if press is None:
+                    return bool(cancelled)
+                if press in (Press.BACK, Press.QUIT):
+                    cancelled.append(press)
+
         try:
-            self.job.generate(progress=progress)
-        except gen_cancelled() as exc:  # pragma: no cover - needs a live button
-            self.stage = "error"
-            self.error = str(exc)
+            self.job.generate(progress=progress, should_cancel=should_cancel)
+        except gen_cancelled():
+            self.job.finish()
+            self.stage = "cancelled"
             return self
         except Exception as exc:
+            self.job.finish()
             self.stage = "error"
             self.error = f"GENERATE FAILED: {exc}"
             return self
@@ -350,12 +466,25 @@ class RunJob(Screen):
         return self
 
     def _advance(self, app):
-        if self.job.done:
-            self.job.finish()
-            self.stage = "done"
-        else:
+        if not self.job.done:
             self.stage = "swap"
+            return self
+        # lp returns as soon as a job is spooled, so "the tray is clear" is
+        # the operator's guess. Purging while copy B is still queued would
+        # cancel the rest of it and destroy the key, leaving a truncated
+        # half of a pair that can never be regenerated.
+        try:
+            if self.cups_busy(app):
+                self.stage = "waiting"
+                return self
+        except Exception:
+            pass
+        self._wipe()
+        self.stage = "done"
         return self
+
+    def cups_busy(self, app) -> bool:
+        return app.cups.active_jobs(app.queue) > 0
 
 
 def gen_cancelled():
@@ -434,16 +563,25 @@ def main_menu():
     def simple(kind, count=1):
         return lambda app: RunJob(jobs_mod.JobSpec(kind, "", app.settings, count))
 
+    def manual(app):
+        # The manual is rendered at image-build time; a source install has
+        # none. Say so plainly rather than failing with a truncated errno.
+        if not jobs_mod.manual_available():
+            return Message("MANUAL", ["NOT INSTALLED ON THIS", "UNIT"])
+        return RunJob(jobs_mod.JobSpec(jobs_mod.JobKind.MANUAL, "", app.settings))
+
     menu = Menu([
         ("PRINT PAD PAIR", pad_pair),
         ("PRINT WORKSHEETS", simple(jobs_mod.JobKind.WORKSHEETS, 10)),
         ("PRINT TABULA RECTA", simple(jobs_mod.JobKind.TABULA, 2)),
-        ("PRINT MANUAL", simple(jobs_mod.JobKind.MANUAL)),
+        ("PRINT MANUAL", manual),
         ("PRINT TEST PAGE", simple(jobs_mod.JobKind.TEST_PAGE)),
         ("SETTINGS", lambda app: settings_menu()),
         ("SHUT DOWN", lambda app: Message(
-            "SHUT DOWN", ["HOLD OK TO CONFIRM", "THEN WAIT FOR THE LED"],
-            on_ok=lambda a: a.request_shutdown())),
+            "SHUT DOWN", ["POWER OFF THE UNIT?", "", "WAIT FOR THE LED",
+                          "BEFORE PULLING POWER"],
+            on_ok=lambda a: a.request_shutdown(),
+            footer="OK=YES  HOLD=NO")),
     ])
     menu.title = "OTP PRINT UNIT"
     return menu
@@ -459,7 +597,9 @@ class WaitForPrinter(Screen):
         self.spinner = (self.spinner + 1) % 4
         return Frame(
             title="OTP PRINT UNIT",
-            lines=["", "PLUG IN A USB PRINTER", "", "|/-\\"[self.spinner] + " SEARCHING"],
+            lines=["", "PLUG IN A USB PRINTER", "",
+                   "|/-\\"[self.spinner] + " SEARCHING",
+                   "HOLD OK TO SHUT DOWN"],
             footer=f"v{VERSION}",
         )
 
@@ -506,19 +646,25 @@ class App:
             press = self.buttons.wait(timeout=self.poll_seconds)
             if press is Press.QUIT:
                 self.running = False
+            elif press is Press.BACK:
+                # An unsupported or dead printer would otherwise leave the
+                # operator on this screen with every button inert and no way
+                # to power down cleanly except pulling the plug.
+                self.request_shutdown()
         return False
 
     def run(self) -> None:
         if not self.wait_for_printer():
             return
+        # The main menu is always the bottom of the stack, even when setup
+        # failed: an operator who dismisses a printer error still needs a
+        # route to SETTINGS and SHUT DOWN.
+        self.stack = [main_menu()]
         try:
             device = self.cups.devices()[0]
             self.queue = self.cups.ensure_queue(device)
         except (IndexError, printer_mod.PrinterError) as exc:
-            self.stack = [Message("PRINTER", [str(exc)[:21]])]
-
-        if not self.stack:
-            self.stack = [main_menu()]
+            self.stack.append(Message("PRINTER", wrap(str(exc))))
 
         while self.running and self.stack:
             self.render()
@@ -529,7 +675,15 @@ class App:
                 break
             current = self.stack[-1]
             nxt = current.press(self, press)
-            if nxt is None:
-                self.stack.pop()
+            if nxt is HOME:
+                self.stack = [main_menu()]
+            elif nxt is None:
+                # Never pop the last screen. This is a headless appliance
+                # with three buttons: an empty stack ends run(), the panel
+                # goes dark and every button stops responding, with nothing
+                # short of a power cycle to recover. A back press at the
+                # root menu must simply do nothing.
+                if len(self.stack) > 1:
+                    self.stack.pop()
             elif nxt is not current:
                 self.stack.append(nxt)

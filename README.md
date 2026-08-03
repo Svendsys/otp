@@ -146,14 +146,24 @@ copies back to back, then wipes itself. No screen, no keyboard, no network.
 This exists because the manual's advice about generation hygiene is hard to
 follow with a laptop and easy to follow with a dedicated box:
 
-- **Key material never becomes a file.** The PDF is generated into RAM and
-  piped to `lp` on stdin. CUPS still spools each job — unavoidable short of
-  writing raw to `/dev/usb/lp0`, which only PostScript and PCL printers
-  accept — so the spool is forced onto tmpfs, where it lives in RAM, never
-  reaches the SD card, and is purged after every job.
-- **No swap**, so the buffer holding key material cannot be paged to disk.
-- **Read-only root with a RAM overlay**, so a power-cycle is a full reset.
-- **Volatile logs**, and job metadata only.
+- **No pad ever reaches the SD card.** The PDF is generated into RAM and
+  piped to `lp` on stdin — this process opens no file. CUPS still spools
+  each job, which is unavoidable short of writing raw to `/dev/usb/lp0` and
+  only PostScript and PCL printers accept that; so its spool, temp and cache
+  directories are all forced onto tmpfs and purged after every job.
+- **The codeword never leaves the process.** It is not used as the CUPS job
+  title, because job names persist in CUPS's own records.
+- **No swap**, so nothing holding key material can be paged to disk.
+- **Volatile logs**, no core dumps, and job metadata only.
+- **Read-only root with a RAM overlay** — see [docs/IMAGE.md](docs/IMAGE.md).
+  This is one manual step after first boot, not the state you are handed.
+
+Be clear about what is *not* claimed. Key material is not scrubbed from RAM
+when a job ends: the working buffer is zeroed, but reportlab's intermediates
+and the immutable bytes handed to the subprocess cannot be, and copies stay
+resident until that memory is reused. Nothing is paged to disk and nothing
+survives a power cycle, so **powering the unit off is the wipe** — which is
+what the panel tells the operator to do.
 
 It also prints worksheets, tabula recta cards, and this manual.
 
