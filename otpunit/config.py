@@ -32,6 +32,8 @@ AUTH_SIZE_CHOICES = (0, 3, 4, 5, 6, 7, 8)  # 0 means no AUTH group
 # cuts the whole stack at once, so every sheet needs identical geometry, and
 # driver-side scaling would drift the cut line from sheet to sheet.
 PAPER_CHOICES = ("A4", "LETTER", "A6")
+# Kept equal to the CLI's ceiling in otp_generator.main.
+MAX_PAGES = 9999
 
 PAPER_LABELS = {
     "A4": "A4, 4-UP + CUT",
@@ -58,15 +60,32 @@ class Settings:
     @property
     def lp_options(self) -> dict:
         """
-        CUPS options. Only the media size -- the imposition is already in
-        the PDF, so nothing here may scale or re-tile it.
+        CUPS options: the media size, and the two defaults that would
+        otherwise silently invalidate the cut geometry.
+
+        `print-scaling=none` is the important one. The imposition is baked
+        into the PDF at exact millimetre positions and the crop marks are a
+        promise about where the blade goes -- but cups-filters defaults
+        print-scaling to `auto`, which fits the page to the printable area.
+        On a printer with a 4.23mm unprintable band that is roughly a 4%
+        shrink, so every cut lands off the mark and the two halves of a pair
+        no longer match. This code used to only send `media` and rely on the
+        driver doing nothing; a comment even named the risk. Saying nothing
+        is not the same as saying no.
+
+        `sides=one-sided` guards a queue that defaults to duplex, which
+        would put two pad pages on one slip of paper -- and "destroy the
+        page after use" has no answer for a page with another page's key on
+        its back.
         """
+        fixed = {"print-scaling": "none", "sides": "one-sided"}
         if self.a7:
             # A7 emits landscape-A6 sheets with their own cut line; the
             # paper setting does not apply to it, and sending media=A4 would
             # ask the driver to scale a sheet that is already the right size.
-            return {"media": "A6"}
-        return {"media": {"A6": "A6", "LETTER": "Letter"}.get(self.paper, "A4")}
+            return {"media": "A6", **fixed}
+        media = {"A6": "A6", "LETTER": "Letter"}.get(self.paper, "A4")
+        return {"media": media, **fixed}
 
     @property
     def sheets(self) -> int:
@@ -95,6 +114,14 @@ class Settings:
         problems = []
         if self.pages < 1:
             problems.append("pages must be at least 1")
+        # The same ceiling the CLI enforces. It landed there and not here,
+        # but this is the side that reads a hand-edited file off the boot
+        # partition, so it is the side that actually receives a silly
+        # number. Above 9999 the page-number field runs to five digits while
+        # the manual's message header stays four, and the two ends stop
+        # being able to name the same page.
+        if self.pages > MAX_PAGES:
+            problems.append(f"pages cannot exceed {MAX_PAGES}")
         if self.with_auth and self.auth_size < 1:
             problems.append("auth size must be at least 1")
         # A negative auth_size shortens the draw in draw_pad_page instead of

@@ -442,7 +442,8 @@ class TestRunJobFlow:
         app.cups = cups
         screen.press(app, Press.OK)
         screen.press(app, Press.OK)             # swap prompt
-        screen.press(app, Press.BACK)           # abandon
+        screen.press(app, Press.BACK)           # ask to abandon
+        screen.press(app, Press.OK)             # confirm -- swap now asks
         assert cups.purged == 1
         # Copy A is already on the tray and the key is now gone, so the pair
         # can never be completed. The operator must be told those sheets are
@@ -499,12 +500,25 @@ class TestSettings:
         assert config.Settings().paper == "A4"
         assert config.Settings().imposed is True
 
-    def test_lp_options_only_set_media(self):
+    def test_lp_options_pin_the_geometry(self):
         # The imposition is baked into the PDF. If CUPS also tiled or scaled
         # it, the cut lines would no longer be where the crop marks say.
-        assert config.Settings(paper="A4").lp_options == {"media": "A4"}
-        assert config.Settings(paper="LETTER").lp_options == {"media": "Letter"}
-        assert config.Settings(paper="A6").lp_options == {"media": "A6"}
+        #
+        # This test used to assert lp_options == {"media": ...} exactly --
+        # naming that risk in a comment and then locking in the absence of
+        # the options that prevent it. cups-filters defaults print-scaling
+        # to `auto`, so "we send nothing" meant "the driver may shrink it to
+        # fit", which is precisely the failure the comment describes.
+        for paper, media in (("A4", "A4"), ("LETTER", "Letter"), ("A6", "A6")):
+            options = config.Settings(paper=paper).lp_options
+            assert options["media"] == media
+            assert options["print-scaling"] == "none"
+            assert options["sides"] == "one-sided"
+
+    def test_a7_sheets_are_not_scaled_either(self):
+        options = config.Settings(paper="A4", a7=True).lp_options
+        assert options == {"media": "A6", "print-scaling": "none",
+                           "sides": "one-sided"}
 
     def test_a6_paper_is_not_imposed(self):
         assert config.Settings(paper="A6").imposed is False
@@ -529,7 +543,9 @@ class TestSettings:
         job = jobs.PadPairJob(spec, cups)
         job.generate(progress=lambda d, t: None)
         job.print_next_copy()
-        assert cups.submitted[0]["options"] == {"media": "Letter"}
+        assert cups.submitted[0]["options"]["media"] == "Letter"
+        # The driver must not be left free to shrink an imposed sheet.
+        assert cups.submitted[0]["options"]["print-scaling"] == "none"
 
     def test_manual_job_leaves_paper_to_the_driver(self):
         cups = RecordingCups()

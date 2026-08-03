@@ -553,3 +553,103 @@ class TestCodewordNeverLeavesTheProcess:
         # Pinning the metadata must not have introduced per-copy variation.
         cups = self._submit_a_pair()
         assert cups.submitted[0]["data"] == cups.submitted[1]["data"]
+
+
+class TestSwapAsksBeforeDestroying:
+    """
+    The swap screen has the same consequence as the waiting screen -- copy
+    A on the tray, the key zeroed, the pair impossible to finish -- and
+    round four gave `waiting` a confirmation and left `swap` on a single
+    unconfirmed press.
+    """
+
+    def _at_swap(self):
+        cups = Cups()
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "SILENT-OSPREY",
+                            config.Settings(pages=2))
+        app, screen = make_app([]), ui.RunJob(spec)
+        app.cups = cups
+        screen.press(app, Press.OK)        # generate and submit copy A
+        screen.press(app, Press.OK)        # queue idle, so copy A is done
+        assert screen.stage == "swap"
+        return app, screen, cups
+
+    def test_back_at_swap_asks_first(self):
+        app, screen, _ = self._at_swap()
+        buffer = screen.job._buffer
+        screen.press(app, Press.BACK)
+        assert screen.stage == "confirm_abandon"
+        assert screen.job is not None, "the job must survive an unconfirmed press"
+        assert any(buffer), "the key must not be zeroed before confirmation"
+
+    def test_declining_returns_to_swap_not_to_waiting(self):
+        # Landing on `waiting` would tell an operator a job is printing
+        # when the queue is idle and copy B has not been submitted.
+        app, screen, _ = self._at_swap()
+        screen.press(app, Press.BACK)
+        screen.press(app, Press.BACK)
+        assert screen.stage == "swap"
+
+    def test_declining_still_lets_copy_b_print(self):
+        app, screen, cups = self._at_swap()
+        screen.press(app, Press.BACK)
+        screen.press(app, Press.BACK)
+        screen.press(app, Press.OK)
+        assert len(cups.submitted) == 2
+
+    def test_confirming_destroys_the_key(self):
+        # Hold the buffer itself, so this checks that the bytes were
+        # overwritten rather than that a reference was dropped.
+        app, screen, _ = self._at_swap()
+        buffer = screen.job._buffer
+        assert any(buffer), "precondition: the key is live"
+        screen.press(app, Press.BACK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "abandoned"
+        assert not any(buffer), "the key must be zeroed, not just released"
+
+    def test_declining_from_waiting_still_returns_to_waiting(self):
+        # The shared prompt must not have made the two paths converge.
+        cups = Cups(busy=3)
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "SILENT-OSPREY",
+                            config.Settings(pages=2))
+        app, screen = make_app([]), ui.RunJob(spec)
+        app.cups = cups
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "waiting"
+        screen.press(app, Press.BACK)
+        assert screen.stage == "confirm_abandon"
+        screen.press(app, Press.BACK)
+        assert screen.stage == "waiting"
+
+
+class TestQueueSetupNeverEscapes:
+    """
+    ensure_queue runs on the boot path, next to a cupsd that is itself
+    still starting. App.run catches only PrinterError, so anything else
+    unwinds run() into Restart=on-failure and a dark panel.
+    """
+
+    def _cups(self, raiser):
+        return printer.Cups(run=raiser)
+
+    def test_a_timeout_becomes_a_printer_error(self):
+        import subprocess
+
+        def wedged(argv, stdin=None):
+            raise subprocess.TimeoutExpired(argv, 120)
+
+        cups = self._cups(wedged)
+        device = printer.Device("ipp://localhost/ipp/print", "HP LaserJet")
+        with pytest.raises(printer.PrinterError):
+            cups.ensure_queue(device)
+
+    def test_a_missing_lpadmin_becomes_a_printer_error(self):
+        def absent(argv, stdin=None):
+            raise FileNotFoundError(2, "No such file", argv[0])
+
+        cups = self._cups(absent)
+        device = printer.Device("usb://HP/LaserJet%20Pro%20M12w", "")
+        with pytest.raises(printer.PrinterError):
+            cups.ensure_queue(device)

@@ -279,14 +279,14 @@ class TestLayoutsDrawWhatTheyPromise:
         g.generate_set_pdf_a4(sink, "RUSTED-BADGER", 4, 665, 9,
                               page_size=page_size, progress=lambda d, t: None)
         page_w, page_h = page_size
-        tick = 4 * g.mm
+        inset, tick = g.CROP_INSET, g.CROP_TICK
         expected = {
-            # Vertical cut, marked at the bottom and top edges.
-            (page_w / 2, 0.0, page_w / 2, tick),
-            (page_w / 2, page_h - tick, page_w / 2, page_h),
-            # Horizontal cut, marked at the left and right edges.
-            (0.0, page_h / 2, tick, page_h / 2),
-            (page_w - tick, page_h / 2, page_w, page_h / 2),
+            # Vertical cut, marked near the bottom and top edges.
+            (page_w / 2, inset, page_w / 2, inset + tick),
+            (page_w / 2, page_h - inset - tick, page_w / 2, page_h - inset),
+            # Horizontal cut, marked near the left and right edges.
+            (inset, page_h / 2, inset + tick, page_h / 2),
+            (page_w - inset - tick, page_h / 2, page_w - inset, page_h / 2),
         }
         drawn = line_segments(sink.getvalue())
         for mark in expected:

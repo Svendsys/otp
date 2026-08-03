@@ -309,6 +309,15 @@ class RunJob(Screen):
         self.stage = "confirm"
         self.done_pages = 0
         self.error = ""
+        # Which stage the abandon prompt was reached from, so declining it
+        # returns where the operator was rather than to a fixed guess.
+        self.abandon_from = "waiting"
+
+    def _total_pages(self) -> int:
+        """Units the progress callback counts in, for this job kind."""
+        if self.spec.carries_key_material and self.spec.settings:
+            return self.spec.settings.pages
+        return max(1, self.spec.count)
 
     def frame(self, app):
         spec = self.spec
@@ -335,7 +344,11 @@ class RunJob(Screen):
             return Frame(title="CONFIRM", lines=lines, footer="OK START  HOLD CANCEL")
 
         if self.stage == "generating":
-            total = self.spec.settings.pages if self.spec.settings else 1
+            # settings.pages counts PAD pages. Worksheets and tabula recta
+            # are driven by spec.count instead, so reading settings.pages
+            # for them showed a ten-copy worksheet run as "0/100 PAGES"
+            # with a progress bar that never moved off zero.
+            total = self._total_pages()
             return Frame(
                 title="GENERATING",
                 lines=[self.spec.codeword or self.spec.kind.value.upper(),
@@ -349,7 +362,7 @@ class RunJob(Screen):
                 title="COPY A DONE",
                 lines=["REMOVE THE STACK", "AND KEEP IT TOGETHER", "",
                        "OK TO PRINT COPY B"],
-                footer="HOLD TO ABANDON",
+                footer="OK COPY B  HOLD STOP",
             )
 
         if self.stage == "waiting":
@@ -427,9 +440,15 @@ class RunJob(Screen):
             return self._generate(app)
 
         if self.stage == "swap":
+            # Asks first, exactly as `waiting` does. The consequence is
+            # identical -- copy A on the tray, the key gone, the pair
+            # impossible to finish -- and this screen also invites a
+            # confident OK, so a tap held a beat too long landed on an
+            # unconfirmed destroy. Round four guarded `waiting` and left
+            # its neighbour.
             if press is Press.BACK:
-                self._wipe()
-                self.stage = "abandoned"
+                self.abandon_from = "swap"
+                self.stage = "confirm_abandon"
                 return self
             if press is Press.OK:
                 return self._print_copy(app)
@@ -452,6 +471,7 @@ class RunJob(Screen):
             # tap held a beat too long would otherwise purge the queue and
             # zero the key with no confirmation at all.
             if press is Press.BACK:
+                self.abandon_from = "waiting"
                 self.stage = "confirm_abandon"
                 return self
             if press is Press.OK:
@@ -463,7 +483,7 @@ class RunJob(Screen):
                 self._wipe()
                 self.stage = "abandoned"
             elif press is Press.BACK:
-                self.stage = "waiting"
+                self.stage = self.abandon_from
             return self
 
         if self.stage in ("done", "error", "cancelled", "abandoned"):

@@ -124,17 +124,33 @@ class Cups:
         host-based lasers get a PPD matched on their USB device ID instead.
         """
         if device.is_ipp:
-            result = self._run([LPADMIN, "-p", name, "-E", "-v", device.uri,
-                                "-m", "everywhere"])
-            if result.returncode == 0:
+            if self._lpadmin(name, device.uri, "everywhere"):
                 return name
 
         model = self._match_ppd(device)
-        if model:
-            result = self._run([LPADMIN, "-p", name, "-E", "-v", device.uri, "-m", model])
-            if result.returncode == 0:
-                return name
+        if model and self._lpadmin(name, device.uri, model):
+            return name
         raise PrinterError(f"no driver for {device.label}")
+
+    def _lpadmin(self, name: str, uri: str, model: str) -> bool:
+        """
+        Run lpadmin, reporting failure rather than raising.
+
+        Every other call into CUPS already contains its own failures, but
+        this one used to let them out: _subprocess_run raises
+        TimeoutExpired after TIMEOUT seconds, and a missing lpadmin raises
+        FileNotFoundError, neither of which is a PrinterError. Queue setup
+        runs on the boot path, alongside a cupsd that is itself still
+        starting -- precisely when a slow answer is most likely -- and the
+        caller only catches PrinterError. So the escape route was an
+        uncaught traceback out of run(), Restart=on-failure, and a dark
+        panel with nothing on it to explain why.
+        """
+        try:
+            result = self._run([LPADMIN, "-p", name, "-E", "-v", uri, "-m", model])
+        except Exception:
+            return False
+        return result.returncode == 0
 
     def _match_ppd(self, device: Device) -> str | None:
         """

@@ -55,6 +55,14 @@ A7_CHARS_PER_ROW = A7_GROUPS_PER_ROW * GROUP_SIZE  # 25
 HEADER_MARGIN_H = 4 * mm
 HEADER_GAP = 2 * mm
 
+# Crop marks for the guillotine, on imposed sheets. Inset because a laser
+# leaves the outer few millimetres of a sheet unprinted -- 4.23mm on an HP
+# LaserJet Pro M12w and most of its class -- so a mark that starts at the
+# paper's edge is a mark that never appears. 5mm clears that band on every
+# printer in docs/PRINTERS.md.
+CROP_INSET = 5 * mm
+CROP_TICK = 7 * mm
+
 # Two-word codewords (RUSTED-BADGER) do not fit the A7 header at the body font
 # size, so the codeword shrinks to fit. It is a label, not key material — the
 # AUTH group and page number always stay at full size because those are read
@@ -502,21 +510,34 @@ def generate_set_pdf_a4(
 
 def _draw_crop_marks(c: canvas.Canvas, page_w: float, page_h: float):
     """
-    Ticks at the sheet edges marking the two cuts.
+    Ticks near the sheet edges marking the two cuts.
 
     Edge ticks rather than full rules: a line across the sheet would run
-    through the key area, and the blade only needs the edges to line up on.
+    through the key area, and the blade only needs something collinear with
+    the cut to line up on.
+
+    They are inset rather than run to the paper's edge. A laser cannot mark
+    the outer few millimetres of a sheet -- the HP LaserJet Pro M12w and
+    most of its class reserve 4.23mm (one sixth of an inch) on every edge --
+    so ticks spanning 0 to 4mm landed entirely inside the band that never
+    receives toner, and the marks the whole cut-and-stack layout depends on
+    simply did not appear. Starting at CROP_INSET puts them on paper.
+
+    Being inset costs nothing: the tick sits ON the cut line, so any part of
+    it defines where the blade goes. Both cuts run along the boundary
+    between tiled pages, which is 4mm clear of any content on either side,
+    so the ticks cannot collide with key material at any length.
     """
-    tick = 4 * mm
     c.saveState()
     c.setStrokeGray(0.45)
     c.setLineWidth(0.4)
-    # Vertical cut, marked top and bottom
-    c.line(page_w / 2, 0, page_w / 2, tick)
-    c.line(page_w / 2, page_h - tick, page_w / 2, page_h)
+    inset, tick = CROP_INSET, CROP_TICK
+    # Vertical cut, marked bottom and top
+    c.line(page_w / 2, inset, page_w / 2, inset + tick)
+    c.line(page_w / 2, page_h - inset - tick, page_w / 2, page_h - inset)
     # Horizontal cut, marked left and right
-    c.line(0, page_h / 2, tick, page_h / 2)
-    c.line(page_w - tick, page_h / 2, page_w, page_h / 2)
+    c.line(inset, page_h / 2, inset + tick, page_h / 2)
+    c.line(page_w - inset - tick, page_h / 2, page_w - inset, page_h / 2)
     c.restoreState()
 
 
