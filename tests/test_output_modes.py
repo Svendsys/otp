@@ -338,6 +338,37 @@ class TestNewCliFlags:
         assert r.returncode != 0
         assert b"unsafe as a filename" in r.stdout
 
+    def test_auth_group_cannot_overprint_the_page_number(self, tmp_path):
+        # codeword_space budgets the codeword against AUTH, but nothing
+        # budgeted AUTH against the page number -- and both are deliberately
+        # kept at full size because they are read character by character.
+        r = run(["--random-codewords", "1", "--pages", "1", "--auth-size", "40",
+                 "--output", str(tmp_path)], cwd=tmp_path)
+        assert r.returncode != 0
+        assert b"overprint the page number" in r.stdout
+
+    def test_the_auth_bound_matches_what_actually_fits(self):
+        for a7 in (False, True):
+            for font_size in (7, 9, 11):
+                limit = g.max_auth_size(font_size, a7)
+                space = g.codeword_space(font_size, a7, True, limit)
+                assert space > 0, (a7, font_size, limit)
+
+    def test_stdout_does_not_tell_you_to_print_the_pdf_twice(self, tmp_path):
+        # The bytes are down the pipe; re-running makes a DIFFERENT pad
+        # wearing the same codeword, which is the one thing the pair
+        # convention exists to prevent.
+        r = run(["--random-codewords", "1", "--pages", "1", "--stdout"],
+                cwd=tmp_path)
+        assert r.returncode == 0, r.stderr
+        assert b"PRINT EACH PDF TWICE" not in r.stderr
+        assert b"lp -n 2" in r.stderr
+
+    def test_file_output_still_says_to_print_twice(self, tmp_path):
+        r = run(["--random-codewords", "1", "--pages", "1",
+                 "--output", str(tmp_path)], cwd=tmp_path)
+        assert b"PRINT EACH PDF TWICE" in r.stdout
+
     def test_a4_and_letter_conflict(self, tmp_path):
         r = run(["--random-codewords", "1", "--a4", "--letter"], cwd=tmp_path)
         assert r.returncode != 0

@@ -206,6 +206,12 @@ And the padding just repeats the key from the same position.
 
 The ciphertext in the padding region is raw key, and unused truly-random key is uniformly distributed — exactly as uniform as (message + key). So a passive observer can't tell where message ends and padding begins even if the convention is public, and length stays hidden.
 
+**But note what that sentence says, and be careful with it.** A *passive* observer learns nothing. An *active* one — anyone who can intercept and substitute rather than merely listen — is handed the key for the whole padding region, because they know the plaintext there is A. Combined with malleability (see Critical technicalities), that means an attacker can replace everything after your genuine text with anything they like, leave the auth group and your real words untouched, and keep the group count the same. Nothing about the result looks wrong, and the auth check still passes: it proves the *sender* held the pad, not that the message was not extended.
+
+So adopt one rule and drill it: **the message ends at the first padding character. Anything after that point is not from your correspondent and is never acted on.** Read the padding as the end-of-message marker it is. If a channel needs to carry text that may itself contain a run of As, agree an explicit end-of-text group at the handover instead.
+
+This is the one place where the padding convention, which is otherwise pure gain, costs something — and it costs nothing at all once the rule is in place.
+
 # Critical technicalities
 
 There are a few details that are absolutely essential to be aware of for secure OTP communication. Never compromise on these points, they are fundamental to the OTP scheme itself. Be aware that following these requirements is not in itself a guarantee against compromise. 
@@ -322,7 +328,7 @@ The handover is the single most sensitive event in the life of a channel. There 
 
 - Generate as close to the handover as practical, so the pads spend minimum time in storage before the copies split up.
 - Each copy travels sealed in an opaque envelope, labeled with the codeword only — no names, no addresses. Make the seal tamper-evident: sign across the flap, or seal it in a way you can verify later. The seal's job is to make "someone opened this" impossible to hide.
-- At the handover, verify together: right codeword, right page count, both copies intact. Agree explicitly on which direction the set will serve — who sends on it — and on every convention of the channel: sanitization, header format, schedule, safety word. This is the one moment you have a secure face-to-face channel. Everything that must ever be agreed, agree now.
+- At the handover, verify together: right codeword, right page count, both copies intact — and **fan each pad and check the page numbers run 1 to N with no repeats and no gaps.** A page count alone is not enough. If the pads were cut from a stack, a single sheet crossing between the two piles gives one pad a duplicated page and a missing one, which passes a count and leaves a repeated key page in play. Check the two copies match, too: hold a matching page from each up to the light. Agree explicitly on which direction the set will serve — who sends on it — and on every convention of the channel: sanitization, header format, schedule, safety word. This is the one moment you have a secure face-to-face channel. Everything that must ever be agreed, agree now.
 - Nothing written leaves the handover except the pads themselves. The association between a codeword and a person is carried in heads.
 - If custody was ever uncertain on the way — a bag out of sight, a border search, an unexplained delay — the set is retired, unused. A pad you are not sure of is worse than no pad, because it produces confidence without security.
 
@@ -356,7 +362,7 @@ Human error is the most likely path of failure. The mathematics of OTP does not 
 ## Protecting Our Network
 - **Compartmentalize by channel.** Every channel has its own pads and its own codeword. No pad, page, or key material is ever shared, copied, or "borrowed" between channels. The capture of one channel must tell the adversary nothing about the others.
 - **Codewords, not names.** A captured pad should reveal a codeword and nothing else — not who holds the twin, not where, not why. The codeword-to-person mapping lives in memory, in as few heads as possible.
-- **Guard the generation point.** Whoever generates pads touches every channel at birth, which makes the generation machine the most valuable object in the network. It stays offline, dedicated to the task, physically controlled, and wiped when the batch is done — and the printer counts as part of the machine. A dedicated appliance makes this easier to actually do than a laptop does: the print unit included with this kit boots into nothing but the pad printer, has no network, holds key material only in RAM, and forgets everything it did when the power goes off. Its printer still remembers, though, which is why it tells you to power-cycle that too.
+- **Guard the generation point.** Whoever generates pads touches every channel at birth, which makes the generation machine the most valuable object in the network. It stays offline, dedicated to the task, physically controlled, and wiped when the batch is done — and the printer counts as part of the machine. A dedicated appliance makes this easier to actually do than a laptop does: the print unit included with this kit boots into nothing but the pad printer, and holds key material only in RAM — no swap, no spool on the card, no file at any point. Two caveats it is worth knowing rather than assuming. Its radios are disabled but a wired or USB network adapter is not, so "offline" is something you arrange physically, not something the image guarantees. And it only forgets what it did once its read-only overlay is switched on, which is a step you take after first boot — until then it is an ordinary computer with an ordinary disk. Its printer remembers regardless, which is why the unit tells you to power-cycle that too.
 - **Keep traffic discipline network-wide.** Schedules and dummy traffic (see Schedules & Signals) keep the network's rhythm constant whether it is idle or busy. The adversary should learn nothing from volume.
 
 ## Protecting Our Cell
@@ -513,7 +519,8 @@ ORCHARD GATE AT NINE PM. Two lessons ride along. First, the diagnostic: where th
 
 # Glossary
 
-- **Auth group** - A five-letter group of key material reserved on each page for authentication, never used for encryption
+- **Auth group** - A group of key material reserved on each page for authentication, never used for encryption. Five letters by default; the generator can produce other lengths, but both ends must agree, and shorter means weaker — a three-letter group is guessable at 1 in 17,576 rather than 1 in 11.9 million
+- **A-padding** - Filling the rest of the page's key with the letter A so every message is the same length. Hides length from a passive observer; see Preparation for the rule it requires against an active one
 - **Channel** - A one-way sender-to-receiver link, secured by one pad set
 - **Cipher** - A cryptographic algorithm or scheme
 - **Ciphertext** - The encrypted output from a cipher

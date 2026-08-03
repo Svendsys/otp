@@ -30,6 +30,13 @@ a7 = no
 # The AUTH group: five key letters per page reserved for authentication and
 # never used for encryption (see otp.md, Authentication). The letters are
 # always CSPRNG output; only the length is adjustable.
+#
+# Five is what the manual's procedure assumes -- it says the first *group*
+# of every message is the auth group, and a group is five letters. Change
+# this only if both ends have agreed to, and know that shorter is weaker:
+# three letters is guessable at 1 in 17,576 against 1 in 11.9 million at
+# five. Setting with_auth = no produces pads on which the manual's own rule
+# ("no auth group, no action") means no message may ever be acted on.
 with_auth = yes
 auth_size = 5
 

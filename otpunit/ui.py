@@ -550,10 +550,23 @@ def settings_menu():
 
     def set_auth(app):
         current = app.settings.auth_size if app.settings.with_auth else 0
+
+        def label(v):
+            # The manual's procedure says "the first group", and a group is
+            # five. Anything else has to be agreed at both ends, and shorter
+            # is genuinely weaker -- say so where the choice is made.
+            if v == 0:
+                return "OFF - NO AUTH"
+            if v < 5:
+                return f"{v} LETTERS  WEAKER"
+            if v == 5:
+                return "5 LETTERS (MANUAL)"
+            return f"{v} LETTERS"
+
         return Chooser("AUTH GROUP", AUTH_SIZE_CHOICES, current,
                        lambda a, v: _apply(a, with_auth=v > 0,
                                            auth_size=v or a.settings.auth_size),
-                       render=lambda v: "OFF" if v == 0 else f"{v} LETTERS")
+                       render=label)
 
     def set_training(app):
         return Chooser("TRAINING", [False, True], app.settings.training,

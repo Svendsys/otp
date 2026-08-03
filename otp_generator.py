@@ -553,6 +553,13 @@ def generate_worksheets_pdf(output, num_pages: int):
         c.setFont("Courier-Bold", 9)
         c.drawString(margin, header_y, "OTP WORKSHEET")
         c.drawRightString(page_w - margin, header_y, "PAGE ________")
+        # The rows are labelled for encryption. Two of the manual's three
+        # exercises are decrypts, where the ciphertext goes in the top row
+        # and the plaintext comes out of the shaded one -- say so, or a
+        # student follows the labels straight into the wrong arithmetic.
+        c.setFont("Courier", 5.5)
+        c.drawCentredString(page_w / 2, header_y - 5.5 * mm,
+                            "ENCRYPT M+K=C   DECRYPT: PUT C IN THE TOP ROW, C-K=M")
         c.setLineWidth(0.3)
         c.line(margin, header_y - 2 * mm, page_w - margin, header_y - 2 * mm)
 
@@ -732,6 +739,26 @@ def fit_codeword_size(
     space = codeword_space(font_size, a7, with_auth, auth_size)
     size = min(font_size, space / width_at_1pt)
     return size if size >= CODEWORD_MIN_FONT else None
+
+
+def max_auth_size(font_size: float, a7: bool = False, box_width: float = None) -> int:
+    """
+    Longest AUTH group that clears the right-aligned page number.
+
+    codeword_space budgets the codeword against the AUTH group, but nothing
+    budgeted AUTH itself: at --auth-size 40 the last AUTH letter overprints
+    the first digit of the page number. Those are the two fields deliberately
+    kept at full size because they are read character by character.
+    """
+    if box_width is None:
+        box_width = (SHEET_HEIGHT / 2) if a7 else SHEET_WIDTH
+    content_width = box_width - 2 * HEADER_MARGIN_H
+    pagenum_w = stringWidth("0000", "Courier-Bold", font_size)
+    label_w = stringWidth("AUTH ", "Courier-Bold", font_size)
+    char_w = stringWidth("X", "Courier-Bold", font_size)
+    # AUTH is centred, so it has to clear the page number on both sides.
+    room = content_width - 2 * (pagenum_w + HEADER_GAP) - label_w
+    return max(0, int(room // char_w))
 
 
 def max_body_font_size(a7: bool = False, box_width: float = None) -> float:
@@ -927,6 +954,23 @@ def main():
                 log(f"ERROR: Codeword '{word}' is unsafe as a filename (use A-Z, 0-9, '-', '_')")
                 sys.exit(1)
 
+        # Imposed layouts get a quarter of the sheet, which on Letter is
+        # shorter and wider than A6 -- measure against the box the pages
+        # actually land in, not against A6.
+        box_height = box_width = None
+        if args.a4 or args.letter:
+            sheet_size = LETTER if args.letter else A4
+            box_height, box_width = sheet_size[1] / 2, sheet_size[0] / 2
+
+        # AUTH first: an oversized AUTH group squeezes the codeword's budget
+        # to almost nothing, so checking the codeword first would blame it
+        # for a fault that is really the AUTH size.
+        auth_limit = max_auth_size(font_size, args.a7, box_width)
+        if with_auth and auth_size > auth_limit:
+            log(f"ERROR: an AUTH group of {auth_size} would overprint the page "
+                f"number on {format_label}. Maximum is {auth_limit}.")
+            sys.exit(1)
+
         # Codewords must fit the page header beside the AUTH group and page
         # number. They shrink to fit, so the limit is what fits at the smallest
         # legible size \u2014 not what fits at the body font size.
@@ -936,14 +980,6 @@ def main():
                 log(f"ERROR: Codeword '{word}' is too long for the {format_label} header "
                     f"(max {codeword_limit} characters)")
                 sys.exit(1)
-
-        # Imposed layouts get a quarter of the sheet, which on Letter is
-        # shorter than A6 -- measure against the box the pages actually land
-        # in, not against A6.
-        box_height = box_width = None
-        if args.a4 or args.letter:
-            sheet_size = LETTER if args.letter else A4
-            box_height, box_width = sheet_size[1] / 2, sheet_size[0] / 2
 
         # Width first. calc_max_chars only measures height, so without this
         # a larger --fontsize drives the inter-group gap negative and the
@@ -1027,7 +1063,15 @@ def main():
     log()
     if generating_sets:
         log("Each PDF contains one complete set.")
-        log("PRINT EACH PDF TWICE to get your A and B copies.")
+        if args.stdout:
+            # The bytes went down the pipe and are gone. Re-running produces
+            # DIFFERENT key material -- two pads wearing one codeword, which
+            # is the failure the whole pair convention exists to prevent.
+            log("You piped one copy. A pad set is two IDENTICAL copies, so")
+            log("ask the printer for both from this one job (lp -n 2).")
+            log("Re-running would make a DIFFERENT pad, not the twin.")
+        else:
+            log("PRINT EACH PDF TWICE to get your A and B copies.")
         if args.a7:
             log("Cut each sheet vertically along the dashed line")
             log("to separate into A7 pad pages.")

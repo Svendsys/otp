@@ -60,6 +60,11 @@ class Settings:
         CUPS options. Only the media size -- the imposition is already in
         the PDF, so nothing here may scale or re-tile it.
         """
+        if self.a7:
+            # A7 emits landscape-A6 sheets with their own cut line; the
+            # paper setting does not apply to it, and sending media=A4 would
+            # ask the driver to scale a sheet that is already the right size.
+            return {"media": "A6"}
         return {"media": {"A6": "A6", "LETTER": "Letter"}.get(self.paper, "A4")}
 
     @property
@@ -105,6 +110,9 @@ class Settings:
             return problems
         if self.font_size > gen.max_body_font_size(self.a7, self._box_width()):
             problems.append("font size too large for the page width")
+        if self.with_auth and self.auth_size > gen.max_auth_size(
+                self.font_size, self.a7, self._box_width()):
+            problems.append("auth group too wide for the header")
         if self.chars_per_page > gen.calc_max_chars(
                 self.font_size, self.a7, self._box_height()):
             problems.append("chars per page exceed the format")

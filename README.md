@@ -95,7 +95,7 @@ are A5: two per A4 sheet, one cut.
 | `--tabula` | 0 | Also generate N tabula recta cards as `TABULA_RECTA.pdf` — the manual's 26×26 table, pocket-sized to go in the envelope with the pad. No key material. |
 | `--auth-size` | 5 | Letters in the AUTH group. The letters are always CSPRNG output; only the length is adjustable. |
 | `--random-codewords` | 0 | Generate N random `<MODIFIER>-<NOUN>` codewords instead of reading a file |
-| `--stdout` | off | Write the single generated PDF to stdout instead of a file: `otp_generator.py --random-codewords 1 --pages 100 --a4 --stdout \| lp`. See the caveat below — this keeps key material out of *this program's* output, not out of your spooler. |
+| `--stdout` | off | Write the single generated PDF to stdout instead of a file: `otp_generator.py --random-codewords 1 --pages 100 --a4 --stdout \| lp -n 2`. Note the `-n 2`: a pad set is two identical copies, and once the bytes are down the pipe they are gone — re-running makes a *different* pad, not the twin. See the caveat below; this keeps key material out of *this program's* output, not out of your spooler. |
 
 ### What `--stdout` does and does not do
 
