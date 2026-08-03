@@ -10,11 +10,14 @@ this as "nothing is written anywhere" -- describe it accurately.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass
 
 QUEUE = "OTP"
+# Kept equal to TempDir in device/install.sh's cups-files.conf.
+TEMP_DIR = "/run/cups/tmp"
 LP = "/usr/bin/lp"
 LPSTAT = "/usr/bin/lpstat"
 LPINFO = "/usr/sbin/lpinfo"
@@ -130,7 +133,25 @@ class Cups:
         model = self._match_ppd(device)
         if model and self._lpadmin(name, device.uri, model):
             return name
+
+        # Every attempt failed, so leave nothing behind that can accept a
+        # job. lpadmin exits non-zero on a bad -m but CREATES THE QUEUE
+        # ANYWAY: verified against a real cupsd, a failed `-m everywhere`
+        # against an unreachable IPP URI left OTP enabled and idle with no
+        # PPD, absent from printers.conf, and happy to accept a complete
+        # pad that it would never print. The caller keeps using the name
+        # `OTP` after reporting the error, so the operator could walk
+        # straight into spooling key material into a black hole and then
+        # wait on a queue that never drains. The tell was a zero StateTime.
+        self._remove_queue(name)
         raise PrinterError(f"no driver for {device.label}")
+
+    def _remove_queue(self, name: str) -> None:
+        """Delete a queue, best effort. Absent is the desired end state."""
+        try:
+            self._run([LPADMIN, "-x", name])
+        except Exception:
+            pass
 
     def _lpadmin(self, name: str, uri: str, model: str) -> bool:
         """
@@ -229,6 +250,37 @@ class Cups:
         except Exception:
             # Best effort. The spool is tmpfs and dies with the power, so a
             # failed purge is not worth propagating into the UI.
+            pass
+        self._clear_temp()
+
+    def _clear_temp(self) -> None:
+        """
+        Delete what the filters left in TempDir.
+
+        `cancel -x` empties RequestRoot but not TempDir, and cancelling is
+        exactly when TempDir matters: CUPS SIGKILLs the filter chain, so
+        Ghostscript never unlinks its own scratch files. Verified against a
+        real cupsd -- cancelling a 400-page pad mid-print left a 1MB
+        gs_XXXXXX holding 384 pages of plaintext PostScript with the
+        codeword and the key groups in it, and a cupsd restart did not
+        clear it. Normal completion is clean; this is the cancel path, and
+        the cancel path is what abandoning a pair invokes.
+
+        Still RAM-only on the device -- TempDir is under /run -- so this is
+        about honouring purge()'s contract, not about the SD card.
+        """
+        try:
+            for entry in os.scandir(TEMP_DIR):
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+                except OSError:
+                    # A file another job still holds. Skip it; this runs
+                    # after cancel, so nothing of ours should be live.
+                    pass
+        except OSError:
+            # No TempDir, or not ours to read. Nothing to do and nothing
+            # worth taking the UI down for.
             pass
 
 

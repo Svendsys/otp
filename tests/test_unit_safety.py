@@ -653,3 +653,86 @@ class TestQueueSetupNeverEscapes:
         device = printer.Device("usb://HP/LaserJet%20Pro%20M12w", "")
         with pytest.raises(printer.PrinterError):
             cups.ensure_queue(device)
+
+
+class TestAFailedSetupLeavesNoQueue:
+    """
+    lpadmin exits non-zero on a bad -m but creates the queue anyway. An
+    enabled queue with no driver accepts a whole pad and never prints it,
+    and the caller goes on using the same queue name.
+    """
+
+    class Recorder:
+        def __init__(self, fail_all=True):
+            self.calls = []
+            self.fail_all = fail_all
+
+        def __call__(self, argv, stdin=None):
+            self.calls.append(argv)
+            import subprocess as sp
+            rc = 1 if self.fail_all else 0
+            return sp.CompletedProcess(argv, rc, b"", b"")
+
+    def test_the_queue_is_deleted_when_no_driver_matches(self):
+        recorder = self.Recorder()
+        cups = printer.Cups(run=recorder)
+        with pytest.raises(printer.PrinterError):
+            cups.ensure_queue(printer.Device("ipp://localhost/ipp/print", "HP"))
+        removals = [c for c in recorder.calls if "-x" in c]
+        assert removals, "a failed setup must not leave a queue behind"
+        assert removals[-1][-1] == "OTP"
+
+    def test_a_successful_setup_deletes_nothing(self):
+        recorder = self.Recorder(fail_all=False)
+        cups = printer.Cups(run=recorder)
+        assert cups.ensure_queue(
+            printer.Device("ipp://localhost/ipp/print", "HP")) == "OTP"
+        assert not [c for c in recorder.calls if "-x" in c]
+
+
+class TestPurgeClearsTheFilterScratchFiles:
+    """
+    cancel -x empties RequestRoot but not TempDir, and CUPS SIGKILLs the
+    filter chain, so Ghostscript leaves its scratch file behind holding
+    plaintext key material.
+    """
+
+    def test_temp_files_are_removed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(printer, "TEMP_DIR", str(tmp_path))
+        leftover = tmp_path / "gs_kLfdpl"
+        leftover.write_bytes(b"(MIDPRINT-KILL) AUTH FUIUQ 0001")
+
+        import subprocess as sp
+        cups = printer.Cups(
+            run=lambda argv, stdin=None: sp.CompletedProcess(argv, 0, b"", b""))
+        cups.purge()
+        assert not leftover.exists(), "key material left in TempDir"
+
+    def test_a_missing_temp_dir_is_not_an_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(printer, "TEMP_DIR", str(tmp_path / "absent"))
+        import subprocess as sp
+        cups = printer.Cups(
+            run=lambda argv, stdin=None: sp.CompletedProcess(argv, 0, b"", b""))
+        cups.purge()        # must not raise
+
+    def test_a_cancel_failure_still_clears_temp(self, tmp_path, monkeypatch):
+        # The wipe path must not depend on cancel having worked.
+        monkeypatch.setattr(printer, "TEMP_DIR", str(tmp_path))
+        leftover = tmp_path / "gs_scratch"
+        leftover.write_bytes(b"key")
+
+        def wedged(argv, stdin=None):
+            raise OSError("cupsd is gone")
+
+        printer.Cups(run=wedged).purge()
+        assert not leftover.exists()
+
+    def test_subdirectories_are_left_alone(self, tmp_path, monkeypatch):
+        # Only files. Recursing risks deleting something that is not ours.
+        monkeypatch.setattr(printer, "TEMP_DIR", str(tmp_path))
+        (tmp_path / "sub").mkdir()
+        import subprocess as sp
+        printer.Cups(
+            run=lambda argv, stdin=None: sp.CompletedProcess(argv, 0, b"", b"")
+        ).purge()
+        assert (tmp_path / "sub").is_dir()

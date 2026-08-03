@@ -231,19 +231,20 @@ set_cupsd() {
 set_cupsd PreserveJobHistory No
 set_cupsd PreserveJobFiles No
 set_cupsd MaxJobs 1
+# CUPS defaults ErrorPolicy to retry-job, which never gives up. Combined
+# with MaxJobs 1 that is a permanent wedge: a job to a printer that is off,
+# jammed or unplugged stays active forever, so active_jobs() returns 1
+# forever, cups_busy() is true forever, copy B can never be submitted, and
+# the UI holds key material until someone pulls the power -- the one thing
+# the whole design is trying to avoid. abort-job lets the job die so the
+# queue drains and the panel can say something. Verified with a real cupsd:
+# a job to an unreachable printer was still active after 20s under
+# retry-job, with lpstat cheerfully reporting "now printing".
+set_cupsd ErrorPolicy abort-job
 
-# Written in one go: appending here would duplicate on every rerun.
-# Prove the daemon will actually load what we just wrote. cupsd only reports
-# a bad directive at startup, and otp-unit.service only Wants= cups, so
-# without this the unit boots looking healthy and fails at print time.
-if command -v cupsd >/dev/null; then
-    if ! cupsd -t -c /etc/cups/cupsd.conf -s /etc/cups/cups-files.conf >/dev/null 2>&1; then
-        echo "ERROR: the generated CUPS configuration is invalid:" >&2
-        cupsd -t -c /etc/cups/cupsd.conf -s /etc/cups/cups-files.conf >&2 || true
-        exit 1
-    fi
-fi
-
+# A stock CUPS creates none of these: there is no /usr/lib/tmpfiles.d/cups*
+# and no RuntimeDirectory= in cups.service, so the directories the hardening
+# points at exist only because this file makes them.
 cat > /etc/tmpfiles.d/otp-unit-cups.conf <<'EOF'
 d /run/cups 0710 root lp -
 d /run/cups/spool 0710 root lp -
@@ -252,7 +253,39 @@ d /run/cups/cache 0770 root lp -
 d /run/ipp-usb 0750 root root -
 L+ /var/log/ipp-usb - - - - /run/ipp-usb
 EOF
-systemd-tmpfiles --create /etc/tmpfiles.d/otp-unit-cups.conf 2>/dev/null || true
+
+# Create them NOW as well, not just at next boot. Two reasons, and the
+# ordering against the cupsd -t gate below is the whole point: cupsd -t
+# checks that every directory named in cups-files.conf exists, so running
+# the gate first aborted provisioning on any unit where /run/cups did not
+# happen to be there already -- "the generated CUPS configuration is
+# invalid" when the configuration was fine. And systemd-tmpfiles is not
+# usable in pi-gen's chroot, so install -d is what actually works there.
+install -d -m 0710 -o root -g lp /run/cups /run/cups/spool
+install -d -m 1770 -o root -g lp /run/cups/tmp
+install -d -m 0770 -o root -g lp /run/cups/cache
+install -d -m 0750 -o root -g root /run/ipp-usb
+# Best effort on top, and only that: the directories already exist by here,
+# and in a chroot this cannot work. Failure is not fatal, but it is not
+# hidden either -- silencing it hid the one step whose failure stops cupsd
+# from starting at all, with the reason going only to the journal.
+if command -v systemd-tmpfiles >/dev/null; then
+    systemd-tmpfiles --create /etc/tmpfiles.d/otp-unit-cups.conf \
+        || log "systemd-tmpfiles declined; the directories above are already in place"
+fi
+
+# Prove the daemon will actually load what we just wrote. cupsd only reports
+# a bad directive at startup, and otp-unit.service only Wants= cups, so
+# without this the unit boots looking healthy and fails at print time.
+# This runs after the directories exist, so it now checks the config rather
+# than the order the script happens to do things in.
+if command -v cupsd >/dev/null; then
+    if ! cupsd -t -c /etc/cups/cupsd.conf -s /etc/cups/cups-files.conf >/dev/null 2>&1; then
+        echo "ERROR: the generated CUPS configuration is invalid:" >&2
+        cupsd -t -c /etc/cups/cupsd.conf -s /etc/cups/cups-files.conf >&2 || true
+        exit 1
+    fi
+fi
 
 
 # --- service ------------------------------------------------------------
