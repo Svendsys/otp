@@ -513,30 +513,30 @@ ORCHARD GATE AT NINE PM. Two lessons ride along. First, the diagnostic: where th
 
 # Glossary
 
-**Auth group** - A five-letter group of key material reserved on each page for authentication, never used for encryption
-**Channel** - A one-way sender-to-receiver link, secured by one pad set
-**Cipher** - A cryptographic algorithm or scheme
-**Ciphertext** - The encrypted output from a cipher
-**Codeword** - The label that identifies a pad set without revealing who holds it
-**Crib** - A guessed fragment of plaintext, used to attack ciphertext
-**Crib dragging** - Sliding a crib along combined ciphertexts to break a reused key
-**CSPRNG** - Cryptographically secure PRNG, such as the random source of a modern operating system
-**Dummy traffic** - Scheduled messages containing nothing but padding, sent to keep the traffic pattern constant
-**Group** - A block of five characters, the standard unit for writing and transmitting ciphertext
-**Key** - The random letters printed on pad pages; also called key material
-**mod** - The modulo operator
-**OTP** - One time pad
-**Pad** - A booklet of key pages, existing as an identical pair (copies A and B)
-**Page** - The unit of key material within a pad; used for at most one message, then destroyed
-**Plaintext** - The readable message, before encryption or after decryption
-**PRNG** - Pseudo-random number generator; deterministic, and therefore not OTP-grade key material on its own
-**Safety word** - A memorized signal present in every genuine message, whose absence means the sender is under duress
-**Sanitization** - Reducing a message to the bare A-Z alphabet by agreed conventions
-**Set** - A pad pair plus its codeword; the key material of one channel
-**Shift cipher** - The cipher family that rotates every letter by the same fixed amount; Caesar's Cipher is the shift-by-three, ROTn the naming scheme
-**Tabula recta** - The 26 x 26 letter table that replaces number conversion and modulo arithmetic
-**Traffic analysis** - Attacking the metadata of communication — who, when, from where, how often — rather than its content
-**Two-time pad** - The fatal condition of one page encrypting two messages
-**VENONA** - The US project that decrypted years of Soviet traffic sent on reused pad pages; the standing proof that the rules are load-bearing
-**Vigenère cipher** - A shift cipher with a short repeating key; what OTP degrades into when key material is stretched or reused
+- **Auth group** - A five-letter group of key material reserved on each page for authentication, never used for encryption
+- **Channel** - A one-way sender-to-receiver link, secured by one pad set
+- **Cipher** - A cryptographic algorithm or scheme
+- **Ciphertext** - The encrypted output from a cipher
+- **Codeword** - The label that identifies a pad set without revealing who holds it
+- **Crib** - A guessed fragment of plaintext, used to attack ciphertext
+- **Crib dragging** - Sliding a crib along combined ciphertexts to break a reused key
+- **CSPRNG** - Cryptographically secure PRNG, such as the random source of a modern operating system
+- **Dummy traffic** - Scheduled messages containing nothing but padding, sent to keep the traffic pattern constant
+- **Group** - A block of five characters, the standard unit for writing and transmitting ciphertext
+- **Key** - The random letters printed on pad pages; also called key material
+- **mod** - The modulo operator
+- **OTP** - One time pad
+- **Pad** - A booklet of key pages, existing as an identical pair (copies A and B)
+- **Page** - The unit of key material within a pad; used for at most one message, then destroyed
+- **Plaintext** - The readable message, before encryption or after decryption
+- **PRNG** - Pseudo-random number generator; deterministic, and therefore not OTP-grade key material on its own
+- **Safety word** - A memorized signal present in every genuine message, whose absence means the sender is under duress
+- **Sanitization** - Reducing a message to the bare A-Z alphabet by agreed conventions
+- **Set** - A pad pair plus its codeword; the key material of one channel
+- **Shift cipher** - The cipher family that rotates every letter by the same fixed amount; Caesar's Cipher is the shift-by-three, ROTn the naming scheme
+- **Tabula recta** - The 26 x 26 letter table that replaces number conversion and modulo arithmetic
+- **Traffic analysis** - Attacking the metadata of communication — who, when, from where, how often — rather than its content
+- **Two-time pad** - The fatal condition of one page encrypting two messages
+- **VENONA** - The US project that decrypted years of Soviet traffic sent on reused pad pages; the standing proof that the rules are load-bearing
+- **Vigenère cipher** - A shift cipher with a short repeating key; what OTP degrades into when key material is stretched or reused
 
