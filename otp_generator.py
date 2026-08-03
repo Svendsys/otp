@@ -493,7 +493,7 @@ def generate_set_pdf_a4(
                 auth_size=auth_size,
             )
             done += 1
-        pass  # MUTANT: crop marks deleted
+        _draw_crop_marks(c, page_w, page_h)
         c.showPage()
         progress(min(done, num_pages), num_pages)
 

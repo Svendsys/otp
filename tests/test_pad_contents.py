@@ -46,6 +46,32 @@ def glyph_rows(data: bytes, page: int = 0):
             for _, items in sorted(rows.items(), key=lambda kv: -kv[0])]
 
 
+SEGMENT = re.compile(
+    r"([-\d.]+)\s+([-\d.]+)\s+m\s+([-\d.]+)\s+([-\d.]+)\s+l\b")
+
+
+def line_segments(data: bytes, page: int = 0) -> set[tuple]:
+    """
+    Straight strokes on a page, as (x0, y0, x1, y1) in points.
+
+    Only single-segment `m ... l` strokes, which is all the crop marks and
+    rules are. Coordinates come straight out of the content stream, so this
+    sees what the printer sees rather than what the code meant to draw.
+    """
+    pypdf = pytest.importorskip("pypdf")
+    content = pypdf.PdfReader(io.BytesIO(data)).pages[page] \
+        .get_contents().get_data().decode("latin-1")
+    return {tuple(float(n) for n in match)
+            for match in SEGMENT.findall(content)}
+
+
+def segments_match(a, b, tolerance: float = 0.05) -> bool:
+    """Same segment, drawn from either end, within rounding."""
+    reversed_b = (b[2], b[3], b[0], b[1])
+    return (all(abs(p - q) <= tolerance for p, q in zip(a, b))
+            or all(abs(p - q) <= tolerance for p, q in zip(a, reversed_b)))
+
+
 def key_groups(data: bytes, page: int = 0) -> list[str]:
     """The five-letter key groups printed on a pad page."""
     out = []
@@ -236,24 +262,55 @@ class TestLayoutsDrawWhatTheyPromise:
         numbers = re.findall(r"\d{4}", "".join("".join(r) for r in rows))
         assert "0001" in numbers and "0002" in numbers
 
-    def test_a4_sheets_carry_crop_marks(self):
-        pypdf = pytest.importorskip("pypdf")
+    @pytest.mark.parametrize("page_size", [g.A4, g.LETTER])
+    def test_a4_sheets_carry_crop_marks(self, page_size):
+        """
+        The marks the guillotine is lined up against.
+
+        This assertion used to count " l\\n" -- PDF lineto -- across the whole
+        page and require four. The page furniture already emits four on its
+        own, so deleting every crop mark left the count at four and the test
+        passed: it never tested the thing it was named for. A mutation that
+        removed the call survived the entire suite and was committed. So
+        check the geometry instead: each mark at its own edge, the right
+        length, on the cut line.
+        """
         sink = io.BytesIO()
         g.generate_set_pdf_a4(sink, "RUSTED-BADGER", 4, 665, 9,
-                              progress=lambda d, t: None)
-        content = pypdf.PdfReader(io.BytesIO(sink.getvalue())).pages[0] \
-            .get_contents().get_data()
-        # Four tick marks: two vertical, two horizontal.
-        assert content.count(b" l\n") >= 4 or content.count(b" l ") >= 4
+                              page_size=page_size, progress=lambda d, t: None)
+        page_w, page_h = page_size
+        tick = 4 * g.mm
+        expected = {
+            # Vertical cut, marked at the bottom and top edges.
+            (page_w / 2, 0.0, page_w / 2, tick),
+            (page_w / 2, page_h - tick, page_w / 2, page_h),
+            # Horizontal cut, marked at the left and right edges.
+            (0.0, page_h / 2, tick, page_h / 2),
+            (page_w - tick, page_h / 2, page_w, page_h / 2),
+        }
+        drawn = line_segments(sink.getvalue())
+        for mark in expected:
+            assert any(segments_match(mark, seg) for seg in drawn), (
+                f"crop mark {mark} missing from {sorted(drawn)}")
 
     def test_a7_sheets_carry_a_cut_line(self):
-        pypdf = pytest.importorskip("pypdf")
+        """
+        The line the A7 sheet is cut down.
+
+        Same flaw as the crop marks above: this used to look for the PDF `d`
+        operator, but setDash emits that whether or not a line follows, so
+        deleting the stroke left the test green. Check the stroke itself --
+        full height, down the middle of the landscape A6 sheet.
+        """
         sink = io.BytesIO()
         g.generate_set_pdf_a7(sink, "RUSTED-BADGER", 2, 375, 9,
                               progress=lambda d, t: None)
-        content = pypdf.PdfReader(io.BytesIO(sink.getvalue())).pages[0] \
-            .get_contents().get_data()
-        assert b"d\n" in content or b" d " in content, "dashed cut line missing"
+        # Two A7 pages side by side, so the sheet is A6 turned on its side.
+        sheet_w, sheet_h = g.A6[1], g.A6[0]
+        cut = (sheet_w / 2, 0.0, sheet_w / 2, sheet_h)
+        drawn = line_segments(sink.getvalue())
+        assert any(segments_match(cut, seg) for seg in drawn), (
+            f"cut line {cut} missing from {sorted(drawn)}")
 
 
 class TestGenerationReallyWritesNoFile:
