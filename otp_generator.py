@@ -15,9 +15,14 @@ Arguments:
     --sets        Number of paired sets to generate (default: 10)
     --pages       Number of pages per set (default: 1000)
     --output      Output directory for PDFs (default: ./output)
-    --chars       Characters of key material per pad page (default: 665 for A6, 300 for A7)
-    --fontsize    Font size in points (default: 9 for A6, 7 for A7)
-    --a7          Layout two pad pages per A6 sheet (cut horizontally to get A7)
+    --chars       Characters of key material per pad page (default: 665 for A6, 375 for A7)
+    --fontsize    Font size in points (default: 9)
+    --a7          Layout two pad pages per A6 sheet (cut along the dashed line to get A7)
+    --no-auth     Omit the AUTH group from page headers
+
+Each page header carries an AUTH group: five extra key letters reserved for
+message authentication, generated alongside the key body but never part of it.
+See the manual (otp.md, Authentication) for the procedure it supports.
 """
 
 import argparse
@@ -25,6 +30,7 @@ import os
 import sys
 from reportlab.lib.units import mm
 from reportlab.lib.pagesizes import A6
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
 
@@ -40,15 +46,14 @@ A7_CHARS_PER_ROW = A7_GROUPS_PER_ROW * GROUP_SIZE  # 25
 
 
 def get_random_bytes(n: int) -> bytes:
-    """Read n bytes from /dev/urandom."""
-    with open("/dev/urandom", "rb") as f:
-        return f.read(n)
+    """Return n bytes from the operating system's CSPRNG."""
+    return os.urandom(n)
 
 
 def generate_random_letters(count: int) -> str:
     """
     Generate `count` uniformly random uppercase letters A-Z
-    using rejection sampling from /dev/urandom for unbiased output.
+    using rejection sampling over CSPRNG bytes for unbiased output.
     """
     letters = []
     while len(letters) < count:
@@ -62,20 +67,14 @@ def generate_random_letters(count: int) -> str:
     return "".join(letters)
 
 
-def format_key_material(chars: str, group_size: int = 5, groups_per_row: int = 7) -> list[str]:
-    """Format random characters into rows of grouped characters."""
-    groups = [chars[i:i + group_size] for i in range(0, len(chars), group_size)]
-    rows = []
-    for i in range(0, len(groups), groups_per_row):
-        row_groups = groups[i:i + groups_per_row]
-        rows.append(" ".join(row_groups))
-    return rows
-
-
 def load_codewords(filepath: str) -> list[str]:
     """Load codewords from file, one per line, stripped and uppercased."""
-    with open(filepath, "r") as f:
-        words = [line.strip().upper() for line in f if line.strip()]
+    try:
+        with open(filepath, "r") as f:
+            words = [line.strip().upper() for line in f if line.strip()]
+    except OSError as e:
+        print(f"ERROR: Cannot read codewords file: {e}")
+        sys.exit(1)
     return words
 
 
@@ -91,6 +90,7 @@ def draw_pad_page(
     box_bottom: float,
     box_width: float,
     box_height: float,
+    with_auth: bool = True,
 ):
     """Draw a single pad page within the given bounding box."""
     margin_h = 4 * mm
@@ -101,10 +101,19 @@ def draw_pad_page(
     right = box_left + box_width - margin_h
     content_width = right - left
 
+    # Key material: body plus an optional AUTH group, reserved for
+    # authentication and excluded from the key body (see otp.md)
+    extra = GROUP_SIZE if with_auth else 0
+    key_chars = generate_random_letters(chars_per_page + extra)
+    body_chars = key_chars[:chars_per_page]
+    auth_group = key_chars[chars_per_page:] if with_auth else None
+
     # Header
     y = box_bottom + box_height - margin_top
     c.setFont("Courier-Bold", font_size)
     c.drawString(left, y, codeword)
+    if auth_group:
+        c.drawCentredString(box_left + box_width / 2, y, f"AUTH {auth_group}")
     c.drawRightString(right, y, f"{page_num:04d}")
 
     # Separator
@@ -148,9 +157,7 @@ def draw_pad_page(
     else:
         group_gap = 0
 
-    # Generate key material as list of groups
-    key_chars = generate_random_letters(chars_per_page)
-    all_groups = [key_chars[i:i + GROUP_SIZE] for i in range(0, len(key_chars), GROUP_SIZE)]
+    all_groups = [body_chars[i:i + GROUP_SIZE] for i in range(0, len(body_chars), GROUP_SIZE)]
 
     y = header_bottom - row_spacing
     group_idx = 0
@@ -187,6 +194,7 @@ def generate_set_pdf_a6(
     num_pages: int,
     chars_per_page: int,
     font_size: float,
+    with_auth: bool = True,
 ):
     """Generate OTP set as A6 pages (one pad page per sheet)."""
     c = canvas.Canvas(output_path, pagesize=A6)
@@ -199,6 +207,7 @@ def generate_set_pdf_a6(
             chars_per_row=A6_CHARS_PER_ROW,
             box_left=0, box_bottom=0,
             box_width=SHEET_WIDTH, box_height=SHEET_HEIGHT,
+            with_auth=with_auth,
         )
         c.showPage()
 
@@ -214,6 +223,7 @@ def generate_set_pdf_a7(
     num_pages: int,
     chars_per_page: int,
     font_size: float,
+    with_auth: bool = True,
 ):
     """Generate OTP set as A7 — two pad pages side by side on landscape A6."""
     # Landscape A6: 148mm wide x 105mm tall
@@ -233,6 +243,7 @@ def generate_set_pdf_a7(
             chars_per_row=A7_CHARS_PER_ROW,
             box_left=0, box_bottom=0,
             box_width=half_width, box_height=sheet_h,
+            with_auth=with_auth,
         )
 
         # Right half (if it exists)
@@ -243,6 +254,7 @@ def generate_set_pdf_a7(
                 chars_per_row=A7_CHARS_PER_ROW,
                 box_left=half_width, box_bottom=0,
                 box_width=half_width, box_height=sheet_h,
+                with_auth=with_auth,
             )
 
         # Cut line: dashed vertical line down the middle
@@ -261,6 +273,25 @@ def generate_set_pdf_a7(
         page_num += 2
 
     c.save()
+
+
+def max_codeword_len(font_size: float, a7: bool, with_auth: bool) -> int:
+    """
+    Longest codeword that fits the page header without colliding with
+    the centered AUTH group or the right-aligned page number.
+    """
+    margin_h = 4 * mm
+    gap = 2 * mm
+    box_width = (SHEET_HEIGHT / 2) if a7 else SHEET_WIDTH
+    content_width = box_width - 2 * margin_h
+    char_w = stringWidth("X", "Courier-Bold", font_size)
+    pagenum_w = stringWidth("0000", "Courier-Bold", font_size)
+    if with_auth:
+        auth_w = stringWidth("AUTH XXXXX", "Courier-Bold", font_size)
+        codeword_space = (content_width - auth_w) / 2 - gap
+    else:
+        codeword_space = content_width - pagenum_w - gap
+    return max(0, int(codeword_space // char_w))
 
 
 def calc_max_chars(font_size: float, a7: bool = False) -> int:
@@ -293,7 +324,16 @@ def main():
     parser.add_argument("--chars", type=int, default=None, help="Key chars per pad page (default: 665 for A6, 375 for A7)")
     parser.add_argument("--fontsize", type=float, default=None, help="Font size in pt (default: 9)")
     parser.add_argument("--a7", action="store_true", help="Two pad pages per A6 sheet (cut to get A7)")
+    parser.add_argument("--no-auth", action="store_true", help="Omit the AUTH group from page headers")
     args = parser.parse_args()
+    with_auth = not args.no_auth
+
+    if args.sets < 1:
+        print("ERROR: --sets must be at least 1")
+        sys.exit(1)
+    if args.pages < 1:
+        print("ERROR: --pages must be at least 1")
+        sys.exit(1)
 
     # Defaults based on format
     if args.a7:
@@ -315,6 +355,25 @@ def main():
         print(f"ERROR: Need {args.sets} codewords but file only contains {len(codewords)}")
         sys.exit(1)
 
+    # Codewords become filenames, and each set must be unique
+    seen = set()
+    for word in codewords[:args.sets]:
+        if word in seen:
+            print(f"ERROR: Duplicate codeword '{word}' — its set would overwrite the previous PDF")
+            sys.exit(1)
+        seen.add(word)
+        if not all(ch.isalnum() or ch in "-_" for ch in word):
+            print(f"ERROR: Codeword '{word}' is unsafe as a filename (use A-Z, 0-9, '-', '_')")
+            sys.exit(1)
+
+    # Codewords must fit the page header beside the AUTH group and page number
+    codeword_limit = max_codeword_len(font_size, args.a7, with_auth)
+    for word in codewords[:args.sets]:
+        if len(word) > codeword_limit:
+            print(f"ERROR: Codeword '{word}' is too long for the {format_label} header "
+                  f"at {font_size}pt (max {codeword_limit} characters)")
+            sys.exit(1)
+
     # Create output directory
     os.makedirs(args.output, exist_ok=True)
 
@@ -328,6 +387,7 @@ def main():
 
     print(f"Format: {format_label}")
     print(f"Generating {args.sets} OTP sets, {args.pages} pad pages each, {chars_per_page} chars/page")
+    print(f"Auth group in header: {'yes' if with_auth else 'no'}")
     print(f"Font: Courier {font_size}pt")
     print(f"Layout: {num_rows} rows of {groups_per_row}x{GROUP_SIZE} groups ({chars_per_row} chars/row)")
     print(f"Max chars per pad page at this font size: {max_chars}")
@@ -344,9 +404,9 @@ def main():
 
         print(f"Set {i + 1}/{args.sets}: {codeword}")
         if args.a7:
-            generate_set_pdf_a7(filepath, codeword, args.pages, chars_per_page, font_size)
+            generate_set_pdf_a7(filepath, codeword, args.pages, chars_per_page, font_size, with_auth)
         else:
-            generate_set_pdf_a6(filepath, codeword, args.pages, chars_per_page, font_size)
+            generate_set_pdf_a6(filepath, codeword, args.pages, chars_per_page, font_size, with_auth)
         print(f"  Saved: {filepath}")
         print()
 
