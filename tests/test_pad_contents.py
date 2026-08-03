@@ -175,14 +175,37 @@ class TestTheAuthGroupIsNeverPartOfTheBody:
             assert auth != body[0]
 
     def test_the_auth_group_does_not_appear_in_the_body(self):
-        # Not a proof -- a 1-in-11.9M coincidence exists -- but it fails
-        # instantly if AUTH is sliced out of the body rather than drawn extra.
-        collisions = 0
-        for _ in range(5):
-            auth, body = self._auth_and_body(a6_pad(1))
-            if auth in body:
-                collisions += 1
-        assert collisions == 0
+        """
+        Checked on the letters, not on the groups.
+
+        This used to be `auth in body`, testing membership of the list of
+        five-letter groups, so it could only see a leak that happened to
+        land group-aligned -- one offset in five. Slicing AUTH straight out
+        of the body at offset 7 left the entire suite green, and that is
+        the real leak: the authenticator becomes five letters that also
+        encrypt the message, so anyone holding a ciphertext recovers it.
+
+        Driven from a seeded stream rather than live entropy. The old form
+        was a coincidence check with a real false-failure rate, and
+        searching letters instead of groups multiplies the number of
+        positions by five, which would have made it flakier still. Seeded,
+        it is exact: eight fixed pages, no flake, and a body-slice mutation
+        fails on the first one.
+        """
+        import os as os_mod
+        import random as random_mod
+
+        real = os_mod.urandom
+        try:
+            for seed in range(8):
+                stream = random_mod.Random(seed)
+                os_mod.urandom = lambda n, s=stream: bytes(
+                    s.getrandbits(8) for _ in range(n))
+                auth, body = self._auth_and_body(a6_pad(1))
+                assert auth, seed
+                assert auth not in "".join(body), (seed, auth)
+        finally:
+            os_mod.urandom = real
 
 
 class TestCodewordIsScrubbedFromEveryLayout:

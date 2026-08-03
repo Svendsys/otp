@@ -1099,9 +1099,16 @@ def main():
             # The bytes went down the pipe and are gone. Re-running produces
             # DIFFERENT key material -- two pads wearing one codeword, which
             # is the failure the whole pair convention exists to prevent.
+            # Collate=True is not optional. Without it cups-filters
+            # interleaves the copies -- page 1, page 1, page 2, page 2 --
+            # so instead of two pads you get one stack that has to be
+            # dealt out by hand, and any slip mixes the two pads of a set.
             log("You piped one copy. A pad set is two IDENTICAL copies, so")
-            log("ask the printer for both from this one job (lp -n 2).")
-            log("Re-running would make a DIFFERENT pad, not the twin.")
+            log("ask the printer for both from this one job:")
+            log("  ... --stdout | lp -n 2 -o Collate=True")
+            log("Collate=True keeps them as two pads rather than")
+            log("interleaving them into one stack. Re-running would make")
+            log("a DIFFERENT pad, not the twin.")
         else:
             log("PRINT EACH PDF TWICE to get your A and B copies.")
         if args.a7:

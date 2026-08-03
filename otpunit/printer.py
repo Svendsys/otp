@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
+from urllib.parse import unquote
 
 QUEUE = "OTP"
 # Kept equal to TempDir in device/install.sh's cups-files.conf.
@@ -89,14 +90,32 @@ class Cups:
         """
         Locally attached printers CUPS can currently see.
 
-        dnssd:// is the awkward case. It is how CUPS usually reports the
-        endpoint ipp-usb publishes for a USB printer -- the driverless path,
-        and the one docs/PRINTERS.md names as primary -- but it is also how
-        a printer across the LAN appears, which a unit whose point is being
-        offline must not silently bind to. (Disabling the radios does not
-        cover wired or USB ethernet.) So it is accepted only when something
-        is actually plugged into USB: a dnssd endpoint alongside a usb://
-        device is ipp-usb; a dnssd endpoint on its own is the network.
+        dnssd:// is the awkward case. It is how CUPS often reports the
+        endpoint ipp-usb publishes for a USB printer -- the driverless path
+        -- but it is also how a printer across the LAN appears, which a unit
+        whose whole point is being offline must not silently bind to.
+        (Disabling the radios does not cover wired or USB ethernet.)
+
+        "Accept dnssd whenever something is plugged into USB" was not good
+        enough, and failed in the worst direction. It never checked that the
+        dnssd entry WAS the plugged-in printer, and driverless endpoints
+        sort first, so a Brother on USB next to an HP on the LAN returned
+        the HP -- and every pad printed on a machine in another room, with
+        nothing on the panel naming the device.
+
+        So a dnssd endpoint has to identify itself as one of the USB
+        devices: its service name must carry all of that device's make and
+        model tokens. An unmatched dnssd entry is the network and is
+        dropped, whether or not anything is plugged in.
+
+        The cost is a printer that speaks IPP-over-USB and exposes no
+        printer-class interface, so it has no usb:// entry to match
+        against. Those are reachable through ipp-usb's loopback endpoint,
+        which LOCAL_IPP accepts unconditionally, but if CUPS reports only a
+        dnssd URI for one it will not be offered and the panel will keep
+        asking for a printer. That is the right way round: a visible,
+        diagnosable refusal beats silently printing key material onto the
+        LAN. docs/PRINTERS.md carries the workaround.
         """
         usb, local_ipp, discovered = [], [], []
         for line in self._text([LPINFO, "-v"]).splitlines():
@@ -112,8 +131,9 @@ class Cups:
             elif uri.startswith("dnssd://"):
                 discovered.append(device)
 
-        if not usb:
-            discovered = []
+        attached = [_tokens(_pretty(device.uri)) for device in usb]
+        discovered = [device for device in discovered
+                      if _identifies_as_attached(device.uri, attached)]
         # Driverless endpoints first: they need no driver at all.
         return local_ipp + discovered + usb
 
@@ -292,6 +312,36 @@ def _pretty(uri: str) -> str:
     make = match.group(1).replace("%20", " ")
     model = match.group(2).replace("%20", " ")
     return f"{make} {model}".strip()
+
+
+def _dnssd_name(uri: str) -> str:
+    """
+    The service name out of a dnssd:// URI.
+
+    `dnssd://HP%20LaserJet%20M428fdw%20%5BABCDEF%5D._ipp._tcp.local/?uuid=1`
+    becomes `HP LaserJet M428fdw [ABCDEF]`. The trailing service type and
+    the query string carry nothing that identifies the printer.
+    """
+    rest = uri[len("dnssd://"):].split("/", 1)[0]
+    rest = rest.split("._", 1)[0]
+    return unquote(rest)
+
+
+def _identifies_as_attached(uri: str, attached: list[list[str]]) -> bool:
+    """
+    True when a dnssd service name names one of the USB devices.
+
+    Requires every make and model token of some attached printer, so
+    "Brother HL-2030 series" matches a usb://Brother/HL-2030%20series and
+    an unrelated "HP LaserJet MFP M428fdw" on the LAN matches nothing. An
+    empty token list cannot match: a usb:// URI _pretty could not parse
+    would otherwise wave through every printer on the network.
+    """
+    name = _tokens(_dnssd_name(uri))
+    if not name:
+        return False
+    return any(wanted and all(token in name for token in wanted)
+               for wanted in attached)
 
 
 def _tokens(text: str) -> list[str]:

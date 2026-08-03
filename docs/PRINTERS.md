@@ -20,6 +20,39 @@ If neither works the panel says `NO DRIVER FOR <printer>` and no job is
 accepted. That is deliberate: a wrong PPD does not fail loudly, it produces
 a queue that accepts jobs and prints garbage.
 
+### Why a printer on the network is never offered
+
+The unit only ever offers printers it can show are attached to it:
+
+- `usb://` — always.
+- `ippusb://`, `ipp://localhost`, `ipp://127.0.0.1` — always. These are
+  `ipp-usb`'s own loopback endpoint, which cannot be anything but local.
+- `dnssd://` — **only when the service name carries the make and model of
+  something plugged into USB.**
+
+That last rule exists because `dnssd://` is how CUPS reports both `ipp-usb`'s
+endpoint *and* a printer across the LAN, and the two are otherwise
+indistinguishable. Accepting a `dnssd://` entry merely because *something*
+was plugged in meant a Brother on USB next to an HP on the network offered
+the HP first — and every pad printed in another room, with nothing on the
+panel naming the machine. Turning off the radios does not help: this reaches
+a wired or USB ethernet adapter just as well.
+
+The cost is a printer that speaks IPP-over-USB and presents no printer-class
+USB interface, so there is no `usb://` entry for its `dnssd://` name to match
+against. If the panel keeps asking for a printer while one is plugged in and
+`lpinfo -v` shows only a `dnssd://` line for it, that is this case. Point the
+queue at the loopback endpoint by hand:
+
+```sh
+lpstat -v                       # what ipp-usb published, if anything
+lpadmin -p OTP -E -v ipp://localhost:60000/ipp/print -m everywhere
+```
+
+Refusing is the intended behaviour here. A printer the unit cannot prove is
+attached to it is one that key material must not be sent to, and a visible
+refusal you can diagnose beats a silent success on the wrong machine.
+
 ## Known good
 
 | Printer | Driver | Notes |

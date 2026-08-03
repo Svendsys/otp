@@ -15,8 +15,12 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
+      # Bounded: a UI regression can make the suite spin rather than fail
+      # -- FakeButtons returns None forever at poll_seconds=0, so a screen
+      # that stops honouring BACK loops instead of raising. Unbounded, that
+      # is a runner burning for six hours and a job that never reports.
       - name: Run tests
-        run: pytest -q
+        run: timeout 600 pytest -q
 
   shellcheck:
     runs-on: ubuntu-latest

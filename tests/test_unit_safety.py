@@ -736,3 +736,58 @@ class TestPurgeClearsTheFilterScratchFiles:
             run=lambda argv, stdin=None: sp.CompletedProcess(argv, 0, b"", b"")
         ).purge()
         assert (tmp_path / "sub").is_dir()
+
+
+class TestTheUnitNeverBindsALanPrinter:
+    """
+    The device is meant to be offline. Binding a printer across the network
+    sends every pad it prints to a machine in another room, and nothing on
+    the panel names the bound device.
+
+    "Accept dnssd whenever something is plugged into USB" failed in the
+    worst direction: it never checked the dnssd entry WAS the plugged-in
+    printer, and driverless endpoints sort first.
+    """
+
+    USB = "direct usb://Brother/HL-2030%20series?serial=A1B2C3"
+    LAN = ("network dnssd://HP%20LaserJet%20MFP%20M428fdw%20%5BABCDEF%5D"
+           "._ipp._tcp.local/?uuid=1")
+    SAME = ("network dnssd://Brother%20HL-2030%20series%20%5B00AA11%5D"
+            "._ipp._tcp.local/?uuid=2")
+    LOOPBACK = "network ippusb://HP/LaserJet?serial=9"
+
+    def _devices(self, *lines):
+        text = "\n".join(lines)
+
+        class Fake(printer.Cups):
+            def _text(self, argv):
+                return text
+
+        return [d.uri for d in Fake(run=None).devices()]
+
+    def test_a_lan_printer_is_not_offered_even_with_usb_attached(self):
+        uris = self._devices(self.USB, self.LAN)
+        assert not any(u.startswith("dnssd://") for u in uris), uris
+        assert uris == [self.USB.split()[1]]
+
+    def test_the_attached_printer_is_still_preferred_over_its_usb_entry(self):
+        # Same printer on both: the driverless endpoint needs no driver.
+        uris = self._devices(self.USB, self.SAME)
+        assert uris[0].startswith("dnssd://")
+        assert len(uris) == 2
+
+    def test_a_lan_printer_alone_offers_nothing(self):
+        assert self._devices(self.LAN) == []
+
+    def test_the_loopback_endpoint_is_always_local(self):
+        uris = self._devices(self.LOOPBACK, self.USB)
+        assert uris[0].startswith("ippusb://")
+
+    def test_bare_backend_names_are_not_devices(self):
+        # lpinfo -v lists backends themselves, which are not URIs.
+        assert self._devices("network lpd", "network ipp", "file cups-pdf:/") == []
+
+    def test_an_unparseable_usb_uri_does_not_wave_the_lan_through(self):
+        # _pretty returns "" for a URI it cannot read; an empty token list
+        # must not match every printer on the network.
+        assert self._devices("direct usb://", self.LAN) == ["usb://"]

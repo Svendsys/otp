@@ -363,6 +363,10 @@ class TestNewCliFlags:
         assert r.returncode == 0, r.stderr
         assert b"PRINT EACH PDF TWICE" not in r.stderr
         assert b"lp -n 2" in r.stderr
+        # Without Collate the two copies come out interleaved, which is a
+        # stack to deal out by hand rather than a pair -- and mixing the two
+        # pads of a set is the failure the convention exists to prevent.
+        assert b"Collate=True" in r.stderr
 
     def test_file_output_still_says_to_print_twice(self, tmp_path):
         r = run(["--random-codewords", "1", "--pages", "1",
