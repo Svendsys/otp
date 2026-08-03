@@ -15,9 +15,12 @@ producing the key material.
 | File | Purpose |
 |------|---------|
 | `otp.md` | The manual. Written to be printed and handed to students: the full encrypt/decrypt walkthrough, the rules that make OTP secure, key generation by hand, communication protocols, authentication, a printable tabula recta, and exercises with an answer key. |
-| `otp_generator.py` | Generates pad sets as pocket-sized PDFs (A6, or two-up A7) from the operating system's cryptographic randomness. Also produces training pads and blank worksheets. |
+| `otp_generator.py` | Generates pad sets as pocket-sized PDFs (A6, four-up on A4, or two-up A7) from the operating system's cryptographic randomness. Also produces tabula recta cards, training pads and blank worksheets. |
+| `otpunit/` | The print unit: a headless Raspberry Pi appliance that prints pad pairs straight from RAM. See [the print unit](#the-print-unit). |
+| `codewords/` | The codeword vocabulary — concrete nouns and modifiers, curated to be picturable and phonetically distinct. |
+| `device/`, `image/` | Everything needed to provision a Pi or build a flashable image. |
 | `sample_codewords.txt` | Example codeword list — one codeword per pad set, one per line. |
-| `tests/` | Test suite (run by CI): guards the generator's randomness against bias and re-verifies every worked number printed in the manual. |
+| `tests/` | Test suite (run by CI): guards the generator's randomness against bias, re-verifies every worked number printed in the manual, and drives the print unit's whole interface without hardware. |
 
 ## The manual
 
@@ -87,23 +90,84 @@ are A5: two per A4 sheet, one cut.
 | `--no-auth` | off | Omit the AUTH group from page headers |
 | `--training` | off | Watermark every page as TRAINING material (the manual requires practice pads to be unmistakably marked) |
 | `--worksheets` | 0 | Also generate N blank A5 worksheet pages as `WORKSHEETS.pdf` — M/K/C rows in five-letter group cells. They contain no key material, so print as many copies as you need. `--codewords` is optional when only worksheets are requested. |
+| `--a4` | off | Four A6 pad pages per A4 sheet with crop marks, imposed **cut-and-stack** — see [Printing on A4](#printing-on-a4) |
+| `--letter` | off | The same, on US Letter |
+| `--tabula` | 0 | Also generate N tabula recta cards as `TABULA_RECTA.pdf` — the manual's 26×26 table, pocket-sized to go in the envelope with the pad. No key material. |
+| `--auth-size` | 5 | Letters in the AUTH group. The letters are always CSPRNG output; only the length is adjustable. |
+| `--random-codewords` | 0 | Generate N random `<MODIFIER>-<NOUN>` codewords instead of reading a file |
+| `--stdout` | off | Write the single generated PDF to stdout instead of a file, so key material never reaches the filesystem: `otp_generator.py --random-codewords 1 --pages 100 --a4 --stdout \| lp` |
+
+### Printing on A4
+
+Pad pages are A6 and most people do not have A6 paper. `--a4` tiles four pad
+pages onto each A4 sheet with crop marks at the edges, ready to be cut down
+on a guillotine.
+
+The imposition is **cut-and-stack**, not reading order. Cut the printed
+stack twice — once down the middle, once across — and you have four piles,
+each already in page order. Assemble the pad by dropping them on top of one
+another: top-left, then top-right, then bottom-left, then bottom-right.
+
+The tiling is in the PDF rather than left to the print dialog, because a
+guillotine cuts the whole stack at once and every sheet therefore needs
+identical geometry. For the same reason, do not add scaling or N-up in your
+print dialog — it will move the cut line away from the crop marks.
 
 ### Anatomy of a page
 
 ```
-CODEWORD        AUTH QJXKV        0001     ← codeword, auth group, page number
+RUSTED-BADGER   AUTH QJXKV        0001     ← codeword, auth group, page number
 ──────────────────────────────────────
 HAJUT SHIFN RCFVF YVIIM TLVIG ...          ← key body, five-letter groups
 ...
         USE ONCE — DESTROY AFTER USE
 ```
 
-- **Codeword** identifies the set without identifying its holders.
+- **Codeword** identifies the set without identifying its holders. It is
+  drawn as `<MODIFIER>-<NOUN>` from a curated vocabulary of concrete,
+  picturable words — an operator has to carry it from a handover to a radio.
+  Two words rather than one because a single-word list collides sooner than
+  it looks: by the birthday bound, 2000 bare words repeat with ~10%
+  probability within twenty sets. It renders smaller than the key body if it
+  needs to, since it is a label rather than something read letter by letter.
 - **AUTH group** — five key letters reserved for message authentication, never
   part of the key body. The manual's Authentication section defines the
   procedure it supports.
 - **Page number** keeps the two ends synchronized; it is sent in clear with
   each message.
+
+## The print unit
+
+A Raspberry Pi that does nothing but print pads. It boots straight into a
+single-purpose appliance: plug in a USB laser printer, pick a codeword and a
+page count on a small OLED with three buttons, and it prints the A and B
+copies back to back, then wipes itself. No screen, no keyboard, no network.
+
+This exists because the manual's advice about generation hygiene is hard to
+follow with a laptop and easy to follow with a dedicated box:
+
+- **Key material never becomes a file.** The PDF is generated into RAM and
+  piped to `lp` on stdin. CUPS still spools each job — unavoidable short of
+  writing raw to `/dev/usb/lp0`, which only PostScript and PCL printers
+  accept — so the spool is forced onto tmpfs, where it lives in RAM, never
+  reaches the SD card, and is purged after every job.
+- **No swap**, so the buffer holding key material cannot be paged to disk.
+- **Read-only root with a RAM overlay**, so a power-cycle is a full reset.
+- **Volatile logs**, and job metadata only.
+
+It also prints worksheets, tabula recta cards, and this manual.
+
+Everything needed is in this repository:
+
+```bash
+./image/build.sh          # build a flashable .img.xz
+sudo ./device/install.sh  # or convert a Pi you already have
+python3 -m otpunit --sim  # or just try the interface in a terminal
+```
+
+See [docs/HARDWARE.md](docs/HARDWARE.md) for parts and wiring,
+[docs/IMAGE.md](docs/IMAGE.md) for building and flashing, and
+[docs/PRINTERS.md](docs/PRINTERS.md) for what works and what does not.
 
 ## A note on randomness
 
@@ -130,7 +194,7 @@ step it is — the manual's Security & Integrity section is the full version:
 ## License
 
 This project is licensed for non-commercial use: the code
-(`otp_generator.py`, `tests/`) under
+(`otp_generator.py`, `otpunit/`, `device/`, `image/`, `tests/`) under
 [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/),
 and the manual and other content (`otp.md`, images) under
 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).

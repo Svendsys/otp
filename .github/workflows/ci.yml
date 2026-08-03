@@ -17,3 +17,31 @@ jobs:
         run: pip install -r requirements-dev.txt
       - name: Run tests
         run: pytest -q
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the provisioning and image scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck device/install.sh image/build.sh image/render-manual.sh
+
+  simulator:
+    # The unit's whole interface runs without hardware, so CI can drive a
+    # pad pair end to end: roll a codeword, confirm, generate, print copy A,
+    # swap, print copy B, wipe.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Drive a pad pair through the simulator
+        run: |
+          printf 'k\nk\nk\nk\nk\nk\nk\n' | timeout 120 python3 -m otpunit --sim > out.txt
+          grep -q "PAIR COMPLETE" out.txt
+          grep -q "KEY WIPED FROM RAM" out.txt

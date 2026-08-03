@@ -356,7 +356,7 @@ Human error is the most likely path of failure. The mathematics of OTP does not 
 ## Protecting Our Network
 - **Compartmentalize by channel.** Every channel has its own pads and its own codeword. No pad, page, or key material is ever shared, copied, or "borrowed" between channels. The capture of one channel must tell the adversary nothing about the others.
 - **Codewords, not names.** A captured pad should reveal a codeword and nothing else — not who holds the twin, not where, not why. The codeword-to-person mapping lives in memory, in as few heads as possible.
-- **Guard the generation point.** Whoever generates pads touches every channel at birth, which makes the generation machine the most valuable object in the network. It stays offline, dedicated to the task, physically controlled, and wiped when the batch is done — and the printer counts as part of the machine.
+- **Guard the generation point.** Whoever generates pads touches every channel at birth, which makes the generation machine the most valuable object in the network. It stays offline, dedicated to the task, physically controlled, and wiped when the batch is done — and the printer counts as part of the machine. A dedicated appliance makes this easier to actually do than a laptop does: the print unit included with this kit boots into nothing but the pad printer, has no network, holds key material only in RAM, and forgets everything it did when the power goes off. Its printer still remembers, though, which is why it tells you to power-cycle that too.
 - **Keep traffic discipline network-wide.** Schedules and dummy traffic (see Schedules & Signals) keep the network's rhythm constant whether it is idle or busy. The adversary should learn nothing from volume.
 
 ## Protecting Our Cell
