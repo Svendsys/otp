@@ -129,10 +129,12 @@ step it is — the manual's Security & Integrity section is the full version:
 
 ## License
 
-Free for any non-commercial use — see [LICENSE](LICENSE) for the full terms.
+This project is licensed for non-commercial use: the code
+(`otp_generator.py`, `tests/`) under
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/),
+and the manual and other content (`otp.md`, images) under
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
+See [LICENSE](LICENSE) for the full terms.
 
-- **Code** (`otp_generator.py`, `tests/`): [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
-- **Manual and content** (`otp.md`, images): [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
-
-Print it, teach with it, adapt it, share it — just not commercially. For
-commercial licensing, contact the author.
+Print it, teach with it, adapt it, share it — just not commercially.
+For alternative licenses, contact the author.
