@@ -266,7 +266,7 @@ The most practical way to generate key-pages is by using computers or specialize
 
 Arguably the most important thing to be aware of when generating randomness is that we can not rely on human sourced data. For example asking humans to say a "random" letter will never be random, choosing "random" characters from a book is also never random. It is essential that humans, and any human constructs are viewed as sources of bias. Even our human sense of what constitutes random is inherently flawed, so that something *feels* random should be given no credence.
 
-![Human predictability](human_bias.png)
+![Survey: pick a random number from 1-10 — out of 8604 respondents, 28% picked 7](human_bias.png)
 **DO NOT UNDERESTIMATE THE PREDICTABILITY OF HUMANS!** 
 
 There are endlessly many ways to generate random data, so I will provide a few examples here for inspiration purposes. The main challenge that all these methods will have in common is to eliminate human bias. Our movements are not random, even if the intention behind the movements is to be random. The physical process must be the source of the randomness; the human is only there to operate it and write down what it says.
