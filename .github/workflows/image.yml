@@ -38,6 +38,19 @@ jobs:
       #
       # Order matters. binfmt first, then the host binary, and deliberately
       # without binfmt-support so nothing re-registers over the F entry.
+      # binfmt_misc has to be mounted ON THE HOST, not just inside the
+      # container that registers it. build-docker.sh greps
+      # /proc/sys/fs/binfmt_misc/qemu-aarch64* and, when that glob matches
+      # nothing, writes its own registration to .../register behind
+      # `2>/dev/null || true` -- so an unmounted binfmt_misc produces no
+      # error at all, just the arm64-unsupported failure two steps later.
+      - name: Mount binfmt_misc on the host
+        run: |
+          sudo modprobe binfmt_misc || true
+          mountpoint -q /proc/sys/fs/binfmt_misc \
+            || sudo mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc
+          mountpoint /proc/sys/fs/binfmt_misc
+
       - name: Register arm64 binfmt with the fix-binary flag
         run: docker run --privileged --rm tonistiigi/binfmt --install arm64
 
@@ -46,10 +59,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-user
           which qemu-aarch64
-          # build-docker.sh greps this for "^interpreter <that path>" and
-          # registers a duplicate if it does not match. Printed so a
-          # mismatch is visible in the log rather than inferred.
-          cat /proc/sys/fs/binfmt_misc/qemu-aarch64* || true
+
+      # Reproduce pi-gen's own check before spending half an hour on it.
+      # build.sh runs `arch-test arm64` inside the build container, and
+      # that is the only thing that actually proves the registration is
+      # usable from another mount namespace.
+      - name: Prove arm64 emulation works from inside a container
+        run: |
+          echo "== registrations visible on the host =="
+          for f in /proc/sys/fs/binfmt_misc/qemu-aarch64*; do
+            [ -e "$f" ] && { echo "--- $f"; cat "$f"; }
+          done
+          echo "== pi-gen's check, in a container =="
+          docker run --privileged --rm debian:trixie-slim bash -c '
+            set -e
+            apt-get update -qq && apt-get install -y -qq arch-test
+            mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
+            arch-test arm64
+          '
 
       - name: Install manual rendering tools
         run: sudo apt-get install -y pandoc weasyprint
