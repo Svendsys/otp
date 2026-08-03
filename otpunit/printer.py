@@ -39,16 +39,6 @@ class Device:
         """Driverless-capable: lpadmin -m everywhere needs an IPP URI."""
         return self.uri.startswith(("ipp://", "ipps://", "ippusb://", "dnssd://"))
 
-    @property
-    def usb_id(self) -> str:
-        """
-        The usb:// form of this device, if it has one.
-
-        ipp-usb publishes a loopback endpoint whose URI names no make or
-        model, so a device discovered that way cannot be matched to a PPD on
-        its own -- the usb:// entry for the same printer carries the name.
-        """
-        return self.uri if self.uri.startswith("usb://") else ""
 
 
 class PrinterError(RuntimeError):
@@ -88,27 +78,41 @@ class Cups:
     # accepts -- driverless setup requires an IPP connection and rejects a
     # raw usb:// URI outright -- so both kinds have to be collected, and
     # the IPP one preferred when the same printer offers both.
-    # Only ipp-usb's own loopback endpoint, never the network. A printer
-    # across the LAN must not be picked up by a unit whose whole point is
-    # being offline -- disabling the radios does not cover wired or USB
-    # ethernet, and install.sh converts Pis that may have either.
+    # Unambiguously local IPP endpoints.
     LOCAL_IPP = ("ippusb://", "ipp://localhost", "ipp://127.0.0.1",
                  "ipps://localhost", "ipps://127.0.0.1")
 
     def devices(self) -> list[Device]:
-        """Locally attached printers CUPS can currently see."""
-        found = []
+        """
+        Locally attached printers CUPS can currently see.
+
+        dnssd:// is the awkward case. It is how CUPS usually reports the
+        endpoint ipp-usb publishes for a USB printer -- the driverless path,
+        and the one docs/PRINTERS.md names as primary -- but it is also how
+        a printer across the LAN appears, which a unit whose point is being
+        offline must not silently bind to. (Disabling the radios does not
+        cover wired or USB ethernet.) So it is accepted only when something
+        is actually plugged into USB: a dnssd endpoint alongside a usb://
+        device is ipp-usb; a dnssd endpoint on its own is the network.
+        """
+        usb, local_ipp, discovered = [], [], []
         for line in self._text([LPINFO, "-v"]).splitlines():
             parts = line.split(None, 1)
             if len(parts) != 2:
                 continue
-            _kind, uri = parts
-            uri = uri.strip()
-            if uri.startswith("usb://") or uri.startswith(self.LOCAL_IPP):
-                found.append(Device(uri=uri, description=_pretty(uri)))
-        # An IPP endpoint needs no driver at all, so try those first.
-        found.sort(key=lambda d: not d.is_ipp)
-        return found
+            uri = parts[1].strip()
+            device = Device(uri=uri, description=_pretty(uri))
+            if uri.startswith("usb://"):
+                usb.append(device)
+            elif uri.startswith(self.LOCAL_IPP):
+                local_ipp.append(device)
+            elif uri.startswith("dnssd://"):
+                discovered.append(device)
+
+        if not usb:
+            discovered = []
+        # Driverless endpoints first: they need no driver at all.
+        return local_ipp + discovered + usb
 
     def queues(self) -> list[str]:
         names = []
@@ -186,10 +190,29 @@ class Cups:
         match = re.search(r"request id is (\S+)", result.stdout.decode("utf-8", "replace"))
         return match.group(1) if match else ""
 
-    def active_jobs(self, name: str = QUEUE) -> int:
-        return len([
-            line for line in self._text([LPSTAT, "-o", name]).splitlines() if line.strip()
-        ])
+    def active_jobs(self, name: str = QUEUE) -> int | None:
+        """
+        Jobs still queued, or None if the queue could not be asked.
+
+        None and 0 must not be conflated. `_text` swallows a wedged cupsd,
+        a missing lpstat and an unknown destination alike, and reporting all
+        of those as "nothing queued" would let the caller purge a spool that
+        is still printing.
+        """
+        result = self._run_text([LPSTAT, "-o", name])
+        if result is None:
+            return None
+        return len([line for line in result.splitlines() if line.strip()])
+
+    def _run_text(self, argv) -> str | None:
+        """Like _text, but None on failure rather than an empty string."""
+        try:
+            result = self._run(argv)
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.decode("utf-8", "replace")
 
     def purge(self, name: str = QUEUE) -> None:
         """Empty the spool. Belt and braces: the spool is already on tmpfs."""

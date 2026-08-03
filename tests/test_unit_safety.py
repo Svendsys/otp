@@ -356,6 +356,70 @@ class TestConfigIsTrusted:
         assert calls in ([], ["rw", "ro"])
 
 
+class TestQueueQueriesFailSafe:
+    """
+    An unanswerable queue query must never read as "nothing queued".
+
+    Cups._text swallows a wedged cupsd, a missing lpstat and an unknown
+    destination alike. Reporting all of those as an empty queue let both
+    job transitions through at once: copy B spooled while A was still
+    printing, then the spool purged, then PAIR COMPLETE on the panel over
+    an interleaved and truncated pair.
+    """
+
+    def _wedged(self):
+        def boom(argv, stdin=None):
+            raise TimeoutError("cupsd wedged")
+        return printer.Cups(run=boom)
+
+    def test_active_jobs_reports_unknown_not_zero(self):
+        assert self._wedged().active_jobs() is None
+
+    def test_a_failed_query_counts_as_busy(self):
+        app = make_app([])
+        app.cups = self._wedged()
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "X-Y", config.Settings(pages=1))
+        assert ui.RunJob(spec).cups_busy(app) is True
+
+    def test_an_empty_queue_counts_as_drained(self):
+        app = make_app([])
+        app.cups = Cups(busy=0)
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "X-Y", config.Settings(pages=1))
+        assert ui.RunJob(spec).cups_busy(app) is False
+
+    def test_a_wedged_queue_does_not_purge_or_claim_completion(self):
+        app = make_app([])
+        cups = self._wedged()
+        submitted = []
+        cups.submit = lambda d, n="OTP", t="OTP", o=None: submitted.append(t) or "j"
+        purges = []
+        cups.purge = lambda n="OTP": purges.append(n)
+        app.cups = cups
+        screen = ui.RunJob(jobs.JobSpec(jobs.JobKind.PAD_PAIR, "X-Y",
+                                        config.Settings(pages=1)))
+        for _ in range(4):
+            screen.press(app, Press.OK)
+        assert screen.stage == "waiting"
+        assert purges == [], "must not purge a queue it cannot read"
+        assert submitted == ["OTP A"], "copy B must not start"
+
+
+class TestAbandonedScreenTellsTheTruth:
+    def test_only_a_pad_is_described_as_key_material(self):
+        app = make_app([])
+        for kind, expect in ((jobs.JobKind.PAD_PAIR, "KEY DISCARDED"),
+                             (jobs.JobKind.TABULA, "JOB ABANDONED"),
+                             (jobs.JobKind.WORKSHEETS, "JOB ABANDONED")):
+            screen = ui.RunJob(jobs.JobSpec(kind, "X-Y", config.Settings(pages=1)))
+            screen.stage = "abandoned"
+            text = "\n".join(screen.frame(app).rendered())
+            assert expect in text, kind
+        # And the destroy warning belongs only to the pad.
+        card = ui.RunJob(jobs.JobSpec(jobs.JobKind.TABULA, "", config.Settings()))
+        card.stage = "abandoned"
+        assert "DESTROY" not in "\n".join(card.frame(app).rendered())
+
+
 class TestManualIsHandledWhenAbsent:
     def test_menu_reports_a_missing_manual_plainly(self, monkeypatch):
         monkeypatch.setattr(jobs, "manual_available", lambda: False)

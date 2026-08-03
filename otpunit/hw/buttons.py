@@ -10,6 +10,7 @@ import queue
 import select
 import sys
 import termios
+import time
 import tty
 from enum import Enum
 
@@ -27,7 +28,7 @@ PIN_UP = 5
 PIN_DOWN = 6
 PIN_OK = 13
 HOLD_SECONDS = 1.0
-BOUNCE_SECONDS = 0.05
+BOUNCE_SECONDS = 0.015
 
 
 class Buttons:
@@ -117,30 +118,41 @@ class GpioButtons(Buttons):
 
         self._events: queue.Queue[Press] = queue.Queue()
         self._buttons = []
-        self._held = False
+        self._pressed_at = None
 
         for pin, press in ((up, Press.UP), (down, Press.DOWN)):
             button = Button(pin, pull_up=True, bounce_time=BOUNCE_SECONDS)
             button.when_pressed = lambda _b=None, p=press: self._events.put(p)
             self._buttons.append(button)
 
-        # OK distinguishes tap from hold: the hold fires BACK on its own, and
-        # the release then has to know not to also emit an OK.
-        okay = Button(pin_factory=None, pin=ok, pull_up=True,
-                      bounce_time=BOUNCE_SECONDS, hold_time=HOLD_SECONDS)
-        okay.when_held = self._on_hold
+        # OK distinguishes tap from hold by timing the press, and decides on
+        # RELEASE. The obvious alternative -- gpiozero's when_held setting a
+        # flag that when_released checks -- is a check-then-act split across
+        # two threads: gpiozero runs when_held on its own HoldThread and
+        # when_released on the pin callback thread. If a release lands in the
+        # ~30us between the hold thread deciding and it setting the flag, one
+        # press emits OK *and* BACK and leaves the flag stuck, swallowing the
+        # next tap. On this device that is not cosmetic: OK and BACK mean
+        # opposite things while a job is printing, so a single borderline
+        # press could purge the spool and destroy a pad pair.
+        #
+        # when_pressed and when_released both run on the pin callback thread,
+        # so measuring between them needs no lock and cannot double-fire.
+        okay = Button(ok, pull_up=True, bounce_time=BOUNCE_SECONDS)
+        okay.when_pressed = self._on_press
         okay.when_released = self._on_release
         self._buttons.append(okay)
 
-    def _on_hold(self, _button=None):
-        self._held = True
-        self._events.put(Press.BACK)
+    def _on_press(self, _button=None):
+        self._pressed_at = time.monotonic()
 
     def _on_release(self, _button=None):
-        if self._held:
-            self._held = False
+        started, self._pressed_at = self._pressed_at, None
+        if started is None:
+            # Released without a press we saw -- ignore rather than guess.
             return
-        self._events.put(Press.OK)
+        held = (time.monotonic() - started) >= HOLD_SECONDS
+        self._events.put(Press.BACK if held else Press.OK)
 
     def wait(self, timeout: float | None = None) -> Press | None:
         try:

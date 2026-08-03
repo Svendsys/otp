@@ -14,6 +14,7 @@ real register.
 """
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 from dataclasses import dataclass, asdict, fields, replace
@@ -103,10 +104,13 @@ class Settings:
             problems.append("auth size cannot be negative")
         if self.paper not in PAPER_CHOICES:
             problems.append("unknown paper size")
-        if self.font_size <= 0:
+        # isfinite as well as > 0: nan compares False against BOTH bounds, so
+        # a bare `<= 0` check lets it through to calc_max_chars, which then
+        # raises out of load() before the panel exists.
+        if not math.isfinite(self.font_size) or self.font_size <= 0:
             # Return here: calc_max_chars divides by a font-size-derived
-            # spacing, so font_size == 0 would raise instead of reporting.
-            problems.append("font size must be positive")
+            # spacing, so a bad size would raise instead of reporting.
+            problems.append("font size must be a positive number")
             return problems
         if self.font_size > gen.max_body_font_size(self.a7, self._box_width()):
             problems.append("font size too large for the page width")

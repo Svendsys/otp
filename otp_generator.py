@@ -32,6 +32,7 @@ unmistakably marked: --training watermarks TRAINING across every page.
 """
 
 import argparse
+import math
 import os
 import sys
 from reportlab.lib.units import mm
@@ -885,8 +886,9 @@ def main():
 
     if args.chars is not None and args.chars < 1:
         parser.error("--chars must be at least 1")
-    if args.fontsize is not None and args.fontsize <= 0:
-        parser.error("--fontsize must be positive")
+    if args.fontsize is not None and (not math.isfinite(args.fontsize)
+                                      or args.fontsize <= 0):
+        parser.error("--fontsize must be a positive number")
     if args.a7 and (args.a4 or args.letter):
         parser.error("--a7 lays out on A6 sheets; it cannot be combined with "
                      "--a4 or --letter")
@@ -988,8 +990,12 @@ def main():
         # unreadable.
         max_font = max_body_font_size(args.a7, box_width)
         if font_size > max_font:
+            # Round DOWN: printing the true maximum to one decimal would
+            # round up, and an operator retyping the number from the error
+            # message would hit the same error again.
+            usable = math.floor(max_font * 10) / 10
             log(f"ERROR: {font_size}pt is too wide for {format_label} — "
-                f"the five-letter groups would overlap. Maximum is {max_font:.1f}pt.")
+                f"the five-letter groups would overlap. Maximum is {usable}pt.")
             sys.exit(1)
 
         max_chars = calc_max_chars(font_size, args.a7, box_height)

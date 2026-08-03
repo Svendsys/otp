@@ -357,12 +357,14 @@ class RunJob(Screen):
             )
 
         if self.stage == "abandoned":
-            return Frame(
-                title="ABANDONED",
-                lines=["KEY DISCARDED", "", "DESTROY ANY PAGES",
-                       "ALREADY PRINTED"],
-                footer="OK TO RETURN",
-            )
+            # Every job kind can reach this now, and only a pad carries key
+            # material -- telling an operator to destroy an abandoned tabula
+            # recta card teaches them to ignore the warning that matters.
+            lines = (["KEY DISCARDED", "", "DESTROY ANY PAGES",
+                      "ALREADY PRINTED"] if self.spec.carries_key_material
+                     else ["JOB ABANDONED", "", "THE PRINTER MAY STILL",
+                           "HAVE WORK QUEUED"])
+            return Frame(title="ABANDONED", lines=lines, footer="OK TO RETURN")
 
         if self.stage == "printing":
             letter = "AB"[max(0, self.job.copies_done - 1)] if self.spec.copies > 1 else ""
@@ -522,11 +524,21 @@ class RunJob(Screen):
         return self
 
     def cups_busy(self, app) -> bool:
-        """Never let a failed query strand the operator: assume drained."""
+        """
+        Whether the queue still holds work.
+
+        An unanswerable query counts as BUSY, not as drained. Treating a
+        wedged cupsd as an empty queue would let both transitions through at
+        once: copy B spooled while A is still printing, then the spool
+        purged and the panel reporting PAIR COMPLETE over an interleaved,
+        truncated pair. Waiting costs one more OK press, and BACK is always
+        available.
+        """
         try:
-            return app.cups.active_jobs(app.queue) > 0
+            queued = app.cups.active_jobs(app.queue)
         except Exception:
-            return False
+            return True
+        return queued is None or queued > 0
 
 
 def gen_cancelled():
@@ -709,11 +721,24 @@ class App:
         self.shutdown_requested = False
         # Settings start matching whatever was loaded from the card.
         self.settings_saved = True
+        self.display_failures = 0
 
     def render(self, screen=None) -> None:
+        """
+        Draw the current screen. Never raises.
+
+        An I2C error mid-job would otherwise unwind run() with the key
+        buffer live and the spool unpurged -- a complete pad left in a tmpfs
+        spool across systemd's restart. A blank panel is bad; a blank panel
+        that also abandons a running job without wiping is worse.
+        """
         target = screen or (self.stack[-1] if self.stack else None)
-        if target is not None:
+        if target is None:
+            return
+        try:
             self.display.show(target.frame(self))
+        except Exception:
+            self.display_failures += 1
 
     def request_shutdown(self):
         self.shutdown_requested = True

@@ -39,6 +39,12 @@ class RecordingCups(printer.Cups):
         self.submitted.append({"title": title, "data": bytes(data), "options": options})
         return f"job-{len(self.submitted)}"
 
+    def active_jobs(self, name="OTP"):
+        # Must be stubbed. The real one shells out to lpstat, which fails
+        # here and now correctly reports "cannot tell" -- which the UI treats
+        # as busy, so an unstubbed fake would park every test at `waiting`.
+        return 0
+
     def purge(self, name="OTP"):
         self.purged += 1
 
