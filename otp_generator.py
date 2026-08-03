@@ -19,17 +19,23 @@ Arguments:
     --fontsize    Font size in points (default: 9)
     --a7          Layout two pad pages per A6 sheet (cut along the dashed line to get A7)
     --no-auth     Omit the AUTH group from page headers
+    --training    Watermark every page as TRAINING material
+    --worksheets  Also generate N A5 worksheet pages as WORKSHEETS.pdf
+                  (no key material — print as many copies as you need)
 
 Each page header carries an AUTH group: five extra key letters reserved for
 message authentication, generated alongside the key body but never part of it.
 See the manual (otp.md, Authentication) for the procedure it supports.
+
+Training pads support the manual's rule that practice material must be
+unmistakably marked: --training watermarks TRAINING across every page.
 """
 
 import argparse
 import os
 import sys
 from reportlab.lib.units import mm
-from reportlab.lib.pagesizes import A6
+from reportlab.lib.pagesizes import A5, A6
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
@@ -91,6 +97,7 @@ def draw_pad_page(
     box_width: float,
     box_height: float,
     with_auth: bool = True,
+    training: bool = False,
 ):
     """Draw a single pad page within the given bounding box."""
     margin_h = 4 * mm
@@ -125,7 +132,10 @@ def draw_pad_page(
     # Footer
     footer_y = box_bottom + margin_bottom
     c.setFont("Courier-Bold", 5.5)
-    footer_text = "USE ONCE \u2014 DESTROY AFTER USE"
+    if training:
+        footer_text = "TRAINING \u2014 USE ONCE \u2014 DESTROY AFTER USE"
+    else:
+        footer_text = "USE ONCE \u2014 DESTROY AFTER USE"
     c.drawCentredString(box_left + box_width / 2, footer_y - 1 * mm, footer_text)
     footer_top = footer_y + 1 * mm
 
@@ -158,12 +168,10 @@ def draw_pad_page(
         group_gap = 0
 
     all_groups = [body_chars[i:i + GROUP_SIZE] for i in range(0, len(body_chars), GROUP_SIZE)]
+    row_ys = [header_bottom - row_spacing * (r + 1) for r in range(num_rows)]
 
-    y = header_bottom - row_spacing
-    group_idx = 0
-
-    for row_num in range(num_rows):
-        # Alternating row shading
+    # Alternating row shading
+    for row_num, y in enumerate(row_ys):
         if row_num % 2 == 1:
             c.saveState()
             c.setFillGray(shade_color)
@@ -176,16 +184,27 @@ def draw_pad_page(
             )
             c.restoreState()
 
-        # Draw each group at calculated x position
-        c.setFont("Courier", font_size)
+    # Training watermark: large, light, diagonal — over the shading,
+    # under the key text so the letters stay fully legible
+    if training:
+        c.saveState()
+        c.setFillGray(0.80)
+        c.setFont("Courier-Bold", box_width / 9)
+        c.translate(box_left + box_width / 2, (header_bottom + footer_top) / 2)
+        c.rotate(45)
+        c.drawCentredString(0, 0, "TRAINING")
+        c.restoreState()
+
+    # Key text
+    c.setFont("Courier", font_size)
+    group_idx = 0
+    for y in row_ys:
         for g in range(groups_per_row):
             if group_idx >= len(all_groups):
                 break
             x = left + g * (single_group_width + group_gap)
             c.drawString(x, y, all_groups[group_idx])
             group_idx += 1
-
-        y -= row_spacing
 
 
 def generate_set_pdf_a6(
@@ -195,10 +214,11 @@ def generate_set_pdf_a6(
     chars_per_page: int,
     font_size: float,
     with_auth: bool = True,
+    training: bool = False,
 ):
     """Generate OTP set as A6 pages (one pad page per sheet)."""
     c = canvas.Canvas(output_path, pagesize=A6)
-    c.setTitle(f"OTP \u2014 {codeword}")
+    c.setTitle(f"OTP TRAINING \u2014 {codeword}" if training else f"OTP \u2014 {codeword}")
 
     for page_num in range(1, num_pages + 1):
         draw_pad_page(
@@ -208,6 +228,7 @@ def generate_set_pdf_a6(
             box_left=0, box_bottom=0,
             box_width=SHEET_WIDTH, box_height=SHEET_HEIGHT,
             with_auth=with_auth,
+            training=training,
         )
         c.showPage()
 
@@ -224,12 +245,13 @@ def generate_set_pdf_a7(
     chars_per_page: int,
     font_size: float,
     with_auth: bool = True,
+    training: bool = False,
 ):
     """Generate OTP set as A7 — two pad pages side by side on landscape A6."""
     # Landscape A6: 148mm wide x 105mm tall
     landscape_a6 = (SHEET_HEIGHT, SHEET_WIDTH)
     c = canvas.Canvas(output_path, pagesize=landscape_a6)
-    c.setTitle(f"OTP \u2014 {codeword}")
+    c.setTitle(f"OTP TRAINING \u2014 {codeword}" if training else f"OTP \u2014 {codeword}")
 
     sheet_w, sheet_h = landscape_a6
     half_width = sheet_w / 2
@@ -244,6 +266,7 @@ def generate_set_pdf_a7(
             box_left=0, box_bottom=0,
             box_width=half_width, box_height=sheet_h,
             with_auth=with_auth,
+            training=training,
         )
 
         # Right half (if it exists)
@@ -255,6 +278,7 @@ def generate_set_pdf_a7(
                 box_left=half_width, box_bottom=0,
                 box_width=half_width, box_height=sheet_h,
                 with_auth=with_auth,
+                training=training,
             )
 
         # Cut line: dashed vertical line down the middle
@@ -271,6 +295,78 @@ def generate_set_pdf_a7(
             print(f"  [{codeword}] {min(page_num + 1, num_pages)}/{num_pages} pages generated")
 
         page_num += 2
+
+    c.save()
+
+
+def generate_worksheets_pdf(output_path: str, num_pages: int):
+    """
+    Generate blank A5 worksheets: blocks of M/K/C rows in five-letter
+    group cells. Worksheets carry no key material, so unlike pads they
+    can be printed in any quantity.
+    """
+    page_w, page_h = A5  # 148mm x 210mm
+    c = canvas.Canvas(output_path, pagesize=A5)
+    c.setTitle("OTP WORKSHEETS")
+
+    margin = 8 * mm
+    label_w = 6 * mm
+    groups_per_line = 5
+    gap = 2 * mm
+    cell_h = 6 * mm
+    block_gap = 5 * mm
+    row_labels = ("M", "K", "C")
+
+    left = margin + label_w
+    content_w = page_w - margin - left
+    cell_w = (content_w - (groups_per_line - 1) * gap) / (groups_per_line * GROUP_SIZE)
+
+    header_y = page_h - 10 * mm
+    footer_y = 6 * mm
+    top_of_blocks = header_y - 8 * mm
+    block_h = 3 * cell_h
+    usable = top_of_blocks - (footer_y + 6 * mm)
+    blocks_per_page = int((usable + block_gap) // (block_h + block_gap))
+
+    for _ in range(num_pages):
+        c.setFont("Courier-Bold", 9)
+        c.drawString(margin, header_y, "OTP WORKSHEET")
+        c.drawRightString(page_w - margin, header_y, "PAGE ________")
+        c.setLineWidth(0.3)
+        c.line(margin, header_y - 2 * mm, page_w - margin, header_y - 2 * mm)
+
+        c.setFont("Courier-Bold", 5.5)
+        c.drawCentredString(page_w / 2, footer_y - 1 * mm,
+                            "WORK ON A HARD SURFACE \u2014 DESTROY WITH THE PAGE")
+
+        block_top = top_of_blocks
+        for _block in range(blocks_per_page):
+            c.saveState()
+            for r, label in enumerate(row_labels):
+                row_top = block_top - r * cell_h
+                row_bottom = row_top - cell_h
+
+                # Shade the result row so students always know where output goes
+                if label == "C":
+                    c.setFillGray(0.93)
+                    c.rect(left, row_bottom, content_w, cell_h, fill=1, stroke=0)
+
+                c.setFont("Courier", 6)
+                c.setFillGray(0.45)
+                c.drawCentredString(margin + label_w / 2, row_bottom + cell_h / 2 - 1 * mm, label)
+
+                c.setLineWidth(0.4)
+                c.setStrokeGray(0.65)
+                x = left
+                for _g in range(groups_per_line):
+                    for _i in range(GROUP_SIZE):
+                        c.rect(x, row_bottom, cell_w, cell_h, fill=0, stroke=1)
+                        x += cell_w
+                    x += gap
+            c.restoreState()
+            block_top -= block_h + block_gap
+
+        c.showPage()
 
     c.save()
 
@@ -317,7 +413,7 @@ def calc_max_chars(font_size: float, a7: bool = False) -> int:
 
 def main():
     parser = argparse.ArgumentParser(description="Generate OTP pad sets as pocket-sized PDFs")
-    parser.add_argument("--codewords", required=True, help="Path to codewords file (one per line)")
+    parser.add_argument("--codewords", help="Path to codewords file (one per line)")
     parser.add_argument("--sets", type=int, default=10, help="Number of sets to generate")
     parser.add_argument("--pages", type=int, default=1000, help="Pad pages per set")
     parser.add_argument("--output", default="./output", help="Output directory")
@@ -325,15 +421,17 @@ def main():
     parser.add_argument("--fontsize", type=float, default=None, help="Font size in pt (default: 9)")
     parser.add_argument("--a7", action="store_true", help="Two pad pages per A6 sheet (cut to get A7)")
     parser.add_argument("--no-auth", action="store_true", help="Omit the AUTH group from page headers")
+    parser.add_argument("--training", action="store_true", help="Watermark every page as TRAINING material")
+    parser.add_argument("--worksheets", type=int, default=0,
+                        help="Also generate N A5 worksheet pages as WORKSHEETS.pdf")
     args = parser.parse_args()
     with_auth = not args.no_auth
+    generating_sets = args.codewords is not None
 
-    if args.sets < 1:
-        print("ERROR: --sets must be at least 1")
-        sys.exit(1)
-    if args.pages < 1:
-        print("ERROR: --pages must be at least 1")
-        sys.exit(1)
+    if args.worksheets < 0:
+        parser.error("--worksheets must be 0 or more")
+    if not generating_sets and args.worksheets == 0:
+        parser.error("nothing to do \u2014 provide --codewords for pad sets and/or --worksheets N")
 
     # Defaults based on format
     if args.a7:
@@ -349,78 +447,97 @@ def main():
         groups_per_row = A6_GROUPS_PER_ROW
         format_label = "A6"
 
-    # Load codewords
-    codewords = load_codewords(args.codewords)
-    if len(codewords) < args.sets:
-        print(f"ERROR: Need {args.sets} codewords but file only contains {len(codewords)}")
-        sys.exit(1)
-
-    # Codewords become filenames, and each set must be unique
-    seen = set()
-    for word in codewords[:args.sets]:
-        if word in seen:
-            print(f"ERROR: Duplicate codeword '{word}' — its set would overwrite the previous PDF")
-            sys.exit(1)
-        seen.add(word)
-        if not all(ch.isalnum() or ch in "-_" for ch in word):
-            print(f"ERROR: Codeword '{word}' is unsafe as a filename (use A-Z, 0-9, '-', '_')")
-            sys.exit(1)
-
-    # Codewords must fit the page header beside the AUTH group and page number
-    codeword_limit = max_codeword_len(font_size, args.a7, with_auth)
-    for word in codewords[:args.sets]:
-        if len(word) > codeword_limit:
-            print(f"ERROR: Codeword '{word}' is too long for the {format_label} header "
-                  f"at {font_size}pt (max {codeword_limit} characters)")
-            sys.exit(1)
-
-    # Create output directory
     os.makedirs(args.output, exist_ok=True)
 
-    # Validate
-    max_chars = calc_max_chars(font_size, args.a7)
-    if chars_per_page > max_chars:
-        print(f"ERROR: {chars_per_page} chars won't fit on {format_label} at {font_size}pt. Maximum is {max_chars}.")
-        sys.exit(1)
+    if generating_sets:
+        if args.sets < 1:
+            print("ERROR: --sets must be at least 1")
+            sys.exit(1)
+        if args.pages < 1:
+            print("ERROR: --pages must be at least 1")
+            sys.exit(1)
 
-    num_rows = -(-chars_per_page // chars_per_row)
+        codewords = load_codewords(args.codewords)
+        if len(codewords) < args.sets:
+            print(f"ERROR: Need {args.sets} codewords but file only contains {len(codewords)}")
+            sys.exit(1)
 
-    print(f"Format: {format_label}")
-    print(f"Generating {args.sets} OTP sets, {args.pages} pad pages each, {chars_per_page} chars/page")
-    print(f"Auth group in header: {'yes' if with_auth else 'no'}")
-    print(f"Font: Courier {font_size}pt")
-    print(f"Layout: {num_rows} rows of {groups_per_row}x{GROUP_SIZE} groups ({chars_per_row} chars/row)")
-    print(f"Max chars per pad page at this font size: {max_chars}")
-    if args.a7:
-        num_sheets = -(-args.pages // 2)
-        print(f"Paper: {num_sheets} A6 sheets per set (cut vertically to separate)")
-    print(f"Output: {args.output}")
-    print()
+        # Codewords become filenames, and each set must be unique
+        seen = set()
+        for word in codewords[:args.sets]:
+            if word in seen:
+                print(f"ERROR: Duplicate codeword '{word}' \u2014 its set would overwrite the previous PDF")
+                sys.exit(1)
+            seen.add(word)
+            if not all(ch.isalnum() or ch in "-_" for ch in word):
+                print(f"ERROR: Codeword '{word}' is unsafe as a filename (use A-Z, 0-9, '-', '_')")
+                sys.exit(1)
 
-    for i in range(args.sets):
-        codeword = codewords[i]
-        filename = f"{codeword}.pdf"
-        filepath = os.path.join(args.output, filename)
+        # Codewords must fit the page header beside the AUTH group and page number
+        codeword_limit = max_codeword_len(font_size, args.a7, with_auth)
+        for word in codewords[:args.sets]:
+            if len(word) > codeword_limit:
+                print(f"ERROR: Codeword '{word}' is too long for the {format_label} header "
+                      f"at {font_size}pt (max {codeword_limit} characters)")
+                sys.exit(1)
 
-        print(f"Set {i + 1}/{args.sets}: {codeword}")
+        max_chars = calc_max_chars(font_size, args.a7)
+        if chars_per_page > max_chars:
+            print(f"ERROR: {chars_per_page} chars won't fit on {format_label} at {font_size}pt. Maximum is {max_chars}.")
+            sys.exit(1)
+
+        num_rows = -(-chars_per_page // chars_per_row)
+
+        print(f"Format: {format_label}")
+        print(f"Generating {args.sets} OTP sets, {args.pages} pad pages each, {chars_per_page} chars/page")
+        print(f"Auth group in header: {'yes' if with_auth else 'no'}")
+        print(f"Training pads: {'yes' if args.training else 'no'}")
+        print(f"Font: Courier {font_size}pt")
+        print(f"Layout: {num_rows} rows of {groups_per_row}x{GROUP_SIZE} groups ({chars_per_row} chars/row)")
+        print(f"Max chars per pad page at this font size: {max_chars}")
         if args.a7:
-            generate_set_pdf_a7(filepath, codeword, args.pages, chars_per_page, font_size, with_auth)
-        else:
-            generate_set_pdf_a6(filepath, codeword, args.pages, chars_per_page, font_size, with_auth)
-        print(f"  Saved: {filepath}")
+            num_sheets = -(-args.pages // 2)
+            print(f"Paper: {num_sheets} A6 sheets per set (cut vertically to separate)")
+        print(f"Output: {args.output}")
+        print()
+
+        for i in range(args.sets):
+            codeword = codewords[i]
+            filename = f"{codeword}.pdf"
+            filepath = os.path.join(args.output, filename)
+
+            print(f"Set {i + 1}/{args.sets}: {codeword}")
+            if args.a7:
+                generate_set_pdf_a7(filepath, codeword, args.pages, chars_per_page, font_size,
+                                    with_auth, args.training)
+            else:
+                generate_set_pdf_a6(filepath, codeword, args.pages, chars_per_page, font_size,
+                                    with_auth, args.training)
+            print(f"  Saved: {filepath}")
+            print()
+
+    if args.worksheets:
+        worksheet_path = os.path.join(args.output, "WORKSHEETS.pdf")
+        print(f"Worksheets: {args.worksheets} A5 pages")
+        generate_worksheets_pdf(worksheet_path, args.worksheets)
+        print(f"  Saved: {worksheet_path}")
         print()
 
     print("=" * 50)
     print("DONE")
     print()
-    print("Each PDF contains one complete set.")
-    print("PRINT EACH PDF TWICE to get your A and B copies.")
-    if args.a7:
-        print("Cut each sheet vertically along the dashed line")
-        print("to separate into A7 pad pages.")
-    print("Store both copies in a sealed envelope labeled")
-    print("with the codeword. Destroy this digital data")
-    print("and wipe the generation machine when finished.")
+    if generating_sets:
+        print("Each PDF contains one complete set.")
+        print("PRINT EACH PDF TWICE to get your A and B copies.")
+        if args.a7:
+            print("Cut each sheet vertically along the dashed line")
+            print("to separate into A7 pad pages.")
+        print("Store both copies in a sealed envelope labeled")
+        print("with the codeword. Destroy this digital data")
+        print("and wipe the generation machine when finished.")
+    if args.worksheets:
+        print("Worksheets contain no key material \u2014 print as many")
+        print("copies as you need.")
 
 
 if __name__ == "__main__":
