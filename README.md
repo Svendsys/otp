@@ -126,3 +126,13 @@ step it is — the manual's Security & Integrity section is the full version:
   material as part of the pad.
 - Delete the PDFs after printing and wipe the machine when the batch is done.
 - Seal each printed copy in an opaque envelope labeled only with its codeword.
+
+## License
+
+Free for any non-commercial use — see [LICENSE](LICENSE) for the full terms.
+
+- **Code** (`otp_generator.py`, `tests/`): [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
+- **Manual and content** (`otp.md`, images): [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
+
+Print it, teach with it, adapt it, share it — just not commercially. For
+commercial licensing, contact the author.
