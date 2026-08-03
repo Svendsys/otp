@@ -35,7 +35,7 @@ import argparse
 import os
 import sys
 from reportlab.lib.units import mm
-from reportlab.lib.pagesizes import A5, A6
+from reportlab.lib.pagesizes import A4, A5, A6, LETTER
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
@@ -410,6 +410,99 @@ def generate_set_pdf_a7(
     c.save()
 
 
+def generate_set_pdf_a4(
+    output,
+    codeword: str,
+    num_pages: int,
+    chars_per_page: int,
+    font_size: float,
+    with_auth: bool = True,
+    training: bool = False,
+    auth_size: int = GROUP_SIZE,
+    progress=None,
+    should_cancel=None,
+    page_size=A4,
+):
+    """
+    Generate OTP set as four A6 pad pages per A4 sheet, for guillotine work.
+
+    Imposed **cut-and-stack**, not in reading order. Four A6 pages tile onto
+    A4 exactly, so the whole printed stack is cut twice -- once down the
+    middle, once across -- giving four piles. Each pile is already in page
+    order, so the pad is assembled by dropping them on top of one another:
+    top-left pile, then top-right, then bottom-left, then bottom-right.
+
+    Reading order would be the obvious layout and the wrong one: it would
+    leave four piles that have to be interleaved page by page.
+
+    The tiling is exact rather than driver-scaled. That matters because a
+    guillotine cuts the whole stack at once, so every sheet has to have
+    identical geometry -- fit-to-page scaling would drift the cut line.
+    """
+    if progress is None:
+        progress = _printing_progress(codeword)
+    # Quartering whatever sheet is in the tray, rather than assuming A6
+    # exactly, keeps the cut lines dead centre on Letter as well as A4.
+    page_w, page_h = page_size
+    half_w, half_h = page_w / 2, page_h / 2
+    # Cut-and-stack: position p carries pages p*sheets+1 .. (p+1)*sheets.
+    sheets = -(-num_pages // 4)
+    positions = [
+        (0, half_h),        # top-left     pile 1
+        (half_w, half_h),   # top-right    pile 2
+        (0, 0),             # bottom-left  pile 3
+        (half_w, 0),        # bottom-right pile 4
+    ]
+
+    c = canvas.Canvas(output, pagesize=page_size)
+    c.setTitle(f"OTP TRAINING — {codeword}" if training else f"OTP — {codeword}")
+
+    done = 0
+    for sheet in range(sheets):
+        if should_cancel is not None and should_cancel():
+            raise GenerationCancelled(f"cancelled at sheet {sheet + 1} of {sheets}")
+        for slot, (box_left, box_bottom) in enumerate(positions):
+            page_num = slot * sheets + sheet + 1
+            if page_num > num_pages:
+                continue
+            draw_pad_page(
+                c, codeword, page_num, chars_per_page, font_size,
+                groups_per_row=A6_GROUPS_PER_ROW,
+                chars_per_row=A6_CHARS_PER_ROW,
+                box_left=box_left, box_bottom=box_bottom,
+                box_width=half_w, box_height=half_h,
+                with_auth=with_auth,
+                training=training,
+                auth_size=auth_size,
+            )
+            done += 1
+        _draw_crop_marks(c, page_w, page_h)
+        c.showPage()
+        progress(min(done, num_pages), num_pages)
+
+    c.save()
+
+
+def _draw_crop_marks(c: canvas.Canvas, page_w: float, page_h: float):
+    """
+    Ticks at the sheet edges marking the two cuts.
+
+    Edge ticks rather than full rules: a line across the sheet would run
+    through the key area, and the blade only needs the edges to line up on.
+    """
+    tick = 4 * mm
+    c.saveState()
+    c.setStrokeGray(0.45)
+    c.setLineWidth(0.4)
+    # Vertical cut, marked top and bottom
+    c.line(page_w / 2, 0, page_w / 2, tick)
+    c.line(page_w / 2, page_h - tick, page_w / 2, page_h)
+    # Horizontal cut, marked left and right
+    c.line(0, page_h / 2, tick, page_h / 2)
+    c.line(page_w - tick, page_h / 2, page_w, page_h / 2)
+    c.restoreState()
+
+
 def generate_worksheets_pdf(output, num_pages: int):
     """
     Generate blank A5 worksheets: blocks of M/K/C rows in five-letter
@@ -672,6 +765,12 @@ def main():
     parser.add_argument("--chars", type=int, default=None, help="Key chars per pad page (default: 665 for A6, 375 for A7)")
     parser.add_argument("--fontsize", type=float, default=None, help="Font size in pt (default: 9)")
     parser.add_argument("--a7", action="store_true", help="Two pad pages per A6 sheet (cut to get A7)")
+    parser.add_argument("--a4", action="store_true",
+                        help="Four A6 pad pages per A4 sheet, imposed cut-and-stack "
+                             "with crop marks (guillotine the stack twice, then pile "
+                             "the four stacks in order)")
+    parser.add_argument("--letter", action="store_true",
+                        help="Like --a4 but on US Letter")
     parser.add_argument("--no-auth", action="store_true", help="Omit the AUTH group from page headers")
     parser.add_argument("--training", action="store_true", help="Watermark every page as TRAINING material")
     parser.add_argument("--worksheets", type=int, default=0,
@@ -715,6 +814,12 @@ def main():
             parser.error("--stdout writes a single PDF: use exactly one of "
                          "--sets 1, --worksheets N, or --tabula N")
 
+    if args.a7 and (args.a4 or args.letter):
+        parser.error("--a7 lays out on A6 sheets; it cannot be combined with "
+                     "--a4 or --letter")
+    if args.a4 and args.letter:
+        parser.error("use either --a4 or --letter, not both")
+
     # Defaults based on format
     if args.a7:
         font_size = args.fontsize or 9
@@ -727,7 +832,12 @@ def main():
         chars_per_page = args.chars or 665
         chars_per_row = A6_CHARS_PER_ROW
         groups_per_row = A6_GROUPS_PER_ROW
-        format_label = "A6"
+        if args.a4:
+            format_label = "A6 (4-up on A4, cut-and-stack)"
+        elif args.letter:
+            format_label = "A6 (4-up on Letter, cut-and-stack)"
+        else:
+            format_label = "A6"
 
     # With --stdout the PDF owns the stdout stream, so all chatter goes to
     # stderr; otherwise print() as before so the CLI output is unchanged.
@@ -797,7 +907,15 @@ def main():
         log(f"Output: {'<stdout>' if args.stdout else args.output}")
         log()
 
-        generate = generate_set_pdf_a7 if args.a7 else generate_set_pdf_a6
+        if args.a7:
+            generate = generate_set_pdf_a7
+        elif args.a4 or args.letter:
+            sheet = LETTER if args.letter else A4
+            def generate(out, *rest, **kwargs):
+                return generate_set_pdf_a4(out, *rest, page_size=sheet, **kwargs)
+        else:
+            generate = generate_set_pdf_a6
+
         for i in range(args.sets):
             codeword = codewords[i]
             log(f"Set {i + 1}/{args.sets}: {codeword}")

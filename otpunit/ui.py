@@ -12,7 +12,8 @@ from dataclasses import replace
 from . import codewords as cw
 from . import jobs as jobs_mod
 from . import printer as printer_mod
-from .config import AUTH_SIZE_CHOICES, PAGE_CHOICES, Settings, save
+from .config import (AUTH_SIZE_CHOICES, PAGE_CHOICES, PAPER_CHOICES,
+                     PAPER_LABELS, Settings, save)
 from .hw.buttons import Press
 from .hw.display import Frame
 
@@ -243,6 +244,9 @@ class RunJob(Screen):
                 settings = spec.settings
                 lines += [
                     f"{settings.pages} PAGES  {settings.format_label}",
+                    # Sheets, not pages: it is what tells you whether there
+                    # is enough paper in the tray for both copies.
+                    f"{settings.sheets * 2} SHEETS TOTAL",
                     f"AUTH {settings.auth_size if settings.with_auth else 'OFF'}"
                     + ("  TRAINING" if settings.training else ""),
                     "2 COPIES: A AND B",
@@ -385,8 +389,14 @@ def settings_menu():
                        lambda a, v: _apply(a, training=v),
                        render=lambda v: "TRAINING (MARKED)" if v else "LIVE MATERIAL")
 
+    def set_paper(app):
+        return Chooser("PAPER IN TRAY", PAPER_CHOICES, app.settings.paper,
+                       lambda a, v: _apply(a, paper=v),
+                       render=lambda v: PAPER_LABELS[v])
+
     menu = Menu([
         ("PAGES", set_pages),
+        ("PAPER", set_paper),
         ("FORMAT", set_format),
         ("AUTH GROUP", set_auth),
         ("TRAINING", set_training),

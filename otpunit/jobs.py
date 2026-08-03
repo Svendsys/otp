@@ -62,11 +62,21 @@ def generate(spec: JobSpec, progress=None, should_cancel=None) -> bytearray:
     sink = io.BytesIO()
 
     if spec.kind is JobKind.PAD_PAIR:
-        build = gen.generate_set_pdf_a7 if settings.a7 else gen.generate_set_pdf_a6
+        extra = {}
+        if settings.a7:
+            build = gen.generate_set_pdf_a7
+        elif settings.imposed:
+            # Four A6 pad pages per sheet, imposed cut-and-stack so the four
+            # piles left by the guillotine are each already in page order.
+            build = gen.generate_set_pdf_a4
+            extra["page_size"] = gen.LETTER if settings.paper == "LETTER" else gen.A4
+        else:
+            build = gen.generate_set_pdf_a6
         build(
             sink, spec.codeword, settings.pages, settings.chars_per_page,
             settings.font_size, settings.with_auth, settings.training,
             settings.auth_size, progress=progress, should_cancel=should_cancel,
+            **extra,
         )
     elif spec.kind is JobKind.WORKSHEETS:
         gen.generate_worksheets_pdf(sink, spec.count)
@@ -148,7 +158,12 @@ class PadPairJob:
             raise RuntimeError("all copies already submitted")
         letter = "AB"[self.copies_done] if self.spec.copies > 1 else ""
         title = f"{self.spec.codeword or self.spec.kind.value}{' ' + letter if letter else ''}"
-        options = {"media": "A6"} if self.spec.kind is JobKind.PAD_PAIR else {}
+        # Pad pages and tabula cards are A6; worksheets and the manual are
+        # already laid out for their own paper, so leave those to the driver.
+        if self.spec.kind in (JobKind.PAD_PAIR, JobKind.TABULA, JobKind.TEST_PAGE):
+            options = (self.spec.settings or Settings()).lp_options
+        else:
+            options = {}
         job = self.cups.submit(self._buffer, self.queue, title, options)
         self.copies_done += 1
         return job

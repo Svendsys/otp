@@ -1,0 +1,21 @@
+[Unit]
+Description=Lay a tmpfs over /etc/cups so print queues never persist
+DefaultDependencies=no
+Before=cups.service
+After=local-fs.target
+ConditionPathIsDirectory=/opt/otp-unit/cups-etc
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The root filesystem is a read-only overlay, so CUPS cannot write its queue
+# configuration to /etc/cups. Rather than fight that, lean on it: mount a
+# tmpfs there and repopulate it from a baked-in template on every boot. The
+# queue is then rebuilt from the printer that is actually plugged in, and no
+# record of previous printers survives a power-cycle.
+ExecStart=/bin/mount -t tmpfs -o mode=0755,size=4M tmpfs /etc/cups
+ExecStart=/bin/sh -c 'cp -a /opt/otp-unit/cups-etc/. /etc/cups/'
+ExecStop=/bin/umount /etc/cups
+
+[Install]
+WantedBy=sysinit.target

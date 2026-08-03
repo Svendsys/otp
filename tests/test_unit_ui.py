@@ -476,6 +476,51 @@ class TestSettings:
         config.save(config.Settings(), str(path), remount=False)
         assert "codeword" not in path.read_text().lower()
 
+    def test_a4_is_the_default(self):
+        # Almost nobody has A6 paper; almost everybody has A4 or Letter.
+        assert config.Settings().paper == "A4"
+        assert config.Settings().imposed is True
+
+    def test_lp_options_only_set_media(self):
+        # The imposition is baked into the PDF. If CUPS also tiled or scaled
+        # it, the cut lines would no longer be where the crop marks say.
+        assert config.Settings(paper="A4").lp_options == {"media": "A4"}
+        assert config.Settings(paper="LETTER").lp_options == {"media": "Letter"}
+        assert config.Settings(paper="A6").lp_options == {"media": "A6"}
+
+    def test_a6_paper_is_not_imposed(self):
+        assert config.Settings(paper="A6").imposed is False
+
+    def test_a7_is_never_imposed(self):
+        # A7 already lays two pad pages on an A6 sheet with its own cut line.
+        assert config.Settings(paper="A4", a7=True).imposed is False
+
+    def test_sheet_count_reflects_tiling(self):
+        assert config.Settings(pages=100, paper="A6").sheets == 100
+        assert config.Settings(pages=100, paper="A4").sheets == 25
+        assert config.Settings(pages=99, paper="A4").sheets == 25
+        assert config.Settings(pages=100, a7=True).sheets == 50
+
+    def test_unknown_paper_is_rejected(self):
+        assert config.Settings(paper="A3").validate()
+
+    def test_pad_job_uses_the_paper_setting(self):
+        cups = RecordingCups()
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "RUSTED-BADGER",
+                            config.Settings(pages=1, paper="LETTER"))
+        job = jobs.PadPairJob(spec, cups)
+        job.generate(progress=lambda d, t: None)
+        job.print_next_copy()
+        assert cups.submitted[0]["options"] == {"media": "Letter"}
+
+    def test_manual_job_leaves_paper_to_the_driver(self):
+        cups = RecordingCups()
+        spec = jobs.JobSpec(jobs.JobKind.WORKSHEETS, "", config.Settings(), count=1)
+        job = jobs.PadPairJob(spec, cups)
+        job.generate()
+        job.print_next_copy()
+        assert cups.submitted[0]["options"] == {}
+
     def test_chars_per_page_follows_the_format(self):
         assert config.Settings(a7=False).chars_per_page == 665
         assert config.Settings(a7=True).chars_per_page == 375
@@ -548,6 +593,103 @@ class TestPrinterDiscovery:
         assert seen["stdin"] == b"%PDF-fake", "key material goes over stdin, not a file"
         assert "-d" in seen["argv"] and printer.QUEUE in seen["argv"]
         assert not any(str(a).endswith(".pdf") for a in seen["argv"])
+
+    def test_submit_raises_on_failure_(self):
+        class Result:
+            returncode = 1
+            stdout = b""
+            stderr = b"lp: no destination"
+
+        cups = printer.Cups(run=lambda argv, stdin=None: Result())
+        with pytest.raises(printer.PrinterError):
+            cups.submit(bytearray(b"x"))
+
+
+# Real-shaped `lpinfo -m` output. The M12w is the interesting case: it is a
+# host-based laser with no driverless support, so it needs a Foomatic PPD
+# picked correctly out of a list where "HP" matches hundreds of lines.
+LPINFO_M = """\
+everywhere IPP Everywhere
+drv:///sample.drv/generic.ppd Generic PostScript Printer
+foomatic-ppds/HP/HP-LaserJet_1020-foo2zjs.ppd.gz HP LaserJet 1020 Foomatic/foo2zjs
+foomatic-ppds/HP/HP-LaserJet_Pro_M12a-foo2zjs-z2.ppd.gz HP LaserJet Pro M12a Foomatic/foo2zjs-z2
+foomatic-ppds/HP/HP-LaserJet_Pro_M12w-foo2zjs-z2.ppd.gz HP LaserJet Pro M12w Foomatic/foo2zjs-z2
+foomatic-ppds/HP/HP-LaserJet_Pro_M1212nf_MFP-foo2xqx.ppd.gz HP LaserJet Pro M1212nf MFP Foomatic/foo2xqx
+foomatic-ppds/Brother/Brother-HL-2030-brlaser.ppd.gz Brother HL-2030 Foomatic/brlaser
+"""
+
+
+class TestPpdMatching:
+    """Picking the wrong PPD gives a queue that prints garbage, not an error."""
+
+    def _cups(self, driverless_ok=False, listing=LPINFO_M):
+        calls = []
+
+        class Result:
+            def __init__(self, rc=0, out=b""):
+                self.returncode = rc
+                self.stdout = out
+                self.stderr = b""
+
+        def run(argv, stdin=None):
+            calls.append(argv)
+            if argv[0] == printer.LPADMIN:
+                if "everywhere" in argv:
+                    return Result(0 if driverless_ok else 1)
+                return Result(0)
+            if argv[0] == printer.LPINFO and "-m" in argv:
+                return Result(0, listing.encode())
+            return Result(0)
+
+        cups = printer.Cups(run=run)
+        cups.calls = calls
+        return cups
+
+    def test_picks_the_exact_model(self):
+        cups = self._cups()
+        device = printer.Device("usb://HP/LaserJet%20Pro%20M12w?serial=X", "")
+        assert cups._match_ppd(device) == \
+            "foomatic-ppds/HP/HP-LaserJet_Pro_M12w-foo2zjs-z2.ppd.gz"
+
+    def test_does_not_confuse_sibling_models(self):
+        cups = self._cups()
+        for model, expected in (("M12a", "M12a"), ("M12w", "M12w")):
+            device = printer.Device(f"usb://HP/LaserJet%20Pro%20{model}?serial=X", "")
+            assert expected in cups._match_ppd(device)
+
+    def test_does_not_fall_back_to_another_manufacturer(self):
+        cups = self._cups()
+        device = printer.Device("usb://Canon/LBP6000?serial=X", "")
+        assert cups._match_ppd(device) is None
+
+    def test_returns_none_when_the_model_is_unknown(self):
+        cups = self._cups()
+        device = printer.Device("usb://HP/LaserJet%20Ultra%20M999?serial=X", "")
+        assert cups._match_ppd(device) is None
+
+    def test_tokeniser_splits_letters_from_digits(self):
+        assert printer._tokens("LaserJet Pro M12w") == ["laserjet", "pro", "m", "12", "w"]
+        assert printer._tokens("HP-LaserJet_Pro_M12w") == \
+            ["hp", "laserjet", "pro", "m", "12", "w"]
+
+    def test_driverless_is_tried_before_a_ppd(self):
+        cups = self._cups(driverless_ok=True)
+        device = printer.Device("usb://HP/LaserJet%20Pro%20M12w?serial=X", "")
+        assert cups.ensure_queue(device) == printer.QUEUE
+        assert not any("-m" in argv and printer.LPINFO in argv[0] for argv in cups.calls)
+
+    def test_falls_back_to_the_ppd_when_driverless_fails(self):
+        cups = self._cups(driverless_ok=False)
+        device = printer.Device("usb://HP/LaserJet%20Pro%20M12w?serial=X", "")
+        assert cups.ensure_queue(device) == printer.QUEUE
+        used = [argv for argv in cups.calls if argv[0] == printer.LPADMIN][-1]
+        assert "M12w" in used[used.index("-m") + 1]
+
+    def test_raises_when_nothing_can_drive_the_printer(self):
+        cups = self._cups(driverless_ok=False, listing="everywhere IPP Everywhere\n")
+        device = printer.Device("usb://Canon/LBP6000?serial=X", "")
+        with pytest.raises(printer.PrinterError):
+            cups.ensure_queue(device)
 
     def test_submit_raises_on_failure(self):
         class Result:

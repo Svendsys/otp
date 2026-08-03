@@ -21,6 +21,19 @@ CONFIG_PATH = "/boot/firmware/otp-unit.conf"
 PAGE_CHOICES = (10, 20, 50, 100, 200, 500, 1000)
 AUTH_SIZE_CHOICES = (0, 3, 4, 5, 6, 7, 8)  # 0 means no AUTH group
 
+# Pad pages are A6. Most printers have A4 or Letter loaded, so the default
+# imposes four pad pages per sheet for cutting down on a guillotine. The
+# tiling is done in the PDF rather than with CUPS number-up: a guillotine
+# cuts the whole stack at once, so every sheet needs identical geometry, and
+# driver-side scaling would drift the cut line from sheet to sheet.
+PAPER_CHOICES = ("A4", "LETTER", "A6")
+
+PAPER_LABELS = {
+    "A4": "A4, 4-UP + CUT",
+    "LETTER": "LETTER, 4-UP + CUT",
+    "A6": "A6 SHEETS",
+}
+
 
 @dataclass
 class Settings:
@@ -31,7 +44,28 @@ class Settings:
     training: bool = False
     cover_sheet: bool = True
     font_size: float = 9.0
+    paper: str = "A4"
     printer: str = ""
+
+    @property
+    def imposed(self) -> bool:
+        """True when pad pages are tiled four to a sheet for cutting."""
+        return self.paper in ("A4", "LETTER") and not self.a7
+
+    @property
+    def lp_options(self) -> dict:
+        """
+        CUPS options. Only the media size -- the imposition is already in
+        the PDF, so nothing here may scale or re-tile it.
+        """
+        return {"media": {"A6": "A6", "LETTER": "Letter"}.get(self.paper, "A4")}
+
+    @property
+    def sheets(self) -> int:
+        """Physical sheets a job of `pages` pad pages will use."""
+        if self.a7:
+            return -(-self.pages // 2)      # two pad pages per A6 sheet
+        return -(-self.pages // 4) if self.imposed else self.pages
 
     @property
     def chars_per_page(self) -> int:
@@ -48,6 +82,8 @@ class Settings:
             problems.append("pages must be at least 1")
         if self.with_auth and self.auth_size < 1:
             problems.append("auth size must be at least 1")
+        if self.paper not in PAPER_CHOICES:
+            problems.append("unknown paper size")
         if self.chars_per_page > gen.calc_max_chars(self.font_size, self.a7):
             problems.append("chars per page exceed the format")
         return problems

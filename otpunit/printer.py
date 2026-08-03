@@ -98,14 +98,38 @@ class Cups:
         raise PrinterError(f"no driver for {device.label}")
 
     def _match_ppd(self, device: Device) -> str | None:
-        make = _pretty(device.uri).split()[0].lower() if _pretty(device.uri) else ""
-        if not make:
+        """
+        Pick a PPD for a printer CUPS has no driverless queue for.
+
+        Matching on manufacturer alone is not good enough: "HP" appears in
+        hundreds of PPDs, and picking the wrong one produces a queue that
+        accepts jobs and prints garbage. So score candidates on the model
+        tokens too and require the model itself to match.
+        """
+        wanted = _tokens(_pretty(device.uri))
+        if len(wanted) < 2:
             return None
+        make, model = wanted[0], wanted[1:]
+
+        best, best_score = None, 0
         for line in self._text([LPINFO, "-m"]).splitlines():
             parts = line.split(None, 1)
-            if len(parts) == 2 and make in parts[1].lower():
-                return parts[0]
-        return None
+            if len(parts) != 2:
+                continue
+            name, description = parts
+            candidate = _tokens(description)
+            if make not in candidate:
+                continue
+            score = sum(1 for token in model if token in candidate)
+            # Every model token has to appear, or it is a different printer.
+            if score < len(model):
+                continue
+            # Among equals prefer the shortest description: "LaserJet Pro
+            # M12w" over "LaserJet Pro M12w MFP Special Edition".
+            if score > best_score or (score == best_score and best
+                                      and len(description) < best[1]):
+                best, best_score = (name, len(description)), score
+        return best[0] if best else None
 
     def submit(self, data: bytes, name: str = QUEUE, title: str = "OTP",
                options: dict | None = None) -> str:
@@ -137,3 +161,17 @@ def _pretty(uri: str) -> str:
     make = match.group(1).replace("%20", " ")
     model = match.group(2).replace("%20", " ")
     return f"{make} {model}".strip()
+
+
+def _tokens(text: str) -> list[str]:
+    """
+    Lowercase alphanumeric words, for comparing a device name to a PPD's.
+
+    Splits letter/digit runs apart so "M12w" and "M 12 W" compare equal --
+    manufacturers are not consistent about that and CUPS descriptions are
+    not either.
+    """
+    words = []
+    for chunk in re.split(r"[^A-Za-z0-9]+", text.lower()):
+        words.extend(part for part in re.findall(r"[a-z]+|[0-9]+", chunk) if part)
+    return words

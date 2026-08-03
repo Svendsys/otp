@@ -1,0 +1,38 @@
+# Apt packages the print unit needs, one per line.
+#
+# This is the single source of truth: device/install.sh reads it, and the
+# pi-gen stage generates its 00-packages from it. Everything here is in
+# Debian Trixie, so a freshly flashed image needs no network on first boot
+# -- which matters for a device whose whole point is being offline.
+
+# Generation
+python3-reportlab
+
+# Front panel: 128x64 SSD1306 OLED over I2C, three buttons on GPIO
+python3-luma.oled
+python3-pil
+python3-gpiozero
+python3-lgpio
+i2c-tools
+
+# Printing. ipp-usb covers driverless IPP-over-USB, which is most printers
+# made since roughly 2017; printer-driver-all carries the older host-based
+# lasers (brlaser for Brother, foo2zjs, Gutenprint, hplip).
+cups
+cups-client
+cups-filters
+ipp-usb
+printer-driver-all
+ghostscript
+
+# The Foomatic PPD database. printer-driver-all ships the foo2zjs *binaries*
+# but not the PPDs that drive them, and host-based lasers are exactly the
+# ones that need a Foomatic PPD rather than a driverless queue. Without
+# this, an HP LaserJet Pro M12w has a driver on disk and no way to use it.
+foomatic-db
+foomatic-db-engine
+foomatic-db-compressed-ppds
+
+# Entropy. The Pi has a hardware RNG; rng-tools feeds it to the kernel pool
+# so the CSPRNG is seeded early rather than at some point after boot.
+rng-tools5

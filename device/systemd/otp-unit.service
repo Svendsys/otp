@@ -1,0 +1,33 @@
+[Unit]
+Description=OTP pad print unit
+Documentation=https://github.com/Svendsys/otp
+After=cups.service otp-unit-etc-cups.service
+Wants=cups.service
+Requires=otp-unit-etc-cups.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m otpunit
+WorkingDirectory=/opt/otp-unit
+Environment=PYTHONPATH=/opt/otp-unit
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+RestartSec=2
+
+# The unit generates key material into RAM and pipes it to lp. None of it
+# should ever be able to reach a filesystem, so take away the ability --
+# a bug then fails loudly instead of quietly leaving a pad on the SD card.
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/cups /boot/firmware
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+# Needs the console for the OLED and GPIO, and poweroff for a clean shutdown.
+SupplementaryGroups=lp gpio i2c
+
+[Install]
+WantedBy=multi-user.target

@@ -91,6 +91,80 @@ class TestInMemoryGeneration:
         assert other.getvalue() != pdf, "separate runs must not share key material"
 
 
+def page_numbers_by_slot(data: bytes):
+    """Per sheet, the four corner page numbers as (TL, TR, BL, BR)."""
+    pypdf = pytest.importorskip("pypdf")
+    sheets = []
+    for page in pypdf.PdfReader(io.BytesIO(data)).pages:
+        found = []
+
+        def visit(text, cm, tm, font_dict, font_size, _found=found):
+            stripped = text.strip()
+            if stripped.isdigit() and len(stripped) == 4:
+                _found.append((round(tm[5]), round(tm[4]), int(stripped)))
+
+        page.extract_text(visitor_text=visit)
+        # Sort top row first, then left to right within each row.
+        ordered = sorted(found, key=lambda t: (-t[0], t[1]))
+        sheets.append([n for _, _, n in ordered])
+    return sheets
+
+
+class TestA4Imposition:
+    """
+    Four A6 pad pages per sheet, imposed for a guillotine.
+
+    The stack is cut twice, leaving four piles. Cut-and-stack order means
+    each pile is already sequential, so the pad is assembled by piling them
+    up. Reading order would force a page-by-page interleave instead, and
+    getting this wrong is silent -- the pages all print, just in an order
+    that makes the pad useless.
+    """
+
+    def _impose(self, pages, **kwargs):
+        buf = io.BytesIO()
+        g.generate_set_pdf_a4(buf, "RUSTED-BADGER", pages, 665, 9,
+                              progress=lambda d, t: None, **kwargs)
+        return buf.getvalue()
+
+    def test_four_pad_pages_per_sheet(self):
+        assert len(page_numbers_by_slot(self._impose(12))) == 3
+        assert len(page_numbers_by_slot(self._impose(13))) == 4
+
+    def test_each_pile_is_sequential_after_cutting(self):
+        sheets = page_numbers_by_slot(self._impose(12))
+        piles = list(zip(*sheets))
+        assert piles == [(1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12)]
+
+    def test_stacking_the_piles_gives_the_whole_pad_in_order(self):
+        sheets = page_numbers_by_slot(self._impose(20))
+        assembled = [page for pile in zip(*sheets) for page in pile]
+        assert assembled == list(range(1, 21))
+
+    def test_short_last_sheet_leaves_gaps_not_wrong_pages(self):
+        sheets = page_numbers_by_slot(self._impose(6))
+        seen = sorted(n for sheet in sheets for n in sheet)
+        assert seen == [1, 2, 3, 4, 5, 6]
+
+    def test_letter_paper_uses_letter_geometry(self):
+        pypdf = pytest.importorskip("pypdf")
+        from reportlab.lib.pagesizes import LETTER
+
+        data = self._impose(4, page_size=LETTER)
+        box = pypdf.PdfReader(io.BytesIO(data)).pages[0].mediabox
+        assert round(float(box.width)) == round(LETTER[0])
+
+    def test_generates_into_memory_only(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        before = set(tmp_path.rglob("*"))
+        assert self._impose(8)[:5] == b"%PDF-"
+        assert set(tmp_path.rglob("*")) == before
+
+    def test_cancel_aborts_imposed_generation(self):
+        with pytest.raises(g.GenerationCancelled):
+            self._impose(400, should_cancel=lambda: True)
+
+
 class TestProgressAndCancel:
     def test_progress_reports_every_page(self):
         seen = []
@@ -188,6 +262,24 @@ class TestNewCliFlags:
         assert len(pdfs) == 2
         for name in pdfs:
             assert re.fullmatch(r"[A-Z]+-[A-Z]+\.pdf", name), name
+
+    def test_a4_flag(self, tmp_path):
+        r = run(["--random-codewords", "1", "--pages", "8", "--a4",
+                 "--output", str(tmp_path)], cwd=tmp_path)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert b"4-up on A4" in r.stdout
+        pdf = next(tmp_path.glob("*.pdf")).read_bytes()
+        assert len(page_numbers_by_slot(pdf)) == 2
+
+    def test_a4_and_a7_conflict(self, tmp_path):
+        r = run(["--random-codewords", "1", "--a4", "--a7"], cwd=tmp_path)
+        assert r.returncode != 0
+        assert b"cannot be combined" in r.stderr
+
+    def test_a4_and_letter_conflict(self, tmp_path):
+        r = run(["--random-codewords", "1", "--a4", "--letter"], cwd=tmp_path)
+        assert r.returncode != 0
+        assert b"not both" in r.stderr
 
     def test_random_codewords_conflicts_with_codewords_file(self, tmp_path):
         words = tmp_path / "w.txt"
