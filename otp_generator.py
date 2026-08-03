@@ -30,6 +30,7 @@ import os
 import sys
 from reportlab.lib.units import mm
 from reportlab.lib.pagesizes import A6
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
 
@@ -274,6 +275,25 @@ def generate_set_pdf_a7(
     c.save()
 
 
+def max_codeword_len(font_size: float, a7: bool, with_auth: bool) -> int:
+    """
+    Longest codeword that fits the page header without colliding with
+    the centered AUTH group or the right-aligned page number.
+    """
+    margin_h = 4 * mm
+    gap = 2 * mm
+    box_width = (SHEET_HEIGHT / 2) if a7 else SHEET_WIDTH
+    content_width = box_width - 2 * margin_h
+    char_w = stringWidth("X", "Courier-Bold", font_size)
+    pagenum_w = stringWidth("0000", "Courier-Bold", font_size)
+    if with_auth:
+        auth_w = stringWidth("AUTH XXXXX", "Courier-Bold", font_size)
+        codeword_space = (content_width - auth_w) / 2 - gap
+    else:
+        codeword_space = content_width - pagenum_w - gap
+    return max(0, int(codeword_space // char_w))
+
+
 def calc_max_chars(font_size: float, a7: bool = False) -> int:
     """Calculate maximum characters that fit on one pad page."""
     margin_top = 5 * mm
@@ -308,6 +328,13 @@ def main():
     args = parser.parse_args()
     with_auth = not args.no_auth
 
+    if args.sets < 1:
+        print("ERROR: --sets must be at least 1")
+        sys.exit(1)
+    if args.pages < 1:
+        print("ERROR: --pages must be at least 1")
+        sys.exit(1)
+
     # Defaults based on format
     if args.a7:
         font_size = args.fontsize or 9
@@ -337,6 +364,14 @@ def main():
         seen.add(word)
         if not all(ch.isalnum() or ch in "-_" for ch in word):
             print(f"ERROR: Codeword '{word}' is unsafe as a filename (use A-Z, 0-9, '-', '_')")
+            sys.exit(1)
+
+    # Codewords must fit the page header beside the AUTH group and page number
+    codeword_limit = max_codeword_len(font_size, args.a7, with_auth)
+    for word in codewords[:args.sets]:
+        if len(word) > codeword_limit:
+            print(f"ERROR: Codeword '{word}' is too long for the {format_label} header "
+                  f"at {font_size}pt (max {codeword_limit} characters)")
             sys.exit(1)
 
     # Create output directory
