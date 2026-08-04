@@ -220,6 +220,28 @@ SWAP = "swap"
 DONE = "done"
 
 
+def _key_source() -> str:
+    """
+    Said on the pad's own sheet, not just the status sheet.
+
+    Someone may keep this page with the pad for years. If the unit had no
+    hardware TRNG, what they are holding is stream-cipher output rather
+    than a one-time pad -- still strong, but not unbreakable-in-principle,
+    and that is a difference they are entitled to know about the specific
+    pad in their hand.
+    """
+    import otp_generator as gen
+
+    try:
+        if gen.entropy_source() == "hwrng+urandom":
+            return "hardware TRNG, mixed with the system CSPRNG"
+        return ("NO HARDWARE RNG WAS FOUND. This key came from the system "
+                "CSPRNG alone, which makes it a very strong stream cipher "
+                "rather than a true one-time pad.")
+    except Exception:                            # noqa: BLE001
+        return "unknown"
+
+
 def sheet(kind, codeword="", settings=None, seconds=0):
     """One full-page instruction sheet, as PDF bytes."""
     settings = settings or Settings()
@@ -258,6 +280,7 @@ def sheet(kind, codeword="", settings=None, seconds=0):
                 ("Codeword", codeword or "(unset)"),
                 ("Pages per copy", str(settings.pages)),
                 ("Format", "A7" if settings.a7 else "A6"),
+                ("Key source", _key_source()),
                 (None, "Two copies were printed, A then B. They are "
                        "identical, and that is the point: one stays with "
                        "you, the other goes to the person you will be "

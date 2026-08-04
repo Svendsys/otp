@@ -35,6 +35,7 @@ import argparse
 import math
 import os
 import sys
+import time
 from reportlab.lib.units import mm
 from reportlab.lib.pagesizes import A4, A5, A6, LETTER
 from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -70,9 +71,104 @@ CROP_TICK = 7 * mm
 CODEWORD_MIN_FONT = 5.5
 
 
+# Every Raspberry Pi has a hardware TRNG on the SoC -- a ring oscillator,
+# sampled: BCM2835/6/7 on the Pi 1, 2, 3, Zero and Zero 2 W, and RNG200 on
+# the Pi 4 and 5. Linux exposes it here.
+# Overridable so tests can point at a fake, and so a laptop can opt out.
+HWRNG_PATH = os.environ.get("OTP_HWRNG_PATH", "/dev/hwrng")
+
+# TRNGs are slow, and how slow varies by two orders of magnitude: a Pi's
+# BCM2835 gives on the order of 100 KiB/s, which covers a 1000-page pad in
+# seconds, while a throttled virtio-rng in a VM can manage 6 KiB/s, which
+# would make the same pad take minutes. So reads are bounded. Past the
+# deadline the whole request falls back to the CSPRNG and SAYS SO, rather
+# than leaving an operator staring at a printer that never starts.
+HWRNG_TIMEOUT = float(os.environ.get("OTP_HWRNG_TIMEOUT", "60"))
+# Small enough that the deadline above is tested often on a slow device,
+# large enough not to make syscalls the bottleneck on a fast one.
+_HWRNG_CHUNK = 4096
+
+# A stuck TRNG is a real failure mode, and the one that matters most: it
+# fails silently, and a pad made from its output is not a pad. Anything
+# this repetitive is treated as broken rather than trusted.
+_HEALTH_SAMPLE = 256
+
+
+def _hwrng_bytes(n: int, path: str | None = None) -> bytes | None:
+    """
+    n bytes straight off the hardware TRNG, or None if there is not one.
+
+    Short reads are a None, not a partial answer: silently returning fewer
+    bytes than asked for would leave the caller padding key material with
+    something else without knowing it.
+
+    The path is resolved on each call rather than bound as a default, so
+    HWRNG_PATH stays overridable at runtime -- which is what lets a test
+    point this at a stuck or absent device and see what happens.
+    """
+    path = path or HWRNG_PATH
+    deadline = time.monotonic() + HWRNG_TIMEOUT
+    try:
+        with open(path, "rb", buffering=0) as handle:
+            chunks, got = [], 0
+            while got < n:
+                # Bounded chunks, not `read(n - got)`. A single large read
+                # blocks inside the kernel until it is satisfied, so the
+                # deadline below would only be tested once the whole thing
+                # had already arrived -- a 1-second budget measured at 73
+                # seconds before this was chunked.
+                chunk = handle.read(min(_HWRNG_CHUNK, n - got))
+                if not chunk:
+                    return None
+                chunks.append(chunk)
+                got += len(chunk)
+                if got < n and time.monotonic() > deadline:
+                    # Give up on the whole request rather than splice a
+                    # CSPRNG tail onto a TRNG head: a pad half from each
+                    # is neither, and nothing downstream could tell.
+                    return None
+    except OSError:
+        return None
+    data = b"".join(chunks)
+    return data if len(data) == n and _looks_alive(data) else None
+
+
+def _looks_alive(data: bytes) -> bool:
+    """A crude stuck-output check: constant bytes are not random."""
+    sample = data[:_HEALTH_SAMPLE]
+    return len(set(sample)) > 1 if len(sample) > 1 else True
+
+
+def entropy_source(path: str | None = None) -> str:
+    """Which source get_random_bytes is currently drawing on."""
+    return "hwrng+urandom" if _hwrng_bytes(1, path) is not None else "urandom"
+
+
 def get_random_bytes(n: int) -> bytes:
-    """Return n bytes from the operating system's CSPRNG."""
-    return os.urandom(n)
+    """
+    n bytes for key material: the hardware TRNG XORed with the CSPRNG.
+
+    A one-time pad has to come from a physical process. os.urandom is a
+    ChaCha20 construction -- excellent, but algorithmic, so a pad built
+    only from it is strictly a stream cipher rather than a one-time pad.
+    The Pi has a real TRNG, so use it.
+
+    XORed with os.urandom rather than used raw, because a ring-oscillator
+    TRNG can be biased, correlated, or stuck, and on an embedded board
+    with no RTC the alternative failure -- a CSPRNG that is barely seeded
+    at first boot -- is just as real. XOR is safe against both: if either
+    source is good the output is good, and neither can weaken the other.
+
+    Falls back to os.urandom alone when there is no /dev/hwrng, which is
+    every laptop running the CLI. entropy_source() reports which happened,
+    and the unit prints it.
+    """
+    system = os.urandom(n)
+    hardware = _hwrng_bytes(n)
+    if hardware is None:
+        return system
+    mixed = int.from_bytes(hardware, "big") ^ int.from_bytes(system, "big")
+    return mixed.to_bytes(n, "big")
 
 
 def generate_random_letters(count: int) -> str:

@@ -15,7 +15,7 @@ producing the key material.
 | File | Purpose |
 |------|---------|
 | `otp.md` | The manual. Written to be printed and handed to students: the full encrypt/decrypt walkthrough, the rules that make OTP secure, key generation by hand, communication protocols, authentication, a printable tabula recta, and exercises with an answer key. |
-| `otp_generator.py` | Generates pad sets as pocket-sized PDFs (A6, four-up on A4, or two-up A7) from the operating system's cryptographic randomness. Also produces tabula recta cards, training pads and blank worksheets. |
+| `otp_generator.py` | Generates pad sets as pocket-sized PDFs (A6, four-up on A4, or two-up A7) from the machine's hardware RNG mixed with the OS CSPRNG. Also produces tabula recta cards, training pads and blank worksheets. |
 | `otpunit/` | The print unit: a headless Raspberry Pi appliance that prints pad pairs straight from RAM. See [the print unit](#the-print-unit). |
 | `codewords/` | The codeword vocabulary — concrete nouns and modifiers, curated to be picturable and phonetically distinct. |
 | `device/`, `image/` | Everything needed to provision a Pi or build a flashable image. |

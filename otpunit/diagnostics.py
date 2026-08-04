@@ -159,6 +159,21 @@ def _entropy():
     return f"{avail} bits ({verdict})"
 
 
+def _entropy_source():
+    """
+    Whether key material comes from the SoC's TRNG or only the CSPRNG.
+
+    This is the difference between a one-time pad and a stream cipher. A
+    pad expanded algorithmically from a seed is the latter by definition,
+    however good the algorithm, so a unit falling back to os.urandom alone
+    has to say so on paper rather than let it pass unnoticed.
+    """
+    if gen.entropy_source() == "hwrng+urandom":
+        return "hardware TRNG + CSPRNG (correct)"
+    return ("CSPRNG ONLY -- no /dev/hwrng. Pads are stream-cipher output, "
+            "not true one-time pads.")
+
+
 def _disk():
     usage = shutil.disk_usage("/")
     return (f"{usage.used / 2**30:.1f} / {usage.total / 2**30:.1f} GiB used, "
@@ -316,6 +331,9 @@ def collect(settings=None, printer=None, queue=None, driver=None,
     # The four claims the README makes about this device, each checked
     # rather than asserted. A unit that fails one should say so on paper.
     sections.append(Section("SECURITY POSTURE", [
+        # First, because it is the one that decides whether what comes out
+        # of this unit is a one-time pad at all.
+        ("Key source", _try(_entropy_source)),
         ("Swap", _try(_swap)),
         ("Root filesystem", _try(_root_filesystem)),
         ("Network links", _try(_networks)),
