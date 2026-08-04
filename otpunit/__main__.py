@@ -48,21 +48,23 @@ class SimulatedCups(Cups):
         pass
 
 
-def build(args):
+def open_display(args):
+    """The panel, or None if there is not one on the bus."""
+    try:
+        return Ssd1306Display(rotate=args.rotate)
+    except Exception as exc:
+        # A display that is not on the bus yet must not take the unit down.
+        # With Restart=on-failure this would otherwise burn through
+        # systemd's start limit in seconds and leave the service
+        # permanently failed, with no panel to say why.
+        print(f"OLED unavailable ({exc})", file=sys.stderr)
+        return None
+
+
+def build(args, display=None):
     if args.sim:
         return ConsoleDisplay(), KeyboardButtons(), SimulatedCups()
-
-    # A display that is not on the bus yet must not take the unit down. With
-    # Restart=on-failure this would otherwise burn through systemd's start
-    # limit in seconds and leave the service permanently failed, with no
-    # panel to say why.
-    try:
-        display = Ssd1306Display(rotate=args.rotate)
-    except Exception as exc:
-        print(f"OLED unavailable ({exc}); falling back to console output",
-              file=sys.stderr)
-        display = ConsoleDisplay(stream=sys.stderr)
-    return display, GpioButtons(), Cups()
+    return display or ConsoleDisplay(stream=sys.stderr), GpioButtons(), Cups()
 
 
 def main(argv=None):
@@ -73,14 +75,39 @@ def main(argv=None):
                         help="rotate the OLED by N*90 degrees")
     parser.add_argument("--config", default=config.CONFIG_PATH,
                         help="settings file (default: %(default)s)")
+    parser.add_argument("--diagnostic", action="store_true",
+                        help="print the status sheet and exit, even if a "
+                             "panel is attached")
     args = parser.parse_args(argv)
 
-    display, buttons, cups = build(args)
+    settings = config.load(args.config)
+
+    # Probed once, here, and the handle carried forward. Opening the panel
+    # is not free and doing it twice would leave one of them unclosed.
+    display = None if args.sim else open_display(args)
+
+    # No panel means no way to choose a codeword and no way to read a
+    # warning, so the unit cannot print pads and cannot say why. The
+    # printer is the only output device it has left: wait for one, print
+    # everything known about the unit, and say what hardware to add.
+    if args.diagnostic or (not args.sim and display is None):
+        from otpunit import diagnostics
+
+        if display is not None:
+            display.close()
+        print("no display detected; entering diagnostic mode"
+              if display is None else "diagnostic sheet requested",
+              file=sys.stderr)
+        return diagnostics.run_headless(
+            Cups(), settings=settings, once=args.diagnostic,
+            log=lambda message: print(message, file=sys.stderr))
+
+    display, buttons, cups = build(args, display)
     app = App(
         display=display,
         buttons=buttons,
         cups=cups,
-        settings=config.load(args.config),
+        settings=settings,
         vocabulary=Vocabulary(),
         config_path=args.config,
     )

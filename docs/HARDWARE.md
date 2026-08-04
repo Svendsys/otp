@@ -55,6 +55,39 @@ Three buttons, because a long press does the work of a fourth:
 | OK (tap) | Select, confirm, advance |
 | OK (hold ~1s) | Back, or cancel a running job |
 
+## Before you have any of it: the status sheet
+
+You do not need the OLED or the buttons to make a start. Flash the image,
+plug in a USB printer, and power up with nothing else attached. The unit
+finds no panel on the I2C bus, so instead of sitting there mute it waits
+for the printer and prints a single sheet telling you what it found:
+
+- the wiring table below, so you can build the panel from the sheet alone
+- an I2C scan, so you can tell "nothing wired up" from "wired up, but at
+  0x3D"
+- which of `luma.oled`, `gpiozero` and `lgpio` actually imported
+- the printer it detected, the queue it created and the driver it matched
+- whether swap is off, whether the root filesystem is a read-only overlay,
+  and whether any network link is up — the three claims this device makes
+  about itself, checked rather than asserted
+- Pi model, serial, memory, temperature, kernel, entropy, disk
+
+It reprints when the printer is unplugged and reconnected, not on a timer,
+so a unit left plugged in overnight produces one sheet and not a ream. To
+ask for one deliberately:
+
+```sh
+sudo systemctl stop otp-unit
+sudo -u otp python3 -m otpunit --diagnostic
+```
+
+The sheet carries no key material and is safe to photograph or email when
+you want help with a unit that will not come up.
+
+**It will not print pads in this state.** Choosing a codeword and a page
+count needs the panel and the buttons; there is no way to drive a pad pair
+without them, and no attempt is made to fake one.
+
 ## Checking the hardware
 
 With the unit powered and the image flashed:

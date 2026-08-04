@@ -59,6 +59,14 @@ test here is what the image does.
 The unit starts automatically, needs no network and no keyboard. Plug in a
 USB printer and use the three buttons.
 
+**No OLED wired up yet?** Boot it anyway with a printer attached. Finding
+no panel, the unit prints one sheet of everything it knows about itself —
+the wiring table, an I2C scan, which drivers loaded, the printer it
+matched, and whether swap, the overlay and the network are where they
+should be. That sheet is the fastest way to find out whether the image is
+healthy before you have any hardware to look at it with. See
+[HARDWARE.md](HARDWARE.md#before-you-have-any-of-it-the-status-sheet).
+
 One step is left manual, because it makes the filesystem read-only and you
 want to be sure everything works first:
 
