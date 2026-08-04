@@ -12,8 +12,22 @@ python3-reportlab
 python3-luma.oled
 python3-pil
 python3-gpiozero
+# NOT in Debian proper -- it comes from archive.raspberrypi.org, which
+# Raspberry Pi OS enables and pi-gen therefore has. Checking these names
+# against packages.debian.org flags it as missing; that is the check
+# being wrong, not this line. It does mean install.sh needs Raspberry Pi
+# OS rather than plain Debian, which is what docs/IMAGE.md tells you to
+# flash anyway.
 python3-lgpio
 i2c-tools
+# Listed even though python3-luma.core already Depends on it, because
+# otpunit/diagnostics.py imports smbus2 directly to scan the I2C bus for
+# the status sheet. Relying on another package's dependency graph for
+# something we import ourselves means the day luma is dropped -- say for
+# a unit built to run headless -- the scan goes quiet rather than
+# failing loudly, and that scan is the one line on the sheet that tells
+# someone whether their panel is wired up.
+python3-smbus2
 
 # Printing. ipp-usb covers driverless IPP-over-USB, which is most printers
 # made since roughly 2017.
