@@ -29,14 +29,24 @@ for tool in docker pandoc weasyprint; do
         exit 1
     }
 done
-# build-docker.sh looks for the qemu interpreter on the HOST path, so
-# registering binfmt via a container is not enough on x86.
-if [ "$(uname -m)" != "aarch64" ] && ! command -v qemu-aarch64-static >/dev/null \
-        && ! command -v qemu-aarch64 >/dev/null; then
-    echo "ERROR: qemu-user-static is required on non-arm64 hosts." >&2
-    echo "       sudo apt-get install -y qemu-user-static qemu-user-binfmt" >&2
-    exit 1
-fi
+# build-docker.sh runs `which qemu-aarch64` on the HOST and exits if it is
+# missing, so registering binfmt via a container is not enough on x86.
+#
+# It has to be the NON-static name. qemu-user-static ships only
+# qemu-aarch64-static, which this check used to accept -- passing here and
+# then failing inside pi-gen with a much less obvious message.
+case "$(uname -m)" in
+    aarch64|arm*) ;;
+    *)
+        if ! command -v qemu-aarch64 >/dev/null; then
+            echo "ERROR: qemu-aarch64 is required on non-arm64 hosts." >&2
+            echo "       sudo apt-get install -y qemu-user qemu-user-binfmt" >&2
+            echo "       (qemu-user-static alone is NOT enough: pi-gen looks" >&2
+            echo "        for the non-static interpreter on PATH.)" >&2
+            exit 1
+        fi
+        ;;
+esac
 
 
 # --- the manual --------------------------------------------------------

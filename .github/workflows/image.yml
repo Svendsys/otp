@@ -20,13 +20,92 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           df -h /
 
-      - name: Register arm64 binfmt
-        run: docker run --privileged --rm tonistiigi/binfmt --install arm64
+      # Two separate requirements, and it takes both. They are not
+      # alternatives, which is what the previous attempt got wrong.
+      #
+      # 1. The registration must carry binfmt_misc's F (fix binary) flag.
+      #    pi-gen's build.sh runs `arch-test arm64` INSIDE the build
+      #    container; without F the kernel resolves the interpreter path in
+      #    the caller's mount namespace, where it does not exist, and the
+      #    test fails with "not supported on this machine/kernel".
+      #    update-binfmts does not set F, so installing binfmt-support is
+      #    not a substitute -- registering from a container is.
+      #
+      # 2. The interpreter must ALSO exist on the host PATH, because
+      #    build-docker.sh runs `which qemu-aarch64` and exits 1 without
+      #    it. Note the non-static name: qemu-user-static ships only
+      #    qemu-aarch64-static and does not satisfy this.
+      #
+      # Order matters. binfmt first, then the host binary, and deliberately
+      # without binfmt-support so nothing re-registers over the F entry.
+      # binfmt_misc has to be mounted ON THE HOST, not just inside the
+      # container that registers it. build-docker.sh greps
+      # /proc/sys/fs/binfmt_misc/qemu-aarch64* and, when that glob matches
+      # nothing, writes its own registration to .../register behind
+      # `2>/dev/null || true` -- so an unmounted binfmt_misc produces no
+      # error at all, just the arm64-unsupported failure two steps later.
+      - name: Mount binfmt_misc on the host
+        run: |
+          sudo modprobe binfmt_misc || true
+          mountpoint -q /proc/sys/fs/binfmt_misc \
+            || sudo mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc
+          mountpoint /proc/sys/fs/binfmt_misc
 
-      - name: Install manual rendering tools
+      # --no-install-recommends is load-bearing, not tidiness. qemu-user
+      # RECOMMENDS qemu-user-binfmt, which registers its own handler:
+      #
+      #   interpreter /usr/libexec/qemu-binfmt/aarch64-binfmt-P
+      #   flags: PO
+      #
+      # No F flag, so it cannot work inside the build container -- and
+      # because it is registered last it takes precedence over the one that
+      # can. That entry, pulled in by a Recommends nobody asked for, is
+      # what broke the previous two runs. It also explains the failing
+      # grep in build-docker.sh, which looks for /usr/bin/qemu-aarch64 and
+      # never sees that wrapper path.
+      - name: Install the qemu interpreter on the host PATH
         run: |
           sudo apt-get update
-          sudo apt-get install -y pandoc python3-weasyprint
+          sudo apt-get install -y --no-install-recommends qemu-user
+          which qemu-aarch64
+          dpkg -l | grep -q qemu-user-binfmt && {
+            echo "qemu-user-binfmt got installed anyway; it will clobber the F entry" >&2
+            exit 1
+          } || true
+
+      # Registered LAST, so nothing can overwrite it, and with exactly one
+      # handler for the magic so there is no precedence question at all.
+      - name: Register arm64 binfmt with the fix-binary flag
+        run: |
+          if [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            echo "removing pre-existing registration"
+            echo -1 | sudo tee /proc/sys/fs/binfmt_misc/qemu-aarch64 >/dev/null
+          fi
+          docker run --privileged --rm tonistiigi/binfmt --install arm64
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+          # The F flag is the whole point. Assert it rather than hope.
+          grep -q '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-aarch64
+
+      # Reproduce pi-gen's own check before spending half an hour on it.
+      # build.sh runs `arch-test arm64` inside the build container, and
+      # that is the only thing that actually proves the registration is
+      # usable from another mount namespace.
+      - name: Prove arm64 emulation works from inside a container
+        run: |
+          echo "== registrations visible on the host =="
+          for f in /proc/sys/fs/binfmt_misc/qemu-aarch64*; do
+            [ -e "$f" ] && { echo "--- $f"; cat "$f"; }
+          done
+          echo "== pi-gen's check, in a container =="
+          docker run --privileged --rm debian:trixie-slim bash -c '
+            set -e
+            apt-get update -qq && apt-get install -y -qq arch-test
+            mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
+            arch-test arm64
+          '
+
+      - name: Install manual rendering tools
+        run: sudo apt-get install -y pandoc weasyprint
 
       - name: Build
         run: ./image/build.sh
