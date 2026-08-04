@@ -34,6 +34,7 @@ unmistakably marked: --training watermarks TRAINING across every page.
 import argparse
 import math
 import os
+import select
 import sys
 import time
 from reportlab.lib.units import mm
@@ -112,21 +113,35 @@ def _hwrng_bytes(n: int, path: str | None = None) -> bytes | None:
         with open(path, "rb", buffering=0) as handle:
             chunks, got = [], 0
             while got < n:
-                # Bounded chunks, not `read(n - got)`. A single large read
-                # blocks inside the kernel until it is satisfied, so the
-                # deadline below would only be tested once the whole thing
-                # had already arrived -- a 1-second budget measured at 73
-                # seconds before this was chunked.
+                # Waited for BEFORE reading, with select, and unconditionally.
+                #
+                # Two earlier attempts at this did nothing. Checking after
+                # the read meant a single blocking read() sat in the kernel
+                # past any budget -- 73 seconds against 1. Chunking fixed
+                # that but the check was written `if got < n`, so a request
+                # satisfied in one chunk skipped it entirely -- and every
+                # request this program makes is one chunk (an A6 page is
+                # 1340 bytes against a 4096 chunk), so it never ran at all
+                # in production. select() bounds the wait itself, which is
+                # the only version that survives a device that simply
+                # stops answering.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                try:
+                    ready, _, _ = select.select([handle], [], [], remaining)
+                except (OSError, ValueError, TypeError):
+                    # Not selectable -- a pipe on some platforms, or any
+                    # file-like object without a fileno. Fall through and
+                    # read; the deadline above still caps the loop.
+                    ready = [handle]
+                if not ready:
+                    return None
                 chunk = handle.read(min(_HWRNG_CHUNK, n - got))
                 if not chunk:
                     return None
                 chunks.append(chunk)
                 got += len(chunk)
-                if got < n and time.monotonic() > deadline:
-                    # Give up on the whole request rather than splice a
-                    # CSPRNG tail onto a TRNG head: a pad half from each
-                    # is neither, and nothing downstream could tell.
-                    return None
     except OSError:
         return None
     data = b"".join(chunks)
@@ -134,14 +149,92 @@ def _hwrng_bytes(n: int, path: str | None = None) -> bytes | None:
 
 
 def _looks_alive(data: bytes) -> bool:
-    """A crude stuck-output check: constant bytes are not random."""
-    sample = data[:_HEALTH_SAMPLE]
-    return len(set(sample)) > 1 if len(sample) > 1 else True
+    """
+    Reject output no working TRNG would produce.
+
+    This cannot make a key stronger -- the result is XORed with the CSPRNG
+    either way -- so its only job is to stop the unit CLAIMING hardware
+    entropy it did not get. The previous version looked at the first 256
+    bytes and asked only whether they were all identical, which passed a
+    free-running counter, a stuck nibble, and 255 zeros after one live
+    byte. It also passed any 1-byte read unconditionally, which is what
+    made entropy_source() report hardware on a dead device.
+
+    So: the whole buffer, a distinct-value floor against the count random
+    data would actually give, and a periodicity check for a latched or
+    counting register.
+    """
+    n = len(data)
+    if n < 16:
+        return len(set(data)) > 1
+    # For random bytes, expected distinct values = 256(1 - e^(-n/256)).
+    # Half of that is far below sampling noise and far above a stuck bus.
+    if len(set(data)) < 256 * (1 - math.exp(-n / 256)) * 0.5:
+        return False
+    for period in (1, 2, 3, 4, 8, 16, 32, 64, 128, 256):
+        if n >= period * 3 and data[period:] == data[:-period]:
+            return False
+    return True
+
+
+# What get_random_bytes actually drew on, rather than what a separate
+# probe predicts it would. Two different things: the probe reads one byte
+# now, the pad is hundreds of reads over minutes, and a device that dies
+# in between made every page after it CSPRNG-only while the sheet still
+# said "hardware". Callers reset this before a job and read it after.
+class Tally:
+    """A count of which source each request was actually served from."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self.hardware = 0
+        self.software = 0
+
+    def record(self, hardware: bool) -> None:
+        if hardware:
+            self.hardware += 1
+        else:
+            self.software += 1
+
+    @property
+    def total(self) -> int:
+        return self.hardware + self.software
+
+    def summary(self) -> str:
+        """One line, true for the material just generated."""
+        if not self.total:
+            return "nothing generated yet"
+        if not self.software:
+            return "hardware TRNG, mixed with the system CSPRNG"
+        if not self.hardware:
+            return ("NO HARDWARE RNG. This key came from the system CSPRNG "
+                    "alone, which makes it a very strong stream cipher "
+                    "rather than a true one-time pad.")
+        return (f"MIXED SOURCES: {self.hardware} of {self.total} draws used "
+                f"the hardware TRNG; the rest fell back to the system "
+                f"CSPRNG alone. Treat this pad as a stream cipher.")
+
+
+TALLY = Tally()
 
 
 def entropy_source(path: str | None = None) -> str:
-    """Which source get_random_bytes is currently drawing on."""
-    return "hwrng+urandom" if _hwrng_bytes(1, path) is not None else "urandom"
+    """
+    Which source get_random_bytes would draw on right now.
+
+    Probes with a realistic amount rather than one byte. A single byte can
+    never fail the health check -- it cannot be periodic and it cannot be
+    short of distinct values -- so the old one-byte probe reported
+    "hardware" for a device stuck at zero, which is precisely the case the
+    check exists to catch.
+
+    This is still only a prediction. For what a particular pad was really
+    made from, read TALLY.
+    """
+    return "hwrng+urandom" if _hwrng_bytes(_HEALTH_SAMPLE, path) is not None \
+        else "urandom"
 
 
 def get_random_bytes(n: int) -> bytes:
@@ -165,6 +258,7 @@ def get_random_bytes(n: int) -> bytes:
     """
     system = os.urandom(n)
     hardware = _hwrng_bytes(n)
+    TALLY.record(hardware is not None)
     if hardware is None:
         return system
     mixed = int.from_bytes(hardware, "big") ^ int.from_bytes(system, "big")

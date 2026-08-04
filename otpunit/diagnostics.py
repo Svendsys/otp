@@ -498,13 +498,18 @@ def render_bytes(sections, page_size=A4, **heading) -> bytearray:
 
 # --- headless mode -----------------------------------------------------
 
-PAGE_SIZES = {"A4": A4}
+# Consecutive empty polls before believing the printer is really gone.
+GONE_AFTER = 3
 
 
 def _page_size(settings):
     from reportlab.lib.pagesizes import LETTER
 
-    return {"A4": A4, "LETTER": LETTER}.get(
+    from reportlab.lib.pagesizes import A6
+
+    # A6 was missing, so an A6-only unit rendered A4 instruction sheets
+    # and submitted them to a queue loaded with A6.
+    return {"A4": A4, "LETTER": LETTER, "A6": A6}.get(
         getattr(settings, "paper", "A4"), A4)
 
 
@@ -526,6 +531,7 @@ def run_headless(cups, settings=None, poll_seconds=2.0, log=print,
 
     sleep = sleep or time.sleep
     printed_for = None
+    misses = 0
 
     while True:
         devices = []
@@ -535,14 +541,21 @@ def run_headless(cups, settings=None, poll_seconds=2.0, log=print,
             log(f"printer lookup failed: {exc}")
 
         if not devices:
-            # Unplugged: arm for a reprint when something comes back.
-            if printed_for is not None:
+            # Only re-arm after SEVERAL consecutive empties. devices()
+            # returns [] for a busy cupsd or a timed-out lpinfo just as it
+            # does for an unplugged cable, and re-arming on one of those
+            # started a whole second pad pair -- 68 more sheets and a new
+            # codeword -- with the first still in the tray. Measured: one
+            # bad poll in five produced 12 pad-pair starts in 60 polls.
+            misses += 1
+            if printed_for is not None and misses >= GONE_AFTER:
                 log("printer disconnected")
                 printed_for = None
             if once:
                 return 1
             sleep(poll_seconds)
             continue
+        misses = 0
 
         device = devices[0]
         if device.uri == printed_for:
@@ -570,7 +583,8 @@ def run_headless(cups, settings=None, poll_seconds=2.0, log=print,
         printed_for = device.uri
         try:
             result = sequence(cups, settings=settings, queue=queue or "OTP",
-                              log=log, sleep=sleep, buttons=buttons)
+                              log=log, sleep=sleep, buttons=buttons,
+                              driver=driver)
         except Exception as exc:                 # noqa: BLE001
             log(f"unattended sequence failed: {exc}")
             result = 1

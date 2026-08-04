@@ -225,7 +225,7 @@ class TestUnpluggingIsTheAbort:
 
     def test_unplugging_during_the_wait_prints_no_pad(self):
         # Status sheet, then the printer goes away before the delay ends.
-        cups = Cups(script=[[DEVICE], [], [], []])
+        cups = Cups(script=[[DEVICE]] + [[]] * 8)
         assert run(cups) == 1
         assert cups.titles() == ["OTP status"]
 
@@ -244,11 +244,18 @@ class TestUnpluggingIsTheAbort:
         cups = Flaky()
         assert run(cups) == 0, "a hiccup must not throw away a pad"
 
-    def test_countdown_reports_a_disconnect(self):
-        cups = Cups(script=[[]])
+    def test_countdown_reports_a_sustained_disconnect(self):
+        cups = Cups(script=[[]] * unattended.GONE_AFTER)
         with pytest.raises(unattended.Aborted):
-            unattended.countdown(cups, seconds=5, sleep=lambda s: None,
+            unattended.countdown(cups, seconds=50, sleep=lambda s: None,
                                  log=lambda *_: None)
+
+    def test_one_empty_poll_does_not_abandon_the_pad(self):
+        # devices() returns [] for a busy cupsd, not just for an unplugged
+        # cable. Treating a single one as a disconnect threw away pads.
+        cups = Cups(script=[[DEVICE], [], [DEVICE], [], [DEVICE]])
+        assert unattended.countdown(cups, seconds=5, sleep=lambda s: None,
+                                    log=lambda *_: None) == "elapsed"
 
 
 class TestAButtonMeansPrintNow:
@@ -355,3 +362,126 @@ class TestTheSheetsThatStandInForAPanel:
     def test_the_plan_says_so_when_auto_print_is_off(self):
         lines = " ".join(unattended._plan(settings(auto_print=False)))
         assert "auto_print" in lines
+
+
+class TestEverySheetAsksForTheRightPaper:
+    def test_the_instruction_sheets_carry_the_media_size(self):
+        # These were submitted with no options at all, so a LETTER unit
+        # rendered Letter and asked the queue for nothing.
+        class Recording(Cups):
+            def __init__(self):
+                super().__init__()
+                self.options = []
+
+            def submit(self, data, name="OTP", title="OTP", options=None):
+                self.options.append((title, options))
+                return super().submit(data, name, title, options)
+
+        cups = Recording()
+        run(cups, settings=settings(paper="LETTER"))
+        for title, options in cups.options:
+            assert options, f"{title} was submitted with no options"
+            assert "media" in options, title
+
+    def test_a6_sheets_are_rendered_a6_not_a4(self):
+        from otpunit import diagnostics
+        from reportlab.lib.pagesizes import A6
+
+        assert diagnostics._page_size(config.Settings(paper="A6")) == A6
+
+
+class TestCopyBActuallyReachesPaper:
+    """
+    finish() purges the spool with `cancel -x -a`, which cancels EVERY job
+    on the queue including the one printing. It ran in a finally directly
+    after copy B was handed to lp -- which returns once a job is spooled,
+    not printed. So the unit cancelled its own copy B on every single run
+    and then printed a sheet saying the pair was complete.
+
+    The interactive path has always waited for the queue to drain before
+    touching the spool. These pin that the unattended path does too.
+    """
+
+    class Spool(Cups):
+        """Models lp returning on spool, with work still outstanding."""
+
+        def __init__(self, drain_after=2, stuck=False):
+            super().__init__()
+            self.queued = 0
+            self.polls = 0
+            self.drain_after = drain_after
+            self.stuck = stuck
+            self.purged_with_work = None
+
+        def submit(self, data, name="OTP", title="OTP", options=None):
+            self.queued += 1
+            return super().submit(data, name, title, options)
+
+        def active_jobs(self, name="OTP"):
+            self.polls += 1
+            if self.stuck:
+                return self.queued
+            if self.polls % self.drain_after == 0:
+                self.queued = 0
+            return self.queued
+
+        def purge(self, name="OTP"):
+            if self.purged_with_work is None:
+                self.purged_with_work = self.queued > 0
+
+    def test_the_spool_is_not_purged_while_copy_b_is_live(self):
+        cups = self.Spool()
+        assert run(cups) == 0
+        assert cups.purged_with_work is False, \
+            "purging with work queued cancels the copy that is printing"
+
+    def test_it_waits_for_the_queue_rather_than_a_fixed_timer(self):
+        cups = self.Spool()
+        run(cups)
+        assert cups.polls > 0, "the queue must actually be asked"
+
+    def test_a_queue_that_never_drains_is_not_purged(self):
+        # Unknowable state is not an empty queue. Better to leave the
+        # spool than cancel a job that may still be printing.
+        cups = self.Spool(stuck=True)
+        run(cups, settings=settings())
+        assert cups.purged_with_work in (False, None)
+
+
+class TestAHalfPairIsNeverCalledComplete:
+    def test_an_abort_after_copy_a_says_the_pad_is_unusable(self):
+        class DiesOnB(Cups):
+            def submit(self, data, name="OTP", title="OTP", options=None):
+                if title == "OTP B":
+                    raise printer.PrinterError("out of paper")
+                return super().submit(data, name, title, options)
+
+        cups = DiesOnB()
+        assert run(cups) == 1, "an incomplete pair is not a success"
+        assert "WHAT TO DO NOW" in cups.titles()
+
+    def test_the_final_sheet_does_not_claim_two_identical_copies(self,
+                                                                monkeypatch):
+        seen = []
+        real = unattended.diagnostics.render_bytes
+
+        def spy(sections, page_size=None, **heading):
+            seen.append((heading, sections))
+            return real(sections, page_size, **heading)
+
+        monkeypatch.setattr(unattended.diagnostics, "render_bytes", spy)
+        unattended.sheet(unattended.HALF, codeword="X-Y", settings=settings())
+        heading, sections = seen[-1]
+        blurb = f"{heading.get('title','')} {heading.get('subtitle','')}"
+        assert "NOT USABLE" in blurb
+        body = " ".join(str(v) for _, rows in
+                        ((s.title, s.rows) for s in sections)
+                        for _, v in rows)
+        assert "DESTROY" in body
+        assert "identical" not in body
+
+    def test_the_half_pair_sheet_is_one_page(self):
+        import re
+        data = bytes(unattended.sheet(unattended.HALF, codeword="X-Y",
+                                      settings=settings()))
+        assert len(re.findall(rb"/Type\s*/Page[^s]", data)) == 1

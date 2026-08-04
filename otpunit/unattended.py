@@ -39,6 +39,11 @@ class Aborted(Exception):
     """The printer went away mid-sequence."""
 
 
+# Consecutive empty device lists before believing the printer is really
+# gone. One empty answer is a hiccup; several in a row is a cable.
+GONE_AFTER = 3
+
+
 def _press_waiter(buttons):
     """
     A callable that reports whether anything is pressing a button.
@@ -79,27 +84,65 @@ def countdown(cups, seconds, buttons=None, sleep=None, log=print,
     """
     sleep = sleep or time.sleep
     pressed = _press_waiter(buttons)
+    # Discard edges banked BEFORE this window opened. GpioButtons is a
+    # queue, and a stray edge -- a wire being connected, a test press at
+    # boot -- otherwise satisfies the very next countdown instantly. Two
+    # banked taps erased both the 5-minute abort window and the tray
+    # break, spooling copy A and copy B back to back.
+    for _ in range(64):
+        if not pressed():
+            break
     waited = 0.0
+    misses = 0
     while waited < seconds:
         if pressed():
             log("button pressed; starting now")
             return "pressed"
+        # A single empty answer is NOT a disconnect. The real
+        # Cups.devices() swallows every error and returns [] -- a busy
+        # cupsd, a timed-out lpinfo, a missing binary all look identical
+        # to an unplugged cable. Reading one of those as "unplugged"
+        # abandoned the pad mid-pair over a hiccup, and the except-clause
+        # that was supposed to tolerate it was dead code, because
+        # devices() cannot raise.
         try:
-            if not cups.devices():
-                raise Aborted("printer disconnected")
-        except Aborted:
-            raise
+            present = bool(cups.devices())
         except Exception as exc:                 # noqa: BLE001
-            # A failed lookup is not the same as an unplugged printer.
-            # Carry on rather than throwing away a pad over a hiccup.
-            log(f"printer lookup failed, continuing: {exc}")
+            log(f"printer lookup failed: {exc}")
+            present = False
+        misses = 0 if present else misses + 1
+        if misses >= GONE_AFTER:
+            raise Aborted("printer disconnected")
         sleep(step)
         waited += step
     return "elapsed"
 
 
+def drain(cups, queue, sleep, log, timeout=3600.0, step=2.0) -> bool:
+    """
+    Block until the queue reports no work, or the timeout expires.
+
+    True means the queue is genuinely empty and it is safe to purge.
+    False means we could not establish that -- an unanswerable lpstat or a
+    queue that never emptied -- in which case the caller must NOT purge,
+    because cancelling a job that is still printing destroys the copy.
+    """
+    waited = 0.0
+    while waited < timeout:
+        try:
+            queued = cups.active_jobs(queue)
+        except Exception:                        # noqa: BLE001
+            queued = None
+        if queued == 0:
+            return True
+        sleep(step)
+        waited += step
+    log("timed out waiting for the print queue to drain")
+    return False
+
+
 def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
-        sleep=None, buttons=None, vocabulary=None) -> int:
+        sleep=None, buttons=None, vocabulary=None, driver=None) -> int:
     """
     Status sheet, a pause, then a pad pair, with printed sheets between.
 
@@ -111,13 +154,20 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
 
     codeword = settings.auto_codeword or vocabulary.random()
 
+    # Every sheet carries the media size. Dropping it left the status,
+    # swap and done sheets submitted with no media at all, so a LETTER or
+    # A6 unit rendered one size and asked the queue for another.
+    paper = {"media": getattr(settings, "paper", "A4")}
+
     def send(data, title, options=None):
-        cups.submit(data, name=queue, title=title, options=options or {})
+        cups.submit(data, name=queue, title=title,
+                    options=paper if options is None else options)
 
     # 1. Say what is about to happen, before doing any of it.
     send(diagnostics.render_bytes(
         diagnostics.collect(settings=settings, printer=_first(cups),
-                            queue=queue, plan=_plan(settings)),
+                            queue=queue, driver=driver,
+                            plan=_plan(settings)),
         diagnostics._page_size(settings)), "OTP status")
     log("status sheet submitted")
 
@@ -166,6 +216,8 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         log(f"generation failed: {exc}")
         return 1
 
+    printed_b = False
+    drained = False
     try:
         job.print_next_copy()
         log(f"copy A submitted ({settings.pages} pages)")
@@ -174,24 +226,55 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         #    for a keypress, so the sheet names the deadline instead.
         send(sheet(SWAP, codeword=codeword, settings=settings,
                    seconds=settings.auto_swap_delay), "REMOVE COPY A")
+
+        # Wait for copy A and the separator to physically COME OUT before
+        # timing the tray break. lp returns once a job is spooled, so a
+        # fixed timer started here runs while the printer is still working
+        # -- at 12 ppm a 25-sheet copy A needs 125s against a 90s break, so
+        # copy B was spooled before the separator sheet even landed.
+        drain(cups, queue, sleep, log)
         countdown(cups, settings.auto_swap_delay, buttons=buttons,
                   sleep=sleep, log=log)
 
         job.print_next_copy()
         log("copy B submitted")
+
+        # THE important wait. finish() below purges the spool with
+        # `cancel -x -a`, which cancels every job on the queue INCLUDING
+        # the one currently printing -- and copy B was handed to lp
+        # microseconds ago. Without this the unit cancelled its own copy B
+        # on every single run, then printed a sheet saying the pair was
+        # complete. The interactive path has always waited for this; the
+        # unattended path did not.
+        drained = drain(cups, queue, sleep, log)
+        if not drained:
+            log("queue never drained; leaving the spool rather than "
+                "cancelling a copy that may still be printing")
+        printed_b = True
     except Aborted as exc:
         log(f"aborted mid-pair: {exc}")
-        return 1
     except Exception as exc:                     # noqa: BLE001
         log(f"printing failed: {exc}")
-        return 1
     finally:
-        job.finish()
+        try:
+            # The key is wiped either way; only the spool purge is
+            # conditional, because cancelling an in-flight job destroys
+            # the copy that is printing.
+            job.finish(purge=drained)
+        except Exception as exc:                 # noqa: BLE001
+            # Never let a wipe failure mask what happened to the pair.
+            log(f"wipe failed: {exc}")
 
-    # 6. What they are now holding, and what it costs them to get wrong.
-    send(sheet(DONE, codeword=codeword, settings=settings), "WHAT TO DO NOW")
-    log("done")
-    return 0
+    # 6. What they are now holding -- which is NOT always a pair. Saying
+    #    "two identical copies" over half a pair is worse than saying
+    #    nothing, because the operator files it and finds out later.
+    try:
+        send(sheet(DONE if printed_b else HALF, codeword=codeword,
+                   settings=settings), "WHAT TO DO NOW")
+    except Exception as exc:                     # noqa: BLE001
+        log(f"could not print the final sheet: {exc}")
+    log("done" if printed_b else "pair incomplete")
+    return 0 if printed_b else 1
 
 
 def _first(cups):
@@ -271,6 +354,7 @@ def _plan(settings: Settings) -> list[str]:
 
 SWAP = "swap"
 DONE = "done"
+HALF = "half"
 
 
 def _key_source() -> str:
@@ -321,6 +405,31 @@ def sheet(kind, codeword="", settings=None, seconds=0):
                 (None, "Unlike the status sheet, these pages ARE secret. "
                        "Anyone who photographs them can read every message "
                        "the pad ever protects."),
+            ]),
+        ]
+    elif kind is HALF:
+        heading = dict(
+            title="STOP -- THIS PAD IS NOT USABLE",
+            subtitle="Printing did not finish. What is in the tray is half "
+                     "a pair, and half a pair is worthless.")
+        sections = [
+            diagnostics.Section("WHAT WENT WRONG", [
+                (None, "Copy A was printed but copy B was not, so there is "
+                       "no second copy to give to the person you were going "
+                       "to talk to. A one-time pad only works because both "
+                       "ends hold the SAME key."),
+                ("Codeword", codeword or "(unset)"),
+            ]),
+            diagnostics.Section("WHAT TO DO", [
+                (None, "1. DESTROY every page in the tray. Burn it. Do not "
+                       "keep it and do not try to use it -- the key has "
+                       "already been wiped from this unit, so a matching "
+                       "copy B can never be made."),
+                (None, "2. Check the printer: paper, toner, a jam, or the "
+                       "cable. The status sheet at the top of the stack "
+                       "lists what this unit could see."),
+                (None, "3. Power the unit off and on with the printer "
+                       "attached to try again. It will roll a new codeword."),
             ]),
         ]
     else:

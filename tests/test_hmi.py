@@ -157,3 +157,67 @@ class TestClosingUp:
 
     def test_close_handles_missing_parts(self):
         hmi.Interface().close()
+
+
+class TestAnInterfaceNobodyAnswersIsNotAnInterface:
+    """
+    Opening GpioButtons proves only that a pin could be reserved. gpiozero
+    has no presence detection, so on any Pi with lgpio the constructor
+    always succeeds -- tests/test_hardware.py builds one against a mock
+    factory with nothing wired and asserts exactly that.
+
+    Without a liveness check, attaching a monitor to a working headless
+    unit made `interactive` True and sent it into a menu whose first
+    wait() blocks forever. No pad, no log line, no fallback.
+    """
+
+    class Silent:
+        def wait(self, timeout=None):
+            return None
+
+    class Answers:
+        def __init__(self):
+            self.calls = 0
+
+        def wait(self, timeout=None):
+            self.calls += 1
+            return "PRESS" if self.calls > 1 else None
+
+    class Broken:
+        def wait(self, timeout=None):
+            raise OSError(121, "Remote I/O error")
+
+    def _interface(self, buttons):
+        return hmi.Interface(display=object(), buttons=buttons,
+                             display_kind="HDMI console",
+                             input_kind="GPIO buttons")
+
+    def test_silence_means_not_drivable(self):
+        clock = [0.0]
+
+        def tick(_):
+            clock[0] += 0.5
+        assert self._interface(self.Silent()).prove(
+            seconds=5, sleep=tick, clock=lambda: clock[0]) is False
+
+    def test_a_press_proves_it(self):
+        clock = [0.0]
+        assert self._interface(self.Answers()).prove(
+            seconds=5, sleep=lambda _: clock.__setitem__(0, clock[0] + 0.5),
+            clock=lambda: clock[0]) is True
+
+    def test_it_gives_up_rather_than_waiting_forever(self):
+        # The bug was an unbounded wait. Pin that this returns.
+        clock = [0.0]
+
+        def tick(_):
+            clock[0] += 1.0
+        assert self._interface(self.Silent()).prove(
+            seconds=3, sleep=tick, clock=lambda: clock[0]) is False
+        assert clock[0] >= 3
+
+    def test_a_broken_button_layer_does_not_hang(self):
+        assert self._interface(self.Broken()).prove(seconds=5) is False
+
+    def test_nothing_to_press_is_not_drivable(self):
+        assert hmi.Interface(display=object()).prove(seconds=5) is False

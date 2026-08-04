@@ -168,7 +168,7 @@ HAJUT SHIFN RCFVF YVIIM TLVIG ...          ← key body, five-letter groups
 A Raspberry Pi that does nothing but print pads. It boots straight into a
 single-purpose appliance: plug in a USB laser printer, pick a codeword and a
 page count on a small OLED with three buttons, and it prints the A and B
-copies back to back, then wipes itself. No screen, no keyboard, no network.
+copies back to back, then wipes itself. No network. A screen and keyboard are optional: it will use an HDMI monitor and a USB keyboard if they are there, an OLED and three buttons if they are not, and paper alone if neither.
 
 This exists because the manual's advice about generation hygiene is hard to
 follow with a laptop and easy to follow with a dedicated box:

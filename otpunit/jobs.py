@@ -203,12 +203,21 @@ class PadPairJob:
     def done(self) -> bool:
         return self.copies_done >= self.spec.copies
 
-    def finish(self) -> None:
-        """Zero the key material and empty the spool. Safe to call twice."""
+    def finish(self, purge: bool = True) -> None:
+        """
+        Zero the key material and empty the spool. Safe to call twice.
+
+        The key is ALWAYS zeroed; that part is not optional. The purge is,
+        because `cancel -x -a` cancels every job on the queue including
+        one that is still printing. A caller that could not establish the
+        queue was empty passes purge=False and leaves the spool alone --
+        it is on tmpfs and dies with the power, which is a far better
+        outcome than shredding the copy currently coming out.
+        """
         if self._buffer is not None:
             zero(self._buffer)
             self._buffer = None
-        if self.spec.carries_key_material:
+        if purge and self.spec.carries_key_material:
             self.cups.purge(self.queue)
 
     def __enter__(self):

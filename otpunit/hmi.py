@@ -46,6 +46,43 @@ class Interface:
         """A menu needs something to draw on AND something to press."""
         return self.display is not None and self.buttons is not None
 
+    def prove(self, seconds: float = 20.0, sleep=None, clock=None) -> bool:
+        """
+        Wait for one press, to confirm somebody can actually drive this.
+
+        Opening GpioButtons proves NOTHING about whether buttons exist.
+        gpiozero only reserves and configures a pin; there is no presence
+        detection, so on any Pi with lgpio installed -- every unit this
+        targets -- the constructor always succeeds. That made the keyboard
+        branch unreachable, and worse: attaching a monitor to a working
+        headless unit promoted `display` to non-None, `interactive` to
+        True, and sent it into a menu whose first `buttons.wait()` blocks
+        on an empty queue forever. No pad, no log line, no timeout.
+
+        A keyboard being present says nothing either -- it says a keyboard
+        is plugged in, not that anyone is at it.
+
+        So neither is trusted. One press within the window and the panel
+        is proven; silence means print instead. The cost is that an
+        operator must press something at boot, which also tells them the
+        panel works.
+        """
+        import time
+
+        sleep = sleep or time.sleep
+        clock = clock or time.monotonic
+        if not self.interactive:
+            return False
+        deadline = clock() + seconds
+        while clock() < deadline:
+            try:
+                if self.buttons.wait(timeout=0.5) is not None:
+                    return True
+            except Exception:                    # noqa: BLE001
+                return False
+            sleep(0)
+        return False
+
     def describe(self) -> str:
         return f"display: {self.display_kind}, input: {self.input_kind}"
 
@@ -127,7 +164,7 @@ def open_display(rotate: int = 0, log=None):
             log(f"no OLED ({exc})")
 
     if screen_connected() and console_usable():
-        return ConsoleDisplay(stream=sys.stdout), "HDMI console"
+        return ConsoleDisplay(stream=sys.stdout, hint=False), "HDMI console"
     return None, "none"
 
 
@@ -140,7 +177,7 @@ def open_buttons(log=None):
             log(f"no GPIO buttons ({exc})")
 
     if keyboard_connected() and console_usable():
-        return KeyboardButtons(), "USB keyboard"
+        return KeyboardButtons(allow_quit=False), "USB keyboard"
     return None, "none"
 
 

@@ -80,9 +80,9 @@ def drive(cups, rounds=6, sequence=None, **kwargs):
 def record(cups):
     """A stand-in sequence that just notes it ran."""
     def sequence(c, settings=None, queue="OTP", log=None, sleep=None,
-                 buttons=None):
+                 buttons=None, driver=None):
         cups.submitted.append({"title": "OTP status", "data": b"%PDF-",
-                               "options": {"media": getattr(settings, "paper", "A4")}})
+                               "driver": driver})
         return 0
     return sequence
 
@@ -204,10 +204,23 @@ class TestTheHeadlessLoop:
         drive(cups, rounds=8)
         assert len(cups.submitted) == 1, "one sheet per connection, not per poll"
 
-    def test_it_reprints_after_a_disconnect_and_reconnect(self):
-        cups = Cups(script=[[DEVICE], [], [], [DEVICE]])
-        drive(cups, rounds=5)
+    def test_it_reprints_after_a_real_disconnect_and_reconnect(self):
+        # GONE_AFTER consecutive empties, not one: see below.
+        cups = Cups(script=[[DEVICE], [], [], [], [DEVICE]])
+        drive(cups, rounds=6)
         assert len(cups.submitted) == 2
+
+    def test_one_bad_poll_does_not_start_a_second_pad_pair(self):
+        """
+        The real Cups.devices() returns [] for a busy cupsd or a timed-out
+        lpinfo exactly as it does for an unplugged cable. Re-arming on one
+        of those printed a whole second pair -- 68 more sheets and a fresh
+        codeword -- with the first still in the tray. One bad poll in five
+        produced twelve pad-pair starts in sixty polls.
+        """
+        cups = Cups(script=[[DEVICE], [], [DEVICE], [], [DEVICE], []])
+        drive(cups, rounds=8)
+        assert len(cups.submitted) == 1
 
     def test_it_waits_quietly_with_no_printer(self):
         cups = Cups(script=[[]] * 6)
@@ -243,10 +256,17 @@ class TestTheHeadlessLoop:
         drive(cups, rounds=3)
         assert cups.polls >= 3, "it must keep trying"
 
-    def test_the_media_option_follows_the_configured_paper(self):
-        cups = Cups()
-        drive(cups, settings=config.Settings(paper="A4"))
-        assert cups.submitted[0]["options"]["media"] == "A4"
+    def test_the_queue_setup_error_reaches_the_sequence(self):
+        """
+        The setup error is the most useful line on the sheet a mute unit
+        prints. Moving collect() into unattended.run left `driver`
+        computed here and passed nowhere, so the sheet always said
+        "Driver unknown" -- and the test that covered it only counted
+        sheets, so it stayed green.
+        """
+        cups = Cups(fail_setup=True)
+        drive(cups)
+        assert "no driver" in (cups.submitted[0]["driver"] or "")
 
     def test_once_returns_rather_than_looping(self):
         cups = Cups()

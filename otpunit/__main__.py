@@ -48,6 +48,27 @@ class SimulatedCups(Cups):
         pass
 
 
+PROVE_SECONDS = 20.0
+
+
+def _prove(interface, log) -> bool:
+    from otpunit.hw.display import Frame
+
+    try:
+        interface.display.show(Frame(
+            title="PRESS ANY BUTTON",
+            lines=["TO USE THE PANEL.", "", "OTHERWISE THIS UNIT",
+                   "PRINTS ON ITS OWN."],
+            footer="WAITING..."))
+    except Exception:                            # noqa: BLE001
+        pass
+    if interface.prove(PROVE_SECONDS):
+        log("panel answered; using it")
+        return True
+    log("nobody answered the panel; printing instead")
+    return False
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="OTP pad print unit")
     parser.add_argument("--sim", action="store_true",
@@ -65,7 +86,11 @@ def main(argv=None):
     log = lambda message: print(message, file=sys.stderr)   # noqa: E731
 
     if args.sim:
-        interface = hmi.Interface(ConsoleDisplay(), KeyboardButtons(),
+        # allow_quit only in the simulator: on a real unit QUIT ends the
+        # process with status 0, and Restart=on-failure reads that as
+        # success and does not restart.
+        interface = hmi.Interface(ConsoleDisplay(),
+                                  KeyboardButtons(allow_quit=True),
                                   "terminal", "keyboard")
         cups = SimulatedCups()
     else:
@@ -80,7 +105,13 @@ def main(argv=None):
     # No menu without something to draw on AND something to press. That is
     # not an error: it is the case this device exists for, so fall through
     # to printing unattended, using the printer itself as the interface.
-    if args.diagnostic or not interface.interactive:
+    # An interface that nobody answers is not an interface. See
+    # Interface.prove: opening GPIO buttons proves only that a pin could
+    # be reserved, so without this a monitor plus no buttons walks into a
+    # menu that blocks forever instead of printing.
+    driven = interface.interactive and (args.sim or _prove(interface, log))
+
+    if args.diagnostic or not driven:
         from otpunit import diagnostics
 
         buttons = interface.buttons
@@ -114,7 +145,16 @@ def main(argv=None):
 
     if app.shutdown_requested and not args.sim:
         subprocess.run(["/sbin/poweroff"])
-    return 0
+        return 0
+    if args.sim:
+        return 0
+    # The menu ended without anyone asking to shut down -- a hangup, a
+    # stray key, an empty screen stack. Exit NON-ZERO so systemd's
+    # Restart=on-failure brings the unit back. Returning 0 here told
+    # systemd the appliance had finished its job, and it stayed off until
+    # somebody power-cycled it.
+    log("panel exited without a shutdown request; restarting")
+    return 1
 
 
 if __name__ == "__main__":

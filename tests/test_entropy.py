@@ -92,28 +92,26 @@ class TestItFailsSafeRatherThanQuietly:
         assert len(data) == 512
         assert len(set(data)) > 16, "must fall back, not emit zeros"
 
-    def test_a_slow_trng_gives_up_instead_of_blocking(self, tmp_path,
-                                                       monkeypatch):
+    def test_a_slow_trng_gives_up_instead_of_blocking(self, monkeypatch):
         """
-        TRNG throughput varies by two orders of magnitude -- a Pi's does
-        ~100 KiB/s, a throttled virtio-rng ~6 KiB/s. A 1000-page pad needs
-        ~700 KB, so an unbounded read is minutes of a printer doing
-        nothing with no way to tell why.
+        The deadline has to bound the WAIT, not be checked around it.
 
-        The deadline has to be checked DURING the read, not between reads:
-        a single large read blocks in the kernel until satisfied, which
-        measured 73 seconds against a 1-second budget before the reads
-        were chunked.
+        Three versions of this failed. Checking after the read let a single
+        blocking read sit in the kernel indefinitely -- 73 seconds against a
+        1-second budget. Chunking helped but the check read `if got < n`, so
+        a request satisfied in one chunk never evaluated it, and every
+        request this program makes is one chunk (an A6 page is 1340 bytes
+        against a 4096 chunk) -- so it never ran in production at all.
+
+        Note the fake returns EXACTLY n bytes. An earlier version of this
+        test over-delivered, so `len(data) == n` rejected the result no
+        matter what the deadline did, and the test passed with the deadline
+        deleted.
         """
         class SlowFile:
-            def __init__(self, *args, **kwargs):
-                self.served = 0
-
             def read(self, n):
-                # Every chunk costs "time"; the fake clock does the rest.
                 clock[0] += 1.0
-                self.served += n
-                return bytes(range(256)) * (n // 256 + 1)
+                return bytes(range(256)) * (n // 256) + bytes(n % 256)
 
             def __enter__(self):
                 return self
@@ -125,9 +123,21 @@ class TestItFailsSafeRatherThanQuietly:
         monkeypatch.setattr(gen, "HWRNG_TIMEOUT", 3.0)
         monkeypatch.setattr(gen.time, "monotonic", lambda: clock[0])
         monkeypatch.setattr("builtins.open", lambda *a, **k: SlowFile())
-        # Far more than the budget allows at one chunk per simulated
-        # second, so it must abandon the request.
+        # Many chunks at one simulated second each, against a 3s budget.
         assert gen._hwrng_bytes(gen._HWRNG_CHUNK * 100) is None
+
+    def test_the_deadline_bounds_a_device_that_stops_answering(self,
+                                                               monkeypatch):
+        # select() is what makes this bounded: a device that never becomes
+        # readable must time out rather than block inside read().
+        monkeypatch.setattr(gen, "HWRNG_TIMEOUT", 0.25)
+        monkeypatch.setattr(gen.select, "select",
+                            lambda r, w, x, t: ([], [], []))
+        import time as real_time
+
+        start = real_time.monotonic()
+        assert gen._hwrng_bytes(4096, "/dev/zero") is None
+        assert real_time.monotonic() - start < 5
 
     def test_a_fast_trng_is_not_cut_off_early(self, hwrng, monkeypatch):
         # The converse of the test above: a device that keeps up must be

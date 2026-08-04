@@ -73,7 +73,9 @@ of each, so these all work:
 both, they need no soldering, and the menu they give you is the same one
 the OLED shows — the unit binds itself to `tty1`, so plug an HDMI screen
 and a USB keyboard into a Pi and it just appears. Arrow keys move,
-Enter selects, and holding Enter is "back".
+Enter selects, and **SHIFT+K** is back or cancel. There is no
+hold-to-go-back on a keyboard: `KeyboardButtons` maps single keys, so
+the long press that the three-button panel uses has its own key here.
 
 It checks the DRM connector rather than trusting the presence of a
 terminal, so a unit with nothing plugged into its HDMI socket does not
@@ -153,18 +155,24 @@ unit found:
 - which of `luma.oled`, `gpiozero` and `lgpio` actually imported
 - the printer it detected, the queue it created and the driver it matched
 - whether swap is off, whether the root filesystem is a read-only overlay,
-  and whether any network link is up — the three claims this device makes
+  whether any network link is up, and whether the key came from the
+  hardware RNG — the claims this device makes
   about itself, checked rather than asserted
 - Pi model, serial, memory, temperature, kernel, entropy, disk
 
 It reprints when the printer is unplugged and reconnected, not on a timer,
-so a unit left plugged in overnight produces one sheet and not a ream. To
+so a unit left plugged in overnight runs the sequence once, not repeatedly. To
 ask for one deliberately:
 
 ```sh
 sudo systemctl stop otp-unit
-sudo -u otp python3 -m otpunit --diagnostic
+sudo python3 -m otpunit --diagnostic
 ```
+
+Note this runs the **whole** unattended sequence, pads included — it is
+not a status-sheet-only switch. To get the sheet without the pads, set
+`auto_print = no` first. (The service runs as root; there is no `otp`
+user.)
 
 The sheet carries no key material and is safe to photograph or email when
 you want help with a unit that will not come up. The sheets that come out
