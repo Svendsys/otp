@@ -93,14 +93,25 @@ def main(argv=None):
     if args.diagnostic or (not args.sim and display is None):
         from otpunit import diagnostics
 
+        from otpunit import unattended
+
         if display is not None:
             display.close()
-        print("no display detected; entering diagnostic mode"
-              if display is None else "diagnostic sheet requested",
+        print("no display detected; running unattended"
+              if display is None else "unattended sequence requested",
               file=sys.stderr)
-        return diagnostics.run_headless(
-            Cups(), settings=settings, once=args.diagnostic,
-            log=lambda message: print(message, file=sys.stderr))
+        # Buttons are optional here and stay optional: with no panel a
+        # press only ever means "stop waiting", so a unit with nothing
+        # bridging those pins still produces a pad, just later.
+        buttons = unattended.open_buttons()
+        try:
+            return diagnostics.run_headless(
+                Cups(), settings=settings, once=args.diagnostic,
+                buttons=buttons,
+                log=lambda message: print(message, file=sys.stderr))
+        finally:
+            if buttons is not None:
+                buttons.close()
 
     display, buttons, cups = build(args, display)
     app = App(

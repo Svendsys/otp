@@ -42,6 +42,18 @@ PAPER_LABELS = {
 }
 
 
+def _codeword_ok(word: str) -> bool:
+    """
+    A hand-typed codeword has to survive being used as a filename.
+
+    Imported lazily rather than at module scope because config is loaded
+    before anything else and must not depend on the codewords module.
+    """
+    from otpunit import codewords
+
+    return codewords.is_filename_safe(word)
+
+
 @dataclass
 class Settings:
     pages: int = 100
@@ -51,6 +63,21 @@ class Settings:
     training: bool = False
     font_size: float = 9.0
     paper: str = "A4"
+    # --- unattended operation ------------------------------------------
+    # What the unit does when there is no panel and no buttons attached.
+    # Defaulting this ON is deliberate. A unit that can only tell you to go
+    # and find an SSD1306 is useless to someone who cannot get one, and the
+    # pads are the point -- the panel only ever chose a codeword and a page
+    # count, both of which have perfectly good defaults.
+    auto_print: bool = True
+    # Seconds between the status sheet and the pad. Long enough to read the
+    # sheet and pull the plug, short enough not to abandon someone.
+    auto_delay: int = 300
+    # Seconds the tray break gets, since with no buttons nothing can wait
+    # for a keypress before copy B starts.
+    auto_swap_delay: int = 90
+    # Empty means roll one. Set it to agree a codeword out of band.
+    auto_codeword: str = ""
 
     @property
     def imposed(self) -> bool:
@@ -131,6 +158,14 @@ class Settings:
             problems.append("auth size cannot be negative")
         if self.paper not in PAPER_CHOICES:
             problems.append("unknown paper size")
+        # Zero is allowed: it means "print the pad immediately", which is
+        # what someone who already knows what this unit does will want.
+        if self.auto_delay < 0:
+            problems.append("auto delay cannot be negative")
+        if self.auto_swap_delay < 0:
+            problems.append("auto swap delay cannot be negative")
+        if self.auto_codeword and not _codeword_ok(self.auto_codeword):
+            problems.append("auto codeword must be A-Z, 0-9, - or _ only")
         # isfinite as well as > 0: nan compares False against BOTH bounds, so
         # a bare `<= 0` check lets it through to calc_max_chars, which then
         # raises out of load() before the panel exists.
@@ -231,9 +266,20 @@ def render(settings: Settings) -> str:
         "",
     ]
     for key, value in asdict(settings).items():
+        # The unit reads auto_codeword but never writes one. A codeword is
+        # not key material, but it names a live pad, and the SD card is the
+        # part most likely to be captured together with the unit -- so the
+        # card must never learn which pad this unit produced. A human who
+        # deliberately puts one there is making their own trade; the unit
+        # does not make it for them, and does not record it afterwards.
+        if key == "auto_codeword":
+            continue
         if isinstance(value, bool):
             value = "yes" if value else "no"
         lines.append(f"{key} = {value}")
+    lines.append("")
+    lines.append("# auto_codeword = MODIFIER-NOUN   # optional; read but"
+                 " never written by the unit")
     return "\n".join(lines) + "\n"
 
 

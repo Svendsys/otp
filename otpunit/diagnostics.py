@@ -232,7 +232,8 @@ def _image_build():
     return _read("/etc/otp-image-release", 400).replace("\n", "  ")
 
 
-def collect(settings=None, printer=None, queue=None, driver=None) -> list[Section]:
+def collect(settings=None, printer=None, queue=None, driver=None,
+            plan=None) -> list[Section]:
     """Everything worth knowing, as printable sections. Never raises."""
     sections = []
 
@@ -240,24 +241,39 @@ def collect(settings=None, printer=None, queue=None, driver=None) -> list[Sectio
         (None, "This unit booted with no display attached, so it printed its "
                "status here instead. The printer is the only output device a "
                "headless unit has."),
-        (None, "It will NOT print pads in this state: choosing a codeword and "
-               "a page count needs the panel and buttons. Add the hardware "
-               "below and reboot."),
+        (None, "It contains no key material and is safe to show anyone."),
     ]))
 
-    sections.append(Section("WHAT TO DO NEXT", [
-        (None, "1. Wire up a 128x64 SSD1306 OLED and three momentary buttons "
-               "as listed under WIRING."),
-        (None, "2. Reboot. The unit detects the panel on the I2C bus at "
-               "start-up; nothing needs configuring."),
-        (None, "3. If the panel still does not come up, compare the I2C scan "
-               "below against 0x3C (or 0x3D)."),
-        (None, "4. To print this sheet again, power-cycle with the printer "
-               "attached, or run: python3 -m otpunit --diagnostic"),
+    # The countdown notice, when the unit is about to print a pad on its
+    # own. This is the part someone with no hardware actually needs.
+    if plan:
+        sections.append(Section("WHAT HAPPENS NEXT",
+                                [(None, line) for line in plan]))
+
+    sections.append(Section("CONFIGURATION", [
+        (None, "Power the unit off, take the SD card to any computer, and "
+               "edit otp-unit.conf on its first partition -- it is a FAT "
+               "partition, so Windows, macOS and Linux can all read it. This "
+               "works with no display, no buttons and no network."),
+        ("auto_print", "yes/no -- print a pad pair on its own"),
+        ("auto_delay", "seconds to wait first (0 = at once)"),
+        ("auto_codeword", "leave empty to have one rolled"),
+        ("pages", "pages per copy (default 100)"),
+        ("paper", "A4, LETTER or A6"),
     ]))
 
-    sections.append(Section("WIRING", [(f"{sig}", f"{pin} / {hdr}")
-                                       for sig, pin, hdr in PINOUT]))
+    sections.append(Section("IF YOU HAVE NO PARTS AT ALL", [
+        (None, "You do not need buttons. Briefly bridging header pin 33 to "
+               "pin 34 with a wire, a paperclip or a screwdriver is a button "
+               "press, and during the wait above that means START NOW."),
+        (None, "You do not need the display to get pads. It only ever chose "
+               "a codeword and a page count, and the defaults are fine. "
+               "Everything below is how to make the unit nicer to use, not "
+               "how to make it work."),
+    ]))
+
+    sections.append(Section("WIRING (OPTIONAL)", [(f"{sig}", f"{pin} / {hdr}")
+                                                  for sig, pin, hdr in PINOUT]))
 
     sections.append(Section("PANEL AND BUTTONS", [
         ("I2C bus nodes", _try(_i2c_buses)),
@@ -347,10 +363,23 @@ def _wrap(text, font, size, width, canvas):
     return lines
 
 
-def render(sections, output, page_size=A4) -> None:
-    """Draw the report onto `output` (a path or a binary stream)."""
+STATUS_TITLE = "OTP PRINT UNIT - STATUS SHEET"
+STATUS_SUBTITLE = ("No display detected. This sheet is printed automatically; "
+                   "it contains no key material.")
+
+
+def render(sections, output, page_size=A4, title=STATUS_TITLE,
+           subtitle=STATUS_SUBTITLE) -> None:
+    """
+    Draw the report onto `output` (a path or a binary stream).
+
+    The heading is a parameter because these same two columns are used for
+    the sheets that stand in for a panel, and the status sheet's "contains
+    no key material" is a dangerous thing to print at the top of the sheet
+    that tells someone to keep the secret pages above it.
+    """
     width, height = page_size
-    canvas = gen.new_canvas(output, page_size, title="OTP unit status")
+    canvas = gen.new_canvas(output, page_size, title="OTP unit")
 
     margin = 14 * mm
     gutter = 8 * mm
@@ -358,11 +387,9 @@ def render(sections, output, page_size=A4) -> None:
     top = height - margin
 
     canvas.setFont("Helvetica-Bold", TITLE_SIZE)
-    canvas.drawString(margin, top - TITLE_SIZE, "OTP PRINT UNIT - STATUS SHEET")
+    canvas.drawString(margin, top - TITLE_SIZE, title)
     canvas.setFont("Helvetica", BODY_SIZE)
-    canvas.drawString(margin, top - TITLE_SIZE - 11,
-                      "No display detected. This sheet is printed automatically; "
-                      "it contains no key material.")
+    canvas.drawString(margin, top - TITLE_SIZE - 11, subtitle)
     canvas.setLineWidth(0.6)
     canvas.line(margin, top - TITLE_SIZE - 16, width - margin, top - TITLE_SIZE - 16)
 
@@ -442,12 +469,12 @@ def render(sections, output, page_size=A4) -> None:
     canvas.save()
 
 
-def render_bytes(sections, page_size=A4) -> bytearray:
+def render_bytes(sections, page_size=A4, **heading) -> bytearray:
     """The sheet as bytes, for piping straight to lp."""
     import io
 
     buffer = io.BytesIO()
-    render(sections, buffer, page_size)
+    render(sections, buffer, page_size, **heading)
     return bytearray(buffer.getvalue())
 
 
@@ -464,15 +491,20 @@ def _page_size(settings):
 
 
 def run_headless(cups, settings=None, poll_seconds=2.0, log=print,
-                 sleep=None, once=False) -> int:
+                 sleep=None, once=False, sequence=None, buttons=None) -> int:
     """
-    Wait for a printer, print the status sheet, then idle.
+    Wait for a printer, then run the unattended sequence against it.
 
-    Reprints only when the printer goes away and comes back, so a unit left
-    plugged in overnight does not produce a ream. Everything is injectable
-    because this loop is the one part of headless mode a test can drive.
+    Runs once per connection, so a unit left plugged in overnight produces
+    one pad pair and not a ream. Everything is injectable because this
+    loop is the one part of headless mode a test can drive.
     """
     import time
+
+    if sequence is None:
+        from otpunit import unattended
+
+        sequence = unattended.run
 
     sleep = sleep or time.sleep
     printed_for = None
@@ -513,22 +545,18 @@ def run_headless(cups, settings=None, poll_seconds=2.0, log=print,
             log(f"queue setup failed: {exc}")
             driver = f"SETUP FAILED: {exc}"
 
-        sections = collect(settings=settings, printer=device,
-                           queue=queue, driver=driver)
+        # Mark the connection handled BEFORE running the sequence. A
+        # failure part-way through must not leave the loop thinking this
+        # printer is still untouched and start over, printing copy A of a
+        # second pair on top of the first.
+        printed_for = device.uri
         try:
-            data = render_bytes(sections, _page_size(settings))
-            cups.submit(data, name=queue or "OTP", title="OTP status",
-                        options={"media": getattr(settings, "paper", "A4")})
-            log("status sheet submitted")
-            printed_for = device.uri
+            result = sequence(cups, settings=settings, queue=queue or "OTP",
+                              log=log, sleep=sleep, buttons=buttons)
         except Exception as exc:                 # noqa: BLE001
-            log(f"could not print the status sheet: {exc}")
-            if once:
-                return 1
-            # Do not spin: back off before trying this printer again.
-            sleep(poll_seconds)
-            continue
+            log(f"unattended sequence failed: {exc}")
+            result = 1
 
         if once:
-            return 0
+            return result
         sleep(poll_seconds)

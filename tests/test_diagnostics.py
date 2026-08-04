@@ -63,7 +63,7 @@ class Cups:
         return "job-1"
 
 
-def drive(cups, rounds=6, **kwargs):
+def drive(cups, rounds=6, sequence=None, **kwargs):
     """Run the headless loop for a bounded number of polls."""
     calls = []
 
@@ -73,8 +73,18 @@ def drive(cups, rounds=6, **kwargs):
             raise KeyboardInterrupt
     with pytest.raises(KeyboardInterrupt):
         diagnostics.run_headless(cups, sleep=sleep, log=lambda *_: None,
-                                 **kwargs)
+                                 sequence=sequence or record(cups), **kwargs)
     return calls
+
+
+def record(cups):
+    """A stand-in sequence that just notes it ran."""
+    def sequence(c, settings=None, queue="OTP", log=None, sleep=None,
+                 buttons=None):
+        cups.submitted.append({"title": "OTP status", "data": b"%PDF-",
+                               "options": {"media": getattr(settings, "paper", "A4")}})
+        return 0
+    return sequence
 
 
 class TestTheSheetSurvivesABrokenSystem:
@@ -140,9 +150,21 @@ class TestTheSheetFitsAndSaysTheRightThings:
         assert "GPIO13" in text, "the button pinout has to be on the sheet"
         assert "0x3C" in text
 
-    def test_it_says_pads_will_not_print_in_this_state(self):
+    def test_it_says_what_is_about_to_happen(self):
+        # The countdown notice is the part someone with no hardware
+        # actually needs: what is coming, and how to stop it.
+        plan = ["THIS UNIT WILL PRINT A ONE-TIME PAD PAIR IN 5 MINUTES.",
+                "TO STOP IT: unplug the printer."]
+        text = text_of(diagnostics.collect(settings=config.Settings(),
+                                           plan=plan))
+        assert "WILL PRINT" in text and "unplug" in text
+
+    def test_it_explains_the_card_and_the_paperclip(self):
+        # The two control surfaces that need no parts at all.
         text = text_of(diagnostics.collect(settings=config.Settings()))
-        assert "NOT print pads" in text
+        assert "otp-unit.conf" in text
+        assert "paperclip" in text
+        assert "pin 33" in text
 
     def test_it_reports_the_printer_it_found(self):
         text = text_of(diagnostics.collect(printer=DEVICE, queue="OTP",
@@ -192,19 +214,24 @@ class TestTheHeadlessLoop:
         drive(cups, rounds=5)
         assert cups.submitted == []
 
-    def test_a_failed_queue_setup_still_prints_the_sheet(self):
+    def test_a_failed_queue_setup_still_runs_the_sequence(self):
         # The setup error is the single most useful line on the page, so
         # failing to create a queue must not suppress the report.
         cups = Cups(fail_setup=True)
         drive(cups)
         assert len(cups.submitted) == 1
-        body = cups.submitted[0]["data"]
-        assert page_count(body) == 1
 
-    def test_a_failed_submit_does_not_spin(self):
-        cups = Cups(fail_submit=True)
-        calls = drive(cups, rounds=4)
-        assert calls, "a submit failure must back off, not busy-loop"
+    def test_a_sequence_that_raises_does_not_restart_the_pair(self):
+        # Re-running would print copy A of a second pair on top of the
+        # first, which is how a tray ends up holding two half-pairs.
+        cups = Cups(script=[[DEVICE]] * 8)
+
+        def explode(*args, **kwargs):
+            cups.submitted.append("attempt")
+            raise RuntimeError("printer caught fire")
+
+        drive(cups, rounds=8, sequence=explode)
+        assert len(cups.submitted) == 1, "one attempt per connection"
 
     def test_a_lookup_failure_is_survived(self):
         class Broken(Cups):
@@ -224,10 +251,12 @@ class TestTheHeadlessLoop:
     def test_once_returns_rather_than_looping(self):
         cups = Cups()
         assert diagnostics.run_headless(cups, once=True, log=lambda *_: None,
-                                        sleep=lambda s: None) == 0
+                                        sleep=lambda s: None,
+                                        sequence=record(cups)) == 0
         assert len(cups.submitted) == 1
 
     def test_once_reports_failure_when_there_is_no_printer(self):
         cups = Cups(script=[[]])
         assert diagnostics.run_headless(cups, once=True, log=lambda *_: None,
-                                        sleep=lambda s: None) == 1
+                                        sleep=lambda s: None,
+                                        sequence=record(cups)) == 1

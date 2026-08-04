@@ -55,12 +55,61 @@ Three buttons, because a long press does the work of a fourth:
 | OK (tap) | Select, confirm, advance |
 | OK (hold ~1s) | Back, or cancel a running job |
 
-## Before you have any of it: the status sheet
+## If you cannot get any of these parts
 
-You do not need the OLED or the buttons to make a start. Flash the image,
-plug in a USB printer, and power up with nothing else attached. The unit
-finds no panel on the I2C bus, so instead of sitting there mute it waits
-for the printer and prints a single sheet telling you what it found:
+Then the unit still makes pads, and that is the point. Assume the shops
+are shut and nothing is coming: flash the image, plug in a USB printer,
+power up with nothing else attached, and leave it alone. Five minutes
+later it prints a complete, usable pad pair.
+
+The panel was never load-bearing. All it ever did was choose a codeword
+and a page count, and both have defaults that are fine. What replaces it
+is built from things that cannot run out:
+
+| Instead of | Use |
+|---|---|
+| A display | Paper. The unit prints what it would have shown. |
+| Buttons | Time. It waits, and tells you on paper how long. |
+| A cancel button | The plug. Unplugging the printer aborts everything. |
+| A confirm button | Any wire. Bridging pin 33 to pin 34 means "now". |
+| A settings menu | The SD card. `otp-unit.conf` in any computer. |
+
+The sequence, once a printer appears:
+
+1. **Status sheet**, at once — what it found, and a countdown saying
+   exactly what is about to print and how to stop it.
+2. **Five minutes**, so there is time to read that and pull the plug.
+   Bridging header pin 33 to pin 34 with a wire, a paperclip or a
+   screwdriver skips the wait.
+3. **A tabula recta card** — the lookup table that lets you encrypt and
+   decrypt by hand without doing any arithmetic.
+4. **Copy A** of the pad.
+5. **A separator sheet**: take copy A out of the tray, copy B follows in
+   90 seconds. With no buttons, the sheet *is* the prompt.
+6. **Copy B** — byte-identical to A, which is what makes them a pair.
+7. **A final sheet**: what you are holding, the four rules that matter,
+   and how to use it.
+
+It does this once per connection, not on a timer. To make another pair,
+power-cycle with the printer attached. To change anything, edit
+`otp-unit.conf` on the SD card's first partition — it is FAT, so any
+computer can read it:
+
+```ini
+auto_print    = yes          # print a pair unattended
+auto_delay    = 300          # seconds to wait first; 0 prints at once
+pages         = 100          # pages per copy
+auto_codeword =              # leave empty to have one rolled
+```
+
+The unit **reads** `auto_codeword` but never writes one. A codeword is not
+key material, but it names a live pad, and the SD card is the part most
+likely to be captured along with the unit.
+
+## The status sheet
+
+Whether or not you let it print pads, the first sheet tells you what the
+unit found:
 
 - the wiring table below, so you can build the panel from the sheet alone
 - an I2C scan, so you can tell "nothing wired up" from "wired up, but at
