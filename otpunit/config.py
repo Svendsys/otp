@@ -78,6 +78,11 @@ class Settings:
     auto_swap_delay: int = 90
     # Empty means roll one. Set it to agree a codeword out of band.
     auto_codeword: str = ""
+    # Print the manual before the pads. On by default and deliberately so:
+    # a pad is useless to someone who does not know the rules, and one
+    # reused page undoes the whole scheme. Costs paper, which is the right
+    # trade for the situation this mode exists for.
+    auto_manual: bool = True
 
     @property
     def imposed(self) -> bool:

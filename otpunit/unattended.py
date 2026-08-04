@@ -133,9 +133,21 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         log(f"aborted: {exc}")
         return 1
 
-    # 3. The tabula recta, which is what makes a pad usable by hand
-    #    without the manual. No key material, so it is printed first and
-    #    unconditionally.
+    # 3. The manual, BEFORE the pads. A pad is useless to someone who
+    #    does not know the rules -- one reused page undoes the whole
+    #    thing -- and the person this mode exists for has no other way to
+    #    find out. It goes first so that if the paper runs out, what
+    #    survives is the instructions rather than half a pad.
+    if settings.auto_manual:
+        try:
+            book = jobs.generate(jobs.JobSpec(jobs.JobKind.MANUAL, "", settings))
+            send(book, "MANUAL", _manual_options(settings))
+            log("manual submitted")
+        except Exception as exc:                 # noqa: BLE001
+            log(f"manual failed, continuing: {exc}")
+
+    # 4. The tabula recta, which is what makes a pad usable by hand
+    #    without doing arithmetic. No key material.
     try:
         card = jobs.generate(jobs.JobSpec(jobs.JobKind.TABULA, "", settings))
         send(card, "TABULA RECTA", settings.lp_options)
@@ -190,6 +202,42 @@ def _first(cups):
     return devices[0] if devices else None
 
 
+MANUAL_PAGES = 28          # the rendered A5 manual, for the paper estimate
+
+
+def _manual_options(settings: Settings) -> dict:
+    """
+    Two manual pages per sheet on A4 or Letter.
+
+    The manual is laid out A5, which is exactly half of A4, so two to a
+    sheet is a clean fit rather than a scaling compromise -- and it halves
+    28 sheets to 14. Paper is a real constraint for anyone relying on this
+    mode, so it is not a detail.
+    """
+    if settings.paper in ("A4", "LETTER"):
+        return {"media": settings.paper, "number-up": "2"}
+    return {}
+
+
+def sheets_needed(settings: Settings) -> int:
+    """
+    Roughly how much paper a full run costs, for the status sheet.
+
+    Someone deciding whether to let this run may have a finite stack and
+    no way to get more. Better an estimate on the first sheet than a
+    printer that stops halfway through copy B.
+    """
+    per_copy = settings.pages
+    if settings.imposed:
+        per_copy = -(-settings.pages // 4)       # four pad pages to a sheet
+    manual = 0
+    if settings.auto_manual:
+        manual = (MANUAL_PAGES + 1) // 2 if settings.paper in ("A4", "LETTER") \
+            else MANUAL_PAGES
+    # status + tabula + swap + done
+    return manual + per_copy * 2 + 4
+
+
 def _plan(settings: Settings) -> list[str]:
     """The countdown notice printed on the status sheet."""
     if not settings.auto_print:
@@ -200,10 +248,15 @@ def _plan(settings: Settings) -> list[str]:
     when = ("immediately" if settings.auto_delay == 0
             else f"in {settings.auto_delay} seconds"
             if settings.auto_delay < 120 else f"in about {minutes:.0f} minutes")
+    order = ["the manual"] if settings.auto_manual else []
+    order += ["a tabula recta card", "copy A of the pad", "copy B"]
     return [
         f"THIS UNIT WILL PRINT A ONE-TIME PAD PAIR {when.upper()}.",
-        f"Two identical copies, {settings.pages} pages each, plus a tabula "
-        f"recta card. You do not need to do anything.",
+        f"In order: {', '.join(order)}. Two identical copies, "
+        f"{settings.pages} pages each. You do not need to do anything.",
+        f"PAPER: about {sheets_needed(settings)} sheets of "
+        f"{settings.paper} in total. Load more than that if you can; if it "
+        "runs out mid-pair you lose the pair, not just the paper.",
         "TO STOP IT: unplug the printer, or power the unit off. Nothing is "
         "printed until the wait is over.",
         "TO START NOW: if anything is bridging GPIO13 (header pin 33) to "

@@ -38,7 +38,23 @@ LockPersonality=yes
 LimitCORE=0
 
 # Needs the console for the OLED and GPIO, and poweroff for a clean shutdown.
-SupplementaryGroups=lp gpio i2c
+# `input` is for reading a USB keyboard when there is no GPIO button.
+SupplementaryGroups=lp gpio i2c input
+
+# Bound to tty1 so that a monitor and a USB keyboard work as a front panel
+# when no OLED is fitted -- the console renderer and the keyboard reader
+# are the same ones --sim uses, so this costs nothing but the wiring.
+#
+# This alone does NOT decide the interface. stdin is a terminal here
+# whether or not anything is plugged into the HDMI socket, so otpunit/hmi
+# checks the DRM connector status and looks for a real keyboard device
+# before choosing the console; otherwise it prints unattended.
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
 
 [Install]
 WantedBy=multi-user.target

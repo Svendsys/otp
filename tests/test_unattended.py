@@ -75,14 +75,81 @@ def run(cups, **kwargs):
 
 
 class TestTheSequence:
-    def test_it_prints_a_complete_usable_set_in_order(self):
+    def test_it_prints_a_complete_usable_set_in_order(self, monkeypatch):
+        # The manual is a file on the unit; stand one in so the ordering
+        # can be checked without the rendered asset being present.
+        monkeypatch.setattr(unattended.jobs, "manual_available", lambda: True)
+        monkeypatch.setattr(unattended.jobs, "generate",
+                            lambda spec, *a, **k: bytearray(b"%PDF-fake"))
         cups = Cups()
         assert run(cups) == 0
-        titles = cups.titles()
-        # Status first so the countdown is readable BEFORE the wait; then
-        # the tabula card; then A, the tray break, and B.
-        assert titles == ["OTP status", "TABULA RECTA", "OTP A",
-                          "REMOVE COPY A", "OTP B", "WHAT TO DO NOW"]
+        # Status first so the countdown is readable BEFORE the wait. Then
+        # the MANUAL -- ahead of the pads deliberately, so that if paper
+        # runs out what survives is the instructions rather than half a
+        # pad. Then the card, copy A, the tray break, copy B.
+        assert cups.titles() == ["OTP status", "MANUAL", "TABULA RECTA",
+                                 "OTP A", "REMOVE COPY A", "OTP B",
+                                 "WHAT TO DO NOW"]
+
+    def test_the_manual_can_be_turned_off(self, monkeypatch):
+        monkeypatch.setattr(unattended.jobs, "generate",
+                            lambda spec, *a, **k: bytearray(b"%PDF-fake"))
+        cups = Cups()
+        run(cups, settings=settings(auto_manual=False))
+        assert "MANUAL" not in cups.titles()
+
+    def test_a_missing_manual_does_not_stop_the_pads(self, monkeypatch):
+        # The rendered asset is absent on a hand-provisioned unit.
+        import otpunit.jobs as jobs_mod
+
+        real = jobs_mod.generate
+
+        def flaky(spec, *args, **kwargs):
+            if spec.kind is jobs_mod.JobKind.MANUAL:
+                raise FileNotFoundError("/opt/otp-unit/assets/...")
+            return real(spec, *args, **kwargs)
+
+        monkeypatch.setattr(unattended.jobs, "generate", flaky)
+        cups = Cups()
+        assert run(cups) == 0
+        assert "OTP A" in cups.titles() and "OTP B" in cups.titles()
+
+    def test_the_manual_is_two_up_on_a4_to_halve_the_paper(self):
+        assert unattended._manual_options(config.Settings(paper="A4")) == {
+            "media": "A4", "number-up": "2"}
+        # A6 paper cannot take two A5 pages; leave it to the driver.
+        assert unattended._manual_options(config.Settings(paper="A6")) == {}
+
+
+class TestThePaperEstimate:
+    """
+    Someone deciding whether to let this run may have a finite stack of
+    paper and no way to get more, and running out mid-pair loses the pair
+    rather than just the paper.
+    """
+
+    def test_it_counts_both_copies_and_the_imposition(self):
+        # 100 pad pages, four to a sheet, twice, plus the fixed sheets.
+        plain = unattended.sheets_needed(
+            config.Settings(pages=100, auto_manual=False))
+        assert plain == 25 * 2 + 4
+
+    def test_the_manual_is_included_when_it_will_be_printed(self):
+        with_manual = unattended.sheets_needed(config.Settings(pages=100))
+        without = unattended.sheets_needed(
+            config.Settings(pages=100, auto_manual=False))
+        assert with_manual - without == (unattended.MANUAL_PAGES + 1) // 2
+
+    def test_unimposed_paper_costs_four_times_as_much(self):
+        a4 = unattended.sheets_needed(
+            config.Settings(pages=100, paper="A4", auto_manual=False))
+        a6 = unattended.sheets_needed(
+            config.Settings(pages=100, paper="A6", auto_manual=False))
+        assert a6 > a4 * 3
+
+    def test_the_estimate_reaches_the_status_sheet(self):
+        lines = " ".join(unattended._plan(config.Settings()))
+        assert "sheets" in lines and "PAPER" in lines
 
     def test_the_two_copies_are_byte_identical(self):
         # This is what makes them a pair; generated once, submitted twice.
