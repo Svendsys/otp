@@ -333,6 +333,13 @@ systemctl enable otp-unit-etc-cups.service
 systemctl enable otp-unit.service
 systemctl enable cups.service 2>/dev/null || true
 
+# otp-unit takes tty1 to use as its front panel, so the login prompt that
+# normally lives there is gone. Put one on tty2 instead: with no network
+# and no SSH, Alt+F2 is the only way into a unit that will not come up.
+# This costs nothing in exposure -- anyone at the keyboard already has the
+# SD card, and the SD card is the whole device.
+systemctl enable getty@tty2.service 2>/dev/null || true
+
 if [ "$IMAGE_BUILD" -eq 0 ]; then
     log "Done. Reboot to start the unit."
     cat <<'EOF'

@@ -5,6 +5,15 @@ After=cups.service otp-unit-etc-cups.service
 Wants=cups.service
 Requires=otp-unit-etc-cups.service
 
+# The unit owns tty1, because that is the front panel when a monitor is
+# attached. Raspberry Pi OS Lite runs a login prompt there, and
+# StandardInput=tty-force below TAKES the console rather than failing --
+# so without this both processes hold /dev/tty1, output interleaves and
+# keystrokes go to whichever grabbed them. Conflicts= makes systemd stop
+# the getty first. A login prompt is still available on tty2 (Alt+F2).
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 -m otpunit
