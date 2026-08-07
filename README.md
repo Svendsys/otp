@@ -236,6 +236,15 @@ sampling, shake-and-draw), which keep the proof intact.
 python3 otp_generator.py --entropy     # which source this machine will use
 ```
 
+Expect it to be **slow** where a TRNG is present. `/dev/hwrng` on a Pi
+delivers single-digit KiB/s, so a large batch that takes seconds on a
+laptop takes minutes on the unit. That is the hardware, not the code —
+the generator prints its key source at the start of every run so the
+wait is explained rather than mysterious, and reports at the end what the
+pages were actually made from, which is not always the same answer: a
+TRNG that stops responding mid-run leaves every page after it
+CSPRNG-only.
+
 The print unit reports the same thing on paper: on its status sheet, and on
 the sheet that comes out with the pad itself, so it reaches whoever ends up
 holding it.
