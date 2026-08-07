@@ -41,6 +41,12 @@ PAPER_LABELS = {
     "A6": "A6 SHEETS",
 }
 
+# How long a panel-less unit waits after the status sheet before printing
+# a pair. Offered on the panel too, because the reason to change it is to
+# set a unit up now and run it headless later -- and the alternative is
+# powering down and editing a file on the SD card in another computer.
+AUTO_DELAY_CHOICES = (0, 60, 300, 900, 3600)
+
 
 def _codeword_ok(word: str) -> bool:
     """

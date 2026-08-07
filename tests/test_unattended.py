@@ -35,6 +35,10 @@ class Cups:
         self.submitted.append({"title": title, "data": bytes(data)})
         return f"job-{len(self.submitted)}"
 
+    def active_jobs(self, name="OTP"):
+        # An idle queue. Tests that model a spool override this.
+        return 0
+
     def purge(self, name="OTP"):
         pass
 
@@ -117,8 +121,13 @@ class TestTheSequence:
     def test_the_manual_is_two_up_on_a4_to_halve_the_paper(self):
         assert unattended._manual_options(config.Settings(paper="A4")) == {
             "media": "A4", "number-up": "2"}
-        # A6 paper cannot take two A5 pages; leave it to the driver.
-        assert unattended._manual_options(config.Settings(paper="A6")) == {}
+
+    def test_even_one_up_the_manual_still_names_its_media(self):
+        # A6 cannot take two A5 pages, but returning a bare {} left the
+        # manual as the one job in the whole sequence submitted with no
+        # size at all, rendered at whatever the queue defaulted to.
+        assert unattended._manual_options(config.Settings(paper="A6")) == {
+            "media": "A6"}
 
 
 class TestThePaperEstimate:
@@ -146,6 +155,24 @@ class TestThePaperEstimate:
         a6 = unattended.sheets_needed(
             config.Settings(pages=100, paper="A6", auto_manual=False))
         assert a6 > a4 * 3
+
+    def test_a7_counts_two_pad_pages_to_a_sheet(self):
+        """
+        A7 pages print two to an A6 sheet, so 100 pages is 50 sheets a
+        copy. Restating the imposition here instead of asking Settings
+        quoted 100 -- double the true cost, on the one sheet whose entire
+        job is to let someone check they have enough paper.
+        """
+        a7 = config.Settings(pages=100, a7=True, auto_manual=False)
+        assert a7.sheets == 50
+        assert unattended.sheets_needed(a7) == 50 * 2 + 4
+
+    def test_a7_quotes_the_media_that_comes_out_of_the_tray(self):
+        # A7 lays out on A6 sheets whatever `paper` says, and `paper` is
+        # what the notice used to name.
+        lines = " ".join(unattended._plan(
+            config.Settings(pages=10, a7=True, paper="A4")))
+        assert "sheets of A6" in lines
 
     def test_the_estimate_reaches_the_status_sheet(self):
         lines = " ".join(unattended._plan(config.Settings()))
@@ -290,12 +317,20 @@ class TestAButtonMeansPrintNow:
                                     sleep=lambda s: None,
                                     log=lambda *_: None) == "elapsed"
 
-    def test_open_buttons_never_raises(self):
+    def test_opening_buttons_never_raises(self):
         """
         On a unit with no gpiozero, no gpiochip or no permissions this has
         to answer "no button", not take the pads down with it.
+
+        This module used to carry its own copy of hmi.open_buttons, which
+        nothing called: __main__ hands the buttons in. One implementation,
+        so a fix to it cannot land on the dead one.
         """
-        result = unattended.open_buttons()
+        from otpunit import hmi
+
+        assert not hasattr(unattended, "open_buttons")
+        result, kind = hmi.open_buttons()
+        assert isinstance(kind, str)
         if result is not None:
             result.close()
 
@@ -446,6 +481,257 @@ class TestCopyBActuallyReachesPaper:
         cups = self.Spool(stuck=True)
         run(cups, settings=settings())
         assert cups.purged_with_work in (False, None)
+
+
+class TestTheQueueIsNeverAskedToHoldTwoJobs:
+    """
+    The unit ships MaxJobs 4 and cupsd does not queue past it -- it
+    REFUSES, with `lp: Too many active jobs.` Measured against a real
+    cupsd at the old MaxJobs 1: the status sheet and the manual printed
+    and every job after them was rejected in turn, so the operator got a
+    sheet promising a pad pair followed by silence. Waits existed in two
+    of the six gaps; they are needed in all of them.
+    """
+
+    class OneAtATime(Cups):
+        """A queue that refuses a second job while one is outstanding."""
+
+        def __init__(self, max_jobs=1):
+            super().__init__()
+            self.max_jobs = max_jobs
+            self.outstanding = 0
+            self.refusals = 0
+            self.high_water = 0
+
+        def submit(self, data, name="OTP", title="OTP", options=None):
+            if self.outstanding >= self.max_jobs:
+                self.refusals += 1
+                raise printer.PrinterError("lp: Too many active jobs.")
+            self.outstanding += 1
+            self.high_water = max(self.high_water, self.outstanding)
+            return super().submit(data, name, title, options)
+
+        def active_jobs(self, name="OTP"):
+            # One poll of the queue retires one job, as a printer does.
+            if self.outstanding:
+                self.outstanding -= 1
+            return self.outstanding
+
+    def test_the_whole_sequence_prints_against_a_maxjobs_of_one(self,
+                                                                monkeypatch):
+        monkeypatch.setattr(unattended.jobs, "generate",
+                            lambda spec, *a, **k: bytearray(b"%PDF-fake"))
+        cups = self.OneAtATime()
+        assert run(cups) == 0
+        assert cups.refusals == 0
+        assert cups.titles() == ["OTP status", "MANUAL", "TABULA RECTA",
+                                 "OTP A", "REMOVE COPY A", "OTP B",
+                                 "WHAT TO DO NOW"]
+
+    def test_only_one_job_is_ever_outstanding(self, monkeypatch):
+        # The spool holds one job's key material at a time, which is what
+        # the low MaxJobs was reaching for in the first place.
+        monkeypatch.setattr(unattended.jobs, "generate",
+                            lambda spec, *a, **k: bytearray(b"%PDF-fake"))
+        cups = self.OneAtATime(max_jobs=4)
+        run(cups)
+        assert cups.high_water == 1
+
+
+class TestADrainedQueueIsNotProofOfPrinting:
+    """
+    ErrorPolicy is abort-job, deliberately, so a job that fails is
+    discarded as promptly as one that printed and `lpstat -o` empties just
+    as fast. Measured with the tray empty against a real cupsd: all seven
+    jobs aborted, the queue drained in four seconds, and the unit printed
+    "YOUR PAD PAIR IS PRINTED / They are identical" over an empty tray,
+    returned 0, and zeroed the key so copy B could never be remade.
+    """
+
+    class OutOfPaper(Cups):
+        def __init__(self, fault="Out of paper", after=0):
+            super().__init__()
+            self.fault = fault
+            self.after = after
+
+        def printer_fault(self, name="OTP"):
+            return self.fault if len(self.submitted) >= self.after else None
+
+    def test_a_reported_fault_beats_an_empty_queue(self):
+        cups = self.OutOfPaper()
+        assert run(cups) == 1, "an empty tray is not a printed pair"
+
+    def test_the_operator_is_told_to_destroy_the_stack(self):
+        cups = self.OutOfPaper()
+        run(cups)
+        final = [job for job in cups.submitted
+                 if job["title"] == "WHAT TO DO NOW"][-1]
+        assert b"%PDF" == final["data"][:4]
+        text = bytes(unattended.sheet(unattended.HALF, "X-Y",
+                                      config.Settings(),
+                                      trouble="Out of paper"))
+        assert text[:4] == b"%PDF"
+
+    def test_the_reason_reaches_the_half_sheet(self):
+        # A sheet that says the pad failed without saying why leaves the
+        # operator to guess at a printer they may not be able to see.
+        rows = [value for section in _half_sections(trouble="Out of paper")
+                for _, value in section.rows]
+        assert any("Out of paper" in str(value) for value in rows)
+
+    def test_it_stops_before_wasting_copy_b_on_a_dead_printer(self):
+        # Copy A already failed; 25 more sheets of a pad nobody can use is
+        # the wrong answer.
+        cups = self.OutOfPaper()
+        run(cups)
+        assert "OTP B" not in cups.titles()
+
+    def test_a_queue_that_cannot_be_asked_falls_back_to_the_drain(self):
+        # Silence is not a fault. Inventing one would send an operator to
+        # burn a pair that printed perfectly.
+        class Mute(Cups):
+            def printer_fault(self, name="OTP"):
+                return None
+
+        assert run(Mute()) == 0
+
+    def test_a_cups_without_the_probe_at_all_still_works(self):
+        # Older doubles, and any Cups that predates printer_fault.
+        class Old(Cups):
+            printer_fault = None
+
+            def __getattr__(self, name):
+                raise AttributeError(name)
+
+        assert run(Old()) == 0
+
+
+def _half_sections(trouble=""):
+    """The HALF sheet's sections, without going through the PDF."""
+    captured = []
+    real = unattended.diagnostics.render_bytes
+    try:
+        unattended.diagnostics.render_bytes = \
+            lambda sections, *a, **k: captured.append(sections) or bytearray()
+        unattended.sheet(unattended.HALF, "X-Y", config.Settings(),
+                         trouble=trouble)
+    finally:
+        unattended.diagnostics.render_bytes = real
+    return captured[0]
+
+
+class TestThePlugWorksDuringTheDrainToo:
+    """
+    Unplugging the printer is the only cancel this mode offers, and the
+    drain is the longest wait in the sequence -- a 25-sheet copy A at 12ppm
+    is over two minutes, and the bound is fifteen. It used to poll only
+    lpstat, so pulling the cable during that window did nothing at all: the
+    unit sat there until the timeout and then printed copy B's separator to
+    a printer that had gone.
+    """
+
+    class Gone(Cups):
+        """A queue with work outstanding and a printer that vanishes."""
+
+        def __init__(self, disconnect_after=1):
+            super().__init__()
+            self.disconnect_after = disconnect_after
+            self.device_polls = 0
+
+        def devices(self):
+            self.device_polls += 1
+            return [] if self.device_polls > self.disconnect_after else [DEVICE]
+
+        def active_jobs(self, name="OTP"):
+            return 1                             # never drains
+
+    def test_drain_aborts_when_the_printer_is_unplugged(self):
+        cups = self.Gone()
+        with pytest.raises(unattended.Aborted):
+            unattended.drain(cups, "OTP", lambda s: None, lambda *_: None)
+
+    def test_one_empty_poll_during_the_drain_is_not_a_disconnect(self):
+        """
+        Cups.devices() returns [] for a busy cupsd and a timed-out lpinfo
+        exactly as it does for an unplugged cable, and the drain runs while
+        cupsd is at its busiest.
+        """
+        class Flaky(Cups):
+            def __init__(self):
+                super().__init__()
+                self.polls = 0
+
+            def devices(self):
+                self.polls += 1
+                return [] if self.polls % 2 == 0 else [DEVICE]
+
+            def active_jobs(self, name="OTP"):
+                return 0 if self.polls > 6 else 1
+
+        cups = Flaky()
+        assert unattended.drain(cups, "OTP", lambda s: None,
+                                lambda *_: None) is True
+
+    def test_the_drain_is_bounded_even_with_a_no_op_sleep(self):
+        # A wall clock alone does not bound a loop whose sleep does not
+        # advance one, which is every test in this file.
+        cups = self.Gone(disconnect_after=10_000)
+        assert unattended.drain(cups, "OTP", lambda s: None, lambda *_: None,
+                                timeout=10.0, step=2.0) is False
+
+
+class TestTheSpoolIsPurgedWhenNothingCanBePrinting:
+    """
+    finish(purge=False) leaves the spooled pad on tmpfs. That is the right
+    call while a copy may still be feeding paper -- cancelling destroys it.
+    It is the wrong call once the printer is gone, and an abort is exactly
+    the case where it is gone: there is nothing left to destroy, and what
+    stays behind is a complete copy of the key.
+    """
+
+    class Vanishes(Cups):
+        """Copy A spools, then the cable comes out while it is printing."""
+
+        def __init__(self):
+            super().__init__()
+            self.purged = 0
+            self.polls = 0
+
+        def devices(self):
+            self.polls += 1
+            # Present through the status sheet and the countdown, gone by
+            # the time copy A is draining.
+            return [DEVICE] if self.polls <= 8 else []
+
+        def active_jobs(self, name="OTP"):
+            # Work outstanding, so the drain is the window the disconnect
+            # lands in -- which is the realistic case: the drain is the
+            # longest wait in the sequence.
+            return 1 if self.submitted else 0
+
+        def purge(self, name="OTP"):
+            self.purged += 1
+
+    def test_an_abort_still_purges_the_spool(self):
+        cups = self.Vanishes()
+        assert run(cups) == 1
+        assert cups.purged >= 1, \
+            "the printer is gone; the spooled pad is all that is left"
+
+    def test_an_unknown_failure_does_not_purge(self, monkeypatch):
+        # Anything other than a disconnect leaves the queue in a state we
+        # cannot reason about, and cancelling a live job loses that copy.
+        cups = Cups()
+        purged = []
+        monkeypatch.setattr(cups, "purge", lambda name="OTP": purged.append(1))
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("the printer caught fire")
+
+        monkeypatch.setattr(unattended.jobs.PadPairJob, "print_next_copy",
+                            explode)
+        assert run(cups) == 1
+        assert purged == []
 
 
 class TestAHalfPairIsNeverCalledComplete:

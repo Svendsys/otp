@@ -33,6 +33,49 @@ def text_of(sections) -> str:
     return "\n".join(out)
 
 
+def drawn_at(sections, page_size=None):
+    """
+    [(y, text)] for every string the renderer actually put on paper.
+
+    Reading the drawing calls rather than the section list is the point:
+    the two used to disagree by 241 lines, and a test that walked the
+    sections could not see the difference.
+    """
+    import otp_generator as gen
+
+    calls = []
+
+    class Spy:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __getattr__(self, name):
+            attribute = getattr(self.inner, name)
+            if name != "drawString":
+                return attribute
+
+            def draw(x, y, text, *args, **kwargs):
+                calls.append((y, text))
+                return attribute(x, y, text, *args, **kwargs)
+            return draw
+
+    real = gen.new_canvas
+    try:
+        gen.new_canvas = lambda out, size, **kw: Spy(real(out, size, **kw))
+        diagnostics.render_bytes(sections, page_size or diagnostics.A4)
+    finally:
+        gen.new_canvas = real
+    return calls
+
+
+def drawn_lines(sections, page_size=None) -> list:
+    return [text for _, text in drawn_at(sections, page_size)]
+
+
+def words(lines) -> set:
+    return {word for line in lines for word in line.split()}
+
+
 class Cups:
     """Scripted printer discovery."""
 
@@ -135,14 +178,62 @@ class TestTheSheetFitsAndSaysTheRightThings:
                                        printer=DEVICE, queue="OTP")
         assert page_count(diagnostics.render_bytes(sections)) == 1
 
-    def test_it_stays_one_page_when_every_value_is_long(self):
-        # Probe failures produce long strings; they must not spill a page.
+    def test_nothing_is_dropped_when_every_value_is_long(self):
+        """
+        Probe failures produce long strings, and they have to survive.
+
+        This used to assert the sheet stayed on one page -- which it did,
+        by counting the lines that would not fit and throwing them away
+        behind a one-line footnote. The content that gets discarded first
+        is the content at the bottom, which is the SECURITY POSTURE and
+        SETTINGS sections: exactly what a long probe failure is about.
+        """
         sections = diagnostics.collect(settings=config.Settings(),
                                        printer=DEVICE, queue="OTP")
         for section in sections:
             section.rows = [(label, (str(value) + " ") * 12)
                             for label, value in section.rows]
-        assert page_count(diagnostics.render_bytes(sections)) == 1
+        drawn = drawn_lines(sections)
+        assert page_count(diagnostics.render_bytes(sections)) > 1, \
+            "this much text cannot fit one sheet; it must run onto another"
+        for section in sections:
+            assert section.title in drawn
+        assert not [line for line in drawn if "did not fit" in line]
+
+    def test_a6_gets_the_whole_sheet_not_a_fortieth_of_it(self):
+        """
+        A6 is 105mm wide. Two columns there leave 13pt of width for a value
+        beside a 30mm label, so every value wrapped one word to a line and
+        the sheet shed 241 of its 282 lines -- silently, apart from a
+        footnote giving the count. An A6 unit is exactly the unit least
+        likely to have any other way of being read.
+        """
+        from reportlab.lib.pagesizes import A6
+
+        settings = config.Settings(paper="A6")
+        sections = diagnostics.collect(settings=settings, printer=DEVICE,
+                                       queue="OTP")
+        on_a4 = drawn_lines(sections, page_size=diagnostics.A4)
+        on_a6 = drawn_lines(sections, page_size=A6)
+        # Wrapping differs with the column width, so compare the words that
+        # reached paper rather than the lines they were broken into.
+        assert words(on_a6) >= words(on_a4)
+        for section in sections:
+            assert section.title in on_a6
+
+    def test_no_line_is_drawn_below_the_bottom_margin(self):
+        """
+        Pagination that runs off the foot of the sheet is the same defect
+        in a different costume: a laser printer's unprintable band eats it
+        and nothing says so.
+        """
+        from reportlab.lib.pagesizes import A6
+
+        for page_size in (diagnostics.A4, A6):
+            settings = config.Settings(paper="A6")
+            sections = diagnostics.collect(settings=settings)
+            lowest = min(y for y, _ in drawn_at(sections, page_size))
+            assert lowest > 20, f"{page_size}: text at y={lowest}"
 
     def test_it_tells_the_operator_what_hardware_to_add(self):
         text = text_of(diagnostics.collect(settings=config.Settings()))

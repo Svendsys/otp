@@ -125,6 +125,18 @@ to be read:
   `cupsd.conf.d`, so a drop-in file would be silently ignored — and the
   defaults are the opposite of what is wanted here: history is kept forever
   and the spooled document, the entire pad, is kept for 24 hours.
+- Sets `MaxJobs 4` and `ErrorPolicy abort-job`. Both numbers have a
+  history. `MaxJobs 1` looks right — one job's key material in the spool
+  at a time — but cupsd does not *queue* past `MaxJobs`, it **refuses**:
+  `lp: Too many active jobs.` Against a real cupsd that meant the status
+  sheet and the manual printed and every job after them was rejected, so
+  the unit promised a pad pair and then produced nothing. The unit waits
+  for the queue to drain before each submit, so only one job is live in
+  practice; the headroom is what stops a timing race costing the whole
+  run. `abort-job` then means a failed job is discarded as promptly as a
+  successful one — so an empty queue is *not* proof anything printed, and
+  the unit asks `lpstat -p` for the printer's own state before it tells
+  anyone they are holding a pair.
 - Mounts a tmpfs over `/etc/cups` at boot from a baked-in template, so the
   print queue is rebuilt from whatever is plugged in. The template excludes
   `printers.conf`, which holds the last printer's make, model and serial.

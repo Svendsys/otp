@@ -212,14 +212,33 @@ See [docs/HARDWARE.md](docs/HARDWARE.md) for parts and wiring,
 
 ## A note on randomness
 
-The generator draws from the operating system's CSPRNG (`os.urandom`) and maps
-bytes to letters with rejection sampling, so every letter is exactly equally
-likely. An OS CSPRNG is continuously re-seeded with physical noise and is not
-practically attackable — but strictly speaking it makes these pads
-*computationally* secure rather than *information-theoretically* secure. For
-teaching and hobby use that distinction is academic. If your threat model
-disagrees, the manual describes hand-generation methods (dice with rejection
-sampling, shake-and-draw) that keep the proof intact.
+Where the key comes from is the difference between a one-time pad and a very
+good stream cipher, so the generator is explicit about it.
+
+It draws from the machine's **hardware random number generator** when there is
+one — `/dev/hwrng`, which every Raspberry Pi has — **XORed with the OS CSPRNG**
+(`os.urandom`), and maps the result to letters with rejection sampling so every
+letter is exactly equally likely. The XOR is deliberate: if *either* source is
+good the output is good, and neither can spoil the other. That matters at both
+ends, because a raw ring oscillator can be biased and a board that has just
+booted can have a barely-seeded OS pool.
+
+With no hardware source the generator falls back to the CSPRNG alone and
+**says so** rather than letting it pass. An OS CSPRNG is continuously
+re-seeded with physical noise and is not practically attackable, but it is
+still an algorithm expanding a seed — which makes those pads *computationally*
+secure rather than *information-theoretically* secure. For teaching and hobby
+use the distinction is academic; if your threat model disagrees, use a machine
+with a TRNG, or the manual's hand-generation methods (dice with rejection
+sampling, shake-and-draw), which keep the proof intact.
+
+```bash
+python3 otp_generator.py --entropy     # which source this machine will use
+```
+
+The print unit reports the same thing on paper: on its status sheet, and on
+the sheet that comes out with the pad itself, so it reaches whoever ends up
+holding it.
 
 ## Generation hygiene
 

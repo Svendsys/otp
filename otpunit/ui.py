@@ -12,8 +12,8 @@ from dataclasses import replace
 from . import codewords as cw
 from . import jobs as jobs_mod
 from . import printer as printer_mod
-from .config import (AUTH_SIZE_CHOICES, PAGE_CHOICES, PAPER_CHOICES,
-                     PAPER_LABELS, Settings, save)
+from .config import (AUTH_SIZE_CHOICES, AUTO_DELAY_CHOICES, PAGE_CHOICES,
+                     PAPER_CHOICES, PAPER_LABELS, Settings, save)
 from .hw.buttons import Press
 from .hw.display import Frame
 
@@ -725,12 +725,32 @@ def settings_menu():
                        lambda a, v: _apply(a, paper=v),
                        render=lambda v: PAPER_LABELS[v])
 
+    def set_auto_print(app):
+        # What this unit does when nobody is at the panel. It is reachable
+        # only FROM the panel, which is the point: the person setting a unit
+        # up to be left headless is holding the buttons now, and otherwise
+        # has to power down and edit the card in another computer.
+        return Chooser("UNATTENDED", [False, True], app.settings.auto_print,
+                       lambda a, v: _apply(a, auto_print=v),
+                       render=lambda v: ("PRINTS A PAIR ALONE" if v
+                                         else "STATUS SHEET ONLY"))
+
+    def set_auto_delay(app):
+        return Chooser("WAIT FIRST", AUTO_DELAY_CHOICES,
+                       app.settings.auto_delay,
+                       lambda a, v: _apply(a, auto_delay=v),
+                       render=lambda v: ("NO WAIT - AT ONCE" if v == 0
+                                         else f"{v // 60} MIN" if v >= 60
+                                         else f"{v} SEC"))
+
     menu = SettingsMenu([
         ("PAGES", set_pages),
         ("PAPER", set_paper),
         ("FORMAT", set_format),
         ("AUTH GROUP", set_auth),
         ("TRAINING", set_training),
+        ("UNATTENDED", set_auto_print),
+        ("UNATTENDED WAIT", set_auto_delay),
         ("SAVE SETTINGS", _save),
     ])
     menu.title = "SETTINGS"

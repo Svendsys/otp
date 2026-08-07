@@ -230,16 +230,28 @@ set_cupsd() {
 }
 set_cupsd PreserveJobHistory No
 set_cupsd PreserveJobFiles No
-set_cupsd MaxJobs 1
-# CUPS defaults ErrorPolicy to retry-job, which never gives up. Combined
-# with MaxJobs 1 that is a permanent wedge: a job to a printer that is off,
-# jammed or unplugged stays active forever, so active_jobs() returns 1
-# forever, cups_busy() is true forever, copy B can never be submitted, and
-# the UI holds key material until someone pulls the power -- the one thing
-# the whole design is trying to avoid. abort-job lets the job die so the
-# queue drains and the panel can say something. Verified with a real cupsd:
-# a job to an unreachable printer was still active after 20s under
-# retry-job, with lpstat cheerfully reporting "now printing".
+# NOT 1. cupsd does not queue past MaxJobs, it REFUSES: `lp: Too many
+# active jobs.` The unattended sequence submits seven jobs, and measured
+# against a real cupsd with MaxJobs 1 the status sheet and the manual went
+# through and every one after them was rejected -- no tabula, no pad, and
+# no sheet to say why. The unit now drains the queue before each submit so
+# in practice only one is ever live; this is the headroom that keeps a
+# timing race from costing the whole run rather than one poll.
+set_cupsd MaxJobs 4
+# CUPS defaults ErrorPolicy to retry-job, which never gives up. With a
+# bounded MaxJobs that is a permanent wedge: a job to a printer that is
+# off, jammed or unplugged stays active forever, so active_jobs() returns
+# nonzero forever, cups_busy() is true forever, copy B can never be
+# submitted, and the UI holds key material until someone pulls the power --
+# the one thing the whole design is trying to avoid. abort-job lets the job
+# die so the queue drains and the panel can say something. Verified with a
+# real cupsd: a job to an unreachable printer was still active after 20s
+# under retry-job, with lpstat cheerfully reporting "now printing".
+#
+# The cost, which the code has to carry: a job that FAILED leaves the queue
+# exactly as empty as one that printed, so an empty `lpstat -o` is not
+# proof anything reached paper. Cups.printer_fault() asks the queue's own
+# state instead, and unattended.run believes that over the drain.
 set_cupsd ErrorPolicy abort-job
 
 # A stock CUPS creates none of these: there is no /usr/lib/tmpfiles.d/cups*

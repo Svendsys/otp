@@ -9,12 +9,20 @@ loses the pad for good.
 """
 import itertools
 import sys
+import pathlib
+import tempfile
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+
+# A path under the temp dir, not "/nonexistent": the suite runs as
+# root, where that absolute path is perfectly writable, and any test
+# reaching SAVE SETTINGS created a real file at the host's root.
+SCRATCH_CONFIG = str(pathlib.Path(tempfile.gettempdir()) /
+                     "otp-unit-test.conf")
 
 from otpunit import codewords as cw
 from otpunit import config, jobs, printer, ui
@@ -59,7 +67,7 @@ def make_app(script, cups=None, settings=None):
         cups=cups or Cups(),
         settings=settings or config.Settings(pages=2),
         vocabulary=cw.Vocabulary(),
-        config_path="/nonexistent",
+        config_path=SCRATCH_CONFIG,
         poll_seconds=0,
     )
 

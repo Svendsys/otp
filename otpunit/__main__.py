@@ -109,7 +109,11 @@ def main(argv=None):
     # Interface.prove: opening GPIO buttons proves only that a pin could
     # be reserved, so without this a monitor plus no buttons walks into a
     # menu that blocks forever instead of printing.
-    driven = interface.interactive and (args.sim or _prove(interface, log))
+    # --diagnostic goes headless whatever is attached, so it must not sit
+    # through the prove window first: it drew PRESS ANY BUTTON on the panel,
+    # waited twenty seconds and then discarded the answer.
+    driven = (not args.diagnostic and interface.interactive
+              and (args.sim or _prove(interface, log)))
 
     if args.diagnostic or not driven:
         from otpunit import diagnostics

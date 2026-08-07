@@ -34,7 +34,6 @@ unmistakably marked: --training watermarks TRAINING across every page.
 import argparse
 import math
 import os
-import select
 import sys
 import time
 from reportlab.lib.units import mm
@@ -109,41 +108,46 @@ def _hwrng_bytes(n: int, path: str | None = None) -> bytes | None:
     """
     path = path or HWRNG_PATH
     deadline = time.monotonic() + HWRNG_TIMEOUT
+    # O_NONBLOCK, because nothing else actually bounds this.
+    #
+    # Fourth attempt. Checking the deadline after a blocking read let one
+    # read sit in the kernel for 73 seconds against a 1-second budget.
+    # Chunking moved the check but wrote it `if got < n`, and every request
+    # this program makes is a single chunk, so it never ran. select() was
+    # measured returning READY instantly and unconditionally on
+    # /dev/hwrng -- the char device implements no .poll, so the VFS hands
+    # back DEFAULT_POLLMASK and the call carries no information at all;
+    # a 0.001s budget still took 0.614s.
+    #
+    # A non-blocking fd is the version that works: read() returns EAGAIN
+    # rather than sleeping in the kernel, so the deadline below is the
+    # thing that decides. On a regular file (every test fake) O_NONBLOCK
+    # is a no-op and reads behave normally.
     try:
-        with open(path, "rb", buffering=0) as handle:
-            chunks, got = [], 0
-            while got < n:
-                # Waited for BEFORE reading, with select, and unconditionally.
-                #
-                # Two earlier attempts at this did nothing. Checking after
-                # the read meant a single blocking read() sat in the kernel
-                # past any budget -- 73 seconds against 1. Chunking fixed
-                # that but the check was written `if got < n`, so a request
-                # satisfied in one chunk skipped it entirely -- and every
-                # request this program makes is one chunk (an A6 page is
-                # 1340 bytes against a 4096 chunk), so it never ran at all
-                # in production. select() bounds the wait itself, which is
-                # the only version that survives a device that simply
-                # stops answering.
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return None
-                try:
-                    ready, _, _ = select.select([handle], [], [], remaining)
-                except (OSError, ValueError, TypeError):
-                    # Not selectable -- a pipe on some platforms, or any
-                    # file-like object without a fileno. Fall through and
-                    # read; the deadline above still caps the loop.
-                    ready = [handle]
-                if not ready:
-                    return None
-                chunk = handle.read(min(_HWRNG_CHUNK, n - got))
-                if not chunk:
-                    return None
-                chunks.append(chunk)
-                got += len(chunk)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
         return None
+    chunks, got = [], 0
+    try:
+        while got < n:
+            if time.monotonic() > deadline:
+                # Abandon the whole request rather than splice a CSPRNG
+                # tail onto a TRNG head: a pad half from each is neither,
+                # and nothing downstream could tell.
+                return None
+            try:
+                chunk = os.read(fd, min(_HWRNG_CHUNK, n - got))
+            except BlockingIOError:
+                time.sleep(0.01)
+                continue
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            got += len(chunk)
+    finally:
+        os.close(fd)
     data = b"".join(chunks)
     return data if len(data) == n and _looks_alive(data) else None
 
@@ -235,6 +239,16 @@ def entropy_source(path: str | None = None) -> str:
     """
     return "hwrng+urandom" if _hwrng_bytes(_HEALTH_SAMPLE, path) is not None \
         else "urandom"
+
+
+def _source_note(source: str) -> str:
+    """One line naming the source, and what it means for the output."""
+    if source == "hwrng+urandom":
+        return (f"hardware TRNG ({HWRNG_PATH}) XORed with the system CSPRNG "
+                f"-- a true one-time pad")
+    return ("system CSPRNG only -- no hardware TRNG on this machine. These "
+            "pads are a very strong stream cipher, not information-"
+            "theoretically secure one-time pads.")
 
 
 def get_random_bytes(n: int) -> bytes:
@@ -1067,7 +1081,21 @@ def main():
                         help="Write the single generated PDF to stdout instead of a file, "
                              "so key material never reaches the filesystem "
                              "(e.g. otp_generator.py ... --stdout | lp)")
+    parser.add_argument("--entropy", action="store_true",
+                        help="Report which random source this machine will use "
+                             "and exit (status 0 with a hardware TRNG, 2 without)")
     args = parser.parse_args()
+
+    # Answered before the "nothing to do" check: asking what the machine can
+    # do is a complete request on its own.
+    if args.entropy:
+        source = entropy_source()
+        print(_source_note(source))
+        if source != "hwrng+urandom":
+            print(f"No usable {HWRNG_PATH}. Every Raspberry Pi has one; most "
+                  f"laptops do not.")
+        sys.exit(0 if source == "hwrng+urandom" else 2)
+
     with_auth = not args.no_auth
     auth_size = args.auth_size
     generating_sets = args.codewords is not None or args.random_codewords > 0
@@ -1222,6 +1250,11 @@ def main():
         num_rows = -(-chars_per_page // chars_per_row)
 
         log(f"Format: {format_label}")
+        # Named up front, before any of it is generated, because it decides
+        # what these pages ARE -- a one-time pad or a stream cipher's
+        # keystream -- and because it explains why a run on a Pi takes
+        # minutes where the same run on a laptop takes seconds.
+        log(f"Key source: {_source_note(entropy_source())}")
         log(f"Generating {args.sets} OTP sets, {args.pages} pad pages each, {chars_per_page} chars/page")
         log(f"Auth group in header: {'yes' if with_auth else 'no'}")
         log(f"Training pads: {'yes' if args.training else 'no'}")
@@ -1281,6 +1314,12 @@ def main():
         log()
 
     log("=" * 50)
+    # What the pages that just came out were actually made from, measured
+    # rather than predicted. The probe above answers "what is available";
+    # a device that dies mid-run makes every page after it CSPRNG-only,
+    # and this is the only place that difference shows up.
+    if generating_sets and TALLY.total:
+        log(f"Key source: {TALLY.summary()}")
     log("DONE")
     log()
     if generating_sets:

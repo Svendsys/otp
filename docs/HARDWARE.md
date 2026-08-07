@@ -81,6 +81,15 @@ It checks the DRM connector rather than trusting the presence of a
 terminal, so a unit with nothing plugged into its HDMI socket does not
 sit at a menu nobody can see — it goes and prints instead.
 
+**It also waits to be answered.** Finding a screen and finding an input
+are not the same as having someone there: opening a GPIO button only
+proves a pin could be reserved, and an HDMI monitor with no keyboard
+would otherwise park the unit at a menu forever. So the panel shows
+`PRESS ANY BUTTON` and waits **20 seconds**. Press anything and you get
+the menu; press nothing and it prints unattended. If you are wiring up a
+panel and it keeps going off to print, that window is what you are
+missing — power-cycle and press a button while the prompt is up.
+
 ### And if you have none of that either
 
 Then the unit still makes pads, and that is the point. Assume the shops
@@ -174,9 +183,13 @@ not a status-sheet-only switch. To get the sheet without the pads, set
 `auto_print = no` first. (The service runs as root; there is no `otp`
 user.)
 
-The sheet carries no key material and is safe to photograph or email when
-you want help with a unit that will not come up. The sheets that come out
-*with a pad* are a different matter, and say so at the top: those are key
+The sheet carries no key material — no codeword, no key — so photographing
+it or emailing it for help with a unit that will not come up cannot
+compromise a pad. It does identify the hardware: the board serial, the
+printer's serial inside its device URI, and any network link it can see.
+That names the unit rather than the pad, but cross it out before sending
+if that distinction matters where you are. The sheets that come out *with
+a pad* are a different matter, and say so at the top: those are key
 material.
 
 To get the status sheet without the pads that normally follow it, set

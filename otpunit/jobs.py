@@ -217,8 +217,19 @@ class PadPairJob:
         if self._buffer is not None:
             zero(self._buffer)
             self._buffer = None
-        if purge and self.spec.carries_key_material:
+        if not self.spec.carries_key_material:
+            return
+        if purge:
             self.cups.purge(self.queue)
+        else:
+            # Only the `cancel` is dangerous. Clearing TempDir is not, and
+            # cancelling is exactly when it matters: CUPS SIGKILLs the
+            # filter chain, so Ghostscript never unlinks its scratch file.
+            # Skipping both left plaintext pages in /run/cups/tmp.
+            try:
+                self.cups._clear_temp()
+            except Exception:                    # noqa: BLE001
+                pass
 
     def __enter__(self):
         return self

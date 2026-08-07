@@ -131,7 +131,17 @@ class KeyboardButtons(Buttons):
                 return None
             ch = sys.stdin.read(1)
             if ch == "\x1b":
-                ch += sys.stdin.read(2)
+                # An escape byte may be a lone Esc or the start of an arrow
+                # sequence, and in raw mode nothing distinguishes them but
+                # time. A bare read(2) here blocked FOREVER on a single Esc
+                # -- the most natural key to press at a prompt -- which
+                # recreated the exact hang that Interface.prove() exists to
+                # prevent, inside prove() itself.
+                for _ in range(2):
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if not ready:
+                        break
+                    ch += sys.stdin.read(1)
             return self._map(ch)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)

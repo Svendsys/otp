@@ -126,18 +126,53 @@ class TestItFailsSafeRatherThanQuietly:
         # Many chunks at one simulated second each, against a 3s budget.
         assert gen._hwrng_bytes(gen._HWRNG_CHUNK * 100) is None
 
-    def test_the_deadline_bounds_a_device_that_stops_answering(self,
+    def test_the_deadline_bounds_a_device_that_stops_answering(self, tmp_path,
                                                                monkeypatch):
-        # select() is what makes this bounded: a device that never becomes
-        # readable must time out rather than block inside read().
-        monkeypatch.setattr(gen, "HWRNG_TIMEOUT", 0.25)
-        monkeypatch.setattr(gen.select, "select",
-                            lambda r, w, x, t: ([], [], []))
+        """
+        A FIFO with no data is exactly a TRNG that has stopped: open-able,
+        readable in principle, never ready.
+
+        With a blocking fd this sleeps in the kernel forever and no
+        deadline can fire. select() does NOT help -- /dev/hwrng's chardev
+        implements no .poll, so the VFS returns DEFAULT_POLLMASK and
+        select reports ready unconditionally; measured, a 0.001s budget
+        still took 0.614s. O_NONBLOCK is what makes the deadline decide.
+        """
+        import os as real_os
         import time as real_time
 
-        start = real_time.monotonic()
-        assert gen._hwrng_bytes(4096, "/dev/zero") is None
-        assert real_time.monotonic() - start < 5
+        fifo = tmp_path / "hwrng.fifo"
+        real_os.mkfifo(fifo)
+        # Held open read-write so the reader's open() does not block; no
+        # data is ever written, so every read returns EAGAIN.
+        holder = real_os.open(fifo, real_os.O_RDWR | real_os.O_NONBLOCK)
+        try:
+            monkeypatch.setattr(gen, "HWRNG_TIMEOUT", 0.3)
+            start = real_time.monotonic()
+            assert gen._hwrng_bytes(4096, str(fifo)) is None
+            elapsed = real_time.monotonic() - start
+            assert elapsed < 5, f"took {elapsed:.1f}s against a 0.3s budget"
+        finally:
+            real_os.close(holder)
+
+    def test_the_deadline_is_checked_for_a_single_chunk_request(self,
+                                                                monkeypatch):
+        """
+        Every request this program makes is ONE chunk -- an A6 page is
+        1340 bytes against a 4096 chunk -- and the previous deadline was
+        written `if got < n`, so it was skipped entirely for exactly the
+        sizes that occur. Pin the real size, not a synthetic large one.
+        """
+        seen = []
+        real_monotonic = gen.time.monotonic
+
+        def clock():
+            seen.append(1)
+            return real_monotonic()
+
+        monkeypatch.setattr(gen.time, "monotonic", clock)
+        gen._hwrng_bytes(1340, "/dev/zero")
+        assert seen, "the deadline must be evaluated for a 1340-byte request"
 
     def test_a_fast_trng_is_not_cut_off_early(self, hwrng, monkeypatch):
         # The converse of the test above: a device that keeps up must be

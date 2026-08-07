@@ -20,12 +20,20 @@ import io
 import re
 import subprocess
 import sys
+import pathlib
+import tempfile
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+
+# A path under the temp dir, not "/nonexistent": the suite runs as
+# root, where that absolute path is perfectly writable, and any test
+# reaching SAVE SETTINGS created a real file at the host's root.
+SCRATCH_CONFIG = str(pathlib.Path(tempfile.gettempdir()) /
+                     "otp-unit-test.conf")
 
 import otp_generator as g
 from otpunit import codewords as cw
@@ -147,7 +155,7 @@ def make_app(script, cups=None, settings=None):
         cups=cups or FakeCups(),
         settings=settings or config.Settings(pages=2),
         vocabulary=cw.Vocabulary(),
-        config_path="/nonexistent",
+        config_path=SCRATCH_CONFIG,
         poll_seconds=0,
     )
 
@@ -174,6 +182,59 @@ def exploding_cups():
     def boom(argv, stdin=None):
         raise TimeoutError("cupsd wedged")
     return printer.Cups(run=boom)
+
+
+def lpstat_p(text, returncode=0):
+    """A Cups whose `lpstat -p` answers with `text`."""
+    class Result:
+        pass
+
+    def run(argv, stdin=None):
+        result = Result()
+        result.returncode = returncode
+        result.stdout = text.encode()
+        result.stderr = b""
+        return result
+
+    return printer.Cups(run=run)
+
+
+class TestTheQueueIsAskedWhetherItActuallyPrinted:
+    """
+    ErrorPolicy is abort-job, so a job that failed leaves `lpstat -o` as
+    empty as one that printed. Measured against a real cupsd with no paper:
+    seven jobs aborted, the queue drained in four seconds, and the unit
+    declared a matching pair over an empty tray. The queue's own state is
+    the only thing that tells the two apart.
+    """
+
+    def test_an_idle_printer_reports_no_fault(self):
+        cups = lpstat_p("printer OTP is idle.  enabled since Thu 07 Aug 2026\n")
+        assert cups.printer_fault() is None
+
+    def test_ready_to_print_is_not_a_fault(self):
+        cups = lpstat_p("printer OTP is idle.  enabled since Thu 07 Aug 2026\n"
+                        "\tReady to print.\n")
+        assert cups.printer_fault() is None
+
+    def test_out_of_paper_is_a_fault(self):
+        cups = lpstat_p("printer OTP is idle.  enabled since Thu 07 Aug 2026\n"
+                        "\tOut of paper\n")
+        assert cups.printer_fault() == "Out of paper"
+
+    def test_a_disabled_queue_is_a_fault(self):
+        cups = lpstat_p("printer OTP disabled since Thu 07 Aug 2026 -\n"
+                        "\tPaused\n")
+        assert "disabled" in (cups.printer_fault() or "")
+
+    def test_an_unanswerable_query_is_not_a_fault(self):
+        """
+        Silence must not be read as trouble: it would send someone to burn
+        a pair that printed perfectly.
+        """
+        assert exploding_cups().printer_fault() is None
+        assert lpstat_p("", returncode=1).printer_fault() is None
+        assert lpstat_p("").printer_fault() is None
 
 
 # --- what actually reaches lp -------------------------------------------
@@ -205,6 +266,21 @@ class TestTheArgvHandedToLp:
         assert "-o" in argv, "the media option never reached lp"
         assert argv[argv.index("-o") + 1] == "media=Letter"
         assert seen["stdin"] == b"%PDF-fake", "key material goes over stdin"
+
+    def test_a_missing_lp_leaves_as_a_printer_error(self):
+        """
+        The first submit in the unattended sequence is the status sheet,
+        and it is outside every try in run(). A bare FileNotFoundError from
+        subprocess went straight past every caller that catches
+        PrinterError. _lpadmin has guarded this since it was written; this
+        did not, and it is the one on the hot path.
+        """
+        def missing(argv, stdin=None):
+            raise FileNotFoundError(2, "No such file or directory", "/usr/bin/lp")
+
+        with pytest.raises(printer.PrinterError) as caught:
+            printer.Cups(run=missing).submit(bytearray(b"x"))
+        assert "lp" in str(caught.value)
 
     def test_every_option_is_passed_not_just_the_first(self):
         seen, run = recording_run()

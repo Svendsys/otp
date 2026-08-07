@@ -40,8 +40,10 @@ class Aborted(Exception):
 
 
 # Consecutive empty device lists before believing the printer is really
-# gone. One empty answer is a hiccup; several in a row is a cable.
-GONE_AFTER = 3
+# gone. One empty answer is a hiccup; several in a row is a cable. Shared
+# with the headless loop rather than restated: two copies of a threshold
+# whose whole job is to be the same number is a drift waiting to happen.
+GONE_AFTER = diagnostics.GONE_AFTER
 
 
 def _press_waiter(buttons):
@@ -61,17 +63,6 @@ def _press_waiter(buttons):
         except Exception:                        # noqa: BLE001
             return False
     return pressed
-
-
-def open_buttons():
-    """GPIO buttons if they can be opened at all, else None."""
-    try:
-        from otpunit.hw.buttons import GpioButtons
-
-        return GpioButtons()
-    except Exception:                            # noqa: BLE001
-        # No gpiozero, no pins, no permissions -- all the same answer.
-        return None
 
 
 def countdown(cups, seconds, buttons=None, sleep=None, log=print,
@@ -118,7 +109,8 @@ def countdown(cups, seconds, buttons=None, sleep=None, log=print,
     return "elapsed"
 
 
-def drain(cups, queue, sleep, log, timeout=3600.0, step=2.0) -> bool:
+def drain(cups, queue, sleep, log, timeout=900.0, step=2.0,
+          clock=None) -> bool:
     """
     Block until the queue reports no work, or the timeout expires.
 
@@ -126,17 +118,39 @@ def drain(cups, queue, sleep, log, timeout=3600.0, step=2.0) -> bool:
     False means we could not establish that -- an unanswerable lpstat or a
     queue that never emptied -- in which case the caller must NOT purge,
     because cancelling a job that is still printing destroys the copy.
+
+    Raises Aborted if the printer goes away while we wait. The plug is the
+    only cancel this mode offers, and a 25-sheet copy A is fifteen minutes
+    of drain: leaving that window deaf meant pulling the cable during the
+    longest wait in the sequence did nothing at all until the wait ended.
+
+    Measured against a WALL CLOCK, not by adding up the sleeps. Each poll
+    runs lpstat through subprocess with Cups.TIMEOUT = 120s, and counting
+    only the sleeps let a wedged cupsd stretch a 3600-second budget to
+    sixty-one hours. Bounded by the poll count as well, because a test that
+    injects a no-op sleep never advances a real clock.
     """
-    waited = 0.0
-    while waited < timeout:
+    clock = clock or time.monotonic
+    deadline = clock() + timeout
+    polls = misses = 0
+    while clock() < deadline and polls <= timeout / step + 1:
+        polls += 1
         try:
             queued = cups.active_jobs(queue)
         except Exception:                        # noqa: BLE001
             queued = None
         if queued == 0:
             return True
+        # One empty answer is a hiccup, several in a row is a cable -- the
+        # same rule the countdown uses, for the same reason.
+        try:
+            present = bool(cups.devices())
+        except Exception:                        # noqa: BLE001
+            present = False
+        misses = 0 if present else misses + 1
+        if misses >= GONE_AFTER:
+            raise Aborted("printer disconnected while the queue was draining")
         sleep(step)
-        waited += step
     log("timed out waiting for the print queue to drain")
     return False
 
@@ -157,9 +171,18 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
     # Every sheet carries the media size. Dropping it left the status,
     # swap and done sheets submitted with no media at all, so a LETTER or
     # A6 unit rendered one size and asked the queue for another.
-    paper = {"media": getattr(settings, "paper", "A4")}
+    paper = {"media": _media(settings)}
 
     def send(data, title, options=None):
+        # Wait for the queue before adding to it. The unit ships with
+        # MaxJobs 1, so cupsd REJECTS a second job while one is active --
+        # `lp: Too many active jobs.` Measured against a real cupsd with
+        # the shipped config: the manual spooled, then the tabula, copy A,
+        # the separator and the final sheet were all refused in turn, and
+        # the operator got a status sheet promising a pad followed by
+        # nothing at all. Every gap in this sequence needs the wait, not
+        # just the two that had it.
+        drain(cups, queue, sleep, log, timeout=_drain_timeout(settings))
         cups.submit(data, name=queue, title=title,
                     options=paper if options is None else options)
 
@@ -210,6 +233,12 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
     #    copies are byte-identical -- which is what makes them a pair.
     spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, codeword, settings)
     job = jobs.PadPairJob(spec, cups, queue)
+    # Reset before generating and read after, so the sheet reports what
+    # THIS pad was made from. A probe at sheet-render time answers a
+    # different question: the status sheet probes five minutes before
+    # generation starts and the final sheet probes after it ends, and a
+    # device that dies in between made every page after it CSPRNG-only.
+    gen_module().TALLY.reset()
     try:
         job.generate()
     except Exception as exc:                     # noqa: BLE001
@@ -217,8 +246,14 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         return 1
 
     printed_b = False
-    drained = False
+    drained = purge = False
+    trouble = ""
     try:
+        # The pad copies go through PadPairJob rather than send(), so they
+        # need the same wait for the queue that send() does. Copy B gets it
+        # from the tray break; copy A follows the tabula card directly and
+        # was the submission that MaxJobs refused.
+        drain(cups, queue, sleep, log, timeout=_drain_timeout(settings))
         job.print_next_copy()
         log(f"copy A submitted ({settings.pages} pages)")
 
@@ -232,7 +267,13 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         # fixed timer started here runs while the printer is still working
         # -- at 12 ppm a 25-sheet copy A needs 125s against a 90s break, so
         # copy B was spooled before the separator sheet even landed.
-        drain(cups, queue, sleep, log)
+        drain(cups, queue, sleep, log, timeout=_drain_timeout(settings))
+        # If copy A did not reach paper, copy B will not either, and 25
+        # more sheets of a pad nobody can use is the wrong answer. Stop and
+        # say what the printer said.
+        fault = _fault(cups, queue)
+        if fault:
+            raise Aborted(f"the printer reports: {fault}")
         countdown(cups, settings.auto_swap_delay, buttons=buttons,
                   sleep=sleep, log=log)
 
@@ -246,21 +287,43 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         # on every single run, then printed a sheet saying the pair was
         # complete. The interactive path has always waited for this; the
         # unattended path did not.
-        drained = drain(cups, queue, sleep, log)
+        drained = drain(cups, queue, sleep, log,
+                        timeout=_drain_timeout(settings))
         if not drained:
             log("queue never drained; leaving the spool rather than "
                 "cancelling a copy that may still be printing")
-        printed_b = True
+        # A drained queue is necessary but NOT sufficient. It says the
+        # spool emptied; under ErrorPolicy abort-job that happens just as
+        # fast when every job failed. Ask the printer as well.
+        purge = drained
+        fault = _fault(cups, queue)
+        if fault:
+            log(f"the queue drained but the printer reports: {fault}")
+        # Setting this on the drain alone handed the operator "YOUR PAD
+        # PAIR IS PRINTED / They are identical" over a tray that was empty
+        # because the printer had run out of paper -- the exact failure the
+        # HALF sheet exists to report, made unreachable.
+        printed_b = drained and not fault
+        trouble = fault or trouble
     except Aborted as exc:
         log(f"aborted mid-pair: {exc}")
+        trouble = trouble or str(exc)
+        # The printer is gone, so nothing can be mid-print and there is
+        # nothing left to destroy by cancelling. What IS still there is a
+        # spooled copy of the pad, which is the one case where purging is
+        # both safe and the whole point.
+        purge = True
     except Exception as exc:                     # noqa: BLE001
+        # Anything else leaves the queue in an unknown state, and cancelling
+        # a job that is still feeding paper loses that copy for good.
         log(f"printing failed: {exc}")
+        trouble = trouble or str(exc)
     finally:
         try:
             # The key is wiped either way; only the spool purge is
             # conditional, because cancelling an in-flight job destroys
             # the copy that is printing.
-            job.finish(purge=drained)
+            job.finish(purge=purge)
         except Exception as exc:                 # noqa: BLE001
             # Never let a wipe failure mask what happened to the pair.
             log(f"wipe failed: {exc}")
@@ -270,7 +333,9 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
     #    nothing, because the operator files it and finds out later.
     try:
         send(sheet(DONE if printed_b else HALF, codeword=codeword,
-                   settings=settings), "WHAT TO DO NOW")
+                   settings=settings, tally=gen_module().TALLY,
+                   trouble=trouble),
+             "WHAT TO DO NOW")
     except Exception as exc:                     # noqa: BLE001
         log(f"could not print the final sheet: {exc}")
     log("done" if printed_b else "pair incomplete")
@@ -285,7 +350,40 @@ def _first(cups):
     return devices[0] if devices else None
 
 
+def _fault(cups, queue) -> str:
+    """
+    What the printer says is wrong, or "" if it says nothing or cannot say.
+
+    Silence is deliberately not read as trouble. A cupsd that cannot be
+    asked, and an older Cups without this method at all, must fall back to
+    the drain result rather than send someone to burn a pad that printed
+    perfectly.
+    """
+    try:
+        return cups.printer_fault(queue) or ""
+    except Exception:                            # noqa: BLE001
+        return ""
+
+
 MANUAL_PAGES = 28          # the rendered A5 manual, for the paper estimate
+
+
+def _media(settings: Settings) -> str:
+    """What actually comes out of the tray, which is not always `paper`."""
+    return settings.lp_options.get("media", settings.paper)
+
+
+# Seconds of drain budget per physical sheet, plus a fixed floor. A fixed
+# 900s bound is generous for the 25-sheet default and far too short for
+# `pages = 1000`, which is 250 sheets and over twenty minutes of printing
+# on a 12ppm laser -- the drain would time out, the purge be skipped and a
+# perfectly good pair reported as half.
+DRAIN_PER_SHEET = 12.0
+DRAIN_FLOOR = 300.0
+
+
+def _drain_timeout(settings: Settings) -> float:
+    return DRAIN_FLOOR + DRAIN_PER_SHEET * max(settings.sheets, 1)
 
 
 def _manual_options(settings: Settings) -> dict:
@@ -296,10 +394,24 @@ def _manual_options(settings: Settings) -> dict:
     sheet is a clean fit rather than a scaling compromise -- and it halves
     28 sheets to 14. Paper is a real constraint for anyone relying on this
     mode, so it is not a detail.
+
+    Anything narrower gets one page a sheet -- but it still gets the media,
+    because returning a bare {} left the manual as the only job in the
+    sequence submitted with no size at all, to be rendered at whatever the
+    queue happened to default to.
     """
+    media = {"media": _media(settings)}
     if settings.paper in ("A4", "LETTER"):
-        return {"media": settings.paper, "number-up": "2"}
-    return {}
+        return {**media, "number-up": "2"}
+    return media
+
+
+def _manual_sheets(settings: Settings) -> int:
+    if not settings.auto_manual:
+        return 0
+    if settings.paper in ("A4", "LETTER"):
+        return (MANUAL_PAGES + 1) // 2
+    return MANUAL_PAGES
 
 
 def sheets_needed(settings: Settings) -> int:
@@ -309,16 +421,14 @@ def sheets_needed(settings: Settings) -> int:
     Someone deciding whether to let this run may have a finite stack and
     no way to get more. Better an estimate on the first sheet than a
     printer that stops halfway through copy B.
+
+    `Settings.sheets` already knows the imposition, including that A7 is
+    two pad pages to an A6 sheet. Restating the arithmetic here got A7
+    wrong by a factor of two -- 100 pages quoted as 100 sheets a copy
+    rather than 50 -- which is exactly the number this is printed for.
     """
-    per_copy = settings.pages
-    if settings.imposed:
-        per_copy = -(-settings.pages // 4)       # four pad pages to a sheet
-    manual = 0
-    if settings.auto_manual:
-        manual = (MANUAL_PAGES + 1) // 2 if settings.paper in ("A4", "LETTER") \
-            else MANUAL_PAGES
     # status + tabula + swap + done
-    return manual + per_copy * 2 + 4
+    return _manual_sheets(settings) + settings.sheets * 2 + 4
 
 
 def _plan(settings: Settings) -> list[str]:
@@ -338,7 +448,7 @@ def _plan(settings: Settings) -> list[str]:
         f"In order: {', '.join(order)}. Two identical copies, "
         f"{settings.pages} pages each. You do not need to do anything.",
         f"PAPER: about {sheets_needed(settings)} sheets of "
-        f"{settings.paper} in total. Load more than that if you can; if it "
+        f"{_media(settings)} in total. Load more than that if you can; if it "
         "runs out mid-pair you lose the pair, not just the paper.",
         "TO STOP IT: unplug the printer, or power the unit off. Nothing is "
         "printed until the wait is over.",
@@ -357,7 +467,7 @@ DONE = "done"
 HALF = "half"
 
 
-def _key_source() -> str:
+def _key_source(tally=None) -> str:
     """
     Said on the pad's own sheet, not just the status sheet.
 
@@ -367,11 +477,13 @@ def _key_source() -> str:
     and that is a difference they are entitled to know about the specific
     pad in their hand.
     """
-    import otp_generator as gen
-
     try:
-        if gen.entropy_source() == "hwrng+urandom":
-            return "hardware TRNG, mixed with the system CSPRNG"
+        if tally is not None and tally.total:
+            return tally.summary()
+        # No tally means nobody generated anything through this path; fall
+        # back to a probe and be clear that is what it is.
+        if gen_module().entropy_source() == "hwrng+urandom":
+            return "hardware TRNG available (not measured for this pad)"
         return ("NO HARDWARE RNG WAS FOUND. This key came from the system "
                 "CSPRNG alone, which makes it a very strong stream cipher "
                 "rather than a true one-time pad.")
@@ -379,7 +491,14 @@ def _key_source() -> str:
         return "unknown"
 
 
-def sheet(kind, codeword="", settings=None, seconds=0):
+def gen_module():
+    import otp_generator
+
+    return otp_generator
+
+
+def sheet(kind, codeword="", settings=None, seconds=0, tally=None,
+          trouble=""):
     """One full-page instruction sheet, as PDF bytes."""
     settings = settings or Settings()
     if kind is SWAP:
@@ -418,6 +537,10 @@ def sheet(kind, codeword="", settings=None, seconds=0):
                        "no second copy to give to the person you were going "
                        "to talk to. A one-time pad only works because both "
                        "ends hold the SAME key."),
+                # The printer usually knows -- out of paper, cover open,
+                # jammed -- and saying so is the difference between a sheet
+                # that ends the problem and one that only reports it.
+                ("Reported", trouble or "nothing; the printer gave no reason"),
                 ("Codeword", codeword or "(unset)"),
             ]),
             diagnostics.Section("WHAT TO DO", [
@@ -435,14 +558,14 @@ def sheet(kind, codeword="", settings=None, seconds=0):
     else:
         heading = dict(
             title="YOUR PAD PAIR IS PRINTED",
-            subtitle="Everything above this sheet, except the tabula recta "
-                     "card, is secret. This sheet is not.")
+            subtitle="This sheet names a live pad. Keep it with the pad or "
+                     "destroy it -- do not leave it lying about.")
         sections = [
             diagnostics.Section("YOU NOW HAVE A PAD PAIR", [
                 ("Codeword", codeword or "(unset)"),
                 ("Pages per copy", str(settings.pages)),
                 ("Format", "A7" if settings.a7 else "A6"),
-                ("Key source", _key_source()),
+                ("Key source", _key_source(tally)),
                 (None, "Two copies were printed, A then B. They are "
                        "identical, and that is the point: one stays with "
                        "you, the other goes to the person you will be "
