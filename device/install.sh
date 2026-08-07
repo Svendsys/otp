@@ -131,6 +131,31 @@ Storage=volatile
 RuntimeMaxUse=16M
 EOF
 
+log "Ensuring the groups the service runs with exist"
+# otp-unit.service has SupplementaryGroups=lp gpio i2c input, and systemd
+# REFUSES to start a unit naming a group that does not exist:
+#
+#   otp-unit.service: Failed to determine supplementary groups: No such process
+#   otp-unit.service: Failed at step GROUP spawning /usr/bin/python3
+#   otp-unit.service: Main process exited, code=exited, status=216/GROUP
+#
+# With Restart=on-failure that is a restart loop, on a device whose journal
+# is deliberately volatile -- so the evidence dies with the power and the
+# operator gets a dark panel and nothing to read. Measured in a booted VM;
+# no chroot or container can see it, because neither starts the unit.
+#
+# Raspberry Pi OS happens to ship gpio and i2c, so the intended platform
+# was fine. But this script claims to be the single source of truth for
+# what the unit is, and it creates every other precondition it needs. A
+# group that must exist for the service to start at all is one of those.
+# Existing groups keep their GID; this only fills in what is missing.
+for group in lp gpio i2c input; do
+    if ! getent group "$group" >/dev/null 2>&1; then
+        groupadd --system "$group"
+        log "  created missing group: $group"
+    fi
+done
+
 log "Disabling core dumps"
 # The process holds several megabytes of key material while a job runs. A
 # segfault would hand the whole address space to systemd-coredump, which has

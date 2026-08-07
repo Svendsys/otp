@@ -101,11 +101,15 @@ check journal-volatile \
       "$(if [ "$JOURNAL" = "Storage=volatile" ]; then echo yes; else echo no; fi)" \
       "${JOURNAL:-unset}"
 
-COREDUMP=$(sysctl -n kernel.core_pattern 2>/dev/null || echo "?")
-check coredumps-off \
-      "$(if [ "$COREDUMP" = "|/bin/false" ] || [ "$COREDUMP" = "/dev/null" ] \
-         || [ -z "$COREDUMP" ]; then echo yes; else echo no; fi)" \
-      "core_pattern=$COREDUMP"
+# LimitCORE=0 on the unit, not kernel.core_pattern. Measured here: the
+# pattern was plain `core`, meaning systemd-coredump is not the registered
+# handler and install.sh's Storage=none would never be consulted -- a dump
+# would land in the working directory instead. The unit-level rlimit is
+# what actually stops this process producing one, whatever the handler.
+CORELIMIT=$(systemctl show otp-unit.service -p LimitCORE --value 2>/dev/null || echo "?")
+check coredumps-off-for-the-unit \
+      "$(if [ "$CORELIMIT" = "0" ]; then echo yes; else echo no; fi)" \
+      "LimitCORE=$CORELIMIT core_pattern=$(sysctl -n kernel.core_pattern 2>/dev/null)"
 
 # --- the spool is where the hardening says it is ------------------------
 
