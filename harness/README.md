@@ -1,13 +1,21 @@
 # Running the unit without a Raspberry Pi
 
 Six rounds of adversarial code review found real bugs and still left a
-device that could not print a pad. The first run against an actual `cupsd`
-found that in four seconds: `MaxJobs 1` makes CUPS *refuse* a second job
-rather than queue it, so the shipped sequence got two sheets out and was
-rejected for the rest.
+device that could not print a pad, and could not start at all.
 
-That is the argument for this directory. Reading finds defects in code;
-only running finds defects in assumptions.
+Reading finds defects in code; only running finds defects in assumptions.
+What each tier found, once it existed:
+
+| Found by | Defect |
+|---|---|
+| Tier 1, a real `cupsd` | `MaxJobs 1` makes CUPS **refuse** a second job rather than queue it. The unit got two sheets out and was rejected for the rest — it could never print a pad. Four seconds to find. |
+| Tier 1, a real `cupsd` | A drained queue was read as proof of printing. Under `ErrorPolicy abort-job` a failed job empties the queue as fast as a successful one, so an empty tray produced "YOUR PAD PAIR IS PRINTED". |
+| **Tier 2, a booted VM** | **`216/GROUP`.** `otp-unit.service` names supplementary groups `install.sh` never created; systemd refuses to start such a unit, and `Restart=on-failure` looped it forever. Pi OS ships those groups, so the intended platform hid it. |
+| Six rounds of reading | Many real bugs — none of these three. |
+
+None of that needed a Raspberry Pi. The `216/GROUP` one could not have been
+found by emulating one either: pi-gen never boots the image it builds, and
+a container has no systemd to refuse the unit.
 
 ## Is there a Raspberry Pi emulator?
 
@@ -152,12 +160,31 @@ unattended rather than failing to start.
 
 ## Tier 3 — the built image under `-M raspi3b`
 
-Not built yet.
+`./harness/img-boot.sh <image.img.xz>`, or the `Boot the image` step in
+`image.yml`.
 
-Boots the actual `.img` the release pipeline produces: does it come up,
-does the service start, does the overlay work. Worth doing once per image
-rather than per commit, and it gives *worse* peripheral coverage than tier
-1 — a QEMU Pi has nothing plugged into it either.
+**Never executed.** It is written and wired up but unrun: tier 3 needs an
+image, and the image workflow only runs from `master`. It runs for the
+first time when an image is built after this lands, which is why it is
+attached to the image build rather than left as a script nobody invokes.
+It carries `continue-on-error` so an unvalidated step cannot break the
+build or block the artifact upload.
+
+It answers exactly one question nothing else can: **does the thing that
+gets flashed to a card actually boot?** pi-gen assembles a filesystem and
+never starts it; tier 2 boots a Debian cloud image rather than this one. A
+missing kernel module, a broken `cmdline.txt`, an fstab naming a partition
+that moved — all invisible until something powers it on.
+
+Two details that make it fiddly, both handled in the script: QEMU does not
+run the Pi's proprietary bootloader, so `kernel8.img` and the DTB are
+pulled off the FAT boot partition with `mcopy` and passed directly; and
+QEMU's `sd` interface refuses any image whose size is not a power of two,
+which pi-gen's output never is.
+
+**Its peripheral coverage is worse than tier 1's**, and that is not a
+defect in the plan — a QEMU Pi is a Pi with nothing plugged into it. Once
+per image, not per commit.
 
 ## What none of this gives you
 

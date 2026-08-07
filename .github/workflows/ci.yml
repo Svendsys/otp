@@ -40,7 +40,7 @@ jobs:
           ./shellcheck --version
           ./shellcheck device/install.sh image/build.sh image/render-manual.sh \
                        harness/kernel-sim.sh harness/vm-check.sh \
-                       harness/vm-guest-check.sh
+                       harness/vm-guest-check.sh harness/img-boot.sh
 
   hardware:
     # Tier 1 of the harness: the real code against real kernel interfaces
