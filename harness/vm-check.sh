@@ -25,6 +25,18 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 WORK="${OTP_VM_WORK:-${TMPDIR:-/tmp}/otp-vm}"
+# A leading ~ arrives literally from a YAML env: block -- nothing expands
+# it there, and nothing expands it in a variable either. Left alone it
+# creates a directory actually named "~", and qemu-img then resolves the
+# backing file relative to the overlay and asks for ~/otp-vm/~/otp-vm/...
+TILDE='~'                                       # literal, not a path to expand
+if [ "${WORK#"$TILDE"/}" != "$WORK" ]; then
+    WORK="$HOME/${WORK#"$TILDE"/}"
+fi
+mkdir -p "$WORK"
+# Absolute from here on. qemu-img resolves a relative backing path against
+# the overlay's own directory, not the working directory.
+WORK="$(cd "$WORK" && pwd)"
 # Debian 13 (trixie) is what the unit ships on, so the systemd and CUPS
 # under test are the versions the device will really have. The `generic`
 # image rather than `genericcloud`: the cloud kernel drops drivers this
@@ -46,8 +58,6 @@ need() {
 need qemu-system-x86_64
 need qemu-img
 need cloud-localds
-
-mkdir -p "$WORK"
 
 # --- the base image, cached ---------------------------------------------
 
