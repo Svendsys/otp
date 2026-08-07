@@ -63,14 +63,34 @@ class FakeButtons(Buttons):
 
 
 class KeyboardButtons(Buttons):
-    """Maps terminal keys to presses, for --sim."""
+    """
+    Maps terminal keys to presses.
+
+    Originally for --sim only. It is now also the input path for a real
+    unit with a monitor and a USB keyboard, which changes two things.
+
+    `allow_quit` is off by default because on a real unit QUIT is fatal:
+    App.run() breaks, main() returns 0, and systemd's Restart=on-failure
+    treats a zero exit as success and does NOT restart. One `q` -- a key
+    the on-screen footer used to advertise -- turned the appliance off
+    until someone power-cycled it. The simulator still passes it True.
+    """
 
     KEYS = {
         "u": Press.UP, "k": Press.OK, "d": Press.DOWN,
-        "K": Press.BACK, "q": Press.QUIT,
+        "K": Press.BACK,
         "\x1b[A": Press.UP, "\x1b[B": Press.DOWN,
         "\r": Press.OK, "\n": Press.OK,
     }
+    QUIT_KEYS = {"q", "\x03"}
+
+    def __init__(self, allow_quit: bool = False):
+        self.allow_quit = allow_quit
+
+    def _map(self, key):
+        if key in self.QUIT_KEYS:
+            return Press.QUIT if self.allow_quit else None
+        return self.KEYS.get(key)
 
     def wait(self, timeout: float | None = None) -> Press | None:
         # Piped stdin has no terminal to put into raw mode. Falling back to
@@ -90,22 +110,39 @@ class KeyboardButtons(Buttons):
                     return None
             line = sys.stdin.readline()
             if not line:
-                return Press.QUIT
-            return self.KEYS.get(line.strip()[:1] or "\n")
+                # EOF. Only the simulator may read this as "quit" -- on a
+                # real console a hangup would otherwise end the process,
+                # and a zero exit tells systemd not to restart.
+                return Press.QUIT if self.allow_quit else None
+            return self._map(line.strip()[:1] or "\n")
 
         fd = sys.stdin.fileno()
         saved = termios.tcgetattr(fd)
         try:
-            tty.setraw(fd)
+            # TCSANOW, not setraw's TCSAFLUSH default. TCSAFLUSH DISCARDS
+            # the pending input queue, and wait() enters raw mode on every
+            # call -- so every key pressed while the app was rendering a
+            # frame was thrown away by the terminal driver. Measured at 27%
+            # loss just from panel redraws, approaching 100% while a pad is
+            # generating.
+            tty.setraw(fd, termios.TCSANOW)
             ready, _, _ = select.select([sys.stdin], [], [], timeout)
             if not ready:
                 return None
             ch = sys.stdin.read(1)
             if ch == "\x1b":
-                ch += sys.stdin.read(2)
-            if ch == "\x03":
-                return Press.QUIT
-            return self.KEYS.get(ch)
+                # An escape byte may be a lone Esc or the start of an arrow
+                # sequence, and in raw mode nothing distinguishes them but
+                # time. A bare read(2) here blocked FOREVER on a single Esc
+                # -- the most natural key to press at a prompt -- which
+                # recreated the exact hang that Interface.prove() exists to
+                # prevent, inside prove() itself.
+                for _ in range(2):
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if not ready:
+                        break
+                    ch += sys.stdin.read(1)
+            return self._map(ch)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 

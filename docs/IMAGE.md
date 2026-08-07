@@ -56,8 +56,24 @@ test here is what the image does.
 
 ## After first boot
 
-The unit starts automatically, needs no network and no keyboard. Plug in a
-USB printer and use the three buttons.
+The unit starts automatically and needs no network. Plug in a USB
+printer. If an OLED and buttons are fitted it uses those; an HDMI
+monitor and a USB keyboard work just as well; with neither it prints
+unattended.
+
+**No panel wired up yet?** Boot it anyway with a printer attached. It
+prints a status sheet at once — the wiring table, an I2C scan, which
+drivers loaded, the printer it matched, and whether swap, the overlay,
+the network and the hardware RNG are where they should be — and that
+sheet is the fastest way to tell whether the image is healthy before you
+have any hardware to look at it with.
+
+Then, **after five minutes, it prints a pad pair**: the manual, a tabula
+recta card, and two copies of a 100-page pad, about 68 sheets of A4 in
+all. That is deliberate — see
+[HARDWARE.md](HARDWARE.md#if-you-cannot-get-these-parts) — but if you only
+want the status sheet, unplug the printer when it lands, or set
+`auto_print = no` in `otp-unit.conf` on the boot partition first.
 
 One step is left manual, because it makes the filesystem read-only and you
 want to be sure everything works first:
@@ -109,6 +125,18 @@ to be read:
   `cupsd.conf.d`, so a drop-in file would be silently ignored — and the
   defaults are the opposite of what is wanted here: history is kept forever
   and the spooled document, the entire pad, is kept for 24 hours.
+- Sets `MaxJobs 4` and `ErrorPolicy abort-job`. Both numbers have a
+  history. `MaxJobs 1` looks right — one job's key material in the spool
+  at a time — but cupsd does not *queue* past `MaxJobs`, it **refuses**:
+  `lp: Too many active jobs.` Against a real cupsd that meant the status
+  sheet and the manual printed and every job after them was rejected, so
+  the unit promised a pad pair and then produced nothing. The unit waits
+  for the queue to drain before each submit, so only one job is live in
+  practice; the headroom is what stops a timing race costing the whole
+  run. `abort-job` then means a failed job is discarded as promptly as a
+  successful one — so an empty queue is *not* proof anything printed, and
+  the unit asks `lpstat -p` for the printer's own state before it tells
+  anyone they are holding a pair.
 - Mounts a tmpfs over `/etc/cups` at boot from a baked-in template, so the
   print queue is rebuilt from whatever is plugged in. The template excludes
   `printers.conf`, which holds the last printer's make, model and serial.

@@ -203,13 +203,33 @@ class PadPairJob:
     def done(self) -> bool:
         return self.copies_done >= self.spec.copies
 
-    def finish(self) -> None:
-        """Zero the key material and empty the spool. Safe to call twice."""
+    def finish(self, purge: bool = True) -> None:
+        """
+        Zero the key material and empty the spool. Safe to call twice.
+
+        The key is ALWAYS zeroed; that part is not optional. The purge is,
+        because `cancel -x -a` cancels every job on the queue including
+        one that is still printing. A caller that could not establish the
+        queue was empty passes purge=False and leaves the spool alone --
+        it is on tmpfs and dies with the power, which is a far better
+        outcome than shredding the copy currently coming out.
+        """
         if self._buffer is not None:
             zero(self._buffer)
             self._buffer = None
-        if self.spec.carries_key_material:
+        if not self.spec.carries_key_material:
+            return
+        if purge:
             self.cups.purge(self.queue)
+        else:
+            # Only the `cancel` is dangerous. Clearing TempDir is not, and
+            # cancelling is exactly when it matters: CUPS SIGKILLs the
+            # filter chain, so Ghostscript never unlinks its scratch file.
+            # Skipping both left plaintext pages in /run/cups/tmp.
+            try:
+                self.cups._clear_temp()
+            except Exception:                    # noqa: BLE001
+                pass
 
     def __enter__(self):
         return self

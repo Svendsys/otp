@@ -5,6 +5,15 @@ After=cups.service otp-unit-etc-cups.service
 Wants=cups.service
 Requires=otp-unit-etc-cups.service
 
+# The unit owns tty1, because that is the front panel when a monitor is
+# attached. Raspberry Pi OS Lite runs a login prompt there, and
+# StandardInput=tty-force below TAKES the console rather than failing --
+# so without this both processes hold /dev/tty1, output interleaves and
+# keystrokes go to whichever grabbed them. Conflicts= makes systemd stop
+# the getty first. A login prompt is still available on tty2 (Alt+F2).
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 -m otpunit
@@ -38,7 +47,23 @@ LockPersonality=yes
 LimitCORE=0
 
 # Needs the console for the OLED and GPIO, and poweroff for a clean shutdown.
-SupplementaryGroups=lp gpio i2c
+# `input` is for reading a USB keyboard when there is no GPIO button.
+SupplementaryGroups=lp gpio i2c input
+
+# Bound to tty1 so that a monitor and a USB keyboard work as a front panel
+# when no OLED is fitted -- the console renderer and the keyboard reader
+# are the same ones --sim uses, so this costs nothing but the wiring.
+#
+# This alone does NOT decide the interface. stdin is a terminal here
+# whether or not anything is plugged into the HDMI socket, so otpunit/hmi
+# checks the DRM connector status and looks for a real keyboard device
+# before choosing the console; otherwise it prints unattended.
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
 
 [Install]
 WantedBy=multi-user.target

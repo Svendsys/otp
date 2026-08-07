@@ -55,6 +55,152 @@ Three buttons, because a long press does the work of a fourth:
 | OK (tap) | Select, confirm, advance |
 | OK (hold ~1s) | Back, or cancel a running job |
 
+## If you cannot get these parts
+
+The OLED and the buttons are the *nicest* interface, not the only one.
+The unit looks for a display and an input separately and takes the best
+of each, so these all work:
+
+| Display | Input | Result |
+|---|---|---|
+| SSD1306 OLED | 3 buttons | The intended panel |
+| SSD1306 OLED | USB keyboard | Full menu |
+| **Any HDMI monitor or TV** | **USB keyboard** | Full menu |
+| Any HDMI monitor or TV | 3 buttons | Full menu |
+| — | — | Prints unattended, see below |
+
+**A monitor and a keyboard are the easy answer.** Almost every house has
+both, they need no soldering, and the menu they give you is the same one
+the OLED shows — the unit binds itself to `tty1`, so plug an HDMI screen
+and a USB keyboard into a Pi and it just appears. Arrow keys move,
+Enter selects, and **SHIFT+K** is back or cancel. There is no
+hold-to-go-back on a keyboard: `KeyboardButtons` maps single keys, so
+the long press that the three-button panel uses has its own key here.
+
+It checks the DRM connector rather than trusting the presence of a
+terminal, so a unit with nothing plugged into its HDMI socket does not
+sit at a menu nobody can see — it goes and prints instead.
+
+**It also waits to be answered.** Finding a screen and finding an input
+are not the same as having someone there: opening a GPIO button only
+proves a pin could be reserved, and an HDMI monitor with no keyboard
+would otherwise park the unit at a menu forever. So the panel shows
+`PRESS ANY BUTTON` and waits **20 seconds**. Press anything and you get
+the menu; press nothing and it prints unattended. If you are wiring up a
+panel and it keeps going off to print, that window is what you are
+missing — power-cycle and press a button while the prompt is up.
+
+### And if you have none of that either
+
+Then the unit still makes pads, and that is the point. Assume the shops
+are shut and nothing is coming: flash the image, plug in a USB printer,
+power up with nothing else attached, and leave it alone. Five minutes
+later it starts printing a complete, usable set.
+
+The panel was never load-bearing. All it ever did was choose a codeword
+and a page count, and both have defaults that are fine. What replaces it
+is built from things that cannot run out:
+
+| Instead of | Use |
+|---|---|
+| A display | Paper. The unit prints what it would have shown. |
+| Buttons | Time. It waits, and tells you on paper how long. |
+| A cancel button | The plug. Unplugging the printer aborts everything. |
+| A confirm button | Any wire. Bridging pin 33 to pin 34 means "now". |
+| A settings menu | The SD card. `otp-unit.conf` in any computer. |
+
+The sequence, once a printer appears:
+
+1. **Status sheet**, at once — what it found, a countdown saying exactly
+   what is about to print, how much paper it will take, and how to stop
+   it.
+2. **Five minutes**, so there is time to read that and pull the plug.
+   Bridging header pin 33 to pin 34 with a wire, a paperclip or a
+   screwdriver skips the wait.
+3. **The manual** — 28 A5 pages, printed two to a sheet on A4, so 14
+   sheets. It goes *before* the pads deliberately: a pad is useless to
+   someone who does not know the rules, and if the paper runs out, what
+   survives should be the instructions rather than half a pad.
+4. **A tabula recta card** — the lookup table that lets you encrypt and
+   decrypt by hand without doing any arithmetic.
+5. **Copy A** of the pad — 100 A6 pages by default, four to an A4 sheet,
+   so 25 sheets.
+6. **A separator sheet**: take copy A out of the tray, copy B follows in
+   90 seconds. With no buttons, the sheet *is* the prompt. It also tells
+   you what it means if nothing follows it — because the sheet that would
+   normally report a failed copy B needs a working printer to be printed
+   on, and a failed copy B usually means there isn't one.
+7. **Copy B** — byte-identical to A, which is what makes them a pair.
+8. **A final sheet**: what you are holding, the four rules that matter,
+   and how to use it. If the pair did *not* complete, this sheet says so
+   instead, and names what the printer reported — out of paper, jammed,
+   switched off — because the unit asks the queue rather than assuming an
+   empty spool means the pages came out.
+
+That is about **68 sheets of A4** in total for the defaults, and the
+status sheet tells you the number before any of it starts. Load more than
+that if you can: running out mid-pair loses the pair, not just the paper.
+
+It does this once per connection, not on a timer. To make another pair,
+power-cycle with the printer attached. To change anything, edit
+`otp-unit.conf` on the SD card's first partition — it is FAT, so any
+computer can read it:
+
+```ini
+auto_print    = yes          # print a pair unattended
+auto_delay    = 300          # seconds to wait first; 0 prints at once
+auto_manual   = yes          # print the manual before the pads
+pages         = 100          # A6 pad pages per copy
+paper         = A4           # A4, LETTER or A6
+auto_codeword =              # leave empty to have one rolled
+```
+
+The unit **reads** `auto_codeword` but never writes one. A codeword is not
+key material, but it names a live pad, and the SD card is the part most
+likely to be captured along with the unit.
+
+## The status sheet
+
+Whether or not you let it print pads, the first sheet tells you what the
+unit found:
+
+- the wiring table, so you can build the panel from the sheet alone
+- an I2C scan, so you can tell "nothing wired up" from "wired up, but at
+  0x3D"
+- which of `luma.oled`, `gpiozero` and `lgpio` actually imported
+- the printer it detected, the queue it created and the driver it matched
+- whether swap is off, whether the root filesystem is a read-only overlay,
+  whether any network link is up, and whether the key came from the
+  hardware RNG — the claims this device makes
+  about itself, checked rather than asserted
+- Pi model, serial, memory, temperature, kernel, entropy, disk
+
+It reprints when the printer is unplugged and reconnected, not on a timer,
+so a unit left plugged in overnight runs the sequence once, not repeatedly. To
+ask for one deliberately:
+
+```sh
+sudo systemctl stop otp-unit
+sudo python3 -m otpunit --diagnostic
+```
+
+Note this runs the **whole** unattended sequence, pads included — it is
+not a status-sheet-only switch. To get the sheet without the pads, set
+`auto_print = no` first. (The service runs as root; there is no `otp`
+user.)
+
+The sheet carries no key material — no codeword, no key — so photographing
+it or emailing it for help with a unit that will not come up cannot
+compromise a pad. It does identify the hardware: the board serial, the
+printer's serial inside its device URI, and any network link it can see.
+That names the unit rather than the pad, but cross it out before sending
+if that distinction matters where you are. The sheets that come out *with
+a pad* are a different matter, and say so at the top: those are key
+material.
+
+To get the status sheet without the pads that normally follow it, set
+`auto_print = no` in `otp-unit.conf`. The unit then reports and stops.
+
 ## Checking the hardware
 
 With the unit powered and the image flashed:

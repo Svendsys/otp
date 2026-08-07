@@ -16,10 +16,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from otpunit import config
+from otpunit import config, hmi
 from otpunit.codewords import Vocabulary
-from otpunit.hw.buttons import GpioButtons, KeyboardButtons
-from otpunit.hw.display import ConsoleDisplay, Ssd1306Display
+from otpunit.hw.buttons import KeyboardButtons
+from otpunit.hw.display import ConsoleDisplay
 from otpunit.printer import Cups, Device
 from otpunit.ui import App
 
@@ -48,21 +48,25 @@ class SimulatedCups(Cups):
         pass
 
 
-def build(args):
-    if args.sim:
-        return ConsoleDisplay(), KeyboardButtons(), SimulatedCups()
+PROVE_SECONDS = 20.0
 
-    # A display that is not on the bus yet must not take the unit down. With
-    # Restart=on-failure this would otherwise burn through systemd's start
-    # limit in seconds and leave the service permanently failed, with no
-    # panel to say why.
+
+def _prove(interface, log) -> bool:
+    from otpunit.hw.display import Frame
+
     try:
-        display = Ssd1306Display(rotate=args.rotate)
-    except Exception as exc:
-        print(f"OLED unavailable ({exc}); falling back to console output",
-              file=sys.stderr)
-        display = ConsoleDisplay(stream=sys.stderr)
-    return display, GpioButtons(), Cups()
+        interface.display.show(Frame(
+            title="PRESS ANY BUTTON",
+            lines=["TO USE THE PANEL.", "", "OTHERWISE THIS UNIT",
+                   "PRINTS ON ITS OWN."],
+            footer="WAITING..."))
+    except Exception:                            # noqa: BLE001
+        pass
+    if interface.prove(PROVE_SECONDS):
+        log("panel answered; using it")
+        return True
+    log("nobody answered the panel; printing instead")
+    return False
 
 
 def main(argv=None):
@@ -73,14 +77,65 @@ def main(argv=None):
                         help="rotate the OLED by N*90 degrees")
     parser.add_argument("--config", default=config.CONFIG_PATH,
                         help="settings file (default: %(default)s)")
+    parser.add_argument("--diagnostic", action="store_true",
+                        help="run the unattended print sequence and exit, "
+                             "even if an interface is attached")
     args = parser.parse_args(argv)
 
-    display, buttons, cups = build(args)
+    settings = config.load(args.config)
+    log = lambda message: print(message, file=sys.stderr)   # noqa: E731
+
+    if args.sim:
+        # allow_quit only in the simulator: on a real unit QUIT ends the
+        # process with status 0, and Restart=on-failure reads that as
+        # success and does not restart.
+        interface = hmi.Interface(ConsoleDisplay(),
+                                  KeyboardButtons(allow_quit=True),
+                                  "terminal", "keyboard")
+        cups = SimulatedCups()
+    else:
+        # Display and input are looked for separately, so an OLED with a
+        # USB keyboard, or a monitor with three buttons on a breadboard,
+        # are both perfectly good interfaces. Probed once here and the
+        # handles carried forward: opening these is not free.
+        interface = hmi.detect(rotate=args.rotate, log=log)
+        cups = Cups()
+        log(f"interface -- {interface.describe()}")
+
+    # No menu without something to draw on AND something to press. That is
+    # not an error: it is the case this device exists for, so fall through
+    # to printing unattended, using the printer itself as the interface.
+    # An interface that nobody answers is not an interface. See
+    # Interface.prove: opening GPIO buttons proves only that a pin could
+    # be reserved, so without this a monitor plus no buttons walks into a
+    # menu that blocks forever instead of printing.
+    # --diagnostic goes headless whatever is attached, so it must not sit
+    # through the prove window first: it drew PRESS ANY BUTTON on the panel,
+    # waited twenty seconds and then discarded the answer.
+    driven = (not args.diagnostic and interface.interactive
+              and (args.sim or _prove(interface, log)))
+
+    if args.diagnostic or not driven:
+        from otpunit import diagnostics
+
+        buttons = interface.buttons
+        if interface.display is not None:
+            interface.display.close()
+        log("no usable interface; printing unattended" if not interface.interactive
+            else "unattended sequence requested")
+        try:
+            return diagnostics.run_headless(
+                cups, settings=settings, once=args.diagnostic,
+                buttons=buttons, log=log)
+        finally:
+            if buttons is not None:
+                buttons.close()
+
     app = App(
-        display=display,
-        buttons=buttons,
+        display=interface.display,
+        buttons=interface.buttons,
         cups=cups,
-        settings=config.load(args.config),
+        settings=settings,
         vocabulary=Vocabulary(),
         config_path=args.config,
     )
@@ -90,12 +145,20 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
-        display.close()
-        buttons.close()
+        interface.close()
 
     if app.shutdown_requested and not args.sim:
         subprocess.run(["/sbin/poweroff"])
-    return 0
+        return 0
+    if args.sim:
+        return 0
+    # The menu ended without anyone asking to shut down -- a hangup, a
+    # stray key, an empty screen stack. Exit NON-ZERO so systemd's
+    # Restart=on-failure brings the unit back. Returning 0 here told
+    # systemd the appliance had finished its job, and it stayed off until
+    # somebody power-cycled it.
+    log("panel exited without a shutdown request; restarting")
+    return 1
 
 
 if __name__ == "__main__":

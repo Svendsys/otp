@@ -35,6 +35,7 @@ import argparse
 import math
 import os
 import sys
+import time
 from reportlab.lib.units import mm
 from reportlab.lib.pagesizes import A4, A5, A6, LETTER
 from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -70,9 +71,212 @@ CROP_TICK = 7 * mm
 CODEWORD_MIN_FONT = 5.5
 
 
+# Every Raspberry Pi has a hardware TRNG on the SoC -- a ring oscillator,
+# sampled: BCM2835/6/7 on the Pi 1, 2, 3, Zero and Zero 2 W, and RNG200 on
+# the Pi 4 and 5. Linux exposes it here.
+# Overridable so tests can point at a fake, and so a laptop can opt out.
+HWRNG_PATH = os.environ.get("OTP_HWRNG_PATH", "/dev/hwrng")
+
+# TRNGs are slow, and how slow varies by two orders of magnitude: a Pi's
+# BCM2835 gives on the order of 100 KiB/s, which covers a 1000-page pad in
+# seconds, while a throttled virtio-rng in a VM can manage 6 KiB/s, which
+# would make the same pad take minutes. So reads are bounded. Past the
+# deadline the whole request falls back to the CSPRNG and SAYS SO, rather
+# than leaving an operator staring at a printer that never starts.
+HWRNG_TIMEOUT = float(os.environ.get("OTP_HWRNG_TIMEOUT", "60"))
+# Small enough that the deadline above is tested often on a slow device,
+# large enough not to make syscalls the bottleneck on a fast one.
+_HWRNG_CHUNK = 4096
+
+# A stuck TRNG is a real failure mode, and the one that matters most: it
+# fails silently, and a pad made from its output is not a pad. Anything
+# this repetitive is treated as broken rather than trusted.
+_HEALTH_SAMPLE = 256
+
+
+def _hwrng_bytes(n: int, path: str | None = None) -> bytes | None:
+    """
+    n bytes straight off the hardware TRNG, or None if there is not one.
+
+    Short reads are a None, not a partial answer: silently returning fewer
+    bytes than asked for would leave the caller padding key material with
+    something else without knowing it.
+
+    The path is resolved on each call rather than bound as a default, so
+    HWRNG_PATH stays overridable at runtime -- which is what lets a test
+    point this at a stuck or absent device and see what happens.
+    """
+    path = path or HWRNG_PATH
+    deadline = time.monotonic() + HWRNG_TIMEOUT
+    # O_NONBLOCK, because nothing else actually bounds this.
+    #
+    # Fourth attempt. Checking the deadline after a blocking read let one
+    # read sit in the kernel for 73 seconds against a 1-second budget.
+    # Chunking moved the check but wrote it `if got < n`, and every request
+    # this program makes is a single chunk, so it never ran. select() was
+    # measured returning READY instantly and unconditionally on
+    # /dev/hwrng -- the char device implements no .poll, so the VFS hands
+    # back DEFAULT_POLLMASK and the call carries no information at all;
+    # a 0.001s budget still took 0.614s.
+    #
+    # A non-blocking fd is the version that works: read() returns EAGAIN
+    # rather than sleeping in the kernel, so the deadline below is the
+    # thing that decides. On a regular file (every test fake) O_NONBLOCK
+    # is a no-op and reads behave normally.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    chunks, got = [], 0
+    try:
+        while got < n:
+            if time.monotonic() > deadline:
+                # Abandon the whole request rather than splice a CSPRNG
+                # tail onto a TRNG head: a pad half from each is neither,
+                # and nothing downstream could tell.
+                return None
+            try:
+                chunk = os.read(fd, min(_HWRNG_CHUNK, n - got))
+            except BlockingIOError:
+                time.sleep(0.01)
+                continue
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            got += len(chunk)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    return data if len(data) == n and _looks_alive(data) else None
+
+
+def _looks_alive(data: bytes) -> bool:
+    """
+    Reject output no working TRNG would produce.
+
+    This cannot make a key stronger -- the result is XORed with the CSPRNG
+    either way -- so its only job is to stop the unit CLAIMING hardware
+    entropy it did not get. The previous version looked at the first 256
+    bytes and asked only whether they were all identical, which passed a
+    free-running counter, a stuck nibble, and 255 zeros after one live
+    byte. It also passed any 1-byte read unconditionally, which is what
+    made entropy_source() report hardware on a dead device.
+
+    So: the whole buffer, a distinct-value floor against the count random
+    data would actually give, and a periodicity check for a latched or
+    counting register.
+    """
+    n = len(data)
+    if n < 16:
+        return len(set(data)) > 1
+    # For random bytes, expected distinct values = 256(1 - e^(-n/256)).
+    # Half of that is far below sampling noise and far above a stuck bus.
+    if len(set(data)) < 256 * (1 - math.exp(-n / 256)) * 0.5:
+        return False
+    for period in (1, 2, 3, 4, 8, 16, 32, 64, 128, 256):
+        if n >= period * 3 and data[period:] == data[:-period]:
+            return False
+    return True
+
+
+# What get_random_bytes actually drew on, rather than what a separate
+# probe predicts it would. Two different things: the probe reads one byte
+# now, the pad is hundreds of reads over minutes, and a device that dies
+# in between made every page after it CSPRNG-only while the sheet still
+# said "hardware". Callers reset this before a job and read it after.
+class Tally:
+    """A count of which source each request was actually served from."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self.hardware = 0
+        self.software = 0
+
+    def record(self, hardware: bool) -> None:
+        if hardware:
+            self.hardware += 1
+        else:
+            self.software += 1
+
+    @property
+    def total(self) -> int:
+        return self.hardware + self.software
+
+    def summary(self) -> str:
+        """One line, true for the material just generated."""
+        if not self.total:
+            return "nothing generated yet"
+        if not self.software:
+            return "hardware TRNG, mixed with the system CSPRNG"
+        if not self.hardware:
+            return ("NO HARDWARE RNG. This key came from the system CSPRNG "
+                    "alone, which makes it a very strong stream cipher "
+                    "rather than a true one-time pad.")
+        return (f"MIXED SOURCES: {self.hardware} of {self.total} draws used "
+                f"the hardware TRNG; the rest fell back to the system "
+                f"CSPRNG alone. Treat this pad as a stream cipher.")
+
+
+TALLY = Tally()
+
+
+def entropy_source(path: str | None = None) -> str:
+    """
+    Which source get_random_bytes would draw on right now.
+
+    Probes with a realistic amount rather than one byte. A single byte can
+    never fail the health check -- it cannot be periodic and it cannot be
+    short of distinct values -- so the old one-byte probe reported
+    "hardware" for a device stuck at zero, which is precisely the case the
+    check exists to catch.
+
+    This is still only a prediction. For what a particular pad was really
+    made from, read TALLY.
+    """
+    return "hwrng+urandom" if _hwrng_bytes(_HEALTH_SAMPLE, path) is not None \
+        else "urandom"
+
+
+def _source_note(source: str) -> str:
+    """One line naming the source, and what it means for the output."""
+    if source == "hwrng+urandom":
+        return (f"hardware TRNG ({HWRNG_PATH}) XORed with the system CSPRNG "
+                f"-- a true one-time pad")
+    return ("system CSPRNG only -- no hardware TRNG on this machine. These "
+            "pads are a very strong stream cipher, not information-"
+            "theoretically secure one-time pads.")
+
+
 def get_random_bytes(n: int) -> bytes:
-    """Return n bytes from the operating system's CSPRNG."""
-    return os.urandom(n)
+    """
+    n bytes for key material: the hardware TRNG XORed with the CSPRNG.
+
+    A one-time pad has to come from a physical process. os.urandom is a
+    ChaCha20 construction -- excellent, but algorithmic, so a pad built
+    only from it is strictly a stream cipher rather than a one-time pad.
+    The Pi has a real TRNG, so use it.
+
+    XORed with os.urandom rather than used raw, because a ring-oscillator
+    TRNG can be biased, correlated, or stuck, and on an embedded board
+    with no RTC the alternative failure -- a CSPRNG that is barely seeded
+    at first boot -- is just as real. XOR is safe against both: if either
+    source is good the output is good, and neither can weaken the other.
+
+    Falls back to os.urandom alone when there is no /dev/hwrng, which is
+    every laptop running the CLI. entropy_source() reports which happened,
+    and the unit prints it.
+    """
+    system = os.urandom(n)
+    hardware = _hwrng_bytes(n)
+    TALLY.record(hardware is not None)
+    if hardware is None:
+        return system
+    mixed = int.from_bytes(hardware, "big") ^ int.from_bytes(system, "big")
+    return mixed.to_bytes(n, "big")
 
 
 def generate_random_letters(count: int) -> str:
@@ -877,7 +1081,21 @@ def main():
                         help="Write the single generated PDF to stdout instead of a file, "
                              "so key material never reaches the filesystem "
                              "(e.g. otp_generator.py ... --stdout | lp)")
+    parser.add_argument("--entropy", action="store_true",
+                        help="Report which random source this machine will use "
+                             "and exit (status 0 with a hardware TRNG, 2 without)")
     args = parser.parse_args()
+
+    # Answered before the "nothing to do" check: asking what the machine can
+    # do is a complete request on its own.
+    if args.entropy:
+        source = entropy_source()
+        print(_source_note(source))
+        if source != "hwrng+urandom":
+            print(f"No usable {HWRNG_PATH}. Every Raspberry Pi has one; most "
+                  f"laptops do not.")
+        sys.exit(0 if source == "hwrng+urandom" else 2)
+
     with_auth = not args.no_auth
     auth_size = args.auth_size
     generating_sets = args.codewords is not None or args.random_codewords > 0
@@ -1032,6 +1250,11 @@ def main():
         num_rows = -(-chars_per_page // chars_per_row)
 
         log(f"Format: {format_label}")
+        # Named up front, before any of it is generated, because it decides
+        # what these pages ARE -- a one-time pad or a stream cipher's
+        # keystream -- and because it explains why a run on a Pi takes
+        # minutes where the same run on a laptop takes seconds.
+        log(f"Key source: {_source_note(entropy_source())}")
         log(f"Generating {args.sets} OTP sets, {args.pages} pad pages each, {chars_per_page} chars/page")
         log(f"Auth group in header: {'yes' if with_auth else 'no'}")
         log(f"Training pads: {'yes' if args.training else 'no'}")
@@ -1091,6 +1314,12 @@ def main():
         log()
 
     log("=" * 50)
+    # What the pages that just came out were actually made from, measured
+    # rather than predicted. The probe above answers "what is available";
+    # a device that dies mid-run makes every page after it CSPRNG-only,
+    # and this is the only place that difference shows up.
+    if generating_sets and TALLY.total:
+        log(f"Key source: {TALLY.summary()}")
     log("DONE")
     log()
     if generating_sets:

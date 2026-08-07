@@ -104,8 +104,13 @@ class FakeDisplay(Display):
 class ConsoleDisplay(Display):
     """Draws the panel as an ASCII box in the terminal, for --sim."""
 
-    def __init__(self, stream=None):
+    def __init__(self, stream=None, hint=True):
         self.stream = stream or sys.stdout
+        # The key hint is simulator furniture. On a real unit it told the
+        # operator to press [q], which ended the process with status 0 --
+        # and Restart=on-failure reads that as success and does not
+        # restart. One advertised keystroke turned the appliance off.
+        self.hint = hint
 
     def show(self, frame: Frame) -> None:
         width = shutil.get_terminal_size((80, 24)).columns
@@ -116,8 +121,12 @@ class ConsoleDisplay(Display):
         for row in frame.rendered():
             print(f"{pad}| {row} |", file=self.stream)
         print(border, file=self.stream)
-        print(f"\n{pad}  [u] up   [d] down   [k] ok   [K] hold-ok   [q] quit",
-              file=self.stream)
+        if self.hint:
+            print(f"\n{pad}  [u] up   [d] down   [k] ok   [K] hold-ok   [q] quit",
+                  file=self.stream)
+        else:
+            print(f"\n{pad}  arrows move   ENTER select   SHIFT+K back",
+                  file=self.stream)
         self.stream.flush()
 
 

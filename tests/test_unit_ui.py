@@ -490,10 +490,34 @@ class TestSettings:
         path.write_text("# a comment\npages = 50  # trailing\n")
         assert config.load(str(path)).pages == 50
 
-    def test_codeword_is_never_persisted(self, tmp_path):
+    def test_the_unit_never_writes_a_codeword_to_the_card(self, tmp_path):
+        """
+        A codeword is not key material, but it names a live pad, and the SD
+        card is the part most likely to be captured along with the unit.
+        So the unit must never record which pad it produced -- including
+        when auto_codeword was set and used.
+        """
         path = tmp_path / "c.conf"
-        config.save(config.Settings(), str(path), remount=False)
-        assert "codeword" not in path.read_text().lower()
+        config.save(config.Settings(auto_codeword="RUSTED-BADGER"),
+                    str(path), remount=False)
+        written = path.read_text()
+        assert "RUSTED-BADGER" not in written
+        # The only mention may be the commented-out example.
+        live = [line for line in written.splitlines()
+                if "codeword" in line.lower() and not line.strip().startswith("#")]
+        assert live == []
+
+    def test_a_hand_written_codeword_is_still_honoured(self, tmp_path):
+        # Read but never written: someone who agrees a codeword out of band
+        # can still set one, they are just making that trade themselves.
+        path = tmp_path / "c.conf"
+        path.write_text("auto_codeword = SILENT-OSPREY\n")
+        assert config.load(str(path)).auto_codeword == "SILENT-OSPREY"
+
+    def test_a_malformed_codeword_falls_back_rather_than_printing_it(self, tmp_path):
+        path = tmp_path / "c.conf"
+        path.write_text("auto_codeword = has spaces/and slashes\n")
+        assert config.load(str(path)).auto_codeword == ""
 
     def test_a4_is_the_default(self):
         # Almost nobody has A6 paper; almost everybody has A4 or Letter.

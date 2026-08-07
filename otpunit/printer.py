@@ -229,15 +229,66 @@ class Cups:
 
     def submit(self, data: bytes, name: str = QUEUE, title: str = "OTP",
                options: dict | None = None) -> str:
-        """Pipe `data` to lp on stdin and return the job id."""
+        """
+        Pipe `data` to lp on stdin and return the job id.
+
+        Every failure leaves as PrinterError, including the ones that are
+        not lp's fault. A missing /usr/bin/lp raised FileNotFoundError
+        straight out of subprocess, past every caller that catches
+        PrinterError -- and the first submit in the unattended sequence is
+        the status sheet, which is outside any try. _lpadmin has carried a
+        docstring about exactly this since it was written; submit did not.
+        """
         argv = [LP, "-d", name, "-t", title]
         for key, value in (options or {}).items():
             argv += ["-o", f"{key}={value}"]
-        result = self._run(argv, stdin=bytes(data))
+        try:
+            result = self._run(argv, stdin=bytes(data))
+        except PrinterError:
+            raise
+        except Exception as exc:                 # noqa: BLE001
+            raise PrinterError(f"could not run {LP}: {exc}") from exc
         if result.returncode != 0:
             raise PrinterError(result.stderr.decode("utf-8", "replace").strip() or "lp failed")
         match = re.search(r"request id is (\S+)", result.stdout.decode("utf-8", "replace"))
         return match.group(1) if match else ""
+
+    # State reasons cupsd reports when nothing is actually wrong. Anything
+    # else on those lines is a fault worth telling the operator about.
+    BENIGN_REASONS = ("ready to print.", "ready to print", "none")
+
+    def printer_fault(self, name: str = QUEUE) -> str | None:
+        """
+        The fault the queue is reporting, or None if it reports none.
+
+        An empty `lpstat -o` is NOT proof that anything printed. The unit
+        runs ErrorPolicy abort-job, deliberately, so a job that fails is
+        discarded just as promptly as one that succeeds -- measured against
+        a real cupsd with the tray empty, all seven jobs aborted, the queue
+        drained in four seconds, and the unit printed "YOUR PAD PAIR IS
+        PRINTED / They are identical" over a tray holding nothing at all.
+        The queue's own state is what distinguishes the two.
+
+        None also means "cannot tell": a wedged cupsd answers nothing, and
+        inventing a fault would send someone to burn a pad that is fine.
+        Draining stays the primary signal; this only overrides it when the
+        printer says out loud that it failed.
+        """
+        text = self._run_text([LPSTAT, "-p", name])
+        if text is None:
+            return None
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return None
+        if "disabled" in lines[0]:
+            return lines[0]
+        # cupsd prints state reasons on the lines after the header, and only
+        # when it has something to say about them.
+        for line in lines[1:]:
+            if line.lower().rstrip(".") not in [r.rstrip(".") for r
+                                                in self.BENIGN_REASONS]:
+                return line
+        return None
 
     def active_jobs(self, name: str = QUEUE) -> int | None:
         """

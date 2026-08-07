@@ -11,12 +11,20 @@ which is deliberately written so it can be driven with a fake clock.
 """
 import sys
 import threading
+import pathlib
+import tempfile
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+
+# A path under the temp dir, not "/nonexistent": the suite runs as
+# root, where that absolute path is perfectly writable, and any test
+# reaching SAVE SETTINGS created a real file at the host's root.
+SCRATCH_CONFIG = str(pathlib.Path(tempfile.gettempdir()) /
+                     "otp-unit-test.conf")
 
 from otpunit.hw import buttons as buttons_mod
 from otpunit.hw.buttons import GpioButtons, Press
@@ -166,7 +174,7 @@ class TestDisplayFailuresDoNotEscape:
                 return 0
 
         app = ui.App(Dead(), FakeButtons([Press.OK, Press.QUIT]), Cups(),
-                     config.Settings(pages=1), config_path="/nonexistent",
+                     config.Settings(pages=1), config_path=SCRATCH_CONFIG,
                      poll_seconds=0)
         app.run()          # must not raise
 
