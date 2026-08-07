@@ -441,4 +441,12 @@ def available() -> str:
             return f"{tool} is not installed"
     if os.geteuid() != 0:
         return "cupsd needs root here (it binds a socket and runs backends)"
+    if "(enforce)" in _apparmor_state():
+        # Measured on an Ubuntu runner: AppArmor denies cupsd exec of
+        # anything under /tmp, so a hermetic rig gets a daemon that starts,
+        # answers lpstat and finds no printers. Skip with the fix rather
+        # than fail with a riddle.
+        return ("cupsd is confined by AppArmor and cannot run a backend "
+                "from a temp directory. Run: sudo apparmor_parser -R "
+                "/etc/apparmor.d/usr.sbin.cupsd")
     return ""

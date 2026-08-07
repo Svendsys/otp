@@ -70,13 +70,25 @@ jobs:
           # Ubuntu confines cupsd with AppArmor, and the profile permits
           # backends under /usr/lib/cups/backend and nowhere else. The rig
           # is deliberately hermetic -- its own ServerBin in a temp
-          # directory -- which is exactly what the profile forbids, so a
-          # confined cupsd starts, answers lpstat, and reports no devices
-          # at all. Complain mode rather than disabling AppArmor: it is
-          # scoped to one profile and reversible.
-          sudo aa-complain /usr/sbin/cupsd 2>/dev/null || true
-          echo "cupsd apparmor state:"
-          sudo grep cupsd /sys/kernel/security/apparmor/profiles || echo "  no profile"
+          # directory -- which is exactly what that forbids. Measured:
+          #   apparmor="DENIED" operation="exec" profile="/usr/sbin/cupsd"
+          #   name="/tmp/.../cups/bin/backend/usb" comm="cups-deviced"
+          # so cupsd started, answered lpstat, and reported no devices.
+          #
+          # apparmor_parser rather than aa-complain: the latter needs
+          # apparmor-utils, which is not on the runner, and the `|| true`
+          # meant its absence was silent.
+          sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.cupsd 2>/dev/null || true
+          # Assert it worked. If this step ever silently fails, the rig
+          # skips its tests for lack of a working cupsd and the job goes
+          # green having tested nothing -- which is worse than red.
+          if grep -q '^/usr/sbin/cupsd (enforce)' \
+               /sys/kernel/security/apparmor/profiles 2>/dev/null; then
+            echo "cupsd is still confined; the harness cannot run hermetically" >&2
+            grep cupsd /sys/kernel/security/apparmor/profiles >&2
+            exit 1
+          fi
+          echo "cupsd apparmor state: $(grep cupsd /sys/kernel/security/apparmor/profiles || echo unconfined)"
       - name: Bring up the kernel simulators
         # Never fatal: a runner kernel missing one of these should still
         # run everything else. The script reports what it got.

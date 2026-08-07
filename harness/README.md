@@ -62,6 +62,26 @@ sudo pytest -m hardware -v
 sudo ./harness/kernel-sim.sh down
 ```
 
+**On Ubuntu, unconfine cupsd first.** Ubuntu ships an AppArmor profile that
+permits cupsd to execute backends from `/usr/lib/cups/backend` and nowhere
+else — and the rig is deliberately hermetic, with its own ServerBin in a
+temp directory. A confined cupsd starts, answers `lpstat`, and reports no
+printers at all:
+
+```
+apparmor="DENIED" operation="exec" profile="/usr/sbin/cupsd"
+  name="/tmp/.../cups/bin/backend/usb" comm="cups-deviced"
+```
+
+```sh
+sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.cupsd
+```
+
+The rig detects this and skips with that instruction rather than failing
+obscurely. CI does the same removal and then **asserts it worked** — a
+silently-skipped harness is a green job that tested nothing, which is worse
+than a red one.
+
 Anything unavailable is **skipped with a reason, not failed** — a kernel
 without `vkms` should still exercise the other four. `kernel-sim.sh up`
 exits 0 even at zero of four, because that is a reason to skip the
