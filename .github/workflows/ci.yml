@@ -62,10 +62,21 @@ jobs:
             i2c-tools python3-evdev
           pip install -r requirements-dev.txt
           pip install smbus2 luma.oled gpiozero lgpio
-      - name: Stop the system CUPS
-        # The rig runs its own cupsd on its own socket. The distro one is
-        # not needed and only competes for the default socket.
-        run: sudo systemctl stop cups cups-browsed || true
+      - name: Stop the system CUPS and unconfine cupsd
+        run: |
+          # The rig runs its own cupsd on its own socket. The distro one is
+          # not needed and only competes for the default socket.
+          sudo systemctl stop cups cups-browsed || true
+          # Ubuntu confines cupsd with AppArmor, and the profile permits
+          # backends under /usr/lib/cups/backend and nowhere else. The rig
+          # is deliberately hermetic -- its own ServerBin in a temp
+          # directory -- which is exactly what the profile forbids, so a
+          # confined cupsd starts, answers lpstat, and reports no devices
+          # at all. Complain mode rather than disabling AppArmor: it is
+          # scoped to one profile and reversible.
+          sudo aa-complain /usr/sbin/cupsd 2>/dev/null || true
+          echo "cupsd apparmor state:"
+          sudo grep cupsd /sys/kernel/security/apparmor/profiles || echo "  no profile"
       - name: Bring up the kernel simulators
         # Never fatal: a runner kernel missing one of these should still
         # run everything else. The script reports what it got.
@@ -80,7 +91,13 @@ jobs:
             timeout 900 python3 -m pytest -m hardware -v -p no:randomly
       - name: The CUPS error log, if anything failed
         if: failure()
-        run: sudo find /tmp -name error_log -path '*cups*' -exec tail -80 {} + || true
+        # `tail -80` is rejected under -exec ... + ("option used in invalid
+        # context"), which silently cost the diagnostic on the first run.
+        run: |
+          sudo find /tmp -name error_log -path '*cups*' \
+            -exec sh -c 'echo "--- {}"; tail -n 120 "{}"' \; || true
+          echo "--- apparmor denials"
+          sudo dmesg 2>/dev/null | grep -i apparmor | tail -n 30 || true
       - name: Tear down
         if: always()
         run: sudo ./harness/kernel-sim.sh down || true

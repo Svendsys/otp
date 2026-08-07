@@ -190,11 +190,14 @@ cmd_up() {
     fi
     mkdir -p "$STATE"
     log "Bringing up kernel simulators on $(uname -r):"
+    # Explicit if-then rather than `A && B || true`: shellcheck 0.9.0 flags
+    # that as SC2015 and CI pins 0.9.0 deliberately, because it and 0.11.0
+    # genuinely disagree. This is the second time that has bitten here.
     local ok=0
-    up_gpio     && ok=$((ok + 1)) || true
-    up_i2c      && ok=$((ok + 1)) || true
-    up_drm      && ok=$((ok + 1)) || true
-    up_keyboard && ok=$((ok + 1)) || true
+    if up_gpio;     then ok=$((ok + 1)); fi
+    if up_i2c;      then ok=$((ok + 1)); fi
+    if up_drm;      then ok=$((ok + 1)); fi
+    if up_keyboard; then ok=$((ok + 1)); fi
     log "$ok of 4 up. Tests skip whatever is missing rather than failing."
     # Deliberately exit 0 even at 0 of 4. A kernel without these modules is
     # a reason to skip the hardware tests, not to fail the build -- and the

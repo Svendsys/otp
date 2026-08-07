@@ -32,7 +32,29 @@ REPO = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO / "device" / "install.sh"
 
 CUPSD = "/usr/sbin/cupsd"
+LPINFO = "/usr/sbin/lpinfo"
 SYSTEM_SERVERBIN = Path("/usr/lib/cups")
+
+
+def _apparmor_state() -> str:
+    """
+    Whether cupsd is confined, which decides if a rig in /tmp can work.
+
+    Ubuntu ships /etc/apparmor.d/usr.sbin.cupsd, and it permits backends
+    under /usr/lib/cups/backend and nowhere else. A hermetic rig in a temp
+    directory is precisely what that forbids -- so on a confined host the
+    profile has to be put in complain mode first:
+
+        sudo aa-complain /usr/sbin/cupsd
+    """
+    profiles = Path("/sys/kernel/security/apparmor/profiles")
+    try:
+        for line in profiles.read_text().splitlines():
+            if "cupsd" in line:
+                return line.strip()
+    except OSError:
+        return "not available (no apparmor, or securityfs not mounted)"
+    return "no cupsd profile loaded"
 
 # What the fake backend advertises. Three constraints, all learned the
 # hard way against a real cupsd:
@@ -282,15 +304,59 @@ FileDevice Yes
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         deadline = time.monotonic() + 30
+        ready = False
         while time.monotonic() < deadline:
             if self.socket.exists() and self._ok(["/usr/bin/lpstat", "-r"]):
-                return
+                ready = True
+                break
             if self.proc.poll() is not None:
                 raise RuntimeError(
                     f"cupsd exited immediately ({self.proc.returncode}); "
                     f"error_log:\n{self.error_log()}")
             time.sleep(0.2)
-        raise RuntimeError("cupsd never accepted a connection")
+        if not ready:
+            raise RuntimeError("cupsd never accepted a connection")
+        self._verify_backend()
+
+    def _verify_backend(self) -> None:
+        """
+        Prove cupsd can actually run our backend before any test relies on it.
+
+        A daemon that answers `lpstat -r` but cannot execute a backend
+        reports no devices, and the failure surfaces several frames away as
+        `IndexError: list index out of range` on `devices()[0]`. That is a
+        rig whose failure mode is a riddle. Diagnose it here instead.
+        """
+        listed = self.run([LPINFO, "-v"]).stdout.decode("utf-8", "replace")
+        if any(line.startswith("direct usb://") for line in listed.splitlines()):
+            return
+
+        usb = Path(self._serverbin()) / "backend" / "usb"
+        clues = [
+            "cupsd is running but reported no usb:// device, so it could not "
+            "run the rig's backend.",
+            f"lpinfo -v said: {listed.strip() or '(nothing)'}",
+            f"backend: {usb} mode={oct(usb.stat().st_mode & 0o7777)} "
+            f"exists={usb.exists()}",
+            f"backend runs standalone: {self._backend_runs(usb)}",
+        ]
+        # The likeliest cause on a distro that ships one: cupsd is confined
+        # and cannot execute anything under /tmp. The profile permits
+        # /usr/lib/cups/backend/* and nothing else, so a hermetic rig in a
+        # temp directory is exactly what it forbids.
+        clues.append(f"apparmor: {_apparmor_state()}")
+        clues.append(f"error_log tail:\n{self.error_log()[-1500:]}")
+        raise RuntimeError("\n  ".join(clues))
+
+    @staticmethod
+    def _backend_runs(path: Path) -> str:
+        """Whether the backend works when we run it ourselves."""
+        try:
+            result = subprocess.run([str(path)], capture_output=True, timeout=10)
+            return (f"rc={result.returncode} "
+                    f"out={result.stdout.decode('utf-8', 'replace').strip()[:120]!r}")
+        except Exception as exc:                 # noqa: BLE001
+            return f"could not run it: {exc}"
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
