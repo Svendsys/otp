@@ -260,10 +260,10 @@ def codeword_menu(on_choose):
     """Roll / browse / type -- the three ways to land on a codeword."""
 
     def browse(app):
-        # Browsing narrows the space: one category is ~18 nouns against 642,
-        # and human choice within it is not uniform. Two pads from the same
-        # cell both named after birds is an attribution signal. ROLL RANDOM
-        # is the default for that reason.
+        # Browsing narrows the space: one category is a few dozen nouns
+        # against ~700, and human choice within it is not uniform. Two pads
+        # from the same cell both named after birds is an attribution signal.
+        # ROLL RANDOM is the default for that reason.
         def pick_category(app, category):
             def pick_noun(app, noun):
                 return on_choose(app, cw.join(app.vocabulary.random_modifier(), noun))
@@ -275,13 +275,16 @@ def codeword_menu(on_choose):
                        render=str.upper)
 
     def type_in(app):
+        # Each half reaches exactly as far as the bundled lists do, so a
+        # codeword agreed elsewhere can always be typed back in.
         def got_modifier(app, modifier):
             def got_noun(app, noun):
                 return on_choose(app, cw.join(modifier, noun))
 
-            return TextEntry("NOUN", got_noun)
+            return TextEntry("NOUN", got_noun, maxlen=app.vocabulary.noun_maxlen)
 
-        return TextEntry("MODIFIER", got_modifier)
+        return TextEntry("MODIFIER", got_modifier,
+                         maxlen=app.vocabulary.modifier_maxlen)
 
     menu = Menu([
         ("ROLL RANDOM", lambda app: CodewordRoll(on_choose)),

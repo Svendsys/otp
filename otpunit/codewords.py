@@ -31,6 +31,23 @@ class Vocabulary:
     def combinations(self) -> int:
         return len(self.modifiers) * len(self.all_nouns)
 
+    @property
+    def modifier_maxlen(self) -> int:
+        """Longest modifier the bundled list can produce."""
+        return max(len(w) for w in self.modifiers)
+
+    @property
+    def noun_maxlen(self) -> int:
+        """Longest noun the bundled list can produce.
+
+        Read from the lists rather than pinned to a constant: the two halves
+        share a 17-character header, and the split between them (7 + 1 + 9
+        today, so that BUTTERFLY and CROCODILE fit) is a decision made in
+        codewords/build_lists.py. Typing a codeword in by hand should reach
+        exactly as far as rolling one does.
+        """
+        return max(len(w) for w in self.all_nouns)
+
     def random(self) -> str:
         """A fresh <MODIFIER>-<NOUN>."""
         return join(gen.random_choice(self.modifiers), gen.random_choice(self.all_nouns))

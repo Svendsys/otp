@@ -54,14 +54,33 @@ def edit_distance(a, b):
 
 
 class TestVocabularyShape:
+    # The printed header fits 17 characters at the tightest format, split
+    # 7 + 1 + 9 rather than 8 + 1 + 8: the noun carries the picture, so it
+    # gets the spare character and BUTTERFLY, CROCODILE and ACCORDION fit.
+    MODIFIER_MAX = 7
+    NOUN_MAX = 9
+
     def test_lists_are_populated(self):
         assert len(MODIFIERS) > 300
         assert len(FLAT_NOUNS) > 600
         assert len(NOUNS) >= 13, "categories drive the two-press browse on 3 buttons"
 
     def test_every_word_is_plain_uppercase(self):
-        for word in MODIFIERS + FLAT_NOUNS:
-            assert re.fullmatch(r"[A-Z]{3,8}", word), word
+        for word in MODIFIERS:
+            assert re.fullmatch(r"[A-Z]{3,%d}" % self.MODIFIER_MAX, word), word
+        for word in FLAT_NOUNS:
+            assert re.fullmatch(r"[A-Z]{3,%d}" % self.NOUN_MAX, word), word
+
+    def test_the_header_budget_is_spent_but_not_overspent(self):
+        # Both halves reach their cap, so the split is actually in use, and
+        # the longest pair still lands on the 17 characters the header has.
+        assert max(len(w) for w in MODIFIERS) == self.MODIFIER_MAX
+        assert max(len(w) for w in FLAT_NOUNS) == self.NOUN_MAX
+        assert self.MODIFIER_MAX + 1 + self.NOUN_MAX == 17
+
+    def test_no_noun_is_also_a_modifier(self):
+        # Otherwise the vocabulary can roll SCARLET-SCARLET.
+        assert not set(MODIFIERS) & set(FLAT_NOUNS)
 
     def test_no_duplicates_within_a_list(self):
         assert len(set(MODIFIERS)) == len(MODIFIERS)
