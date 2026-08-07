@@ -483,6 +483,56 @@ class TestCopyBActuallyReachesPaper:
         assert cups.purged_with_work in (False, None)
 
 
+class TestTheTrayCanExplainItselfWithoutAPrinter:
+    """
+    The HALF sheet needs the printing channel, and the commonest reason
+    copy B fails is that the printing channel broke. Measured with cupsd
+    killed after the separator: the last sheet in the tray promised a copy
+    B that never came, and nothing ever said otherwise. The warning has to
+    be printed while there is still a printer to print it.
+    """
+
+    def test_the_separator_says_what_a_missing_copy_b_means(self):
+        rows = [str(value) for section in _sections(unattended.SWAP)
+                for _, value in section.rows]
+        text = " ".join(rows).upper()
+        assert "IF THEY DO NOT" in text or "IF NOTHING FOLLOWS" in text
+        assert "HALF A PAIR" in text
+        assert "DESTROY" in text
+
+    def test_a_broken_printer_cannot_erase_that_warning(self, monkeypatch):
+        # The separator is already on paper before copy B is attempted, so
+        # nothing that happens afterwards can take it back.
+        class DiesAfterSeparator(Cups):
+            """cupsd stops answering the moment the separator is on paper."""
+
+            def submit(self, data, name="OTP", title="OTP", options=None):
+                if "REMOVE COPY A" in self.titles():
+                    raise printer.PrinterError("cupsd is not running")
+                return super().submit(data, name, title, options)
+
+        cups = DiesAfterSeparator()
+        assert run(cups) == 1
+        assert cups.titles()[-1] == "REMOVE COPY A", \
+            "the separator must be the last thing that reached paper"
+        assert "OTP B" not in cups.titles()
+        assert "WHAT TO DO NOW" not in cups.titles(), \
+            "this models the case where the final sheet cannot be printed"
+
+
+def _sections(kind, **kwargs):
+    """A sheet's sections, without going through the PDF."""
+    captured = []
+    real = unattended.diagnostics.render_bytes
+    try:
+        unattended.diagnostics.render_bytes = \
+            lambda sections, *a, **k: captured.append(sections) or bytearray()
+        unattended.sheet(kind, "X-Y", config.Settings(), **kwargs)
+    finally:
+        unattended.diagnostics.render_bytes = real
+    return captured[0]
+
+
 class TestTheQueueIsNeverAskedToHoldTwoJobs:
     """
     The unit ships MaxJobs 4 and cupsd does not queue past it -- it
@@ -575,7 +625,7 @@ class TestADrainedQueueIsNotProofOfPrinting:
     def test_the_reason_reaches_the_half_sheet(self):
         # A sheet that says the pad failed without saying why leaves the
         # operator to guess at a printer they may not be able to see.
-        rows = [value for section in _half_sections(trouble="Out of paper")
+        rows = [value for section in _sections(unattended.HALF, trouble="Out of paper")
                 for _, value in section.rows]
         assert any("Out of paper" in str(value) for value in rows)
 
@@ -604,20 +654,6 @@ class TestADrainedQueueIsNotProofOfPrinting:
                 raise AttributeError(name)
 
         assert run(Old()) == 0
-
-
-def _half_sections(trouble=""):
-    """The HALF sheet's sections, without going through the PDF."""
-    captured = []
-    real = unattended.diagnostics.render_bytes
-    try:
-        unattended.diagnostics.render_bytes = \
-            lambda sections, *a, **k: captured.append(sections) or bytearray()
-        unattended.sheet(unattended.HALF, "X-Y", config.Settings(),
-                         trouble=trouble)
-    finally:
-        unattended.diagnostics.render_bytes = real
-    return captured[0]
 
 
 class TestThePlugWorksDuringTheDrainToo:

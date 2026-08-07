@@ -126,10 +126,16 @@ The sequence, once a printer appears:
 5. **Copy A** of the pad — 100 A6 pages by default, four to an A4 sheet,
    so 25 sheets.
 6. **A separator sheet**: take copy A out of the tray, copy B follows in
-   90 seconds. With no buttons, the sheet *is* the prompt.
+   90 seconds. With no buttons, the sheet *is* the prompt. It also tells
+   you what it means if nothing follows it — because the sheet that would
+   normally report a failed copy B needs a working printer to be printed
+   on, and a failed copy B usually means there isn't one.
 7. **Copy B** — byte-identical to A, which is what makes them a pair.
 8. **A final sheet**: what you are holding, the four rules that matter,
-   and how to use it.
+   and how to use it. If the pair did *not* complete, this sheet says so
+   instead, and names what the printer reported — out of paper, jammed,
+   switched off — because the unit asks the queue rather than assuming an
+   empty spool means the pages came out.
 
 That is about **68 sheets of A4** in total for the defaults, and the
 status sheet tells you the number before any of it starts. Load more than

@@ -186,13 +186,24 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         cups.submit(data, name=queue, title=title,
                     options=paper if options is None else options)
 
-    # 1. Say what is about to happen, before doing any of it.
-    send(diagnostics.render_bytes(
-        diagnostics.collect(settings=settings, printer=_first(cups),
-                            queue=queue, driver=driver,
-                            plan=_plan(settings)),
-        diagnostics._page_size(settings)), "OTP status")
-    log("status sheet submitted")
+    # 1. Say what is about to happen, before doing any of it. Guarded like
+    #    everything else: send() now waits for the queue first, so it can
+    #    raise Aborted, and this call sits outside every other try. A
+    #    missing /usr/bin/lp reached here as a bare FileNotFoundError and
+    #    left run() by the front door.
+    try:
+        send(diagnostics.render_bytes(
+            diagnostics.collect(settings=settings, printer=_first(cups),
+                                queue=queue, driver=driver,
+                                plan=_plan(settings)),
+            diagnostics._page_size(settings)), "OTP status")
+        log("status sheet submitted")
+    except Exception as exc:                     # noqa: BLE001
+        # Nothing can be printed, so there is nothing to say and nowhere to
+        # say it. Do not go on to generate a pad for a printer that just
+        # refused a single sheet.
+        log(f"could not print the status sheet: {exc}")
+        return 1
 
     if not settings.auto_print:
         log("auto_print is off; stopping after the status sheet")
@@ -524,6 +535,26 @@ def sheet(kind, codeword="", settings=None, seconds=0, tally=None,
                 (None, "Unlike the status sheet, these pages ARE secret. "
                        "Anyone who photographs them can read every message "
                        "the pad ever protects."),
+            ]),
+            # The sheet that reports a failed copy B has to be printed, and
+            # if copy B failed because the printing stopped working then it
+            # cannot be. Measured: with cupsd killed after the separator,
+            # the last thing in the tray was this sheet promising a copy B
+            # that never came, and nothing ever said otherwise. So the
+            # warning goes here, in advance, while there is still a printer
+            # to put it on paper.
+            diagnostics.Section("IF NOTHING FOLLOWS THIS SHEET", [
+                (None, "A COPY B AND A FINAL INSTRUCTION SHEET SHOULD COME "
+                       "OUT AFTER THIS ONE. If they do not -- the printer "
+                       "runs out of paper, jams, or is switched off -- then "
+                       "what you are holding is HALF A PAIR."),
+                (None, "Half a pair is worthless and dangerous: there is no "
+                       "matching copy for the other end, and the key has "
+                       "already been wiped from this unit, so a copy B can "
+                       "never be made. DESTROY the stack. Burn it."),
+                (None, "Then fix the printer, power the unit off and on with "
+                       "it attached, and it will make a fresh pair under a "
+                       "new codeword."),
             ]),
         ]
     elif kind is HALF:
