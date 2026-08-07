@@ -39,7 +39,8 @@ jobs:
             | tar -xJf - --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           ./shellcheck --version
           ./shellcheck device/install.sh image/build.sh image/render-manual.sh \
-                       harness/kernel-sim.sh
+                       harness/kernel-sim.sh harness/vm-check.sh \
+                       harness/vm-guest-check.sh
 
   hardware:
     # Tier 1 of the harness: the real code against real kernel interfaces
@@ -113,6 +114,39 @@ jobs:
       - name: Tear down
         if: always()
         run: sudo ./harness/kernel-sim.sh down || true
+
+  vm:
+    # Tier 2: boot a real system, run device/install.sh on it, and check
+    # the unit actually comes up. This is the only place otp-unit.service
+    # taking tty1 from getty is ever observed -- pi-gen never boots the
+    # image it builds, and a container has no virtual terminals.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils cloud-image-utils
+          # KVM turns half an hour of emulation into a few minutes. Not
+          # fatal if it is missing -- vm-check.sh falls back to TCG and
+          # says so -- but worth reporting, because a silent fallback
+          # looks exactly like a hang.
+          ls -l /dev/kvm 2>/dev/null || echo "no /dev/kvm; will use TCG"
+          sudo usermod -aG kvm "$USER" || true
+      - name: Cache the Debian base image
+        uses: actions/cache@v4
+        with:
+          path: ~/otp-vm/base.qcow2
+          key: debian-13-generic-amd64-v1
+      - name: Boot, provision and check
+        env:
+          OTP_VM_WORK: ~/otp-vm
+        run: sudo -E ./harness/vm-check.sh
+      - name: The guest console, if anything failed
+        if: failure()
+        run: sudo tail -n 200 ~/otp-vm/console.log || true
 
   simulator:
     # The unit's whole interface runs without hardware, so CI can drive a

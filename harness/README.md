@@ -89,17 +89,46 @@ hardware tests rather than to fail the build.
 
 Runs in CI as the `hardware` job.
 
-## Tier 2 — an arm64 VM running `install.sh`
+## Tier 2 — a VM that actually boots the thing
 
-Not built yet.
+`./harness/vm-check.sh`, or the `vm` job in CI.
 
 The riskiest untested change in the repository is `otp-unit.service`
-binding `tty1` with `StandardInput=tty-force` and `Conflicts=getty@tty1`.
-If that is wrong the unit restart-loops instead of starting, and no
-container will tell you: containers have no real virtual terminals. That
-needs a booted system with actual VTs — but an ordinary arm64 VM under
-`qemu-system-aarch64 -M virt` does it, and `-M virt` is far faster than the
-`raspi` models because it has proper virtio devices.
+binding `tty1` — `StandardInput=tty-force`, `TTYPath=/dev/tty1`,
+`Conflicts=getty@tty1.service`. If that is wrong the unit restart-loops
+instead of starting, and **nothing else will say so**: pi-gen never boots
+the image it builds, a container has no virtual terminals at all, and the
+unit tests substitute systemd entirely.
+
+So this boots a Debian 13 cloud image, runs `device/install.sh` on it, and
+asks the questions only a booted system can answer:
+
+- is `otp-unit.service` active, and has it restarted more than once?
+- did `Conflicts=` actually stop `getty@tty1`?
+- is the unit's main process really holding `/dev/tty1`?
+- is a login prompt still reachable on tty2?
+- is swap off, is the journal volatile, are core dumps disabled?
+- is the spool on tmpfs?
+- does `cupsd -t` still accept the config *after* install.sh edited it?
+- is `install.sh` idempotent, as the top of the file claims — and does the
+  service survive being reprovisioned under it?
+
+**Why amd64 rather than arm64.** Nothing on that list is
+architecture-specific. Emulating arm64 on an x86 host costs half an hour a
+run and buys none of it; amd64 with KVM is a few minutes, which is the
+difference between running per commit and never running. The
+arm64-specific half is covered elsewhere — the image build runs
+`install.sh` in a real arm64 chroot, and tier 3 boots the actual image.
+This tier is about what happens *after* boot.
+
+The repository reaches the guest as a tar handed over as a raw block
+device (`tar -xf /dev/vdb`). That needs no filesystem driver on either
+side, which is one less thing to be wrong.
+
+**`python3-lgpio` is deliberately absent** in the guest — it comes from
+`archive.raspberrypi.org`, not Debian. That is the more interesting case
+anyway: a unit with no working GPIO must fall through to printing
+unattended rather than failing to start.
 
 ## Tier 3 — the built image under `-M raspi3b`
 
