@@ -407,7 +407,11 @@ class TestTheRealI2CPath:
         """
         pytest.importorskip("smbus2")
         found = diagnostics._i2c_scan(bus=int(sim("i2c-bus")))
-        assert "0x3C" in found.upper(), found
+        # Lowercased on both sides. `"0x3C" in found.upper()` cannot ever
+        # match: upper() turns the address into 0X3C and the needle still
+        # carries a lowercase x. The scan was working; the assertion was
+        # not, and it reported the correct answer as the failure message.
+        assert "0x3c" in found.lower(), found
 
     def test_the_display_driver_initialises_against_a_real_bus(self):
         pytest.importorskip("luma.oled")
