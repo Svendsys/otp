@@ -333,12 +333,42 @@ class TestTheRealButtonPath:
 
     @pytest.fixture
     def buttons(self):
+        """
+        GpioButtons, but only if it really bound to the simulated chip.
+
+        gpiozero picks its gpiochip from Pi board detection -- it reads
+        /proc/device-tree/model or a Revision line in /proc/cpuinfo -- and
+        a machine that is not a Pi has neither. Even where it constructs,
+        it opens gpiochip0, which on a normal host is some real controller
+        rather than the one gpio-sim just created.
+
+        So this checks which chip the process actually opened and skips
+        with that reason if it is not ours. Asserting against a chip the
+        driver never opened would fail for a reason that has nothing to do
+        with the code under test; quietly passing would be worse.
+        """
         from otpunit.hw import buttons as buttons_mod
 
         try:
             panel = buttons_mod.GpioButtons()
         except Exception as exc:                 # noqa: BLE001
-            pytest.skip(f"gpiozero could not open the simulated chip: {exc}")
+            pytest.skip(f"gpiozero could not open a gpiochip here: {exc}")
+
+        wanted = f"/dev/gpiochip{sim('gpio-chip')}"
+        opened = set()
+        for fd in Path("/proc/self/fd").iterdir():
+            try:
+                target = str(fd.resolve())
+            except OSError:
+                continue
+            if target.startswith("/dev/gpiochip"):
+                opened.add(target)
+        if wanted not in opened:
+            panel.close()
+            pytest.skip(
+                f"gpiozero bound to {opened or 'no gpiochip'} rather than "
+                f"{wanted}; it selects the chip from Pi board detection, "
+                f"which cannot find gpio-sim. See harness/README.md.")
         yield panel
         panel.close()
 

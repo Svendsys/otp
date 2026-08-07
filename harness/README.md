@@ -87,6 +87,26 @@ without `vkms` should still exercise the other four. `kernel-sim.sh up`
 exits 0 even at zero of four, because that is a reason to skip the
 hardware tests rather than to fail the build.
 
+On a GitHub runner, `gpio-sim`, `i2c-stub` and `vkms` are not in the base
+kernel — they need `linux-modules-extra-$(uname -r)`. Measured before that
+was installed: `1 of 4 up`, with only `uinput` present.
+
+### The gpiozero limitation, stated plainly
+
+`gpio-sim` gives you a real gpiochip. Getting **gpiozero** to talk to it is
+a separate problem: gpiozero picks its chip from Raspberry Pi board
+detection — `/proc/device-tree/model`, or a `Revision` line in
+`/proc/cpuinfo` — and a machine that is not a Pi has neither. Where it does
+construct, it opens `gpiochip0`, which on an ordinary host is some real
+controller rather than the one `gpio-sim` just made.
+
+So the button tests check which chip the process actually opened, and skip
+with that reason if it is not the simulated one. Asserting against a chip
+the driver never opened would fail for a reason unrelated to the code under
+test; quietly passing would be worse. Closing this properly means faking
+the board identity in a mount namespace, which is a bigger piece of work
+than it looks and is not done yet.
+
 Runs in CI as the `hardware` job.
 
 ## Tier 2 — a VM that actually boots the thing

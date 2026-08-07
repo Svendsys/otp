@@ -156,9 +156,15 @@ set -e
 
 # --- the verdict --------------------------------------------------------
 
+# Written out separately so the caller can print it last. The console is
+# thousands of lines of boot chatter, and a verdict buried under that is a
+# verdict nobody reads.
+VERDICT="$WORK/verdict.txt"
+grep -E "OTP-INSTALL|OTP-CHECK|OTP-RESULT" "$CONSOLE" > "$VERDICT" 2>/dev/null || true
+
 log "Console output"
 if grep -q "OTP-CHECK" "$CONSOLE"; then
-    grep -E "OTP-INSTALL|OTP-CHECK|OTP-RESULT" "$CONSOLE" || true
+    cat "$VERDICT"
 else
     echo "The guest never reported. Last 80 lines of the console:" >&2
     tail -80 "$CONSOLE" >&2

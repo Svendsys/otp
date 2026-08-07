@@ -116,17 +116,34 @@ jobs:
         # Root because cupsd runs backends as lp and the simulators are
         # driven through sysfs. -p no:randomly so a failure is reproducible.
         run: |
+          set -o pipefail
           sudo -E env "PATH=$PATH" \
-            timeout 900 python3 -m pytest -m hardware -v -p no:randomly
+            timeout 900 python3 -m pytest -m hardware -v -p no:randomly \
+              --tb=short -rfs 2>&1 | tee /tmp/harness.log
+      - name: Verdict
+        # Last thing in the job log, always, so the outcome is reachable
+        # from the tail without wading through the CUPS dump above.
+        if: always()
+        run: |
+          echo "=== harness verdict ==="
+          grep -E "^(FAILED|ERROR|SKIPPED)|passed|failed" /tmp/harness.log \
+            | tail -n 40 || echo "(no pytest output)"
       - name: The CUPS error log, if anything failed
         if: failure()
-        # `tail -80` is rejected under -exec ... + ("option used in invalid
-        # context"), which silently cost the diagnostic on the first run.
+        # Tightly capped. CUPS dumps its whole debug trace for a failed job
+        # regardless of LogLevel, and one rig per test meant ~1000 lines of
+        # it -- which pushed the pytest summary out of reach of anything
+        # reading the tail of this log. A diagnostic nobody can find past
+        # the noise is not a diagnostic. Two files, twenty lines each.
         run: |
-          sudo find /tmp -name error_log -path '*cups*' \
-            -exec sh -c 'echo "--- {}"; tail -n 120 "{}"' \; || true
-          echo "--- apparmor denials"
-          sudo dmesg 2>/dev/null | grep -i apparmor | tail -n 30 || true
+          sudo find /tmp -name error_log -path '*cups*' 2>/dev/null \
+            | head -n 2 \
+            | while read -r log; do
+                echo "--- $log"
+                sudo grep -E '^[EW] ' "$log" | tail -n 20 || true
+              done
+          echo "--- apparmor denials (cupsd only)"
+          sudo dmesg 2>/dev/null | grep -i 'apparmor="DENIED"' | tail -n 10 || true
       - name: Tear down
         if: always()
         run: sudo ./harness/kernel-sim.sh down || true
@@ -164,7 +181,19 @@ jobs:
         run: sudo -E ./harness/vm-check.sh
       - name: The guest console, if anything failed
         if: failure()
-        run: sudo tail -n 200 ${{ runner.temp }}/otp-vm/console.log || true
+        # Capped: the console is thousands of lines of boot chatter, and an
+        # uncapped dump pushed the verdict out of reach of anything reading
+        # the tail of this log.
+        run: |
+          sudo grep -iE "error|fail|otp-" \
+            ${{ runner.temp }}/otp-vm/console.log | tail -n 60 || true
+      - name: Verdict
+        # Last, always, so the outcome is the first thing you see from the end.
+        if: always()
+        run: |
+          echo "=== tier 2 verdict ==="
+          sudo cat ${{ runner.temp }}/otp-vm/verdict.txt 2>/dev/null \
+            || echo "(the guest never reported)"
 
   simulator:
     # The unit's whole interface runs without hardware, so CI can drive a
