@@ -120,14 +120,6 @@ jobs:
           sudo -E env "PATH=$PATH" \
             timeout 900 python3 -m pytest -m hardware -v -p no:randomly \
               --tb=short -rfs 2>&1 | tee /tmp/harness.log
-      - name: Verdict
-        # Last thing in the job log, always, so the outcome is reachable
-        # from the tail without wading through the CUPS dump above.
-        if: always()
-        run: |
-          echo "=== harness verdict ==="
-          grep -E "^(FAILED|ERROR|SKIPPED)|passed|failed" /tmp/harness.log \
-            | tail -n 40 || echo "(no pytest output)"
       - name: The CUPS error log, if anything failed
         if: failure()
         # Tightly capped. CUPS dumps its whole debug trace for a failed job
@@ -147,6 +139,14 @@ jobs:
       - name: Tear down
         if: always()
         run: sudo ./harness/kernel-sim.sh down || true
+      - name: Verdict
+        # Last thing in the job log, always, so the outcome is reachable
+        # from the tail without wading through the CUPS dump above.
+        if: always()
+        run: |
+          echo "=== harness verdict ==="
+          grep -E "^(FAILED|ERROR|SKIPPED)|passed|failed" /tmp/harness.log \
+            | tail -n 40 || echo "(no pytest output)"
 
   vm:
     # Tier 2: boot a real system, run device/install.sh on it, and check
