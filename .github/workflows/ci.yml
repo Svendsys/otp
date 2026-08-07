@@ -38,7 +38,52 @@ jobs:
             "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
             | tar -xJf - --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           ./shellcheck --version
-          ./shellcheck device/install.sh image/build.sh image/render-manual.sh
+          ./shellcheck device/install.sh image/build.sh image/render-manual.sh \
+                       harness/kernel-sim.sh
+
+  hardware:
+    # Tier 1 of the harness: the real code against real kernel interfaces
+    # and a real cupsd. This is the job that would have caught `MaxJobs 1`
+    # -- six rounds of reading the code did not, and a daemon did in four
+    # seconds. See harness/README.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CUPS, the panel libraries and the simulators
+        run: |
+          sudo apt-get update
+          # cups for the print path; the rest is what the unit imports on a
+          # real Pi, so the panel code can be exercised rather than skipped.
+          sudo apt-get install -y --no-install-recommends \
+            cups cups-client cups-filters printer-driver-cups-pdf \
+            i2c-tools python3-evdev
+          pip install -r requirements-dev.txt
+          pip install smbus2 luma.oled gpiozero lgpio
+      - name: Stop the system CUPS
+        # The rig runs its own cupsd on its own socket. The distro one is
+        # not needed and only competes for the default socket.
+        run: sudo systemctl stop cups cups-browsed || true
+      - name: Bring up the kernel simulators
+        # Never fatal: a runner kernel missing one of these should still
+        # run everything else. The script reports what it got.
+        run: sudo ./harness/kernel-sim.sh up
+      - name: What came up
+        run: sudo ./harness/kernel-sim.sh status
+      - name: Run the harness
+        # Root because cupsd runs backends as lp and the simulators are
+        # driven through sysfs. -p no:randomly so a failure is reproducible.
+        run: |
+          sudo -E env "PATH=$PATH" \
+            timeout 900 python3 -m pytest -m hardware -v -p no:randomly
+      - name: The CUPS error log, if anything failed
+        if: failure()
+        run: sudo find /tmp -name error_log -path '*cups*' -exec tail -80 {} + || true
+      - name: Tear down
+        if: always()
+        run: sudo ./harness/kernel-sim.sh down || true
 
   simulator:
     # The unit's whole interface runs without hardware, so CI can drive a
