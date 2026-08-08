@@ -28,7 +28,7 @@ REPO = Path(__file__).resolve().parent.parent
 VM_CHECK = REPO / "harness" / "vm-check.sh"
 MARKER = "# --- the verdict ---"
 
-PHASES = ("provision", "overlay", "persist")
+PHASES = ("provision", "reboot", "persist")
 
 
 def verdict_block() -> str:
@@ -124,14 +124,14 @@ class TestTheGateFails:
     def test_a_phase_that_started_but_never_finished_fails(self, tmp_path):
         """Results printed, no OTP-GUEST-DONE: killed mid-phase."""
         result = run_verdict(
-            tmp_path, console(done=("provision", "overlay"))
+            tmp_path, console(done=("provision", "reboot"))
         )
         assert result.returncode != 0, "an unfinished phase was accepted"
         assert "persist" in result.stderr
 
     def test_a_phase_with_a_failing_check_fails(self, tmp_path):
         result = run_verdict(
-            tmp_path, console(counts={"overlay": 13}, fails=("root-is-overlay",))
+            tmp_path, console(counts={"reboot": 13}, fails=("unit-holds-tty1",))
         )
         assert result.returncode != 0, "13/14 was accepted as a pass"
 
@@ -139,14 +139,14 @@ class TestTheGateFails:
         """Belt and braces: the counts come from the guest, which is the
         thing under test. A guest that miscounts must not be able to talk
         its way to a green run."""
-        result = run_verdict(tmp_path, console(fails=("root-is-overlay",)))
+        result = run_verdict(tmp_path, console(fails=("unit-holds-tty1",)))
         assert result.returncode != 0, "a FAIL line was accepted"
 
     def test_a_phase_reporting_twice_fails(self, tmp_path):
         """The runner reboots itself. A failed state write loops it on one
         phase forever, and 'it reported' stays true of a machine doing
         nothing else."""
-        result = run_verdict(tmp_path, console(repeat=("overlay",)))
+        result = run_verdict(tmp_path, console(repeat=("reboot",)))
         assert result.returncode != 0, "a boot loop was accepted"
         assert "2x" in result.stderr
 
