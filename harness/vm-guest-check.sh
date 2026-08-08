@@ -73,6 +73,12 @@ check() {
 yesno() { if "$@" >/dev/null 2>&1; then echo yes; else echo no; fi; }
 
 echo "OTP-GUEST starting phase=$PHASE on $(uname -srm)"
+# The kernel command line, every phase. Boots 2 and 3 get theirs from GRUB
+# rather than from cloud-init's seed, and a botched edit there is invisible
+# in every other way -- an earlier version dropped console=ttyS0 while
+# adding the overlay flag, so two whole phases ran and reported into a
+# console that was not connected to anything.
+echo "OTP-CMDLINE $PHASE $(tr -d '\n' < /proc/cmdline)"
 
 # --- the service itself -------------------------------------------------
 

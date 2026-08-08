@@ -240,7 +240,22 @@ runcmd:
   # and the host correctly refused to believe a phase that never reported a
   # well-formed result. Quietening the kernel console is the fix for the
   # collision; the host-side regex below is the fix for tolerating one.
-  - [ sh, -c, "sed -i 's|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"systemd.volatile=overlay loglevel=3\"|' /etc/default/grub && update-grub 2>&1 | tail -3 && grep GRUB_CMDLINE_LINUX= /etc/default/grub" ]
+  #
+  # APPENDED, never replaced. /etc/default/grub is shell-sourced by
+  # grub-mkconfig, so a later assignment that references the earlier value
+  # keeps whatever the image already set -- and what the image sets is
+  # `console=ttyS0,115200`, which is the only reason the serial console
+  # this whole tier reports through exists at all.
+  #
+  # An earlier version used `sed -i 's|^GRUB_CMDLINE_LINUX=.*|...|'` and
+  # replaced the line outright. Boots 2 and 3 then ran with no serial
+  # console: the guest almost certainly did the work, reported into
+  # nothing, and powered off. qemu exited 0 after five minutes and the
+  # harness concluded the phases never happened.
+  #
+  # console= is also stated explicitly here rather than relied upon, so
+  # this does not quietly depend on what a future base image chooses.
+  - [ sh, -c, "echo 'GRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX systemd.volatile=overlay loglevel=3 console=ttyS0,115200\"' >> /etc/default/grub && update-grub 2>&1 | tail -3 && grep -n CMDLINE /etc/default/grub" ]
   # cloud-init must not run again, and this is not optional housekeeping.
   # It decides "have I run before?" from state under /var/lib/cloud -- which
   # is on the root filesystem, which the overlay discards at every boot. So
@@ -375,7 +390,7 @@ tr -d '\r' < "$CONSOLE" > "$CLEAN"
 # thousands of lines of boot chatter, and a verdict buried under that is a
 # verdict nobody reads.
 VERDICT="$WORK/verdict.txt"
-grep -E "OTP-INSTALL|OTP-CHECK|OTP-RESULT|OTP-GUEST-DONE|OTP-REBOOTING" \
+grep -E "OTP-INSTALL|OTP-CHECK|OTP-RESULT|OTP-GUEST-DONE|OTP-REBOOTING|OTP-CMDLINE" \
     "$CLEAN" > "$VERDICT" 2>/dev/null || true
 
 # qemu's stderr, if it said anything. Printed before the verdict rather
@@ -468,6 +483,19 @@ done
 
 if [ -n "$BAD" ]; then
     echo "phases incomplete or failing:$BAD" >&2
+    # A clean power-off with phases missing means something different from a
+    # hang or a panic: the guest reached the end of its sequence and shut
+    # down deliberately. If it did that without reporting, the likeliest
+    # cause is that it COULD NOT BE HEARD -- a broken serial console -- not
+    # that the work never happened. Those have opposite fixes, and one run
+    # was spent concluding the wrong one.
+    if [ "$QEMU_RC" = 0 ]; then
+        echo "NOTE: qemu exited cleanly (0), so the guest powered itself" >&2
+        echo "off rather than hanging. A phase that is missing from a" >&2
+        echo "clean run usually ran and could not report -- check the" >&2
+        echo "OTP-CMDLINE lines for a console= that went missing." >&2
+        grep "OTP-CMDLINE" "$CLEAN" >&2 || echo "(no OTP-CMDLINE at all)" >&2
+    fi
     grep "OTP-CHECK .* FAIL" "$CLEAN" >&2 || true
     echo "--- otp-unit journal from the guest ---" >&2
     sed -n '/--- otp-unit journal/,/--- end journal ---/p' "$CLEAN" >&2 || true
