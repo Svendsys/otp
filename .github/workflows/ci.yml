@@ -20,6 +20,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,6 +37,7 @@ jobs:
 
   shellcheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       # Pinned, not apt's. The runner image's shellcheck floats, and the
@@ -60,6 +62,7 @@ jobs:
     # -- six rounds of reading the code did not, and a daemon did in four
     # seconds. See harness/README.md.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -187,7 +190,11 @@ jobs:
     # taking tty1 from getty is ever observed -- pi-gen never boots the
     # image it builds, and a container has no virtual terminals.
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 15, not 45. The script's own timeout is 600s and MUST fire
+    # first: a job killed by GitHub's timeout skips its remaining
+    # steps, so the console dump and the verdict would never run and
+    # the diagnosis would be lost. This is the outer backstop only.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install QEMU
@@ -233,6 +240,7 @@ jobs:
     # pad pair end to end: roll a codeword, confirm, generate, print copy A,
     # swap, print copy B, wipe.
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

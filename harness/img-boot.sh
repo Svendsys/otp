@@ -48,9 +48,10 @@ set -euo pipefail
 
 IMAGE_XZ="${1:?usage: img-boot.sh <image.img.xz>}"
 WORK="${OTP_IMG_WORK:-${TMPDIR:-/tmp}/otp-img}"
-# Two emulated boots now, not one -- the first-boot resize reboots. Guest
-# time ran at roughly half real time in the first successful boot (11.4s of
-# guest in ~20s of wall), so this is headroom rather than an estimate.
+# A GENEROUS DEFAULT FOR A HUMAN, a tight cap in CI. Someone running this
+# by hand is debugging and wants the room; CI has a ten-minute budget and
+# sets OTP_IMG_TIMEOUT=360 in image.yml. The two numbers are meant to
+# differ, and the CI one is the one that expresses policy.
 TIMEOUT="${OTP_IMG_TIMEOUT:-1200}"
 
 mkdir -p "$WORK"

@@ -14,10 +14,27 @@ name: Build image
 # Not otpunit/** on purpose. The image bakes the package in, but a change
 # there breaks the UNIT, not the image build, and tiers 1 and 2 answer that
 # in minutes rather than half an hour.
+#
+# THE BUDGET IS TEN MINUTES. Not per job -- per PR, wall clock, for a
+# change that does not alter what goes into the image. Two things buy that,
+# and both are below: the image is CACHED on the inputs that actually
+# affect it, and the boot is CAPPED.
+#
+# The honest exception: a PR that really does change the image pays for a
+# real pi-gen build, and no amount of arranging makes that fit in ten
+# minutes. Those are rare. Everything else -- harness work, tests, docs --
+# restores the cache and skips straight to the boot.
+#
+# `push: master` exists to populate that cache. Caches created on a PR
+# branch are visible only to that PR; caches on the base branch are visible
+# to every PR. Without a master build the first run on each new PR would
+# always miss, which is most of the cost this is trying to remove. It also
+# validates the image just after a merge, which nothing did before.
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+    branches: [master]
   pull_request:
     paths:
       - "image/**"
@@ -35,12 +52,46 @@ concurrency:
 
 jobs:
   image:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # NATIVE arm64, not x86 emulating it. This repository is public, and
+    # GitHub's arm64 runners are free for public repositories.
+    #
+    # pi-gen builds an arm64 filesystem. On an x86 runner every binary it
+    # executes goes through qemu-user, which is where the bulk of a
+    # thirty-three minute build went -- and it needs four steps of
+    # binfmt_misc setup, with a comment block longer than most of this file,
+    # to work at all. Natively none of that applies: the steps below are
+    # kept but skipped, so the workflow still runs on x86 if it has to.
+    runs-on: ubuntu-24.04-arm
+    # Was 120. A budget nobody can exceed is not a budget. This is the hard
+    # stop for the expensive case (a real rebuild); the cached case should
+    # come in near seven minutes and is reported against the ten-minute bar
+    # at the end of the job.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
+      # --- can we skip the expensive half entirely? -------------------
+      #
+      # Keyed on what actually ends up IN the image. A change to
+      # harness/img-boot.sh, to a test, or to a doc leaves this key alone,
+      # so the boot runs against the same image the previous run built --
+      # which is exactly right, and is the difference between iterating on
+      # the harness in seven minutes and in fifty-five.
+      #
+      # otpunit/ and the codewords ARE included even though they are not in
+      # the PR trigger. They are baked into the image, so an image built
+      # before they changed is the wrong image to boot, even if the build
+      # would have succeeded either way. The trigger answers "is this worth
+      # checking"; the key answers "is this image still current".
+      - name: Restore a previously built image
+        id: imgcache
+        uses: actions/cache@v4
+        with:
+          path: image/deploy
+          key: otp-image-${{ runner.arch }}-${{ hashFiles('image/**', 'device/**', 'otpunit/**', 'codewords/**', 'otp_generator.py', 'otp.md') }}
+
       - name: Free up disk space
+        if: steps.imgcache.outputs.cache-hit != 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           df -h /
@@ -70,6 +121,7 @@ jobs:
       # `2>/dev/null || true` -- so an unmounted binfmt_misc produces no
       # error at all, just the arm64-unsupported failure two steps later.
       - name: Mount binfmt_misc on the host
+        if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
           sudo modprobe binfmt_misc || true
           mountpoint -q /proc/sys/fs/binfmt_misc \
@@ -89,6 +141,7 @@ jobs:
       # grep in build-docker.sh, which looks for /usr/bin/qemu-aarch64 and
       # never sees that wrapper path.
       - name: Install the qemu interpreter on the host PATH
+        if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-user
@@ -101,6 +154,7 @@ jobs:
       # Registered LAST, so nothing can overwrite it, and with exactly one
       # handler for the magic so there is no precedence question at all.
       - name: Register arm64 binfmt with the fix-binary flag
+        if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
           if [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
             echo "removing pre-existing registration"
@@ -116,6 +170,7 @@ jobs:
       # that is the only thing that actually proves the registration is
       # usable from another mount namespace.
       - name: Prove arm64 emulation works from inside a container
+        if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
           echo "== registrations visible on the host =="
           for f in /proc/sys/fs/binfmt_misc/qemu-aarch64*; do
@@ -130,9 +185,11 @@ jobs:
           '
 
       - name: Install manual rendering tools
+        if: steps.imgcache.outputs.cache-hit != 'true'
         run: sudo apt-get install -y pandoc weasyprint
 
       - name: Build
+        if: steps.imgcache.outputs.cache-hit != 'true'
         run: ./image/build.sh
 
       # The artifact is uploaded and attached BEFORE the image is booted, so
@@ -170,7 +227,18 @@ jobs:
       # Moving it after the upload gets both things: the artifact is already
       # safe, so a red boot costs nothing, and the boot can therefore be
       # honest about failing.
+      #
+      # CAPPED AT SIX MINUTES, and that cap is a policy rather than an
+      # estimate. The budget for a cached run is ten minutes end to end;
+      # restoring and decompressing the image takes about one, so this is
+      # what is left. A boot that cannot come up inside six minutes of
+      # emulation is a boot this tier will report as failing -- which is a
+      # deliberate choice, not an oversight. If the image genuinely needs
+      # longer, that is a finding about the image, and the console-growth
+      # sampling in img-boot.sh will say whether it was progressing.
       - name: Boot the image
+        env:
+          OTP_IMG_TIMEOUT: 360
         run: |
           sudo apt-get install -y --no-install-recommends \
             qemu-system-arm mtools xz-utils
@@ -185,11 +253,40 @@ jobs:
         # nobody can find is not a diagnostic.
         run: |
           echo "=== tier 3 verdict ==="
+          CACHED='${{ steps.imgcache.outputs.cache-hit }}'
+          if [ "$CACHED" = "true" ]; then
+            BUILT="restored from cache (no pi-gen build)"
+          else
+            BUILT="built from source (pi-gen ran)"
+          fi
           {
             echo "## Tier 3 — booting the built image"
+            echo
+            echo "Image: **$BUILT**"
             echo
             echo '```'
             cat ${{ runner.temp }}/otp-img/verdict.txt 2>/dev/null \
               || echo "(the image never reported)"
             echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The bar, stated where it can be seen. Ten minutes is the budget for
+      # a run that did not have to rebuild the image; a run that did is
+      # expected to exceed it and says so rather than failing for it.
+      # Reported rather than enforced: failing an otherwise-good job for
+      # being slow teaches people to ignore the number.
+      - name: Time budget
+        if: always()
+        run: |
+          CACHED='${{ steps.imgcache.outputs.cache-hit }}'
+          {
+            echo
+            if [ "$CACHED" = "true" ]; then
+              echo "Budget: **10 minutes** (cached image). See the job duration above."
+            else
+              echo "Budget: not applicable — this run rebuilt the image from"
+              echo "source, which does not fit in ten minutes and is not"
+              echo "expected to. Only PRs that change what goes INTO the"
+              echo "image pay this."
+            fi
           } | tee -a "$GITHUB_STEP_SUMMARY"

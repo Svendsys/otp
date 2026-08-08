@@ -52,11 +52,17 @@ BASE="$WORK/base.qcow2"
 # verdict would never run and the diagnosis would be lost. This timeout has
 # to fire first, every time.
 #
-# 1800 rather than the 2400 it started at, for a second reason: a boot that
-# is never going to happen took forty minutes to say so, and the console
-# said "No bootable device" in the first fifteen seconds. Waiting longer
-# does not make a dead VM more informative.
-BOOT_TIMEOUT="${OTP_VM_TIMEOUT:-1800}"
+# 600, down from 1800, and this is a POLICY not an estimate. CI has a
+# ten-minute budget; three boots of a healthy guest take under four
+# minutes, measured. Anything that needs more than ten is either broken or
+# has become too slow to keep, and both deserve a red run rather than a
+# quiet twenty-minute drift.
+#
+# The earlier numbers were set by what a hang happened to cost: 1500, then
+# 2400 for three boots, then 1800 because a dead VM took forty minutes to
+# admit it. Sizing a timeout to the worst failure observed is how a
+# ten-minute job becomes a forty-minute one nobody notices.
+BOOT_TIMEOUT="${OTP_VM_TIMEOUT:-600}"
 
 log() { printf '\n== %s\n' "$*" >&2; }
 
