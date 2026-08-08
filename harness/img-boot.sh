@@ -141,10 +141,30 @@ CONSOLE_ALL="$WORK/console-all.log"
 : > "$CONSOLE"
 : > "$CONSOLE2"
 set +e
-# earlycon as well as earlyprintk: earlyprintk is the x86/arm32 spelling
-# and is a no-op on arm64, so the window before the real console comes up
-# was never being reported at all. console= for both ports for the same
-# reason as the two -serial flags.
+# THE COMMAND LINE IS A PERFORMANCE DECISION, not just a configuration one.
+# It used to read `loglevel=8 console=ttyAMA0 console=ttyS0`, and that run
+# spent its entire 1200-second budget reaching 7.6 seconds of guest time --
+# roughly a 160x slowdown.
+#
+# Under TCG every character out an emulated UART costs real work, and that
+# line asked for the maximum: loglevel=8 prints debug-level messages, and
+# naming two consoles makes the kernel emit every one of them TWICE.
+#
+#   loglevel=6  keeps KERN_NOTICE and above, which is what "Linux version"
+#               is printed at, and drops the KERN_INFO flood that makes up
+#               the bulk of a boot.
+#   one console rather than two. The dual-UART capture below stays -- both
+#               ports are still recorded -- but the kernel is only ASKED to
+#               write to one. We know from the previous run which one that
+#               is; there is no longer a reason to pay double to find out.
+#
+# earlyprintk is gone: it is the x86/arm32 spelling and a no-op on arm64.
+# earlycon is the one that does anything here.
+#
+# systemd.show_status=1 is explicit because the verdict greps for "Started
+# OTP pad print unit" and "Reached target", which are systemd's status
+# lines rather than kernel output. Too much has been lost today to output
+# that was assumed rather than asked for.
 #
 # NO -no-reboot, deliberately. A Pi OS image resizes its root filesystem on
 # first boot and then REBOOTS; -no-reboot turned that into a clean qemu
@@ -165,11 +185,31 @@ set +e
 timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -M raspi3b -m 1024 \
     -kernel "$KERNEL" -dtb "$DTB" \
-    -append "rw earlycon earlyprintk loglevel=8 console=ttyAMA0,115200 console=ttyS0,115200 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
+    -append "rw earlycon loglevel=6 console=ttyAMA0,115200 systemd.show_status=1 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
     -drive "file=$IMG,if=sd,format=raw" \
     -serial "file:$CONSOLE" \
     -serial "file:$CONSOLE2" \
-    -display none
+    -display none &
+QEMU_PID=$!
+
+# Sample the console while it boots. A guest grinding slowly along and a
+# guest wedged solid look identical from outside once the output stops, and
+# telling them apart cost a 55-minute build and still ended in a guess. The
+# growth column answers it directly: still climbing means slow, flat for
+# minutes means stuck.
+SAMPLE=30
+ELAPSED=0
+LAST=0
+while kill -0 "$QEMU_PID" 2>/dev/null; do
+    sleep "$SAMPLE"
+    ELAPSED=$((ELAPSED + SAMPLE))
+    NOW=$(wc -c < "$CONSOLE" 2>/dev/null || echo 0)
+    NOW2=$(wc -c < "$CONSOLE2" 2>/dev/null || echo 0)
+    printf '   %4ss  uart0=%-8s (+%-6s) uart1=%s\n' \
+           "$ELAPSED" "$NOW" "$((NOW - LAST))" "$NOW2" >&2
+    LAST=$NOW
+done
+wait "$QEMU_PID"
 QEMU_RC=$?
 set -e
 
