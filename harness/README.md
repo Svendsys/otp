@@ -144,6 +144,55 @@ asks the questions only a booted system can answer:
 - is `install.sh` idempotent, as the top of the file claims — and does the
   service survive being reprovisioned under it?
 
+### Three boots, because one boot answers the wrong question
+
+Every check above used to run in the *same boot* `install.sh` ran in, with
+the service hand-started by the harness. That describes a machine seconds
+after provisioning. The device's actual life is flash → boot → run →
+power-cycle, and **a unit that starts when hand-started but not when systemd
+starts it at boot would have passed**.
+
+| Phase | Boot | What is true of it |
+|---|---|---|
+| `provision` | 1 | `install.sh` has just run. Root still writable, service hand-started. |
+| `overlay` | 2 | systemd started the unit on its own, and the read-only overlay is engaged. Writes a sentinel to `/` and a setting through `config.save()`. |
+| `persist` | 3 | The sentinel must be **gone** and the setting must still be **there**. |
+
+The core checks run in all three. The gate requires **every** phase to have
+reported, exactly once, completely, with its counts in agreement — because a
+boot that never happened produces no output, which is indistinguishable from
+a boot with nothing to say. The single-phase form this replaced took
+`tail -1` of the result line, so a phase that died silently would have left
+the previous phase's success standing as the whole answer.
+
+`tests/test_vm_verdict.py` runs that gate against synthetic consoles and is
+itself mutation-tested: reverting it to last-phase-only, or dropping the
+finished / reported-twice / FAIL-line / qemu-exit checks, each turns the
+right tests red. That is deliberate — four harness checks that could not
+fail have been found in this repository so far, and reading did not catch
+any of them.
+
+### What the overlay phases do and do not prove
+
+The guest uses Debian's `overlayroot` package. A Pi uses `raspi-config
+nonint enable_overlayfs`, which is a **different mechanism**. So tier 2
+establishes that *the unit survives a read-only root* — cupsd starts, the
+spool lands somewhere writable, `config.save()` still persists. It does
+**not** establish that the Pi's overlay is correctly configured in the
+shipped image. That claim belongs to tier 3, which boots the real thing.
+
+`/boot/firmware` is given its own virtio disk, formatted FAT and mounted by
+label, mirroring the Pi's geometry — a `/boot/firmware` that were merely a
+directory on the root would be swallowed by the overlay, and the persistence
+checks would pass in the guest for a reason that does not hold on the
+device.
+
+One trap worth knowing if you touch this: cloud-init decides "have I run
+before?" from state under `/var/lib/cloud`, which the overlay discards. From
+boot 2 onward it would see a new instance every time and re-run the whole
+`runcmd` — `reboot` included. `/etc/cloud/cloud-init.disabled` is written on
+boot 1, before the overlay engages, which is why it survives.
+
 **Why amd64 rather than arm64.** Nothing on that list is
 architecture-specific. Emulating arm64 on an x86 host costs half an hour a
 run and buys none of it; amd64 with KVM is a few minutes, which is the

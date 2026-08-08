@@ -43,7 +43,9 @@ WORK="$(cd "$WORK" && pwd)"
 # needs, including the serial console the whole check reports through.
 IMAGE_URL="${OTP_VM_IMAGE_URL:-https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2}"
 BASE="$WORK/base.qcow2"
-BOOT_TIMEOUT="${OTP_VM_TIMEOUT:-1500}"
+# Three boots now, not one, each with a 45s settle inside it. Under KVM the
+# whole run is around eight minutes; this is headroom, not an estimate.
+BOOT_TIMEOUT="${OTP_VM_TIMEOUT:-2400}"
 
 log() { printf '\n== %s\n' "$*" >&2; }
 
@@ -82,9 +84,23 @@ tar -C "$REPO" --exclude=.git --exclude='image/pi-gen' --exclude='__pycache__' \
     -cf "$WORK/repo.tar" .
 truncate -s %512 "$WORK/repo.tar"
 
+# --- a boot partition, on its own disk -----------------------------------
+
+# The Pi keeps /boot/firmware on a separate FAT partition, and raspi-config's
+# overlay leaves it alone -- which is the only reason settings can persist on
+# a device whose root filesystem discards every write. Reproducing that
+# geometry is the point: a /boot/firmware that is just a directory on the
+# root would be swallowed by the overlay, and the persistence checks would
+# pass in the guest for a reason that does not hold on the device.
+#
+# Formatted in the guest rather than here, so the host needs no mtools and
+# no loop mounts.
+rm -f "$WORK/bootpart.img"
+truncate -s 64M "$WORK/bootpart.img"
+
 # --- what the guest does on first boot ----------------------------------
 
-cat > "$WORK/user-data" <<EOF
+cat > "$WORK/user-data" <<'EOF'
 #cloud-config
 # The packages install.sh would apt-get, minus the ones that exist only in
 # Raspberry Pi OS. python3-lgpio is the notable absence: it comes from
@@ -102,21 +118,99 @@ packages:
   - cups-filters
   - overlayroot
   - rng-tools5
+  - dosfstools
 package_update: true
+
+write_files:
+  # Runs on every boot AFTER the first. cloud-init's runcmd only fires once,
+  # so the second and third boots need their own entry point -- and the
+  # second and third boots are the entire point of this tier.
+  - path: /usr/local/sbin/otp-harness-boot
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # The phase lives on the boot partition because the root filesystem
+      # is an overlay by the time this runs, and anything written to / is
+      # gone at the next boot -- which is precisely what the persist phase
+      # is checking for. State that has to survive a reboot cannot live in
+      # the thing being tested for not surviving reboots.
+      set -u
+      STATE=/boot/firmware/otp-harness-phase
+      mount -o remount,rw /boot/firmware 2>/dev/null || true
+      PHASE=$(cat "$STATE" 2>/dev/null || echo overlay)
+      case "$PHASE" in
+        overlay|persist) ;;
+        *) echo "OTP-GUEST-DONE $PHASE (nothing to do)"; exit 0 ;;
+      esac
+      /repo/harness/vm-guest-check.sh "$PHASE"
+      echo "OTP-GUEST-DONE $PHASE"
+      mount -o remount,rw /boot/firmware 2>/dev/null || true
+      if [ "$PHASE" = "overlay" ]; then
+        echo persist > "$STATE"
+        sync
+        systemctl reboot
+      else
+        echo done > "$STATE"
+        sync
+        systemctl poweroff
+      fi
+  - path: /etc/systemd/system/otp-harness-boot.service
+    content: |
+      [Unit]
+      Description=Tier 2 harness checks for this boot
+      # After the unit, so is-active means something, and after CUPS so the
+      # print path is up. Wants= rather than Requires=: a unit that failed
+      # to start is the single most important thing this can report, and a
+      # hard dependency would stop the report from ever running.
+      After=multi-user.target otp-unit.service cups.service
+      Wants=otp-unit.service
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/otp-harness-boot
+      StandardOutput=journal+console
+      StandardError=journal+console
+      TimeoutStartSec=600
+      [Install]
+      WantedBy=multi-user.target
 
 runcmd:
   - [ sh, -c, "mkdir -p /repo && tar -C /repo -xf /dev/vdb" ]
   - [ sh, -c, "chmod +x /repo/device/install.sh /repo/harness/vm-guest-check.sh" ]
+  # The boot partition, formatted and mounted before install.sh runs so the
+  # unit's settings land on it from the start. Found by serial rather than
+  # by /dev/vdN: the kernel names virtio disks in probe order, and adding a
+  # drive to the qemu line above would silently renumber them.
+  # LABEL= in fstab, not the device node. The kernel names virtio disks in
+  # probe order, so a device path baked in on the first boot is a path that
+  # can point somewhere else on the second -- and the second boot is where
+  # this mount has to carry the settings.
+  - [ sh, -c, "BOOT=$(readlink -f /dev/disk/by-id/virtio-otpboot 2>/dev/null || echo /dev/vdd); echo \"boot partition: $BOOT\"; mkfs.vfat -n OTPBOOT \"$BOOT\" && mkdir -p /boot/firmware && echo 'LABEL=OTPBOOT /boot/firmware vfat defaults,rw 0 0' >> /etc/fstab && mount /boot/firmware && df -h /boot/firmware" ]
   # --skip-apt because cloud-init installed what Debian has above. The
   # point of this tier is what install.sh does to a BOOTED system, not
   # whether apt can resolve a Raspberry Pi OS package list; the image
   # build already covers that in a real arm64 chroot.
-  - [ sh, -c, "/repo/device/install.sh --skip-apt > /var/log/otp-install.log 2>&1; echo \"OTP-INSTALL rc=\$?\"" ]
+  - [ sh, -c, "/repo/device/install.sh --skip-apt > /var/log/otp-install.log 2>&1; echo \"OTP-INSTALL rc=$?\"" ]
   - [ sh, -c, "systemctl daemon-reload; systemctl start otp-unit.service || true" ]
-  - [ sh, -c, "/repo/harness/vm-guest-check.sh" ]
-  - [ sh, -c, "echo OTP-GUEST-DONE" ]
+  - [ sh, -c, "/repo/harness/vm-guest-check.sh provision" ]
+  - [ sh, -c, "echo OTP-GUEST-DONE provision" ]
   - [ sh, -c, "tail -40 /var/log/otp-install.log" ]
-  - [ poweroff ]
+  # Everything from here is setup for the second and third boots.
+  - [ sh, -c, "systemctl enable otp-harness-boot.service" ]
+  - [ sh, -c, "echo 'overlayroot=\"tmpfs\"' > /etc/overlayroot.conf; update-initramfs -u 2>&1 | tail -5" ]
+  # cloud-init must not run again, and this is not optional housekeeping.
+  # It decides "have I run before?" from state under /var/lib/cloud -- which
+  # is on the root filesystem, which the overlay discards at every boot. So
+  # from boot 2 onward cloud-init would see a brand new instance every
+  # single time and re-run this entire runcmd, `reboot` included: an
+  # infinite boot loop that ends at the timeout with no useful output.
+  #
+  # Written now, before the overlay engages, so it lands in the lower layer
+  # and survives. Everything else this boot writes persists for the same
+  # reason -- the overlay only discards what is written AFTER it is up.
+  - [ sh, -c, "touch /etc/cloud/cloud-init.disabled" ]
+  - [ sh, -c, "echo overlay > /boot/firmware/otp-harness-phase; sync" ]
+  - [ sh, -c, "echo 'OTP-REBOOTING into the overlay'" ]
+  - [ reboot ]
 
 # Everything goes to the serial console, which is what the host reads.
 output: { all: "| tee -a /dev/ttyS0" }
@@ -148,6 +242,7 @@ timeout "$BOOT_TIMEOUT" qemu-system-x86_64 \
     -drive "file=$WORK/overlay.qcow2,if=virtio,format=qcow2" \
     -drive "file=$WORK/repo.tar,if=virtio,format=raw" \
     -drive "file=$WORK/seed.iso,if=virtio,format=raw" \
+    -drive "file=$WORK/bootpart.img,if=virtio,format=raw,serial=otpboot" \
     -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
     -serial "file:$CONSOLE" \
     -monitor none
@@ -156,18 +251,27 @@ set -e
 
 # --- the verdict --------------------------------------------------------
 
+# Every boot the guest is expected to complete. Named here rather than
+# counted from the output, because the whole point is to notice a boot that
+# produced NO output -- which cannot be inferred from the output.
+EXPECTED_PHASES="provision overlay persist"
+
+# CR-stripped once, up front. The guest reports over a serial console, which
+# emits CRLF, so every captured line carries a trailing \r. That is
+# invisible in a log and lethal to string comparison -- it once made "13"
+# and "13\r" unequal and failed a run in which everything passed.
+CLEAN="$WORK/console-clean.log"
+tr -d '\r' < "$CONSOLE" > "$CLEAN"
+
 # Written out separately so the caller can print it last. The console is
 # thousands of lines of boot chatter, and a verdict buried under that is a
 # verdict nobody reads.
-# CR-stripped. The guest reports over a serial console, which emits CRLF,
-# so every captured line carries a trailing \r. That is invisible in a log
-# and lethal to string comparison -- see the OTP-RESULT check below.
 VERDICT="$WORK/verdict.txt"
-grep -E "OTP-INSTALL|OTP-CHECK|OTP-RESULT" "$CONSOLE" 2>/dev/null \
-    | tr -d '\r' > "$VERDICT" || true
+grep -E "OTP-INSTALL|OTP-CHECK|OTP-RESULT|OTP-GUEST-DONE|OTP-REBOOTING" \
+    "$CLEAN" > "$VERDICT" 2>/dev/null || true
 
 log "Console output"
-if grep -q "OTP-CHECK" "$CONSOLE"; then
+if grep -q "OTP-CHECK" "$CLEAN"; then
     cat "$VERDICT"
 else
     echo "The guest never reported. Last 80 lines of the console:" >&2
@@ -176,44 +280,67 @@ else
     exit 1
 fi
 
-FAILED=$(grep -c "OTP-CHECK .* FAIL" "$CONSOLE" || true)
-RESULT=$(grep -o "OTP-RESULT .*" "$CONSOLE" | tr -d '\r' | tail -1 || true)
-log "${RESULT:-no result line}"
+FAILED=$(grep -c "OTP-CHECK .* FAIL" "$CLEAN" || true)
+log "$(grep "OTP-RESULT" "$CLEAN" | tr '\n' ' ')"
 
-# A truncated run is not a passing run. Zero FAIL lines is trivially true
-# of a guest that was killed after two checks -- and with no KVM this
-# script falls back to TCG and takes an order of magnitude longer, so that
-# is reachable. The guest echoes OTP-GUEST-DONE when it finishes; require
-# it, require qemu to have exited cleanly, and require the two numbers in
-# OTP-RESULT to agree.
+# qemu first. A run killed by the timeout can still leave a complete-looking
+# transcript for whichever phases did finish before the axe fell.
 if [ "$QEMU_RC" != 0 ]; then
     echo "qemu exited $QEMU_RC (124 = killed by the ${BOOT_TIMEOUT}s timeout)" >&2
-    exit 1
-fi
-if ! tr -d '\r' < "$CONSOLE" | grep -q "OTP-GUEST-DONE"; then
-    echo "the guest never finished: no OTP-GUEST-DONE marker" >&2
+    echo "phases that reported: $(grep -c "OTP-RESULT" "$CLEAN" || true) of 3" >&2
     tail -n 40 "$CONSOLE" >&2
     exit 1
 fi
-# Numeric, not string. A serial console's trailing \r made "13" and "13\r"
-# unequal, so this gate -- added to catch a run killed part-way -- failed a
-# run in which all thirteen checks passed. Fixing a diagnostic and breaking
-# it in the same motion is a pattern in this file's history; hence the
-# comparison that cannot be fooled by whitespace.
-PASSED=${RESULT#OTP-RESULT }
-GOT=${PASSED%%/*}
-WANT=${PASSED##*/}
-if [ -z "$PASSED" ] || ! [ "${GOT:-0}" -eq "${WANT:--1}" ] 2>/dev/null; then
-    echo "not every check passed: ${RESULT:-no result line}" >&2
-    grep "OTP-CHECK .* FAIL" "$CONSOLE" >&2 || true
+
+# EVERY expected phase must have reported, exactly once, completely, and
+# with its two numbers in agreement.
+#
+# This is the gate that makes a three-boot run mean anything. A boot that
+# never happened produces no output, which is indistinguishable from a boot
+# with nothing to say -- and the single-phase form this replaces took
+# `tail -1` of the result line, so a phase that died silently would have
+# left the PREVIOUS phase's success standing as the whole answer. Exactly
+# once, not at least once, because the runner reboots itself: a failed state
+# write would loop it on one phase forever, and "it reported" would be true
+# of a machine doing nothing else.
+BAD=""
+for phase in $EXPECTED_PHASES; do
+    count=$(grep -c "OTP-RESULT $phase " "$CLEAN" || true)
+    if [ "${count:-0}" -eq 0 ]; then
+        BAD="$BAD $phase(never reported)"
+        continue
+    fi
+    if [ "${count:-0}" -gt 1 ]; then
+        BAD="$BAD $phase(reported ${count}x)"
+        continue
+    fi
+    if ! grep -q "OTP-GUEST-DONE $phase\$" "$CLEAN"; then
+        BAD="$BAD $phase(unfinished)"
+        continue
+    fi
+    counts=$(grep "OTP-RESULT $phase " "$CLEAN" | tail -1)
+    counts=${counts#*"OTP-RESULT $phase "}
+    got=${counts%%/*}
+    want=${counts##*/}
+    # Numeric, not string, for the CRLF reason above.
+    if ! [ "${got:-0}" -eq "${want:--1}" ] 2>/dev/null; then
+        BAD="$BAD $phase($counts)"
+    fi
+done
+
+if [ -n "$BAD" ]; then
+    echo "phases incomplete or failing:$BAD" >&2
+    grep "OTP-CHECK .* FAIL" "$CLEAN" >&2 || true
+    echo "--- otp-unit journal from the guest ---" >&2
+    sed -n '/--- otp-unit journal/,/--- end journal ---/p' "$CLEAN" >&2 || true
     exit 1
 fi
 
 if [ "${FAILED:-1}" -ne 0 ]; then
     echo "$FAILED check(s) failed" >&2
-    grep "OTP-CHECK .* FAIL" "$CONSOLE" >&2 || true
+    grep "OTP-CHECK .* FAIL" "$CLEAN" >&2 || true
     echo "--- otp-unit journal from the guest ---" >&2
-    sed -n '/--- otp-unit journal ---/,/--- end journal ---/p' "$CONSOLE" >&2 || true
+    sed -n '/--- otp-unit journal/,/--- end journal ---/p' "$CLEAN" >&2 || true
     exit 1
 fi
-log "all checks passed"
+log "all checks passed across $EXPECTED_PHASES"
