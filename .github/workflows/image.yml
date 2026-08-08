@@ -25,6 +25,14 @@ on:
       - "harness/img-boot.sh"
       - ".github/workflows/image.yml"
 
+# Same reasoning as ci.yml, and more so: this one is a 35-minute build.
+# Leaving a superseded pi-gen run going costs half an hour of runner time
+# to produce an image for a commit that has already been replaced. Tag and
+# dispatch runs are never cancelled -- those produce artifacts people keep.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   image:
     runs-on: ubuntu-latest

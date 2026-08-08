@@ -5,6 +5,18 @@ on:
     branches: [master]
   pull_request:
 
+# One run per branch. Without this, pushing a fix leaves the superseded
+# run going: two `vm` jobs booting three VMs each, for a commit nobody
+# cares about any more. Measured -- two 40-minute jobs ran concurrently
+# against the same branch, and the older one's result was worthless before
+# it started.
+#
+# NOT cancelled on master: a push there is the record of what that commit
+# does, and cancelling it to start the next one loses that permanently.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
