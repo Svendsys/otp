@@ -38,7 +38,183 @@ jobs:
             "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
             | tar -xJf - --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           ./shellcheck --version
-          ./shellcheck device/install.sh image/build.sh image/render-manual.sh
+          ./shellcheck device/install.sh image/build.sh image/render-manual.sh \
+                       harness/kernel-sim.sh harness/vm-check.sh \
+                       harness/vm-guest-check.sh harness/img-boot.sh
+
+  hardware:
+    # Tier 1 of the harness: the real code against real kernel interfaces
+    # and a real cupsd. This is the job that would have caught `MaxJobs 1`
+    # -- six rounds of reading the code did not, and a daemon did in four
+    # seconds. See harness/README.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CUPS, the panel libraries and the simulators
+        run: |
+          sudo apt-get update
+          # cups for the print path; the rest is what the unit imports on a
+          # real Pi, so the panel code can be exercised rather than skipped.
+          sudo apt-get install -y --no-install-recommends \
+            cups cups-client cups-filters printer-driver-cups-pdf \
+            i2c-tools python3-evdev
+          # gpio-sim, i2c-stub and vkms are not in the runner's base kernel
+          # -- measured: "1 of 4 up" on 6.17.0-1020-azure, with only uinput
+          # present. They live in modules-extra. Not fatal if it will not
+          # install; kernel-sim.sh reports what it got and the tests skip
+          # what is missing.
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" \
+            || echo "no modules-extra for $(uname -r); some simulators will be absent"
+          pip install -r requirements-dev.txt
+          pip install smbus2 luma.oled gpiozero lgpio
+      - name: Stop the system CUPS and unconfine cupsd
+        run: |
+          # The rig runs its own cupsd on its own socket. The distro one is
+          # not needed and only competes for the default socket.
+          sudo systemctl stop cups cups-browsed || true
+          # Ubuntu confines cupsd with AppArmor, and the profile permits
+          # backends under /usr/lib/cups/backend and nowhere else. The rig
+          # is deliberately hermetic -- its own ServerBin in a temp
+          # directory -- which is exactly what that forbids. Measured:
+          #   apparmor="DENIED" operation="exec" profile="/usr/sbin/cupsd"
+          #   name="/tmp/.../cups/bin/backend/usb" comm="cups-deviced"
+          # so cupsd started, answered lpstat, and reported no devices.
+          #
+          # apparmor_parser rather than aa-complain: the latter needs
+          # apparmor-utils, which is not on the runner, and the `|| true`
+          # meant its absence was silent.
+          sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.cupsd 2>/dev/null || true
+          # Assert it worked. If this step ever silently fails, the rig
+          # skips its tests for lack of a working cupsd and the job goes
+          # green having tested nothing -- which is worse than red.
+          #
+          # sudo on the grep, not just the parser. That file is root-only,
+          # so an unprivileged grep exits non-zero with "Permission denied"
+          # and the assertion reads it as "not enforcing" -- an assertion
+          # that cannot observe the state it is asserting about. It passed
+          # for the wrong reason on the first green run.
+          PROFILES=/sys/kernel/security/apparmor/profiles
+          if ! sudo test -r "$PROFILES"; then
+            echo "cannot read $PROFILES; assuming no AppArmor on this runner"
+          elif sudo grep -q '^/usr/sbin/cupsd (enforce)' "$PROFILES"; then
+            echo "cupsd is still confined; the harness cannot run hermetically" >&2
+            sudo grep cupsd "$PROFILES" >&2
+            exit 1
+          else
+            echo "cupsd apparmor state: $(sudo grep cupsd "$PROFILES" || echo unconfined)"
+          fi
+      - name: Bring up the kernel simulators
+        # Never fatal: a runner kernel missing one of these should still
+        # run everything else. The script reports what it got.
+        run: sudo ./harness/kernel-sim.sh up
+      - name: What came up
+        run: sudo ./harness/kernel-sim.sh status
+      - name: Run the harness
+        # Root because cupsd runs backends as lp and the simulators are
+        # driven through sysfs. -p no:randomly so a failure is reproducible.
+        run: |
+          set -o pipefail
+          sudo -E env "PATH=$PATH" \
+            timeout 900 python3 -m pytest -m hardware -v -p no:randomly \
+              --tb=short -rfs 2>&1 | tee /tmp/harness.log
+      - name: The CUPS error log, if anything failed
+        if: failure()
+        # Tightly capped. CUPS dumps its whole debug trace for a failed job
+        # regardless of LogLevel, and one rig per test meant ~1000 lines of
+        # it -- which pushed the pytest summary out of reach of anything
+        # reading the tail of this log. A diagnostic nobody can find past
+        # the noise is not a diagnostic. Two files, twenty lines each.
+        run: |
+          sudo find /tmp -name error_log -path '*cups*' 2>/dev/null \
+            | head -n 2 \
+            | while read -r log; do
+                echo "--- $log"
+                sudo grep -E '^[EW] ' "$log" | tail -n 20 || true
+              done
+          echo "--- apparmor denials (cupsd only)"
+          sudo dmesg 2>/dev/null | grep -i 'apparmor="DENIED"' | tail -n 10 || true
+      - name: Tear down
+        if: always()
+        run: sudo ./harness/kernel-sim.sh down || true
+      - name: Verdict
+        # Last thing in the job log, always, so the outcome is reachable
+        # from the tail without wading through the CUPS dump above.
+        if: always()
+        run: |
+          echo "=== harness verdict ==="
+          # Not `grep ... | tail || echo`: under Actions' default shell
+          # (no pipefail) the pipeline's status is tail's, which is 0 on
+          # empty input, so a missing log read as a clean run.
+          if [ ! -s /tmp/harness.log ]; then
+            echo "no pytest output at all -- the harness did not run" >&2
+            exit 1
+          fi
+          grep -E "^(FAILED|ERROR|SKIPPED)|passed|failed" /tmp/harness.log \
+            | tail -n 40 || true
+          # A floor on what must have RUN. cupsrig.available() skips the
+          # whole CUPS half for five separate reasons -- a confined cupsd,
+          # a non-root runner, a missing binary -- and each of them left
+          # this job green at "1 passed, 20 skipped", the one pass being a
+          # bash -n syntax check. A harness that silently tests nothing is
+          # worse than a red one; that is the premise of this whole PR.
+          PASSED=$(grep -oE '[0-9]+ passed' /tmp/harness.log | tail -1 | cut -d' ' -f1)
+          echo "harness tests passed: ${PASSED:-0}"
+          if [ "${PASSED:-0}" -lt 12 ]; then
+            echo "expected at least 12 passing harness tests (the CUPS rig" >&2
+            echo "alone is 11); got ${PASSED:-0}. Something skipped silently." >&2
+            grep -E "^SKIPPED" /tmp/harness.log >&2 || true
+            exit 1
+          fi
+
+  vm:
+    # Tier 2: boot a real system, run device/install.sh on it, and check
+    # the unit actually comes up. This is the only place otp-unit.service
+    # taking tty1 from getty is ever observed -- pi-gen never boots the
+    # image it builds, and a container has no virtual terminals.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils cloud-image-utils
+          # KVM turns half an hour of emulation into a few minutes. Not
+          # fatal if it is missing -- vm-check.sh falls back to TCG and
+          # says so -- but worth reporting, because a silent fallback
+          # looks exactly like a hang.
+          ls -l /dev/kvm 2>/dev/null || echo "no /dev/kvm; will use TCG"
+          sudo usermod -aG kvm "$USER" || true
+      - name: Cache the Debian base image
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/otp-vm/base.qcow2
+          key: debian-13-generic-amd64-v1
+      - name: Boot, provision and check
+        env:
+          # An absolute path expanded by GitHub, not a ~ that nothing
+          # expands. sudo -E would also hand root's HOME to the script.
+          OTP_VM_WORK: ${{ runner.temp }}/otp-vm
+        run: sudo -E ./harness/vm-check.sh
+      - name: The guest console, if anything failed
+        if: failure()
+        # Capped: the console is thousands of lines of boot chatter, and an
+        # uncapped dump pushed the verdict out of reach of anything reading
+        # the tail of this log.
+        run: |
+          sudo grep -iE "error|fail|otp-" \
+            ${{ runner.temp }}/otp-vm/console.log | tail -n 60 || true
+      - name: Verdict
+        # Last, always, so the outcome is the first thing you see from the end.
+        if: always()
+        run: |
+          echo "=== tier 2 verdict ==="
+          sudo cat ${{ runner.temp }}/otp-vm/verdict.txt 2>/dev/null \
+            || echo "(the guest never reported)"
 
   simulator:
     # The unit's whole interface runs without hardware, so CI can drive a

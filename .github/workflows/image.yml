@@ -110,6 +110,26 @@ jobs:
       - name: Build
         run: ./image/build.sh
 
+      # Tier 3 of the harness: boot the artifact that was just built. Once
+      # per image, not per commit -- it is emulated, so it is slow, and its
+      # peripheral coverage is WORSE than tier 1's simulators. It answers
+      # exactly one question nothing else can: does the thing that gets
+      # flashed to a card actually come up? pi-gen assembles a filesystem
+      # and never starts it. See harness/README.md.
+      - name: Boot the image
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-arm mtools xz-utils
+          OTP_IMG_WORK=${{ runner.temp }}/otp-img \
+            ./harness/img-boot.sh image/deploy/*.img.xz
+      - name: Boot verdict
+        if: always()
+        run: |
+          echo "=== tier 3 verdict ==="
+          cat ${{ runner.temp }}/otp-img/verdict.txt 2>/dev/null \
+            || echo "(the image never reported)"
+
       - name: Upload
         uses: actions/upload-artifact@v4
         with:

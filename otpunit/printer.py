@@ -52,9 +52,14 @@ class PrinterError(RuntimeError):
 class Cups:
     """Thin wrapper over the CUPS command-line tools."""
 
-    def __init__(self, run=None):
+    def __init__(self, run=None, temp_dir=None):
         # Injectable so tests can drive this against recorded output.
         self._run = run or self._subprocess_run
+        # Which TempDir _clear_temp() empties. A module constant here meant
+        # the harness -- which runs its own cupsd in a temp directory --
+        # deleted the HOST's live /run/cups/tmp as root instead, on any
+        # machine with CUPS running, and never once exercised its own.
+        self.temp_dir = temp_dir or TEMP_DIR
 
     # A wedged cupsd must not block the UI forever holding key material
     # resident, with no way out but pulling the power.
@@ -341,7 +346,7 @@ class Cups:
         about honouring purge()'s contract, not about the SD card.
         """
         try:
-            for entry in os.scandir(TEMP_DIR):
+            for entry in os.scandir(self.temp_dir):
                 try:
                     if entry.is_file(follow_symlinks=False):
                         os.unlink(entry.path)
