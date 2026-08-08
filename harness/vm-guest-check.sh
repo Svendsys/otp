@@ -17,13 +17,14 @@
 # the second boot at all.
 #
 #   provision  first boot, right after install.sh ran. The service is
-#              hand-started; the root is still writable.
-#   overlay    second boot. systemd started the unit on its own, and the
-#              read-only overlay is engaged. Writes a sentinel to / and a
-#              setting to the boot partition, for the next phase to find.
-#   persist    third boot. The sentinel must be GONE (the overlay really
-#              discards) and the setting must still be THERE (the boot
-#              partition really is outside the overlay).
+#              hand-started by the harness.
+#   reboot     second boot. SYSTEMD started the unit this time. Writes a
+#              setting through config.save() for the next phase to find.
+#   persist    third boot. The setting must still be there, read back
+#              through config.load() rather than grepped for.
+#
+# A READ-ONLY OVERLAY ROOT IS NOT TESTED HERE -- see issue #9 and the note
+# further down. Two mechanisms were tried and neither works in this guest.
 #
 # The core checks run in every phase, deliberately. A unit that starts when
 # hand-started but not when systemd starts it at boot is precisely the class
@@ -48,13 +49,13 @@ PHASE="${1:-provision}"
 PASS=0
 TOTAL=0
 
-# The boot partition, mounted from a separate disk outside the overlay --
-# the same geometry a Pi has, where /boot/firmware is its own FAT partition
-# and raspi-config's overlay leaves it alone.
+# The boot partition, on its own disk -- the same geometry a Pi has, where
+# /boot/firmware is a separate FAT partition that raspi-config's overlay
+# leaves alone. That is what lets settings survive a device whose root
+# filesystem discards every write.
 BOOTDIR=/boot/firmware
-SENTINEL=/otp-harness-sentinel
 # A page count no default produces, written through config.save() in the
-# overlay phase and looked for again in persist. Deliberately not one of
+# reboot phase and looked for again in persist. Deliberately not one of
 # PAGE_CHOICES: a value the panel can produce would still be there if the
 # unit rewrote the file itself, and would not prove the write survived.
 MARK_PAGES=137
@@ -192,8 +193,8 @@ if [ "$PHASE" = "provision" ]; then
     # on a provisioned system is the only way to find out, and it is exactly
     # what somebody iterating on a real Pi does.
     #
-    # Provision phase only: under the read-only overlay a rerun would fail
-    # for a reason that has nothing to do with idempotency.
+    # Provision phase only: it is slow, and rerunning it on every boot
+    # would test apt more than it tests idempotency.
     if [ -d /repo ]; then
         if /repo/device/install.sh --skip-apt >/tmp/rerun.log 2>&1; then
             check install-idempotent yes "second run exited 0"
@@ -209,60 +210,34 @@ if [ "$PHASE" = "provision" ]; then
     fi
 fi
 
-# --- the read-only overlay ----------------------------------------------
+# --- the boots systemd drove --------------------------------------------
 
-# WHAT THIS DOES AND DOES NOT PROVE. The guest uses systemd's own
-# `systemd.volatile=overlay`; a Pi uses `raspi-config nonint
-# enable_overlayfs`. Different mechanisms. So these checks establish that
-# THE UNIT SURVIVES A READ-ONLY ROOT -- cupsd starts, the spool lands
-# somewhere writable, settings still persist. They do NOT establish that
-# the Pi's overlay is correctly configured in the shipped image. That claim
-# belongs to tier 3, which boots the real thing. Conflating the two would
-# be exactly the kind of overstatement this harness exists to catch.
+# NO READ-ONLY OVERLAY IS TESTED HERE. That is issue #9, and it is left
+# open deliberately rather than faked: two mechanisms have been tried in
+# this guest and neither works.
 #
-# Debian's `overlayroot` package was the first choice and does not work on
-# trixie: its initramfs script feeds `mount` an option it rejects, fails to
-# pivot, and panics the kernel with "Attempted to kill init!". systemd does
-# the same job natively with no initramfs hook to be incompatible with.
-if [ "$PHASE" = "overlay" ] || [ "$PHASE" = "persist" ]; then
-    ROOT_OPTS=$(findmnt -no OPTIONS --target / 2>/dev/null || echo "?")
-    ROOT_FS=$(findmnt -no FSTYPE --target / 2>/dev/null || echo "?")
-    # Ask the kernel, not the config. An overlay that was configured and
-    # failed to engage still leaves overlayroot.conf saying "tmpfs".
-    check root-is-overlay \
-          "$(if [ "$ROOT_FS" = "overlay" ]; then echo yes; else echo no; fi)" \
-          "fstype=$ROOT_FS opts=${ROOT_OPTS%%,*}"
-
-    # The writable layer must be RAM. That is the whole security claim --
-    # a write that lands on the card outlives the power cycle, and on this
-    # device the power cycle IS the wipe. "Can I write to /" is not the
-    # check: an overlay accepts every write, which is the point. This asks
-    # where the write GOES; the persist phase then confirms it does not
-    # come back.
-    UPPER=$(findmnt -no OPTIONS --target / 2>/dev/null \
-              | tr ',' '\n' | awk -F= '/^upperdir=/{print $2}')
-    UPPER_FS=$(findmnt -no FSTYPE --target "${UPPER:-/nonexistent}" 2>/dev/null || echo "?")
-    check overlay-upper-is-ram \
-          "$(if [ "$UPPER_FS" = "tmpfs" ]; then echo yes; else echo no; fi)" \
-          "upperdir=${UPPER:-unset} fstype=$UPPER_FS"
-
-    # The boot partition has to stay writable and outside the overlay, or
-    # settings cannot persist at all.
+#   - Debian's `overlayroot` package feeds `mount` an option it rejects,
+#     fails to pivot, and panics the kernel: "Attempted to kill init!".
+#   - `systemd.volatile=overlay` is accepted on the kernel command line and
+#     silently ignored. It is implemented by systemd INSIDE THE INITRD, and
+#     Debian's initramfs-tools initrd has no systemd in it. Measured: the
+#     flag present in /proc/cmdline, and / still plain rw ext4.
+#
+# What these phases DO establish is what issue #8 was about, and it is not
+# a small thing: the unit comes up on boots that SYSTEMD drove, twice over,
+# on a machine where nobody hand-started anything. Every core check above
+# runs again in each of them.
+if [ "$PHASE" = "reboot" ] || [ "$PHASE" = "persist" ]; then
+    # The boot partition has to be its own mount, or the setting checked a
+    # boot from now was never on the partition whose survival is the point.
     BOOT_SRC=$(findmnt -no SOURCE --target "$BOOTDIR" 2>/dev/null || echo "?")
     BOOT_FS=$(findmnt -no FSTYPE --target "$BOOTDIR" 2>/dev/null || echo "?")
     check boot-partition-separate \
-          "$(if [ "$BOOT_FS" != "overlay" ] && [ "$BOOT_SRC" != "?" ]; then echo yes; else echo no; fi)" \
+          "$(if [ "$BOOT_SRC" != "?" ] && [ "$BOOT_SRC" != "$(findmnt -no SOURCE --target / 2>/dev/null)" ]; then echo yes; else echo no; fi)" \
           "$BOOTDIR src=$BOOT_SRC fstype=$BOOT_FS"
 fi
 
-if [ "$PHASE" = "overlay" ]; then
-    # Leave a mark on the overlay. The next boot decides what happened to
-    # it. Writing it is not the test -- the overlay accepts any write --
-    # so nothing here is checked beyond the write having been possible.
-    date > "$SENTINEL" 2>/dev/null || true
-    check sentinel-written "$(yesno test -f "$SENTINEL")" \
-          "wrote $SENTINEL, expect it GONE next boot"
-
+if [ "$PHASE" = "reboot" ]; then
     # Through config.save() at its real CONFIG_PATH, not a shell redirect
     # to somewhere convenient. The code that persists settings on the
     # device is the thing under test, and it is the only writer that has to
@@ -310,13 +285,6 @@ PY
 fi
 
 if [ "$PHASE" = "persist" ]; then
-    # The load-bearing pair. If the overlay is not really discarding, the
-    # sentinel is still here. If the boot partition is inside the overlay,
-    # the setting is gone. Either way somebody's assumption is wrong.
-    check overlay-discards-root-writes \
-          "$(if [ ! -e "$SENTINEL" ]; then echo yes; else echo no; fi)" \
-          "$SENTINEL $(if [ -e "$SENTINEL" ]; then echo 'SURVIVED a reboot'; else echo gone; fi)"
-
     # Read back through config.load(), not by grepping the file. A setting
     # that persisted as bytes but no longer parses is not a setting that
     # persisted -- load() falls back to the default for any field it cannot

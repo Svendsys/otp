@@ -154,9 +154,9 @@ starts it at boot would have passed**.
 
 | Phase | Boot | What is true of it |
 |---|---|---|
-| `provision` | 1 | `install.sh` has just run. Root still writable, service hand-started. |
-| `overlay` | 2 | systemd started the unit on its own, and the read-only overlay is engaged. Writes a sentinel to `/` and a setting through `config.save()`. |
-| `persist` | 3 | The sentinel must be **gone** and the setting must still be **there**. |
+| `provision` | 1 | `install.sh` has just run. The service is hand-started by the harness. |
+| `reboot` | 2 | **systemd** started the unit this time. Writes a setting through `config.save()`. |
+| `persist` | 3 | The setting must still be there, read back through `config.load()`. |
 
 The core checks run in all three. The gate requires **every** phase to have
 reported, exactly once, completely, with its counts in agreement — because a
@@ -172,26 +172,37 @@ right tests red. That is deliberate — four harness checks that could not
 fail have been found in this repository so far, and reading did not catch
 any of them.
 
-### What the overlay phases do and do not prove
+### The read-only overlay is NOT tested here — issue #9
 
-The guest uses Debian's `overlayroot` package. A Pi uses `raspi-config
-nonint enable_overlayfs`, which is a **different mechanism**. So tier 2
-establishes that *the unit survives a read-only root* — cupsd starts, the
-spool lands somewhere writable, `config.save()` still persists. It does
-**not** establish that the Pi's overlay is correctly configured in the
-shipped image. That claim belongs to tier 3, which boots the real thing.
+Two mechanisms were tried in this guest and neither works. Both are worth
+writing down, because both look like they should:
 
-`/boot/firmware` is given its own virtio disk, formatted FAT and mounted by
-label, mirroring the Pi's geometry — a `/boot/firmware` that were merely a
-directory on the root would be swallowed by the overlay, and the persistence
-checks would pass in the guest for a reason that does not hold on the
-device.
+- **Debian's `overlayroot` package** feeds `mount` an option it rejects,
+  fails to pivot, and panics the kernel: `Attempted to kill init!`.
+- **`systemd.volatile=overlay`** is accepted on the kernel command line and
+  silently ignored. It is implemented by systemd *inside the initrd*, and
+  Debian's initramfs-tools initrd has no systemd in it. Measured: the flag
+  present in `/proc/cmdline`, and `/` still plain `rw` ext4.
 
-One trap worth knowing if you touch this: cloud-init decides "have I run
-before?" from state under `/var/lib/cloud`, which the overlay discards. From
-boot 2 onward it would see a new instance every time and re-run the whole
-`runcmd` — `reboot` included. `/etc/cloud/cloud-init.disabled` is written on
-boot 1, before the overlay engages, which is why it survives.
+Rather than fake it, tier 2 claims only what it demonstrates. The overlay
+stays open as issue #9.
+
+`/boot/firmware` still gets its own virtio disk, formatted FAT and mounted
+by label, mirroring the Pi's geometry — the device keeps settings there
+precisely *because* it is outside the overlay, so testing persistence
+against a directory on the root would pass for a reason that does not hold
+on hardware.
+
+Two traps worth knowing if you touch this:
+
+- **Never replace `GRUB_CMDLINE_LINUX`; append to it.** The image sets
+  `console=ttyS0,115200` there, and that is the only reason this tier has a
+  serial console. Replacing it cost a run in which boots 2 and 3 did all
+  their work and reported into a console connected to nothing.
+- **The kernel and the guest share that console.** A kernel message once
+  landed mid-marker and split `OTP-RESULT provi|sion` in half. The guest
+  runs at `loglevel=3` and the host matches the marker as a whole pattern
+  anywhere in the line.
 
 **Why amd64 rather than arm64.** Nothing on that list is
 architecture-specific. Emulating arm64 on an x86 host costs half an hour a

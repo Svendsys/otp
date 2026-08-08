@@ -139,23 +139,22 @@ write_files:
     permissions: "0755"
     content: |
       #!/bin/sh
-      # The phase lives on the boot partition because the root filesystem
-      # is an overlay by the time this runs, and anything written to / is
-      # gone at the next boot -- which is precisely what the persist phase
-      # is checking for. State that has to survive a reboot cannot live in
-      # the thing being tested for not surviving reboots.
+      # The phase lives on the boot partition, not on the root filesystem.
+      # On the device the root discards every write, so state that has to
+      # survive a reboot cannot live there -- and the harness should not
+      # depend on something the device would not give it.
       set -u
       STATE=/boot/firmware/otp-harness-phase
       mount -o remount,rw /boot/firmware 2>/dev/null || true
-      PHASE=$(cat "$STATE" 2>/dev/null || echo overlay)
+      PHASE=$(cat "$STATE" 2>/dev/null || echo reboot)
       case "$PHASE" in
-        overlay|persist) ;;
+        reboot|persist) ;;
         *) echo "OTP-GUEST-DONE $PHASE (nothing to do)"; exit 0 ;;
       esac
       /repo/harness/vm-guest-check.sh "$PHASE"
       echo "OTP-GUEST-DONE $PHASE"
       mount -o remount,rw /boot/firmware 2>/dev/null || true
-      if [ "$PHASE" = "overlay" ]; then
+      if [ "$PHASE" = "reboot" ]; then
         echo persist > "$STATE"
         sync
         systemctl reboot
@@ -213,22 +212,19 @@ runcmd:
   - [ sh, -c, "tail -40 /var/log/otp-install.log" ]
   # Everything from here is setup for the second and third boots.
   - [ sh, -c, "systemctl enable otp-harness-boot.service" ]
-  # systemd's OWN volatile-overlay support, via the kernel command line --
-  # not Debian's overlayroot package, which is broken on trixie. Measured:
+  # NO read-only overlay is configured. Issue #9 tracks that, and it is
+  # left open rather than faked -- two mechanisms were tried here and
+  # neither works:
   #
-  #   Warning: overlayroot: configuring overlayroot with driver=overlay
-  #   mount: invalid option --
-  #   Failure: overlayroot: failed to move root away from /root to /media/root-ro
-  #   Kernel panic - not syncing: Attempted to kill init!
+  #   - Debian's `overlayroot` package feeds `mount` an option it rejects,
+  #     fails to pivot, and panics: "Attempted to kill init!".
+  #   - `systemd.volatile=overlay` is accepted on the command line and
+  #     silently ignored. It is implemented by systemd INSIDE THE INITRD,
+  #     and Debian's initramfs-tools initrd has no systemd in it. Measured:
+  #     the flag present in /proc/cmdline, and / still plain rw ext4.
   #
-  # Its initramfs script passes an option this mount does not accept, and
-  # the boot dies in the initramfs. systemd.volatile=overlay does the same
-  # job -- read-only root, tmpfs upper, writes discarded at power-off --
-  # inside systemd, with no initramfs hook to be incompatible with.
-  #
-  # This is a HARNESS mechanism, not the device's. A Pi uses raspi-config's
-  # enable_overlayfs. What tier 2 tests is that the unit survives a
-  # read-only root at all; tier 3 is what tests the Pi's actual overlay.
+  # What remains here is the console and log-level configuration, which is
+  # what boots 2 and 3 need in order to be heard at all.
   #
   # loglevel=3 rides along for a different reason: the guest and the kernel
   # share one serial console, and a kernel message landed in the MIDDLE of
@@ -255,20 +251,20 @@ runcmd:
   #
   # console= is also stated explicitly here rather than relied upon, so
   # this does not quietly depend on what a future base image chooses.
-  - [ sh, -c, "echo 'GRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX systemd.volatile=overlay loglevel=3 console=ttyS0,115200\"' >> /etc/default/grub && update-grub 2>&1 | tail -3 && grep -n CMDLINE /etc/default/grub" ]
-  # cloud-init must not run again, and this is not optional housekeeping.
-  # It decides "have I run before?" from state under /var/lib/cloud -- which
-  # is on the root filesystem, which the overlay discards at every boot. So
-  # from boot 2 onward cloud-init would see a brand new instance every
-  # single time and re-run this entire runcmd, `reboot` included: an
-  # infinite boot loop that ends at the timeout with no useful output.
+  - [ sh, -c, "echo 'GRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX loglevel=3 console=ttyS0,115200\"' >> /etc/default/grub && update-grub 2>&1 | tail -3 && grep -n CMDLINE /etc/default/grub" ]
+  # cloud-init must not run this runcmd again on boots 2 and 3 -- it ends
+  # in `reboot`, so a repeat is an infinite boot loop that ends at the
+  # timeout with nothing useful in the log.
   #
-  # Written now, before the overlay engages, so it lands in the lower layer
-  # and survives. Everything else this boot writes persists for the same
-  # reason -- the overlay only discards what is written AFTER it is up.
+  # Belt and braces: cloud-init decides "have I run before?" from state
+  # under /var/lib/cloud, which persists here, so it should already do the
+  # right thing. It would NOT if this guest ever gains the read-only
+  # overlay that issue #9 is about, because the overlay discards that state
+  # and every boot then looks like a new instance. Cheap now, and it stops
+  # the overlay work from tripping over this later.
   - [ sh, -c, "touch /etc/cloud/cloud-init.disabled" ]
-  - [ sh, -c, "echo overlay > /boot/firmware/otp-harness-phase; sync" ]
-  - [ sh, -c, "echo 'OTP-REBOOTING into the overlay'" ]
+  - [ sh, -c, "echo reboot > /boot/firmware/otp-harness-phase; sync" ]
+  - [ sh, -c, "echo 'OTP-REBOOTING for the systemd-driven boot'" ]
   - [ reboot ]
 
 # Everything goes to the serial console, which is what the host reads.
@@ -377,7 +373,7 @@ wait 2>/dev/null || true
 # Every boot the guest is expected to complete. Named here rather than
 # counted from the output, because the whole point is to notice a boot that
 # produced NO output -- which cannot be inferred from the output.
-EXPECTED_PHASES="provision overlay persist"
+EXPECTED_PHASES="provision reboot persist"
 
 # CR-stripped once, up front. The guest reports over a serial console, which
 # emits CRLF, so every captured line carries a trailing \r. That is
