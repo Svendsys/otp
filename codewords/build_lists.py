@@ -80,12 +80,23 @@ NATO = {
     "WHISKEY", "XRAY", "YANKEE", "ZULU",
 }
 
-# Words that would read as instructions or procedure over a voice channel.
+# Words that would read as instructions or procedure over a voice channel,
+# and words this system already uses to talk about itself.
+#
+# The second family is the easier one to miss, because the words are ordinary
+# and picturable and a curator has no reason to suspect them. But a codeword
+# is spoken on the same channel as the traffic it names, and "use RED-DOCUMENT"
+# can be heard as "use the red document" in a way "use RED-MOON" cannot. The
+# test is not whether the word is abstract -- DOCUMENT is concrete enough, and
+# every Scandinavian owns it -- but whether this machine and its operators
+# already say it while running the machine. Pads, keys, groups, messages and
+# documents are the payload; power is the state the unit lives and dies in.
 PROCEDURAL = {
     "ABORT", "AFFIRM", "BREAK", "CANCEL", "CLEAR", "CORRECT", "OUT", "OVER",
     "READY", "RELAY", "REPEAT", "ROGER", "SAY", "SEND", "STOP", "WAIT", "WILCO",
     "MESSAGE", "GROUP", "PAGE", "KEY", "PAD", "CODE", "AUTH", "DUMMY", "NUMBER",
     "RUSH", "HOLD", "NEGATIVE", "STANDBY", "COPY", "CHECK", "COUNT", "ABANDON",
+    "POWER", "DOCUMENT", "BATTERY", "PRINTER", "PAPER", "SESSION",
 }
 
 # Tier 1: a person sees the thing the instant they hear the word.
@@ -237,7 +248,7 @@ RAW = {
 "elements": [
     # The words a child draws first, and the floor the rest of the lists are
     # measured against.
-    "FIRE WATER ICE STONE GRASS POWER",
+    "FIRE WATER ICE STONE GRASS",
     "FLAME EMBER PUDDLE RIPPLE",
     "SMOKE SAND DUST STEAM",
 ],
