@@ -237,7 +237,7 @@ RAW = {
 "elements": [
     # The words a child draws first, and the floor the rest of the lists are
     # measured against.
-    "FIRE WATER ICE STONE GRASS",
+    "FIRE WATER ICE STONE GRASS POWER",
     "FLAME EMBER PUDDLE RIPPLE",
     "SMOKE SAND DUST STEAM",
 ],
