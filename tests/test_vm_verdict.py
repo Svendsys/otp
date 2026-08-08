@@ -161,6 +161,64 @@ class TestTheGateFails:
         assert result.returncode != 0, "a guest that never reported was accepted"
 
 
+class TestASharedSerialConsole:
+    """The guest and the kernel write to the same serial port.
+
+    Observed, after sixteen checks had passed:
+
+        OTP-RESULT provi[  104.959304] systemd-ssh-generator[5039]: Failed...
+
+    A kernel message landed in the middle of the marker and split the word
+    "provision" in half. The guest now runs with loglevel=3 so the console
+    is quiet, but a harness that loses a twenty-minute run to one unlucky
+    printk is a harness with a bad day in it somewhere.
+    """
+
+    def test_a_marker_with_a_kernel_message_after_it_is_still_read(self, tmp_path):
+        """Interleaving that lands AFTER the marker must not hide it."""
+        noise = "[  104.9] systemd-ssh-generator[5039]: Failed to query CID"
+        transcript = console().replace(
+            "OTP-RESULT persist 14/14",
+            "OTP-RESULT persist 14/14" + noise,
+        )
+        result = run_verdict(tmp_path, transcript)
+        assert result.returncode == 0, result.stderr
+
+    def test_a_marker_with_a_timestamp_prefix_is_still_read(self, tmp_path):
+        """Every guest line arrives prefixed by cloud-init and a timestamp,
+        so the marker is never at the start of a line."""
+        transcript = "".join(
+            f"[   92.2] cloud-init[505]: {line}\r\n"
+            for line in console().replace("\r\n", "\n").split("\n")
+            if line
+        )
+        result = run_verdict(tmp_path, transcript)
+        assert result.returncode == 0, result.stderr
+
+    def test_a_marker_split_mid_word_still_fails(self, tmp_path):
+        """The half-written marker must NOT be salvaged into a pass.
+
+        This is the case that actually happened. Tolerating trailing noise
+        is right; guessing at a truncated phase name would be inventing a
+        result the guest never reported.
+        """
+        transcript = console().replace(
+            "OTP-RESULT persist 14/14",
+            "OTP-RESULT persi[  104.9] systemd-ssh-generator: Failed",
+        )
+        result = run_verdict(tmp_path, transcript)
+        assert result.returncode != 0, "a split marker was read as a pass"
+        assert "persist" in result.stderr
+
+    def test_a_marker_missing_its_counts_fails(self, tmp_path):
+        """`OTP-RESULT persist` with no numbers is not a result."""
+        transcript = console().replace(
+            "OTP-RESULT persist 14/14", "OTP-RESULT persist"
+        )
+        result = run_verdict(tmp_path, transcript)
+        assert result.returncode != 0, "a marker with no counts was accepted"
+
+
 class TestTheFailurePathSaysWhy:
     """A gate that fails without explaining why costs an hour every time.
 

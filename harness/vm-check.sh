@@ -229,7 +229,18 @@ runcmd:
   # This is a HARNESS mechanism, not the device's. A Pi uses raspi-config's
   # enable_overlayfs. What tier 2 tests is that the unit survives a
   # read-only root at all; tier 3 is what tests the Pi's actual overlay.
-  - [ sh, -c, "sed -i 's|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"systemd.volatile=overlay\"|' /etc/default/grub && update-grub 2>&1 | tail -3 && grep GRUB_CMDLINE_LINUX= /etc/default/grub" ]
+  #
+  # loglevel=3 rides along for a different reason: the guest and the kernel
+  # share one serial console, and a kernel message landed in the MIDDLE of
+  # a result marker --
+  #
+  #   OTP-RESULT provi[  104.959304] systemd-ssh-generator[5039]: Failed...
+  #
+  # -- splitting the word "provision" in half. Sixteen checks had passed
+  # and the host correctly refused to believe a phase that never reported a
+  # well-formed result. Quietening the kernel console is the fix for the
+  # collision; the host-side regex below is the fix for tolerating one.
+  - [ sh, -c, "sed -i 's|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"systemd.volatile=overlay loglevel=3\"|' /etc/default/grub && update-grub 2>&1 | tail -3 && grep GRUB_CMDLINE_LINUX= /etc/default/grub" ]
   # cloud-init must not run again, and this is not optional housekeeping.
   # It decides "have I run before?" from state under /var/lib/cloud -- which
   # is on the root filesystem, which the overlay discards at every boot. So
@@ -414,9 +425,25 @@ fi
 # once, not at least once, because the runner reboots itself: a failed state
 # write would loop it on one phase forever, and "it reported" would be true
 # of a machine doing nothing else.
+# Matched as a WHOLE PATTERN wherever it appears in a line, not as a line
+# prefix. The guest shares its serial console with the kernel, and a kernel
+# message once landed mid-marker:
+#
+#   OTP-RESULT provi[  104.959304] systemd-ssh-generator[5039]: Failed...
+#
+# Anchoring on the line, or slicing with ${var#...}, treats that as no
+# result at all. This extracts the marker from anywhere in the line and
+# requires it to be complete -- phase word and both numbers -- so a
+# half-written marker is still correctly rejected rather than half-read.
+# The guest also runs with loglevel=3 now, which is the actual fix; this is
+# what keeps one unlucky collision from costing a twenty-minute run.
+MARKER="OTP-RESULT[[:space:]]+%s[[:space:]]+[0-9]+/[0-9]+"
+
 BAD=""
 for phase in $EXPECTED_PHASES; do
-    count=$(grep -c "OTP-RESULT $phase " "$CLEAN" || true)
+    # shellcheck disable=SC2059  # phase is ours, not user input
+    pattern=$(printf "$MARKER" "$phase")
+    count=$(grep -cE "$pattern" "$CLEAN" || true)
     if [ "${count:-0}" -eq 0 ]; then
         BAD="$BAD $phase(never reported)"
         continue
@@ -425,12 +452,12 @@ for phase in $EXPECTED_PHASES; do
         BAD="$BAD $phase(reported ${count}x)"
         continue
     fi
-    if ! grep -q "OTP-GUEST-DONE $phase\$" "$CLEAN"; then
+    if ! grep -qE "OTP-GUEST-DONE[[:space:]]+$phase([[:space:]]|\$)" "$CLEAN"; then
         BAD="$BAD $phase(unfinished)"
         continue
     fi
-    counts=$(grep "OTP-RESULT $phase " "$CLEAN" | tail -1)
-    counts=${counts#*"OTP-RESULT $phase "}
+    counts=$(grep -oE "$pattern" "$CLEAN" | tail -1)
+    counts=${counts##* }
     got=${counts%%/*}
     want=${counts##*/}
     # Numeric, not string, for the CRLF reason above.
