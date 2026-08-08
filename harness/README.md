@@ -215,12 +215,25 @@ unattended rather than failing to start.
 `./harness/img-boot.sh <image.img.xz>`, or the `Boot the image` step in
 `image.yml`.
 
-**Never executed.** It is written and wired up but unrun: tier 3 needs an
-image, and the image workflow only runs from `master`. It runs for the
-first time when an image is built after this lands, which is why it is
-attached to the image build rather than left as a script nobody invokes.
-It carries `continue-on-error` so an unvalidated step cannot break the
-build or block the artifact upload.
+**First run: 2026-08-08. It did not boot.** Everything the review fixed
+before it had ever executed did work — the boot partition was found from
+the MBR at sector 16384 (the old hardcoded 8192 read the pre-partition
+gap), the image was padded to a power of two, and both `mcopy` calls found
+their files. Then QEMU exited 0 having written **nothing** to the serial
+console, not even `Linux version`. Tracked in issue #17.
+
+It no longer carries `continue-on-error`. It used to, so that an
+unvalidated step could not cost anyone the image — and the effect on its
+first real run was worse than the problem it solved: tier 3 exited 1 and
+the job went green, with the API reporting the step as `success`. Anyone
+reading the status rather than the log would have concluded the image
+booted. The boot now runs **after** the artifact is uploaded, so it is free
+to fail loudly without costing anything, and the verdict is written to the
+run's step summary as well as the log.
+
+The image build also now runs on any pull request touching `image/**`,
+`device/**`, `harness/img-boot.sh` or the workflow itself. Before that,
+nothing checked the image on the PR that broke it.
 
 It answers exactly one question nothing else can: **does the thing that
 gets flashed to a card actually boot?** pi-gen assembles a filesystem and
