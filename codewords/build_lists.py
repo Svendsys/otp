@@ -19,6 +19,19 @@ people who could not name a single warbler. So the vocabulary carries figures,
 folklore, food, clothing, gear, toys and the festive calendar alongside the
 natural history -- the shared furniture, wherever it comes from.
 
+The same trap has a second floor: going species-deep and never seating the
+generic parent. The lists carried PANGOLIN, ECHIDNA and QUOKKA long before
+they carried FIRE, WATER, ICE or STONE, because the elemental words were
+never candidates at all -- so the phonetic slots they should have won went
+by walkover to whatever happened to be in RAW. `elements` exists to hold that
+floor, and it is worth re-asking of any new category: what is the word a
+child would draw first, and is it actually in here?
+
+Some everyday words simply cannot be had, and the reason is edit distance
+rather than Soundex. CAR, HOUSE and BOAT are each one character from CAT,
+HORSE and GOAT, and the animal is the better picture in all three cases, so
+the everyday word stays out. Do not spend another round retrying them.
+
 **English the whole channel shares.** The lists lean on words a Nordic
 speaker already owns -- through cognates (HVAL/WHALE, ELG/ELK, NARHVAL/
 NARWHAL, MAMMUT/MAMMOTH, KROKODILLE/CROCODILE), through school English, or
@@ -73,7 +86,7 @@ PROCEDURAL = {
 RAW = {
 "figures": [
     """
-    CLOWN SANTA ROBOT PIRATE COWBOY VIKING KING PRINCESS ASTRONAUT
+    CLOWN SANTA ROBOT PIRATE COWBOY VIKING KING PRINCESS ASTRONAUT BABY
     """,
     """
     QUEEN SAILOR DOCTOR NURSE MONK FIREMAN POLICEMAN FISHERMAN POSTMAN
@@ -109,7 +122,7 @@ RAW = {
     WOLVERINE MAMMOTH ANTELOPE GAZELLE RACCOON WEASEL FERRET SLOTH ARMADILLO
     ANTEATER PORCUPINE CHIPMUNK MEERKAT MONGOOSE HYENA JACKAL LEMUR GIBBON
     BABOON CHIMP NARWHAL ORCA BELUGA WOMBAT PLATYPUS WARTHOG LLAMA ALPACA
-    PUPPY KITTEN HUSKY POODLE TERRIER GREYHOUND DALMATIAN SPANIEL BULLDOG
+    PUPPY KITTEN POODLE TERRIER GREYHOUND DALMATIAN SPANIEL BULLDOG
     STALLION DONKEY
     """,
     """
@@ -130,7 +143,7 @@ RAW = {
     """,
     """
     GLOWWORM WEEVIL APHID LOUSE TICK LARVA SCARAB WOODLOUSE MIDGE GNAT
-    TERMITE FLEA MAYFLY HOVERFLY HORSEFLY MEALWORM BEDBUG
+    TERMITE FLEA MAYFLY HOVERFLY HORSEFLY MEALWORM BEDBUG WORM
     """,
 ],
 "reptiles": [
@@ -215,23 +228,32 @@ RAW = {
     """,
 ],
 "trees": [
-    "OAK BIRCH SPRUCE MAPLE WILLOW PALM CEDAR",
+    "OAK LEAF WOOD BIRCH SPRUCE MAPLE WILLOW PALM CEDAR",
     "PINE FIR BEECH ASPEN ROWAN ALDER HAZEL HOLLY JUNIPER LARCH LINDEN POPLAR "
     "BAMBOO CACTUS ACORN REDWOOD",
     """
-    SEQUOIA BAOBAB MANGROVE MAGNOLIA CYPRESS HEMLOCK HAWTHORN DOGWOOD
+    SEQUOIA BAOBAB MANGROVE MAGNOLIA CYPRESS HEMLOCK HAWTHORN
     SYCAMORE EBONY ROSEWOOD FERN MOSS IVY BRACKEN REED GORSE LICHEN NETTLE
     SEDGE
     """,
 ],
+"elements": [
+    # The words a child draws first. They were missing entirely until now --
+    # the lists went species-deep (PANGOLIN, ECHIDNA, QUOKKA) while FIRE and
+    # WATER were never candidates at all, so the phonetic slots they should
+    # have won went by walkover to whatever happened to be in RAW.
+    "FIRE WATER ICE STONE GRASS",
+    "FLAME EMBER PUDDLE RIPPLE",
+    "SMOKE SAND DUST STEAM",
+],
 "landforms": [
     """
     MOUNTAIN VALLEY ISLAND RIVER LAKE FOREST DESERT BEACH CANYON GLACIER
-    VOLCANO WATERFALL FJORD CAVE CLIFF HILL MEADOW
+    VOLCANO WATERFALL FJORD CAVE CLIFF HILL MEADOW PATH
     """,
     """
     SWAMP JUNGLE TUNDRA PRAIRIE OASIS GEYSER DUNE REEF HARBOR RAPIDS RAVINE
-    GORGE PLATEAU SAVANNA MARSH LAGOON
+    PLATEAU SAVANNA MARSH LAGOON
     """,
     """
     MOOR ESTUARY ATOLL BASIN BAY BLUFF CAPE CAVERN CHASM COVE
@@ -255,7 +277,7 @@ RAW = {
     """,
 ],
 "celestial": [
-    "MOON PLANET COMET GALAXY ECLIPSE SUNRISE SUNSET AURORA METEOR",
+    "MOON STAR PLANET COMET GALAXY ECLIPSE SUNRISE SUNSET AURORA METEOR",
     "NEBULA ORBIT ASTEROID SATELLITE SUPERNOVA STARLIGHT TWILIGHT HORIZON "
     "ZENITH",
     """
@@ -266,7 +288,7 @@ RAW = {
 "tools": [
     """
     HAMMER AXE NAIL SCREW DRILL WRENCH SHOVEL SPADE RAKE LADDER ROPE ANCHOR
-    SCISSORS NEEDLE BRUSH RULER COMPASS
+    SCISSORS NEEDLE BRUSH RULER COMPASS KNIFE
     """,
     """
     CHAIN TELESCOPE HANDSAW CHISEL CROWBAR HATCHET SICKLE SCYTHE CLAMP LEVER WEDGE
@@ -274,7 +296,7 @@ RAW = {
     """,
     """
     ANVIL AUGER WINCH HOIST GRINDER STAPLER SANDER SCALPEL SHEARS BELLOWS
-    FORGE PADLOCK PULLEY RATCHET RIVET TROWEL LATHE FURNACE HACKSAW PICKAXE TOOLBOX
+    FORGE PADLOCK PULLEY RATCHET RIVET TROWEL FURNACE HACKSAW PICKAXE TOOLBOX
     SANDPAPER WORKBENCH
     """,
 ],
@@ -315,8 +337,8 @@ RAW = {
     """,
 ],
 "buildings": [
-    "CASTLE TOWER BRIDGE CHURCH WINDMILL PYRAMID COTTAGE CATHEDRAL PALACE "
-    "TEMPLE",
+    "BARN CASTLE TOWER BRIDGE CHURCH WINDMILL PYRAMID COTTAGE "
+    "CATHEDRAL PALACE TEMPLE",
     "FORTRESS CHAPEL ABBEY HANGAR STABLE TUNNEL BAKERY FARMHOUSE WAREHOUSE "
     "MONASTERY OBELISK",
     """
