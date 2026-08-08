@@ -49,8 +49,13 @@ BASE="$WORK/base.qcow2"
 # Deliberately WELL under the workflow's timeout-minutes (45). The gap is
 # not slack, it is the budget for the failure path: a job killed by
 # GitHub's timeout skips its remaining steps, so the console dump and the
-# verdict never run and the diagnosis is lost. This timeout has to fire
-# first, every time, or a hang is unreportable.
+# verdict would never run and the diagnosis would be lost. This timeout has
+# to fire first, every time.
+#
+# 1800 rather than the 2400 it started at, for a second reason: a boot that
+# is never going to happen took forty minutes to say so, and the console
+# said "No bootable device" in the first fifteen seconds. Waiting longer
+# does not make a dead VM more informative.
 BOOT_TIMEOUT="${OTP_VM_TIMEOUT:-1800}"
 
 log() { printf '\n== %s\n' "$*" >&2; }
@@ -240,16 +245,36 @@ fi
 CONSOLE="$WORK/console.log"
 : > "$CONSOLE"
 
-# The boot partition goes in as `if=none` plus an explicit -device, rather
-# than `if=virtio,serial=`. qemu 8.2 -- the runner's version -- rejects the
-# latter outright:
+# TWO things about the drive list, both learned the hard way, both from
+# adding one extra disk.
 #
-#   Block format 'raw' does not support the option 'serial'
+# 1. The boot partition goes in as `if=none` plus an explicit -device,
+#    rather than `if=virtio,serial=`. qemu 8.2 -- the runner's version --
+#    rejects the latter outright:
 #
-# and does it before the machine starts, so the whole run dies in a tenth of
-# a second with no console at all. The serial is worth keeping: it is what
-# gives the guest /dev/disk/by-id/virtio-otpboot, which is how it finds this
-# disk without depending on virtio probe order.
+#      Block format 'raw' does not support the option 'serial'
+#
+#    and does it before the machine starts, so the run dies in a tenth of a
+#    second with no console at all. The serial is worth keeping: it gives
+#    the guest /dev/disk/by-id/virtio-otpboot, so it can find this disk
+#    without depending on virtio probe order.
+#
+# 2. bootindex=0 on the ROOT disk -- which is why that one had to move to
+#    the if=none form too. Adding an explicit -device changes PCI
+#    enumeration, SeaBIOS takes its boot order from that, and the blank
+#    64MB boot partition became the first boot candidate. The Debian root
+#    was never tried at all:
+#
+#      Booting from Hard Disk...
+#      Boot failed: not a bootable disk
+#      Booting from Floppy... / DVD-CD... / ROM...
+#      No bootable device.
+#
+#    The guest then sat at the iPXE prompt for forty minutes until the
+#    timeout killed it. Nothing about that presented as "the fourth disk
+#    broke booting" -- it presented as a hang, and the hang got blamed on
+#    the overlay for an hour. An explicit bootindex is the only thing that
+#    keeps the order independent of how many devices are added later.
 
 # qemu's own stderr, kept separate from the guest's console. When qemu
 # refuses to start there IS no guest console, so the failure path had
@@ -263,18 +288,18 @@ QEMU_ERR="$WORK/qemu-stderr.log"
 set +e
 # -k 30: SIGTERM, then SIGKILL thirty seconds later if qemu is still there.
 #
-# Bare `timeout` sends TERM and then waits FOREVER for a process that
-# ignores it, which a wedged qemu does. Observed: the step ran 47 minutes,
-# past both this timeout and the job's own timeout-minutes. That is not
-# just slow -- a job killed by GitHub's timeout DOES NOT RUN ITS REMAINING
-# STEPS, so "The guest console, if anything failed" and "Verdict" never
-# executed and the logs were never even published. The timeout that exists
-# to produce a diagnosis was the reason there wasn't one.
+# Precautionary, not a fix for anything observed. Bare `timeout` sends TERM
+# and then waits indefinitely for a process that ignores it; qemu has not
+# actually done that here -- when this fired at 2400s it died on signal 15
+# and the script carried on and reported normally. Kept because the failure
+# mode it guards against is one where the harness cannot report at all,
+# which is the expensive kind.
 timeout -k 30 "$BOOT_TIMEOUT" qemu-system-x86_64 \
     "${ACCEL[@]}" \
     -m 2048 -smp 2 \
     -nographic -display none \
-    -drive "file=$WORK/overlay.qcow2,if=virtio,format=qcow2" \
+    -drive "file=$WORK/overlay.qcow2,if=none,format=qcow2,id=rootdisk" \
+    -device "virtio-blk-pci,drive=rootdisk,bootindex=0" \
     -drive "file=$WORK/repo.tar,if=virtio,format=raw" \
     -drive "file=$WORK/seed.iso,if=virtio,format=raw" \
     -drive "file=$WORK/bootpart.img,if=none,format=raw,id=otpboot" \
