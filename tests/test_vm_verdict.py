@@ -69,10 +69,11 @@ def console(phases=PHASES, counts=None, done=None, fails=(), repeat=()):
     return "".join(line + "\r\n" for line in lines)
 
 
-def run_verdict(tmp_path, transcript, qemu_rc=0):
+def run_verdict(tmp_path, transcript, qemu_rc=0, qemu_stderr=""):
     work = tmp_path / "work"
     work.mkdir()
     (work / "console.log").write_text(transcript)
+    (work / "qemu-stderr.log").write_text(qemu_stderr)
     script = tmp_path / "verdict.sh"
     script.write_text(
         textwrap.dedent(
@@ -80,6 +81,7 @@ def run_verdict(tmp_path, transcript, qemu_rc=0):
             set -uo pipefail
             WORK={work}
             CONSOLE="$WORK/console.log"
+            QEMU_ERR="$WORK/qemu-stderr.log"
             QEMU_RC={qemu_rc}
             BOOT_TIMEOUT=2400
             log() {{ printf '\\n== %s\\n' "$*" >&2; }}
@@ -157,6 +159,40 @@ class TestTheGateFails:
     def test_a_silent_guest_fails(self, tmp_path):
         result = run_verdict(tmp_path, "no markers here at all\r\n")
         assert result.returncode != 0, "a guest that never reported was accepted"
+
+
+class TestTheFailurePathSaysWhy:
+    """A gate that fails without explaining why costs an hour every time.
+
+    The first run of the three-boot cycle died in a tenth of a second --
+    qemu rejected `serial=` on a raw -drive and never booted -- and the run
+    reported "the guest never reported. Last 80 lines of the console:"
+    followed by nothing, because there was no console. The one line that
+    explained it was qemu's stderr, thirty lines up the job log and easy to
+    scroll past.
+    """
+
+    def test_an_empty_console_surfaces_qemu_stderr(self, tmp_path):
+        boom = (
+            "qemu-system-x86_64: -drive file=bootpart.img,if=virtio,"
+            "format=raw,serial=otpboot: Block format 'raw' does not "
+            "support the option 'serial'"
+        )
+        result = run_verdict(tmp_path, "", qemu_rc=1, qemu_stderr=boom + "\n")
+        assert result.returncode != 0
+        assert "Block format 'raw'" in result.stderr, (
+            "qemu's stderr is the only evidence there is when the console is "
+            "empty, and it was not printed"
+        )
+        assert "EMPTY" in result.stderr
+
+    def test_qemu_stderr_is_shown_even_when_the_guest_did_report(self, tmp_path):
+        """A warning that did not stop the boot is still worth seeing."""
+        result = run_verdict(
+            tmp_path, console(), qemu_stderr="warning: something odd\n"
+        )
+        assert result.returncode == 0, result.stderr
+        assert "something odd" in result.stderr
 
 
 class TestTheGateIsNotFooledByWhitespace:

@@ -234,6 +234,26 @@ fi
 CONSOLE="$WORK/console.log"
 : > "$CONSOLE"
 
+# The boot partition goes in as `if=none` plus an explicit -device, rather
+# than `if=virtio,serial=`. qemu 8.2 -- the runner's version -- rejects the
+# latter outright:
+#
+#   Block format 'raw' does not support the option 'serial'
+#
+# and does it before the machine starts, so the whole run dies in a tenth of
+# a second with no console at all. The serial is worth keeping: it is what
+# gives the guest /dev/disk/by-id/virtio-otpboot, which is how it finds this
+# disk without depending on virtio probe order.
+
+# qemu's own stderr, kept separate from the guest's console. When qemu
+# refuses to start there IS no guest console, so the failure path had
+# nothing to print and said "the guest never reported" -- true, useless,
+# and thirty lines below the actual reason, which had scrolled past in the
+# job log. A diagnostic nobody can find is not a diagnostic; this file gets
+# printed wherever the run gives up.
+QEMU_ERR="$WORK/qemu-stderr.log"
+: > "$QEMU_ERR"
+
 set +e
 timeout "$BOOT_TIMEOUT" qemu-system-x86_64 \
     "${ACCEL[@]}" \
@@ -242,12 +262,16 @@ timeout "$BOOT_TIMEOUT" qemu-system-x86_64 \
     -drive "file=$WORK/overlay.qcow2,if=virtio,format=qcow2" \
     -drive "file=$WORK/repo.tar,if=virtio,format=raw" \
     -drive "file=$WORK/seed.iso,if=virtio,format=raw" \
-    -drive "file=$WORK/bootpart.img,if=virtio,format=raw,serial=otpboot" \
+    -drive "file=$WORK/bootpart.img,if=none,format=raw,id=otpboot" \
+    -device "virtio-blk-pci,drive=otpboot,serial=otpboot" \
     -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
     -serial "file:$CONSOLE" \
-    -monitor none
+    -monitor none 2> >(tee "$QEMU_ERR" >&2)
 QEMU_RC=$?
 set -e
+# Process substitution is asynchronous: without this the file can still be
+# empty when the failure path below reads it.
+wait 2>/dev/null || true
 
 # --- the verdict --------------------------------------------------------
 
@@ -270,13 +294,27 @@ VERDICT="$WORK/verdict.txt"
 grep -E "OTP-INSTALL|OTP-CHECK|OTP-RESULT|OTP-GUEST-DONE|OTP-REBOOTING" \
     "$CLEAN" > "$VERDICT" 2>/dev/null || true
 
+# qemu's stderr, if it said anything. Printed before the verdict rather
+# than after, because when qemu refuses to start this is the ONLY thing
+# that explains why.
+if [ -s "$QEMU_ERR" ]; then
+    log "qemu stderr"
+    tail -20 "$QEMU_ERR" >&2
+fi
+
 log "Console output"
 if grep -q "OTP-CHECK" "$CLEAN"; then
     cat "$VERDICT"
 else
-    echo "The guest never reported. Last 80 lines of the console:" >&2
-    tail -80 "$CONSOLE" >&2
-    echo "(qemu exited $QEMU_RC)" >&2
+    echo "The guest never reported (qemu exited $QEMU_RC)." >&2
+    if [ ! -s "$CONSOLE" ]; then
+        echo "The console is EMPTY -- qemu never got as far as booting." >&2
+        echo "Its stderr is the only evidence there is:" >&2
+        cat "$QEMU_ERR" >&2
+    else
+        echo "Last 80 lines of the console:" >&2
+        tail -80 "$CONSOLE" >&2
+    fi
     exit 1
 fi
 
