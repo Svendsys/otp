@@ -257,35 +257,35 @@ class CodewordRoll(Screen):
 
 
 def codeword_menu(on_choose):
-    """Roll / browse / type -- the three ways to land on a codeword."""
+    """Roll or type -- the two ways to land on a codeword.
 
-    def browse(app):
-        # Browsing narrows the space: one category is ~18 nouns against 642,
-        # and human choice within it is not uniform. Two pads from the same
-        # cell both named after birds is an attribution signal. ROLL RANDOM
-        # is the default for that reason.
-        def pick_category(app, category):
-            def pick_noun(app, noun):
-                return on_choose(app, cw.join(app.vocabulary.random_modifier(), noun))
+    There is no third. This menu used to offer BROWSE CATEGORY, and that was
+    a mistake worth naming, because it looked like a convenience and behaved
+    like a leak. Choosing the noun by hand signs the pad set with the
+    operator's taste, and the category chosen is itself a hint about who the
+    twin is meant for. Rolling is uniform over every pair; a person scrolling
+    to a word they like is not, and the codeword's whole job is to identify
+    the set without identifying its holders.
 
-            return Chooser(category.upper()[:21], app.vocabulary.nouns(category),
-                           None, pick_noun)
-
-        return Chooser("CATEGORY", app.vocabulary.categories, None, pick_category,
-                       render=str.upper)
+    Rerolling is free and unlimited, so nothing is lost: press DOWN until a
+    codeword you can carry comes up. TYPE IT IN stays because reproducing a
+    codeword agreed at an earlier handover is transcription, not selection.
+    """
 
     def type_in(app):
+        # Each half reaches exactly as far as the bundled lists do, so a
+        # codeword agreed elsewhere can always be typed back in.
         def got_modifier(app, modifier):
             def got_noun(app, noun):
                 return on_choose(app, cw.join(modifier, noun))
 
-            return TextEntry("NOUN", got_noun)
+            return TextEntry("NOUN", got_noun, maxlen=app.vocabulary.noun_maxlen)
 
-        return TextEntry("MODIFIER", got_modifier)
+        return TextEntry("MODIFIER", got_modifier,
+                         maxlen=app.vocabulary.modifier_maxlen)
 
     menu = Menu([
         ("ROLL RANDOM", lambda app: CodewordRoll(on_choose)),
-        ("BROWSE CATEGORY", browse),
         ("TYPE IT IN", type_in),
     ])
     menu.title = "CODEWORD"

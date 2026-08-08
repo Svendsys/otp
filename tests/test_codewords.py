@@ -54,14 +54,36 @@ def edit_distance(a, b):
 
 
 class TestVocabularyShape:
+    # The printed header fits 17 characters at the tightest format, split
+    # 7 + 1 + 9 rather than 8 + 1 + 8: the noun carries the picture, so it
+    # gets the spare character and BUTTERFLY, CROCODILE and ACCORDION fit.
+    MODIFIER_MAX = 7
+    NOUN_MAX = 9
+
     def test_lists_are_populated(self):
         assert len(MODIFIERS) > 300
         assert len(FLAT_NOUNS) > 600
-        assert len(NOUNS) >= 13, "categories drive the two-press browse on 3 buttons"
+        # Categories are an authoring device, not a UI surface -- the unit
+        # never draws from one. They keep the curation legible and give
+        # build_lists.py the tiers it spends its phonetic budget across.
+        assert len(NOUNS) >= 13, "the lists must stay curated, not one blob"
 
     def test_every_word_is_plain_uppercase(self):
-        for word in MODIFIERS + FLAT_NOUNS:
-            assert re.fullmatch(r"[A-Z]{3,8}", word), word
+        for word in MODIFIERS:
+            assert re.fullmatch(r"[A-Z]{3,%d}" % self.MODIFIER_MAX, word), word
+        for word in FLAT_NOUNS:
+            assert re.fullmatch(r"[A-Z]{3,%d}" % self.NOUN_MAX, word), word
+
+    def test_the_header_budget_is_spent_but_not_overspent(self):
+        # Both halves reach their cap, so the split is actually in use, and
+        # the longest pair still lands on the 17 characters the header has.
+        assert max(len(w) for w in MODIFIERS) == self.MODIFIER_MAX
+        assert max(len(w) for w in FLAT_NOUNS) == self.NOUN_MAX
+        assert self.MODIFIER_MAX + 1 + self.NOUN_MAX == 17
+
+    def test_no_noun_is_also_a_modifier(self):
+        # Otherwise the vocabulary can roll SCARLET-SCARLET.
+        assert not set(MODIFIERS) & set(FLAT_NOUNS)
 
     def test_no_duplicates_within_a_list(self):
         assert len(set(MODIFIERS)) == len(MODIFIERS)
@@ -169,3 +191,55 @@ class TestHeaderFitsTheVocabulary:
     def test_max_fitted_len_exceeds_full_size_limit(self):
         # Shrinking is what buys room for two-word codewords.
         assert g.max_fitted_codeword_len(9, True, True) > g.max_codeword_len(9, True, True)
+
+
+class TestSessionDoesNotRepeatItself:
+    """
+    Two pads printed in one sitting must not carry the same name. The unit
+    keeps no memory across a power cycle -- see the note in otpunit/codewords
+    on why a stored list cannot be made safe by hashing -- so this is scoped
+    to the power-on session and dies with it.
+    """
+
+    def _vocab(self):
+        import otpunit.codewords as cw
+        return cw.Vocabulary()
+
+    def test_a_session_never_issues_the_same_codeword_twice(self):
+        vocab = self._vocab()
+        drawn = [vocab.random() for _ in range(3000)]
+        assert len(set(drawn)) == len(drawn)
+
+    def test_two_sessions_are_independent(self):
+        # A fresh Vocabulary is a fresh power-on: it starts empty and keeps
+        # its own set, so nothing carries across a power cycle. Asserted on
+        # the state rather than by looking for a repeat between two runs --
+        # with 261,000 pairs a repeat is rare enough that such a test would
+        # fail far more often than it passed.
+        first = self._vocab()
+        for _ in range(200):
+            first.random()
+        assert len(first._issued) == 200
+
+        second = self._vocab()
+        assert second._issued == set(), "a new session must start with no memory"
+        second.random()
+        assert len(second._issued) == 1
+        assert len(first._issued) == 200, "sessions must not share the set"
+
+    def test_it_still_draws_from_the_csprng(self, monkeypatch):
+        vocab = self._vocab()
+        calls = []
+        real = g.get_random_bytes
+        monkeypatch.setattr(g, "get_random_bytes", lambda n: calls.append(n) or real(n))
+        vocab.random()
+        assert calls, "codeword selection must use the same CSPRNG as the key material"
+
+    def test_it_refuses_rather_than_repeat_when_exhausted(self):
+        vocab = self._vocab()
+        vocab._issued = {f"X{i}" for i in range(vocab.combinations)}
+        try:
+            vocab.random()
+        except ValueError:
+            return
+        raise AssertionError("an exhausted session must refuse, not repeat")

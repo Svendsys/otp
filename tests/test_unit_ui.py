@@ -126,20 +126,26 @@ class TestEveryScreenFitsThePanel:
         self._check(ui.CodewordRoll(lambda a, w: None), app)
         self._check(ui.TextEntry("MODIFIER", lambda a, v: None), app)
 
-    def test_category_and_noun_choosers(self):
-        app = make_app([])
-        categories = ui.Chooser("CATEGORY", app.vocabulary.categories, None,
-                                lambda a, v: None, render=str.upper)
-        for index in range(len(categories.options)):
-            categories.index = index
-            self._check(categories, app)
+    def test_a_codeword_cannot_be_picked_off_the_list(self):
+        """
+        The unit rolls codewords or takes one typed in, and offers no third
+        way. Browsing a category was removed deliberately: a hand-picked noun
+        carries the operator's taste, and the category picked is a hint about
+        who the twin belongs to. Both defeat the point of a codeword, which is
+        to name the set without naming its holders.
 
-        for category in app.vocabulary.categories:
-            nouns = ui.Chooser(category.upper()[:21], app.vocabulary.nouns(category),
-                               None, lambda a, v: None)
-            for index in (0, len(nouns.options) - 1):
-                nouns.index = index
-                self._check(nouns, app)
+        This guards the whole surface, not just the menu label -- the pool the
+        unit can draw from has to stay the undivided one.
+        """
+        app = make_app([])
+        labels = [label for label, _ in ui.codeword_menu(lambda a, w: None).items]
+        assert labels == ["ROLL RANDOM", "TYPE IT IN"]
+
+        for attr in ("categories", "nouns", "random_noun", "nouns_by_category"):
+            assert not hasattr(app.vocabulary, attr), (
+                f"Vocabulary.{attr} lets a caller narrow a draw to one category"
+            )
+        assert len(app.vocabulary.all_nouns) > 600
 
     def test_settings_choosers(self):
         app = make_app([])

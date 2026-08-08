@@ -1,8 +1,16 @@
 """Codeword selection for the print unit.
 
-Three ways to land on a codeword, because they serve different moments:
-roll one at random (the fast path), browse a category when you want to pick
-the noun deliberately, or type one that was agreed elsewhere.
+Two ways to land on a codeword: roll one, or type one that was agreed
+elsewhere. There is deliberately no way to pick a word off the lists.
+
+A codeword names a pad set without naming its holders, and an operator who
+chooses one puts their own taste into that name. Taste is stable, so it is a
+fingerprint: pads picked by the same hand end up looking like a set, and a
+category picked to suit a particular contact is worse still. Rolling draws
+uniformly over every modifier-noun pair; a human picking a noun does not.
+So the categories below are an authoring device -- they are how the lists
+are curated and how build_lists.py spends its phonetic budget -- and nothing
+in the running unit narrows a draw to one of them.
 
 Everything here draws from otp_generator's CSPRNG helpers rather than the
 `random` module -- the same source as the key material.
@@ -23,27 +31,72 @@ class Vocabulary:
     """The bundled modifier and noun lists, and the ways to draw from them."""
 
     def __init__(self, base_dir: str | None = None):
-        self.modifiers, self.nouns_by_category = gen.load_vocabulary(base_dir)
-        self.categories = list(self.nouns_by_category)
-        self.all_nouns = [w for words in self.nouns_by_category.values() for w in words]
+        modifiers, nouns_by_category = gen.load_vocabulary(base_dir)
+        self.modifiers = modifiers
+        # Flattened on the way in, and the per-category lists are not kept:
+        # the unit has no reason to hold a handle it could draw from.
+        self.all_nouns = [w for words in nouns_by_category.values() for w in words]
+        # Every codeword this power-on has produced, so no two pads printed
+        # in one sitting can share a name. It lives here and only here: in
+        # RAM, in this object, dying with the power like everything else on
+        # the unit.
+        #
+        # It is deliberately not written to the card, and hashing would not
+        # make writing it safe. The whole space is ~261,000 pairs -- under a
+        # second to enumerate and hash exhaustively -- so a stored digest
+        # list is a plaintext list with extra steps, and what it would spell
+        # out is exactly what a codeword exists to hide: which pads this
+        # machine made. The install script already makes the journal
+        # volatile for the weaker version of that reason.
+        #
+        # Nor would it buy much. Codewords only have to be unique among the
+        # sets actually in service, and that is a fact the operator holds
+        # and the unit cannot: it never learns which of its pads are still
+        # live, nor anything about pads from another unit.
+        self._issued: set[str] = set()
 
     @property
     def combinations(self) -> int:
         return len(self.modifiers) * len(self.all_nouns)
 
+    @property
+    def modifier_maxlen(self) -> int:
+        """Longest modifier the bundled list can produce."""
+        return max(len(w) for w in self.modifiers)
+
+    @property
+    def noun_maxlen(self) -> int:
+        """Longest noun the bundled list can produce.
+
+        Read from the lists rather than pinned to a constant: the two halves
+        share a 17-character header, and the split between them (7 + 1 + 9
+        today, so that BUTTERFLY and CROCODILE fit) is a decision made in
+        codewords/build_lists.py. Typing a codeword in by hand should reach
+        exactly as far as rolling one does.
+        """
+        return max(len(w) for w in self.all_nouns)
+
     def random(self) -> str:
-        """A fresh <MODIFIER>-<NOUN>."""
-        return join(gen.random_choice(self.modifiers), gen.random_choice(self.all_nouns))
+        """A fresh <MODIFIER>-<NOUN>, never one already issued this session.
 
-    def random_modifier(self) -> str:
-        return gen.random_choice(self.modifiers)
+        The only draw there is. Reroll until you like one -- rolling costs
+        nothing, so an operator never has to reach for a narrower pool to get
+        a codeword they can remember.
 
-    def random_noun(self, category: str | None = None) -> str:
-        pool = self.nouns_by_category[category] if category else self.all_nouns
-        return gen.random_choice(pool)
-
-    def nouns(self, category: str) -> list[str]:
-        return self.nouns_by_category[category]
+        Sampling is without replacement across the power-on session, which is
+        what stops two pads printed in one sitting from carrying the same
+        name. Rejected rolls count as issued too: a reroll should always move
+        forward, and showing the same codeword twice in one scroll reads as a
+        fault. Each draw is still uniform over what is left.
+        """
+        if len(self._issued) >= self.combinations:
+            raise ValueError("every codeword has been issued this session")
+        while True:
+            word = join(gen.random_choice(self.modifiers),
+                        gen.random_choice(self.all_nouns))
+            if word not in self._issued:
+                self._issued.add(word)
+                return word
 
 
 def join(modifier: str, noun: str) -> str:

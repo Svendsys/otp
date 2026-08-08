@@ -17,7 +17,7 @@ producing the key material.
 | `otp.md` | The manual. Written to be printed and handed to students: the full encrypt/decrypt walkthrough, the rules that make OTP secure, key generation by hand, communication protocols, authentication, a printable tabula recta, and exercises with an answer key. |
 | `otp_generator.py` | Generates pad sets as pocket-sized PDFs (A6, four-up on A4, or two-up A7) from the machine's hardware RNG mixed with the OS CSPRNG. Also produces tabula recta cards, training pads and blank worksheets. |
 | `otpunit/` | The print unit: a headless Raspberry Pi appliance that prints pad pairs straight from RAM. See [the print unit](#the-print-unit). |
-| `codewords/` | The codeword vocabulary — concrete nouns and modifiers, curated to be picturable and phonetically distinct. |
+| `codewords/` | The codeword vocabulary — 796 nouns across 29 categories and 328 modifiers, curated to be picturable, phonetically distinct, and readable by a non-native speaker. `build_lists.py` rebuilds it and explains the rules. |
 | `device/`, `image/` | Everything needed to provision a Pi or build a flashable image. |
 | `sample_codewords.txt` | Example codeword list — one codeword per pad set, one per line. |
 | `tests/` | Test suite (run by CI): guards the generator's randomness against bias, re-verifies every worked number printed in the manual, and drives the print unit's whole interface without hardware. |
@@ -152,7 +152,9 @@ HAJUT SHIFN RCFVF YVIIM TLVIG ...          ← key body, five-letter groups
 
 - **Codeword** identifies the set without identifying its holders. It is
   drawn as `<MODIFIER>-<NOUN>` from a curated vocabulary of concrete,
-  picturable words — an operator has to carry it from a handover to a radio.
+  picturable words — an operator has to carry it from a handover to a radio,
+  so the list is built out of things a person can see (BUTTERFLY, CROCODILE,
+  ACCORDION) rather than things only a field guide knows.
   Two words rather than one because a single-word list collides sooner than
   it looks: by the birthday bound, 2000 bare words repeat with ~10%
   probability within twenty sets. It renders smaller than the key body if it
