@@ -19,11 +19,28 @@
 # from FAIL to PASS.
 #
 # Run 2 then stopped at 11.4 seconds with `qemu exit: 0`, right after
-# "Detected first boot" -- a Pi OS image resizes its root filesystem on
-# first boot and reboots, and -no-reboot turned that into a clean exit.
-# That flag is gone; see the qemu invocation below.
+# "Detected first boot", and -no-reboot was removed on the theory that a
+# Pi OS first-boot resize was rebooting. WRONG: -append carries no
+# `init=`, so init=/usr/lib/raspberrypi-sys-mods/firstboot never runs and
+# no resize happens. The flag is back; see the qemu invocation.
 #
-# See issue #17.
+# Run 4 (31283220918) is the one that actually explains things, because by
+# then the boot sampled itself every 30 seconds:
+#
+#      30s  uart0=0  (+0) uart1=14042
+#      60s  uart0=0  (+0) uart1=28084
+#     ...
+#     360s  uart0=0  (+0) uart1=175525
+#
+# Perfectly linear, and the last 60 lines of that 175KB are still early
+# boot, ending at guest time 2.37s on "mmc0: host does not support reading
+# read-only switch". That is not a slow boot. It is the SAME boot, over
+# and over: the kernel comes up, dies around the SD controller, resets,
+# and repeats about every thirty seconds. Removing -no-reboot is what let
+# it loop instead of exiting.
+#
+# STILL UNSOLVED: why it dies at mmc0. The kernel never enumerates
+# mmcblk0p2, so root is never found. See issue #17.
 #
 # WHAT THIS CATCHES that the other tiers do not: whether the artifact
 # BOOTS. pi-gen assembles a filesystem and never starts it; tier 2 boots a
@@ -156,8 +173,13 @@ set +e
 #               the bulk of a boot.
 #   one console rather than two. The dual-UART capture below stays -- both
 #               ports are still recorded -- but the kernel is only ASKED to
-#               write to one. We know from the previous run which one that
-#               is; there is no longer a reason to pay double to find out.
+#               write to one. Note which one: under -M raspi3b, ttyAMA0
+#               comes out of the SECOND -serial, not the first. Measured:
+#               uart0=0 bytes, uart1=175525. The comment here used to claim
+#               the previous run had established which port carried output;
+#               it had, and this got it backwards. It kept working only
+#               because both are captured and the verdict greps the
+#               concatenation.
 #
 # earlyprintk is gone: it is the x86/arm32 spelling and a no-op on arm64.
 # earlycon is the one that does anything here.
@@ -190,7 +212,7 @@ timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -drive "file=$IMG,if=sd,format=raw" \
     -serial "file:$CONSOLE" \
     -serial "file:$CONSOLE2" \
-    -display none &
+    -display none -no-reboot &
 QEMU_PID=$!
 
 # Sample the console while it boots. A guest grinding slowly along and a
@@ -249,7 +271,12 @@ VERDICT="$WORK/verdict.txt"
             printf 'IMG-CHECK no-%s FAIL\n' "$(printf '%s' "$bad" | tr ' =' '--')"
         fi
     done
-    for want in "Linux version" "systemd" "Reached target"; do
+    # "systemd[1]:" and not "systemd". The bare string matches the
+    # KERNEL COMMAND LINE, which the kernel prints at boot and which now
+    # carries systemd.show_status=1 -- so this check passed on a boot that
+    # never reached userspace at all, matching a flag this harness itself
+    # added. Only PID 1 writes "systemd[1]:".
+    for want in "Linux version" "systemd[1]:" "Reached target"; do
         if grep -qF -- "$want" "$CONSOLE_ALL" 2>/dev/null; then
             printf 'IMG-CHECK %s PASS\n' "$(printf '%s' "$want" | tr ' ' '-')"
         else
