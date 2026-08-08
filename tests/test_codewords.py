@@ -63,7 +63,10 @@ class TestVocabularyShape:
     def test_lists_are_populated(self):
         assert len(MODIFIERS) > 300
         assert len(FLAT_NOUNS) > 600
-        assert len(NOUNS) >= 13, "categories drive the two-press browse on 3 buttons"
+        # Categories are an authoring device, not a UI surface -- the unit
+        # never draws from one. They keep the curation legible and give
+        # build_lists.py the tiers it spends its phonetic budget across.
+        assert len(NOUNS) >= 13, "the lists must stay curated, not one blob"
 
     def test_every_word_is_plain_uppercase(self):
         for word in MODIFIERS:

@@ -1,8 +1,16 @@
 """Codeword selection for the print unit.
 
-Three ways to land on a codeword, because they serve different moments:
-roll one at random (the fast path), browse a category when you want to pick
-the noun deliberately, or type one that was agreed elsewhere.
+Two ways to land on a codeword: roll one, or type one that was agreed
+elsewhere. There is deliberately no way to pick a word off the lists.
+
+A codeword names a pad set without naming its holders, and an operator who
+chooses one puts their own taste into that name. Taste is stable, so it is a
+fingerprint: pads picked by the same hand end up looking like a set, and a
+category picked to suit a particular contact is worse still. Rolling draws
+uniformly over every modifier-noun pair; a human picking a noun does not.
+So the categories below are an authoring device -- they are how the lists
+are curated and how build_lists.py spends its phonetic budget -- and nothing
+in the running unit narrows a draw to one of them.
 
 Everything here draws from otp_generator's CSPRNG helpers rather than the
 `random` module -- the same source as the key material.
@@ -23,9 +31,11 @@ class Vocabulary:
     """The bundled modifier and noun lists, and the ways to draw from them."""
 
     def __init__(self, base_dir: str | None = None):
-        self.modifiers, self.nouns_by_category = gen.load_vocabulary(base_dir)
-        self.categories = list(self.nouns_by_category)
-        self.all_nouns = [w for words in self.nouns_by_category.values() for w in words]
+        modifiers, nouns_by_category = gen.load_vocabulary(base_dir)
+        self.modifiers = modifiers
+        # Flattened on the way in, and the per-category lists are not kept:
+        # the unit has no reason to hold a handle it could draw from.
+        self.all_nouns = [w for words in nouns_by_category.values() for w in words]
 
     @property
     def combinations(self) -> int:
@@ -49,18 +59,13 @@ class Vocabulary:
         return max(len(w) for w in self.all_nouns)
 
     def random(self) -> str:
-        """A fresh <MODIFIER>-<NOUN>."""
+        """A fresh <MODIFIER>-<NOUN>, uniform over every pair.
+
+        The only draw there is. Reroll until you like one -- each roll is
+        independent and costs nothing, so an operator never has to reach for
+        a narrower pool to get a codeword they can remember.
+        """
         return join(gen.random_choice(self.modifiers), gen.random_choice(self.all_nouns))
-
-    def random_modifier(self) -> str:
-        return gen.random_choice(self.modifiers)
-
-    def random_noun(self, category: str | None = None) -> str:
-        pool = self.nouns_by_category[category] if category else self.all_nouns
-        return gen.random_choice(pool)
-
-    def nouns(self, category: str) -> list[str]:
-        return self.nouns_by_category[category]
 
 
 def join(modifier: str, noun: str) -> str:
