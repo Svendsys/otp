@@ -191,3 +191,55 @@ class TestHeaderFitsTheVocabulary:
     def test_max_fitted_len_exceeds_full_size_limit(self):
         # Shrinking is what buys room for two-word codewords.
         assert g.max_fitted_codeword_len(9, True, True) > g.max_codeword_len(9, True, True)
+
+
+class TestSessionDoesNotRepeatItself:
+    """
+    Two pads printed in one sitting must not carry the same name. The unit
+    keeps no memory across a power cycle -- see the note in otpunit/codewords
+    on why a stored list cannot be made safe by hashing -- so this is scoped
+    to the power-on session and dies with it.
+    """
+
+    def _vocab(self):
+        import otpunit.codewords as cw
+        return cw.Vocabulary()
+
+    def test_a_session_never_issues_the_same_codeword_twice(self):
+        vocab = self._vocab()
+        drawn = [vocab.random() for _ in range(3000)]
+        assert len(set(drawn)) == len(drawn)
+
+    def test_two_sessions_are_independent(self):
+        # A fresh Vocabulary is a fresh power-on: it starts empty and keeps
+        # its own set, so nothing carries across a power cycle. Asserted on
+        # the state rather than by looking for a repeat between two runs --
+        # with 261,000 pairs a repeat is rare enough that such a test would
+        # fail far more often than it passed.
+        first = self._vocab()
+        for _ in range(200):
+            first.random()
+        assert len(first._issued) == 200
+
+        second = self._vocab()
+        assert second._issued == set(), "a new session must start with no memory"
+        second.random()
+        assert len(second._issued) == 1
+        assert len(first._issued) == 200, "sessions must not share the set"
+
+    def test_it_still_draws_from_the_csprng(self, monkeypatch):
+        vocab = self._vocab()
+        calls = []
+        real = g.get_random_bytes
+        monkeypatch.setattr(g, "get_random_bytes", lambda n: calls.append(n) or real(n))
+        vocab.random()
+        assert calls, "codeword selection must use the same CSPRNG as the key material"
+
+    def test_it_refuses_rather_than_repeat_when_exhausted(self):
+        vocab = self._vocab()
+        vocab._issued = {f"X{i}" for i in range(vocab.combinations)}
+        try:
+            vocab.random()
+        except ValueError:
+            return
+        raise AssertionError("an exhausted session must refuse, not repeat")

@@ -36,6 +36,24 @@ class Vocabulary:
         # Flattened on the way in, and the per-category lists are not kept:
         # the unit has no reason to hold a handle it could draw from.
         self.all_nouns = [w for words in nouns_by_category.values() for w in words]
+        # Every codeword this power-on has produced, so no two pads printed
+        # in one sitting can share a name. It lives here and only here: in
+        # RAM, in this object, dying with the power like everything else on
+        # the unit.
+        #
+        # It is deliberately not written to the card, and hashing would not
+        # make writing it safe. The whole space is ~261,000 pairs -- under a
+        # second to enumerate and hash exhaustively -- so a stored digest
+        # list is a plaintext list with extra steps, and what it would spell
+        # out is exactly what a codeword exists to hide: which pads this
+        # machine made. The install script already makes the journal
+        # volatile for the weaker version of that reason.
+        #
+        # Nor would it buy much. Codewords only have to be unique among the
+        # sets actually in service, and that is a fact the operator holds
+        # and the unit cannot: it never learns which of its pads are still
+        # live, nor anything about pads from another unit.
+        self._issued: set[str] = set()
 
     @property
     def combinations(self) -> int:
@@ -59,13 +77,26 @@ class Vocabulary:
         return max(len(w) for w in self.all_nouns)
 
     def random(self) -> str:
-        """A fresh <MODIFIER>-<NOUN>, uniform over every pair.
+        """A fresh <MODIFIER>-<NOUN>, never one already issued this session.
 
-        The only draw there is. Reroll until you like one -- each roll is
-        independent and costs nothing, so an operator never has to reach for
-        a narrower pool to get a codeword they can remember.
+        The only draw there is. Reroll until you like one -- rolling costs
+        nothing, so an operator never has to reach for a narrower pool to get
+        a codeword they can remember.
+
+        Sampling is without replacement across the power-on session, which is
+        what stops two pads printed in one sitting from carrying the same
+        name. Rejected rolls count as issued too: a reroll should always move
+        forward, and showing the same codeword twice in one scroll reads as a
+        fault. Each draw is still uniform over what is left.
         """
-        return join(gen.random_choice(self.modifiers), gen.random_choice(self.all_nouns))
+        if len(self._issued) >= self.combinations:
+            raise ValueError("every codeword has been issued this session")
+        while True:
+            word = join(gen.random_choice(self.modifiers),
+                        gen.random_choice(self.all_nouns))
+            if word not in self._issued:
+                self._issued.add(word)
+                return word
 
 
 def join(modifier: str, noun: str) -> str:
