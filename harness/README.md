@@ -144,6 +144,66 @@ asks the questions only a booted system can answer:
 - is `install.sh` idempotent, as the top of the file claims — and does the
   service survive being reprovisioned under it?
 
+### Three boots, because one boot answers the wrong question
+
+Every check above used to run in the *same boot* `install.sh` ran in, with
+the service hand-started by the harness. That describes a machine seconds
+after provisioning. The device's actual life is flash → boot → run →
+power-cycle, and **a unit that starts when hand-started but not when systemd
+starts it at boot would have passed**.
+
+| Phase | Boot | What is true of it |
+|---|---|---|
+| `provision` | 1 | `install.sh` has just run. The service is hand-started by the harness. |
+| `reboot` | 2 | **systemd** started the unit this time. Writes a setting through `config.save()`. |
+| `persist` | 3 | The setting must still be there, read back through `config.load()`. |
+
+The core checks run in all three. The gate requires **every** phase to have
+reported, exactly once, completely, with its counts in agreement — because a
+boot that never happened produces no output, which is indistinguishable from
+a boot with nothing to say. The single-phase form this replaced took
+`tail -1` of the result line, so a phase that died silently would have left
+the previous phase's success standing as the whole answer.
+
+`tests/test_vm_verdict.py` runs that gate against synthetic consoles and is
+itself mutation-tested: reverting it to last-phase-only, or dropping the
+finished / reported-twice / FAIL-line / qemu-exit checks, each turns the
+right tests red. That is deliberate — four harness checks that could not
+fail have been found in this repository so far, and reading did not catch
+any of them.
+
+### The read-only overlay is NOT tested here — issue #9
+
+Two mechanisms were tried in this guest and neither works. Both are worth
+writing down, because both look like they should:
+
+- **Debian's `overlayroot` package** feeds `mount` an option it rejects,
+  fails to pivot, and panics the kernel: `Attempted to kill init!`.
+- **`systemd.volatile=overlay`** is accepted on the kernel command line and
+  silently ignored. It is implemented by systemd *inside the initrd*, and
+  Debian's initramfs-tools initrd has no systemd in it. Measured: the flag
+  present in `/proc/cmdline`, and `/` still plain `rw` ext4.
+
+Rather than fake it, tier 2 claims only what it demonstrates. The overlay
+stays open as issue #9.
+
+`/boot/firmware` still gets its own virtio disk, formatted FAT and mounted
+by label, mirroring the Pi's geometry — the device keeps settings there
+precisely *because* it is outside the overlay, so testing persistence
+against a directory on the root would pass for a reason that does not hold
+on hardware.
+
+Two traps worth knowing if you touch this:
+
+- **Never replace `GRUB_CMDLINE_LINUX`; append to it.** The image sets
+  `console=ttyS0,115200` there, and that is the only reason this tier has a
+  serial console. Replacing it cost a run in which boots 2 and 3 did all
+  their work and reported into a console connected to nothing.
+- **The kernel and the guest share that console.** A kernel message once
+  landed mid-marker and split `OTP-RESULT provi|sion` in half. The guest
+  runs at `loglevel=3` and the host matches the marker as a whole pattern
+  anywhere in the line.
+
 **Why amd64 rather than arm64.** Nothing on that list is
 architecture-specific. Emulating arm64 on an x86 host costs half an hour a
 run and buys none of it; amd64 with KVM is a few minutes, which is the
@@ -166,12 +226,25 @@ unattended rather than failing to start.
 `./harness/img-boot.sh <image.img.xz>`, or the `Boot the image` step in
 `image.yml`.
 
-**Never executed.** It is written and wired up but unrun: tier 3 needs an
-image, and the image workflow only runs from `master`. It runs for the
-first time when an image is built after this lands, which is why it is
-attached to the image build rather than left as a script nobody invokes.
-It carries `continue-on-error` so an unvalidated step cannot break the
-build or block the artifact upload.
+**First run: 2026-08-08. It did not boot.** Everything the review fixed
+before it had ever executed did work — the boot partition was found from
+the MBR at sector 16384 (the old hardcoded 8192 read the pre-partition
+gap), the image was padded to a power of two, and both `mcopy` calls found
+their files. Then QEMU exited 0 having written **nothing** to the serial
+console, not even `Linux version`. Tracked in issue #17.
+
+It no longer carries `continue-on-error`. It used to, so that an
+unvalidated step could not cost anyone the image — and the effect on its
+first real run was worse than the problem it solved: tier 3 exited 1 and
+the job went green, with the API reporting the step as `success`. Anyone
+reading the status rather than the log would have concluded the image
+booted. The boot now runs **after** the artifact is uploaded, so it is free
+to fail loudly without costing anything, and the verdict is written to the
+run's step summary as well as the log.
+
+The image build also now runs on any pull request touching `image/**`,
+`device/**`, `harness/img-boot.sh` or the workflow itself. Before that,
+nothing checked the image on the PR that broke it.
 
 It answers exactly one question nothing else can: **does the thing that
 gets flashed to a card actually boot?** pi-gen assembles a filesystem and

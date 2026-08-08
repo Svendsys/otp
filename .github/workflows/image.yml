@@ -3,10 +3,35 @@ name: Build image
 # Deliberately not on every push: the pi-gen build takes roughly half an
 # hour and needs ~10GB of disk. Run it by hand, or on a tag to attach an
 # image to a release.
+#
+# ...but ALSO on any pull request that touches what goes into the image.
+# Until this was added, nothing checked the image on the PR that broke it:
+# a change to install.sh or the pi-gen stage sailed through CI and was
+# found at release time, or on a Pi. Path-filtered so the cost falls only
+# on the PRs that can actually cause it -- everything else still gets the
+# five fast jobs in ci.yml and nothing here.
+#
+# Not otpunit/** on purpose. The image bakes the package in, but a change
+# there breaks the UNIT, not the image build, and tiers 1 and 2 answer that
+# in minutes rather than half an hour.
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - "image/**"
+      - "device/**"
+      - "harness/img-boot.sh"
+      - ".github/workflows/image.yml"
+
+# Same reasoning as ci.yml, and more so: this one is a 35-minute build.
+# Leaving a superseded pi-gen run going costs half an hour of runner time
+# to produce an image for a commit that has already been replaced. Tag and
+# dispatch runs are never cancelled -- those produce artifacts people keep.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   image:
@@ -110,26 +135,9 @@ jobs:
       - name: Build
         run: ./image/build.sh
 
-      # Tier 3 of the harness: boot the artifact that was just built. Once
-      # per image, not per commit -- it is emulated, so it is slow, and its
-      # peripheral coverage is WORSE than tier 1's simulators. It answers
-      # exactly one question nothing else can: does the thing that gets
-      # flashed to a card actually come up? pi-gen assembles a filesystem
-      # and never starts it. See harness/README.md.
-      - name: Boot the image
-        continue-on-error: true
-        run: |
-          sudo apt-get install -y --no-install-recommends \
-            qemu-system-arm mtools xz-utils
-          OTP_IMG_WORK=${{ runner.temp }}/otp-img \
-            ./harness/img-boot.sh image/deploy/*.img.xz
-      - name: Boot verdict
-        if: always()
-        run: |
-          echo "=== tier 3 verdict ==="
-          cat ${{ runner.temp }}/otp-img/verdict.txt 2>/dev/null \
-            || echo "(the image never reported)"
-
+      # The artifact is uploaded and attached BEFORE the image is booted, so
+      # that a failing boot can be reported honestly without costing anyone
+      # the image. See the boot step below for why that ordering matters.
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
@@ -142,3 +150,46 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: image/deploy/*.img.xz
+
+      # Tier 3 of the harness: boot the artifact that was just built. Once
+      # per image, not per commit -- it is emulated, so it is slow, and its
+      # peripheral coverage is WORSE than tier 1's simulators. It answers
+      # exactly one question nothing else can: does the thing that gets
+      # flashed to a card actually come up? pi-gen assembles a filesystem
+      # and never starts it. See harness/README.md.
+      #
+      # LAST, AND ALLOWED TO FAIL LOUDLY. This step used to run before the
+      # upload with `continue-on-error: true`, so that an unvalidated check
+      # could not cost anyone the image. The effect on its first real run
+      # was worse than the problem it solved: tier 3 exited 1, and the job
+      # went green with the GitHub API reporting this step's conclusion as
+      # `success`. Anyone reading the status rather than the log would have
+      # concluded the image booted. That is a check that cannot fail --
+      # exactly what the rest of this harness exists to eliminate.
+      #
+      # Moving it after the upload gets both things: the artifact is already
+      # safe, so a red boot costs nothing, and the boot can therefore be
+      # honest about failing.
+      - name: Boot the image
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-arm mtools xz-utils
+          OTP_IMG_WORK=${{ runner.temp }}/otp-img \
+            ./harness/img-boot.sh image/deploy/*.img.xz
+      - name: Boot verdict
+        if: always()
+        # Also to the step summary, which is on the run's landing page. The
+        # verdict being in the log was not enough: the one line that
+        # explained the first failure was thirty lines up and easy to scroll
+        # past, and this repository keeps rediscovering that a diagnostic
+        # nobody can find is not a diagnostic.
+        run: |
+          echo "=== tier 3 verdict ==="
+          {
+            echo "## Tier 3 — booting the built image"
+            echo
+            echo '```'
+            cat ${{ runner.temp }}/otp-img/verdict.txt 2>/dev/null \
+              || echo "(the image never reported)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

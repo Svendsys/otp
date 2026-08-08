@@ -4,10 +4,26 @@
 #
 #   ./harness/img-boot.sh image/deploy/otp-print-unit.img.xz
 #
-# NEVER EXECUTED. This is written but unrun -- tier 3 needs an image, the
-# image workflow only runs from master, and this branch is not merged.
-# Attached to image.yml so it validates itself the first time an image is
-# built after it lands, rather than sitting here claiming to work.
+# HISTORY, because this took three runs and each one moved the goalposts.
+#
+# Run 1 (31260949543): nothing at all on the serial console -- not even
+# "Linux version". The MBR-derived boot offset, the power-of-two padding
+# and both mcopy calls all worked; the kernel simply never got going.
+#
+# Run 2 (31263053487): IT BOOTS. The cause was the DTB -- the script chose
+# bcm2710-rpi-3-b-PLUS.dtb, above a comment claiming that was what QEMU's
+# raspi3b models. It is not: `-M raspi3b` is the plain 3 Model B, and a
+# device tree describing hardware the emulator does not provide kills the
+# kernel before console init. With the plain dtb: ext4 root mounted, init
+# ran, systemd 257 came up, hostname set. Linux-version and systemd went
+# from FAIL to PASS.
+#
+# Run 2 then stopped at 11.4 seconds with `qemu exit: 0`, right after
+# "Detected first boot" -- a Pi OS image resizes its root filesystem on
+# first boot and reboots, and -no-reboot turned that into a clean exit.
+# That flag is gone; see the qemu invocation below.
+#
+# See issue #17.
 #
 # WHAT THIS CATCHES that the other tiers do not: whether the artifact
 # BOOTS. pi-gen assembles a filesystem and never starts it; tier 2 boots a
@@ -32,7 +48,10 @@ set -euo pipefail
 
 IMAGE_XZ="${1:?usage: img-boot.sh <image.img.xz>}"
 WORK="${OTP_IMG_WORK:-${TMPDIR:-/tmp}/otp-img}"
-TIMEOUT="${OTP_IMG_TIMEOUT:-900}"
+# Two emulated boots now, not one -- the first-boot resize reboots. Guest
+# time ran at roughly half real time in the first successful boot (11.4s of
+# guest in ~20s of wall), so this is headroom rather than an estimate.
+TIMEOUT="${OTP_IMG_TIMEOUT:-1200}"
 
 mkdir -p "$WORK"
 WORK="$(cd "$WORK" && pwd)"
@@ -83,9 +102,17 @@ if command -v mcopy >/dev/null; then
     # Errors NOT silenced: "Cannot initialize '::'" is the useful message,
     # and hiding it is what made a wrong offset look like a bad image.
     mcopy -n -i "$IMG@@$BOOT_OFFSET" ::kernel8.img "$WORK/boot/" || true
-    # -plus is what QEMU's raspi3b models; fall back to the plain 3b dtb.
-    mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b-plus.dtb "$WORK/boot/" \
-        || mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b.dtb "$WORK/boot/" || true
+    # PLAIN 3-b first, -plus only as a fallback. The order used to be the
+    # other way round, above a comment asserting that "-plus is what QEMU's
+    # raspi3b models" -- which is backwards. `-M raspi3b` models the
+    # Raspberry Pi 3 Model B; the B+ is a different board and QEMU has no
+    # machine for it. Handing the kernel a device tree describing hardware
+    # the emulator is not providing is a strong candidate for the first
+    # run's symptom: qemu exited 0 having written NOTHING to the serial
+    # console, not even "Linux version", which is what an early reset
+    # before console init looks like.
+    mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b.dtb "$WORK/boot/" \
+        || mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b-plus.dtb "$WORK/boot/" || true
 else
     echo "ERROR: mtools (mcopy) is needed to read the boot partition" >&2
     exit 1
@@ -103,17 +130,60 @@ log "kernel=$KERNEL dtb=$DTB"
 # root=/dev/mmcblk0p2 rather than whatever cmdline.txt says: pi-gen writes
 # a PARTUUID, and QEMU's sd emulation does not reproduce it.
 log "Booting under -M raspi3b (this is emulated, not KVM -- allow minutes)"
+# BOTH UARTs, captured separately. A Pi 3 has two -- the PL011 (ttyAMA0)
+# and the mini-UART (ttyS0) -- and which one -serial #1 lands on is exactly
+# the kind of thing to have backwards. The first run captured one port and
+# got a completely empty file, which is indistinguishable from "the kernel
+# never ran". Capturing both, and reporting how many bytes each produced,
+# tells the difference on the next run rather than the one after that.
+CONSOLE2="$WORK/console-uart1.log"
+CONSOLE_ALL="$WORK/console-all.log"
 : > "$CONSOLE"
+: > "$CONSOLE2"
 set +e
-timeout "$TIMEOUT" qemu-system-aarch64 \
+# earlycon as well as earlyprintk: earlyprintk is the x86/arm32 spelling
+# and is a no-op on arm64, so the window before the real console comes up
+# was never being reported at all. console= for both ports for the same
+# reason as the two -serial flags.
+#
+# NO -no-reboot, deliberately. A Pi OS image resizes its root filesystem on
+# first boot and then REBOOTS; -no-reboot turned that into a clean qemu
+# exit at 11.4 seconds, which read as "the unit never started":
+#
+#   systemd[1]: Detected first boot.
+#   systemd[1]: Hostname set to <otp-unit>.
+#   systemd[1]: Initializing machine ID from random generator.
+#   [ qemu exit: 0 ]
+#
+# Letting it reboot is also what the real device does, so the run now
+# covers the same two boots an operator gets from a freshly flashed card.
+# A genuine reboot loop is still caught: it burns the timeout and exits
+# 124, which the verdict gates on.
+# -k 30 for the same reason as tier 2: bare `timeout` sends TERM and waits
+# forever for a process that ignores it, and a job killed by GitHub's own
+# timeout skips the steps that would have reported why.
+timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -M raspi3b -m 1024 \
     -kernel "$KERNEL" -dtb "$DTB" \
-    -append "rw earlyprintk loglevel=8 console=ttyAMA0,115200 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
+    -append "rw earlycon earlyprintk loglevel=8 console=ttyAMA0,115200 console=ttyS0,115200 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
     -drive "file=$IMG,if=sd,format=raw" \
     -serial "file:$CONSOLE" \
-    -display none -no-reboot
+    -serial "file:$CONSOLE2" \
+    -display none
 QEMU_RC=$?
 set -e
+
+# Everything downstream reads the combination, so a boot that talks to
+# whichever port is still judged on what it said.
+cat "$CONSOLE" "$CONSOLE2" > "$CONSOLE_ALL" 2>/dev/null || true
+log "uart0=$(wc -c < "$CONSOLE") bytes  uart1=$(wc -c < "$CONSOLE2") bytes"
+if [ ! -s "$CONSOLE_ALL" ]; then
+    # Worth saying outright rather than leaving as a wall of FAILs. An
+    # empty console is not "the unit did not start" -- it is "there is no
+    # evidence the kernel ever ran", and the two have entirely different
+    # causes.
+    log "NEITHER uart produced any output: no evidence the kernel ran at all"
+fi
 
 # --- the verdict --------------------------------------------------------
 
@@ -127,19 +197,19 @@ VERDICT="$WORK/verdict.txt"
     # not installed at all, BOTH reported PASS. The unit's Description is
     # "OTP pad print unit", so systemd's success line does not contain the
     # string at all. Gate on what only a running unit emits.
-    if grep -q "Started OTP pad print unit" "$CONSOLE" 2>/dev/null; then
+    if grep -q "Started OTP pad print unit" "$CONSOLE_ALL" 2>/dev/null; then
         printf 'IMG-CHECK unit-started PASS\n'
     else
         printf 'IMG-CHECK unit-started FAIL\n'
     fi
     for bad in "status=216" "Failed with result" "Scheduled restart job" \
                "Kernel panic" "Unable to mount root"; do
-        if grep -qF -- "$bad" "$CONSOLE" 2>/dev/null; then
+        if grep -qF -- "$bad" "$CONSOLE_ALL" 2>/dev/null; then
             printf 'IMG-CHECK no-%s FAIL\n' "$(printf '%s' "$bad" | tr ' =' '--')"
         fi
     done
     for want in "Linux version" "systemd" "Reached target"; do
-        if grep -qF -- "$want" "$CONSOLE" 2>/dev/null; then
+        if grep -qF -- "$want" "$CONSOLE_ALL" 2>/dev/null; then
             printf 'IMG-CHECK %s PASS\n' "$(printf '%s' "$want" | tr ' ' '-')"
         else
             printf 'IMG-CHECK %s FAIL\n' "$(printf '%s' "$want" | tr ' ' '-')"
@@ -152,13 +222,13 @@ cat "$VERDICT"
 # on nowhere, so a run killed by the timeout still reported success.
 if [ "$QEMU_RC" != 0 ]; then
     echo "qemu exited $QEMU_RC (124 = killed by the ${TIMEOUT}s timeout)" >&2
-    tail -n 60 "$CONSOLE" >&2
+    tail -n 60 "$CONSOLE_ALL" >&2
     exit 1
 fi
 if grep -q "FAIL" "$VERDICT"; then
     echo "the image did not boot cleanly to a started unit" >&2
     echo "--- last 60 console lines ---" >&2
-    tail -n 60 "$CONSOLE" >&2
+    tail -n 60 "$CONSOLE_ALL" >&2
     exit 1
 fi
 log "the image boots and the unit starts"
