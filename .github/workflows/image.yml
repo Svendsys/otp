@@ -83,7 +83,7 @@ jobs:
       # checking"; the key answers "is this image still current".
       - name: Restore a previously built image
         id: imgcache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: image/deploy
           key: otp-image-${{ runner.arch }}-${{ hashFiles('image/**', 'device/**', 'otpunit/**', 'codewords/**', 'otp_generator.py', 'otp.md') }}
@@ -189,6 +189,20 @@ jobs:
       - name: Build
         if: steps.imgcache.outputs.cache-hit != 'true'
         run: ./image/build.sh
+
+      # Saved HERE, immediately after the build -- not by actions/cache's
+      # automatic post step, which runs under `post-if: success()`. With
+      # the combined action, every run whose BOOT failed skipped the save,
+      # so the cache stayed empty precisely while tier 3 was red -- which
+      # is exactly when cheap iteration on the boot matters. Measured: two
+      # consecutive runs each built the identical image for seven minutes
+      # because the first one's save was silently skipped.
+      - name: Save the image to the cache
+        if: steps.imgcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: image/deploy
+          key: ${{ steps.imgcache.outputs.cache-primary-key }}
 
       # The artifact is uploaded and attached BEFORE the image is booted, so
       # that a failing boot can be reported honestly without costing anyone
@@ -299,3 +313,22 @@ jobs:
               echo "thirty-three."
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The job log shows the last hundred console lines; this carries
+      # everything -- both UARTs in full, the verdict, and the boot
+      # partition's own cmdline.txt and config.txt, so the divergence
+      # between what the device would boot and what this harness booted is
+      # part of the record. Two diagnoses this week were built on a
+      # truncated tail; this is the end of that.
+      - name: Upload the boot evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier3-boot-evidence
+          path: |
+            ${{ runner.temp }}/otp-img/console*.log
+            ${{ runner.temp }}/otp-img/verdict.txt
+            ${{ runner.temp }}/otp-img/boot/cmdline.txt
+            ${{ runner.temp }}/otp-img/boot/config.txt
+          retention-days: 7
+          if-no-files-found: ignore

@@ -24,23 +24,37 @@
 # `init=`, so init=/usr/lib/raspberrypi-sys-mods/firstboot never runs and
 # no resize happens. The flag is back; see the qemu invocation.
 #
-# Run 4 (31283220918) is the one that actually explains things, because by
-# then the boot sampled itself every 30 seconds:
+# Runs 4 and 5 (31283220918, 31283879022) added 30-second console
+# sampling and put -no-reboot back, and between them -- re-reading runs
+# 2 and 3 against them -- the picture unified:
 #
-#      30s  uart0=0  (+0) uart1=14042
-#      60s  uart0=0  (+0) uart1=28084
-#     ...
-#     360s  uart0=0  (+0) uart1=175525
+#   THE GUEST MACHINE RESETS AT ~11.5-12.5 SECONDS GUEST TIME, EVERY
+#   RUN, ON BOTH x86 AND ARM64 HOSTS, WHEREVER THE BOOT HAPPENS TO BE.
 #
-# Perfectly linear, and the last 60 lines of that 175KB are still early
-# boot, ending at guest time 2.37s on "mmc0: host does not support reading
-# read-only switch". That is not a slow boot. It is the SAME boot, over
-# and over: the kernel comes up, dies around the SD controller, resets,
-# and repeats about every thirty seconds. Removing -no-reboot is what let
-# it loop instead of exiting.
+#   - Run 2 (x86, loglevel=8): root mounted, systemd 257 up, machine-id
+#     initializing -- reset at 11.43s, surfaced as exit 0 by -no-reboot.
+#   - Run 3 (x86): the SAME reset, looping. Reported at the time as a
+#     "160x slowdown"; that was a misread of a reboot loop.
+#   - Run 4 (arm64, loglevel=6): same loop, ~30s wall per lap. Reported
+#     at the time as "dies around mmc0 at 2.37s" -- also a misread. The
+#     tail was the SIGTERM-truncated final lap, and loglevel=6 had
+#     suppressed every KERN_INFO line, which is where mmcblk
+#     enumeration, "VFS: Mounted root" and every systemd[1] message
+#     live. The harness blinded itself and called the silence a death.
+#   - Run 5 (arm64, -no-reboot): one lap, exit 0 at ~12.4s guest. Last
+#     visible line: the 10-second deferred-probe report at 12.35s.
 #
-# STILL UNSOLVED: why it dies at mmc0. The kernel never enumerates
-# mmcblk0p2, so root is never found. See issue #17.
+# A reset at a fixed guest time regardless of boot progress is a TIMER:
+# armed early, firing ~10 seconds later -- the shape of a hardware
+# watchdog. Two built-in drivers probe QEMU's incomplete device models
+# inside the arming window: the bcm2835-pm watchdog/power cluster
+# (whose power-domain child read garbage from the stub ASB -- "register
+# ID returned 0x00000000" at ~2.2s) and dwc_otg ("Init: Power Port" at
+# ~2.0s). The -append below blacklists both initcalls; if the reset
+# stops, one of them armed it, and a 3-minute cached run can later say
+# which. Whether the blacklist TOOK is visible in the console: no "FIQ
+# FSM" lines means dwc_otg was skipped, no ASB line means bcm2835-pm
+# was. See issue #17.
 #
 # WHAT THIS CATCHES that the other tiers do not: whether the artifact
 # BOOTS. pi-gen assembles a filesystem and never starts it; tier 2 boots a
@@ -131,6 +145,13 @@ if command -v mcopy >/dev/null; then
     # before console init looks like.
     mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b.dtb "$WORK/boot/" \
         || mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b-plus.dtb "$WORK/boot/" || true
+    # Evidence, not execution: the image's own cmdline.txt and config.txt
+    # ship in the artifact and neither is consulted here (see the header).
+    # They ride along into the failure artifact so the divergence between
+    # what the device would boot and what this harness booted is part of
+    # the record rather than a thing to remember.
+    mcopy -n -i "$IMG@@$BOOT_OFFSET" ::cmdline.txt "$WORK/boot/" || true
+    mcopy -n -i "$IMG@@$BOOT_OFFSET" ::config.txt "$WORK/boot/" || true
 else
     echo "ERROR: mtools (mcopy) is needed to read the boot partition" >&2
     exit 1
@@ -144,9 +165,19 @@ if [ ! -f "$KERNEL" ] || [ -z "$DTB" ]; then
     exit 1
 fi
 log "kernel=$KERNEL dtb=$DTB"
+if [ -s "$WORK/boot/cmdline.txt" ]; then
+    log "the image's own cmdline.txt (replaced wholesale by -append): $(tr -d '\r\n' < "$WORK/boot/cmdline.txt")"
+fi
 
-# root=/dev/mmcblk0p2 rather than whatever cmdline.txt says: pi-gen writes
-# a PARTUUID, and QEMU's sd emulation does not reproduce it.
+# root=/dev/mmcblk0p2 rather than cmdline.txt's root=PARTUUID=..., but not
+# for the reason previously written here. The old comment claimed QEMU does
+# not reproduce PARTUUIDs -- false. A PARTUUID is the MBR disk identifier
+# plus a partition number, both of which ship inside the image file, so it
+# resolves under QEMU exactly as on the device. The real reason is that
+# cmdline.txt is replaced wholesale (it also carries init=...firstboot and
+# quiet, neither wanted here), so root= must be restated -- and an explicit
+# device name beats depending on which revision of cmdline.txt this build
+# happened to produce.
 log "Booting under -M raspi3b (this is emulated, not KVM -- allow minutes)"
 # BOTH UARTs, captured separately. A Pi 3 has two -- the PL011 (ttyAMA0)
 # and the mini-UART (ttyS0) -- and which one -serial #1 lands on is exactly
@@ -159,56 +190,37 @@ CONSOLE_ALL="$WORK/console-all.log"
 : > "$CONSOLE"
 : > "$CONSOLE2"
 set +e
-# THE COMMAND LINE IS A PERFORMANCE DECISION, not just a configuration one.
-# It used to read `loglevel=8 console=ttyAMA0 console=ttyS0`, and that run
-# spent its entire 1200-second budget reaching 7.6 seconds of guest time --
-# roughly a 160x slowdown.
+# THE COMMAND LINE, and what previous revisions of it got wrong.
 #
-# Under TCG every character out an emulated UART costs real work, and that
-# line asked for the maximum: loglevel=8 prints debug-level messages, and
-# naming two consoles makes the kernel emit every one of them TWICE.
+# loglevel=7, not 6 and not 8. KERN_INFO is where a boot narrates itself
+# -- mmcblk enumeration, "VFS: Mounted root", every systemd[1] line --
+# and loglevel=6 suppressed all of it, which is how a systemd-era reset
+# got reported as an early-boot death (see the header). The 8 -> 6 change
+# was justified as fixing a "160x slowdown"; that number was a misread of
+# a reboot loop, and the performance story died with it. 7 keeps INFO and
+# drops only DEBUG.
 #
-#   loglevel=6  keeps KERN_NOTICE and above, which is what "Linux version"
-#               is printed at, and drops the KERN_INFO flood that makes up
-#               the bulk of a boot.
-#   one console rather than two. The dual-UART capture below stays -- both
-#               ports are still recorded -- but the kernel is only ASKED to
-#               write to one. Note which one: under -M raspi3b, ttyAMA0
-#               comes out of the SECOND -serial, not the first. Measured:
-#               uart0=0 bytes, uart1=175525. The comment here used to claim
-#               the previous run had established which port carried output;
-#               it had, and this got it backwards. It kept working only
-#               because both are captured and the verdict greps the
-#               concatenation.
+# initcall_blacklist is the reset hypothesis made testable: the
+# bcm2835-pm watchdog/power cluster and dwc_otg both probe QEMU's
+# incomplete models inside the watchdog-arming window, neither is needed
+# to answer this tier's one question, and neither has real hardware here
+# to drive. An emulation accommodation of exactly the same kind as
+# -append itself -- the DEVICE still boots both drivers, and this harness
+# says so rather than pretending otherwise.
 #
-# earlyprintk is gone: it is the x86/arm32 spelling and a no-op on arm64.
-# earlycon is the one that does anything here.
+# One console on the kernel command line; BOTH captured below. Under
+# -M raspi3b, ttyAMA0 comes out of the SECOND -serial, not the first --
+# measured: uart0=0 bytes, uart1=175525. An earlier comment claimed the
+# opposite while citing the run that proved it. It kept working only
+# because both ports are captured and the verdict greps the
+# concatenation.
 #
-# systemd.show_status=1 is explicit because the verdict greps for "Started
-# OTP pad print unit" and "Reached target", which are systemd's status
-# lines rather than kernel output. Too much has been lost today to output
-# that was assumed rather than asked for.
-#
-# NO -no-reboot, deliberately. A Pi OS image resizes its root filesystem on
-# first boot and then REBOOTS; -no-reboot turned that into a clean qemu
-# exit at 11.4 seconds, which read as "the unit never started":
-#
-#   systemd[1]: Detected first boot.
-#   systemd[1]: Hostname set to <otp-unit>.
-#   systemd[1]: Initializing machine ID from random generator.
-#   [ qemu exit: 0 ]
-#
-# Letting it reboot is also what the real device does, so the run now
-# covers the same two boots an operator gets from a freshly flashed card.
-# A genuine reboot loop is still caught: it burns the timeout and exits
-# 124, which the verdict gates on.
-# -k 30 for the same reason as tier 2: bare `timeout` sends TERM and waits
-# forever for a process that ignores it, and a job killed by GitHub's own
-# timeout skips the steps that would have reported why.
+# systemd.show_status=1 because "Started OTP pad print unit" and
+# "Reached target" are systemd status lines, not kernel output.
 timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -M raspi3b -m 1024 \
     -kernel "$KERNEL" -dtb "$DTB" \
-    -append "rw earlycon loglevel=6 console=ttyAMA0,115200 systemd.show_status=1 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
+    -append "rw earlycon loglevel=7 console=ttyAMA0,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init,dwc_otg_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
     -drive "file=$IMG,if=sd,format=raw" \
     -serial "file:$CONSOLE" \
     -serial "file:$CONSOLE2" \
@@ -251,8 +263,15 @@ fi
 # --- the verdict --------------------------------------------------------
 
 VERDICT="$WORK/verdict.txt"
+LAST_TS=$(grep -oE '\[ *[0-9]+\.[0-9]+\]' "$CONSOLE_ALL" 2>/dev/null | tail -1 | tr -d '[] ')
+KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_ALL" 2>/dev/null || true)
 {
     printf 'qemu exit: %s\n' "$QEMU_RC"
+    # How far it got and how many times the kernel STARTED. Entries > 1 is
+    # a reboot loop stated as a number, instead of an inference from byte
+    # counts that has already been misread once.
+    printf 'guest reached: %ss guest time; kernel entered %s time(s)\n' \
+           "${LAST_TS:-?}" "${KERNEL_ENTRIES:-0}"
     # NOT a bare grep for "otp-unit". The image's hostname IS otp-unit, so
     # `Set hostname to <otp-unit>` and the `otp-unit login:` prompt both
     # match -- proven against a synthetic console: a boot where the service
@@ -290,13 +309,21 @@ cat "$VERDICT"
 # on nowhere, so a run killed by the timeout still reported success.
 if [ "$QEMU_RC" != 0 ]; then
     echo "qemu exited $QEMU_RC (124 = killed by the ${TIMEOUT}s timeout)" >&2
-    tail -n 60 "$CONSOLE_ALL" >&2
+    tail -n 100 "$CONSOLE_ALL" >&2
     exit 1
 fi
 if grep -q "FAIL" "$VERDICT"; then
     echo "the image did not boot cleanly to a started unit" >&2
-    echo "--- last 60 console lines ---" >&2
-    tail -n 60 "$CONSOLE_ALL" >&2
+    if [ "$QEMU_RC" = 0 ]; then
+        # Exit 0 before the timeout + -no-reboot = the GUEST reset or
+        # powered itself off. The reset instant is the end of the console
+        # below -- this is not a hang and not a timeout.
+        echo "qemu exited 0 before the timeout: the guest reset itself" >&2
+        echo "at ~${LAST_TS:-?}s guest time. The console ends at the" >&2
+        echo "reset instant." >&2
+    fi
+    echo "--- last 100 console lines ---" >&2
+    tail -n 100 "$CONSOLE_ALL" >&2
     exit 1
 fi
 log "the image boots and the unit starts"
