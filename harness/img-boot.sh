@@ -136,7 +136,10 @@ set +e
 # and is a no-op on arm64, so the window before the real console comes up
 # was never being reported at all. console= for both ports for the same
 # reason as the two -serial flags.
-timeout "$TIMEOUT" qemu-system-aarch64 \
+# -k 30 for the same reason as tier 2: bare `timeout` sends TERM and waits
+# forever for a process that ignores it, and a job killed by GitHub's own
+# timeout skips the steps that would have reported why.
+timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -M raspi3b -m 1024 \
     -kernel "$KERNEL" -dtb "$DTB" \
     -append "rw earlycon earlyprintk loglevel=8 console=ttyAMA0,115200 console=ttyS0,115200 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \

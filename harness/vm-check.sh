@@ -45,7 +45,13 @@ IMAGE_URL="${OTP_VM_IMAGE_URL:-https://cloud.debian.org/images/cloud/trixie/late
 BASE="$WORK/base.qcow2"
 # Three boots now, not one, each with a 45s settle inside it. Under KVM the
 # whole run is around eight minutes; this is headroom, not an estimate.
-BOOT_TIMEOUT="${OTP_VM_TIMEOUT:-2400}"
+#
+# Deliberately WELL under the workflow's timeout-minutes (45). The gap is
+# not slack, it is the budget for the failure path: a job killed by
+# GitHub's timeout skips its remaining steps, so the console dump and the
+# verdict never run and the diagnosis is lost. This timeout has to fire
+# first, every time, or a hang is unreportable.
+BOOT_TIMEOUT="${OTP_VM_TIMEOUT:-1800}"
 
 log() { printf '\n== %s\n' "$*" >&2; }
 
@@ -255,7 +261,16 @@ QEMU_ERR="$WORK/qemu-stderr.log"
 : > "$QEMU_ERR"
 
 set +e
-timeout "$BOOT_TIMEOUT" qemu-system-x86_64 \
+# -k 30: SIGTERM, then SIGKILL thirty seconds later if qemu is still there.
+#
+# Bare `timeout` sends TERM and then waits FOREVER for a process that
+# ignores it, which a wedged qemu does. Observed: the step ran 47 minutes,
+# past both this timeout and the job's own timeout-minutes. That is not
+# just slow -- a job killed by GitHub's timeout DOES NOT RUN ITS REMAINING
+# STEPS, so "The guest console, if anything failed" and "Verdict" never
+# executed and the logs were never even published. The timeout that exists
+# to produce a diagnosis was the reason there wasn't one.
+timeout -k 30 "$BOOT_TIMEOUT" qemu-system-x86_64 \
     "${ACCEL[@]}" \
     -m 2048 -smp 2 \
     -nographic -display none \
