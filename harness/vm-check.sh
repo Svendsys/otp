@@ -127,7 +127,6 @@ packages:
   - cups
   - cups-client
   - cups-filters
-  - overlayroot
   - rng-tools5
   - dosfstools
 package_update: true
@@ -185,7 +184,11 @@ write_files:
       WantedBy=multi-user.target
 
 runcmd:
-  - [ sh, -c, "mkdir -p /repo && tar -C /repo -xf /dev/vdb" ]
+  # By serial, not /dev/vdb. The kernel numbers virtio disks in probe
+  # order, and adding an explicit -device for the root disk shifted this
+  # one from vdb to vdd -- so this untarred the blank boot partition, /repo
+  # was empty, and install.sh exited 127 for want of existing.
+  - [ sh, -c, "REPO=$(readlink -f /dev/disk/by-id/virtio-otprepo); echo \"repo disk: $REPO\"; mkdir -p /repo && tar -C /repo -xf \"$REPO\" && ls /repo/device/install.sh" ]
   - [ sh, -c, "chmod +x /repo/device/install.sh /repo/harness/vm-guest-check.sh" ]
   # The boot partition, formatted and mounted before install.sh runs so the
   # unit's settings land on it from the start. Found by serial rather than
@@ -195,7 +198,10 @@ runcmd:
   # probe order, so a device path baked in on the first boot is a path that
   # can point somewhere else on the second -- and the second boot is where
   # this mount has to carry the settings.
-  - [ sh, -c, "BOOT=$(readlink -f /dev/disk/by-id/virtio-otpboot 2>/dev/null || echo /dev/vdd); echo \"boot partition: $BOOT\"; mkfs.vfat -n OTPBOOT \"$BOOT\" && mkdir -p /boot/firmware && echo 'LABEL=OTPBOOT /boot/firmware vfat defaults,rw 0 0' >> /etc/fstab && mount /boot/firmware && df -h /boot/firmware" ]
+  # No fallback to a guessed /dev/vdN. mkfs on a guess formats whichever
+  # disk happens to be there -- and a wrong guess about device numbering is
+  # precisely what broke the run before this one. Fail loudly instead.
+  - [ sh, -c, "BOOT=$(readlink -f /dev/disk/by-id/virtio-otpboot) || { echo 'OTP-CHECK provision boot-disk-by-id FAIL not found'; exit 1; }; echo \"boot partition: $BOOT\"; mkfs.vfat -n OTPBOOT \"$BOOT\" && mkdir -p /boot/firmware && echo 'LABEL=OTPBOOT /boot/firmware vfat defaults,rw 0 0' >> /etc/fstab && mount /boot/firmware && df -h /boot/firmware" ]
   # --skip-apt because cloud-init installed what Debian has above. The
   # point of this tier is what install.sh does to a BOOTED system, not
   # whether apt can resolve a Raspberry Pi OS package list; the image
@@ -207,7 +213,23 @@ runcmd:
   - [ sh, -c, "tail -40 /var/log/otp-install.log" ]
   # Everything from here is setup for the second and third boots.
   - [ sh, -c, "systemctl enable otp-harness-boot.service" ]
-  - [ sh, -c, "echo 'overlayroot=\"tmpfs\"' > /etc/overlayroot.conf; update-initramfs -u 2>&1 | tail -5" ]
+  # systemd's OWN volatile-overlay support, via the kernel command line --
+  # not Debian's overlayroot package, which is broken on trixie. Measured:
+  #
+  #   Warning: overlayroot: configuring overlayroot with driver=overlay
+  #   mount: invalid option --
+  #   Failure: overlayroot: failed to move root away from /root to /media/root-ro
+  #   Kernel panic - not syncing: Attempted to kill init!
+  #
+  # Its initramfs script passes an option this mount does not accept, and
+  # the boot dies in the initramfs. systemd.volatile=overlay does the same
+  # job -- read-only root, tmpfs upper, writes discarded at power-off --
+  # inside systemd, with no initramfs hook to be incompatible with.
+  #
+  # This is a HARNESS mechanism, not the device's. A Pi uses raspi-config's
+  # enable_overlayfs. What tier 2 tests is that the unit survives a
+  # read-only root at all; tier 3 is what tests the Pi's actual overlay.
+  - [ sh, -c, "sed -i 's|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"systemd.volatile=overlay\"|' /etc/default/grub && update-grub 2>&1 | tail -3 && grep GRUB_CMDLINE_LINUX= /etc/default/grub" ]
   # cloud-init must not run again, and this is not optional housekeeping.
   # It decides "have I run before?" from state under /var/lib/cloud -- which
   # is on the root filesystem, which the overlay discards at every boot. So
@@ -275,6 +297,16 @@ CONSOLE="$WORK/console.log"
 #    broke booting" -- it presented as a hang, and the hang got blamed on
 #    the overlay for an hour. An explicit bootindex is the only thing that
 #    keeps the order independent of how many devices are added later.
+#
+# 3. EVERY disk the guest looks up by name carries a serial, and the guest
+#    uses /dev/disk/by-id rather than /dev/vdN. Fixing (2) shifted the
+#    probe order in the same motion -- repo.tar moved from vdb to vdd --
+#    so `tar -xf /dev/vdb` unpacked the blank boot partition, /repo was
+#    empty, install.sh did not exist, and the run reported rc=127.
+#
+#    The comment for (1) already said the serial existed so the guest need
+#    not depend on probe order. It then depended on probe order for the
+#    disk right next to it. Names, not numbers, for all of them.
 
 # qemu's own stderr, kept separate from the guest's console. When qemu
 # refuses to start there IS no guest console, so the failure path had
@@ -300,7 +332,8 @@ timeout -k 30 "$BOOT_TIMEOUT" qemu-system-x86_64 \
     -nographic -display none \
     -drive "file=$WORK/overlay.qcow2,if=none,format=qcow2,id=rootdisk" \
     -device "virtio-blk-pci,drive=rootdisk,bootindex=0" \
-    -drive "file=$WORK/repo.tar,if=virtio,format=raw" \
+    -drive "file=$WORK/repo.tar,if=none,format=raw,id=repodisk" \
+    -device "virtio-blk-pci,drive=repodisk,serial=otprepo" \
     -drive "file=$WORK/seed.iso,if=virtio,format=raw" \
     -drive "file=$WORK/bootpart.img,if=none,format=raw,id=otpboot" \
     -device "virtio-blk-pci,drive=otpboot,serial=otpboot" \

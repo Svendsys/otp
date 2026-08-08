@@ -175,13 +175,12 @@ if [ "$PHASE" = "provision" ]; then
           "$(if [ "$BOOT_SRC" != "?" ] && [ "$BOOT_SRC" != "$(findmnt -no SOURCE --target / 2>/dev/null)" ]; then echo yes; else echo no; fi)" \
           "$BOOTDIR src=$BOOT_SRC"
 
-    # Assert the overlay package is here before the run depends on it. It is
-    # in the cloud-init package list, but a package that failed to install
-    # would otherwise surface as an overlay that mysteriously did not
-    # engage, two boots and several minutes later, with the real cause
-    # scrolled far off the top of the console.
-    check overlayroot-installed "$(yesno dpkg -s overlayroot)" \
-          "$(dpkg-query -W -f='${Version}' overlayroot 2>/dev/null || echo 'not installed')"
+    # The repo really did unpack. `tar -xf` against the wrong disk exits 0
+    # having produced nothing, and the next thing to notice was install.sh
+    # exiting 127 for want of existing -- 128 seconds later, with the cause
+    # long scrolled away.
+    check repo-unpacked "$(yesno test -x /repo/device/install.sh)" \
+          "/repo/device/install.sh"
 
     # install.sh says "safe to rerun" at the top of the file. Rerunning it
     # on a provisioned system is the only way to find out, and it is exactly
@@ -206,14 +205,19 @@ fi
 
 # --- the read-only overlay ----------------------------------------------
 
-# WHAT THIS DOES AND DOES NOT PROVE. The guest uses Debian's `overlayroot`
-# package; a Pi uses `raspi-config nonint enable_overlayfs`, which is a
-# different mechanism. So these checks establish that THE UNIT SURVIVES A
-# READ-ONLY ROOT -- that cupsd starts, the spool lands somewhere writable,
-# settings still persist. They do NOT establish that the Pi's overlay is
-# correctly configured in the shipped image. That claim belongs to tier 3,
-# which boots the real thing. Conflating the two would be exactly the kind
-# of overstatement this harness exists to catch.
+# WHAT THIS DOES AND DOES NOT PROVE. The guest uses systemd's own
+# `systemd.volatile=overlay`; a Pi uses `raspi-config nonint
+# enable_overlayfs`. Different mechanisms. So these checks establish that
+# THE UNIT SURVIVES A READ-ONLY ROOT -- cupsd starts, the spool lands
+# somewhere writable, settings still persist. They do NOT establish that
+# the Pi's overlay is correctly configured in the shipped image. That claim
+# belongs to tier 3, which boots the real thing. Conflating the two would
+# be exactly the kind of overstatement this harness exists to catch.
+#
+# Debian's `overlayroot` package was the first choice and does not work on
+# trixie: its initramfs script feeds `mount` an option it rejects, fails to
+# pivot, and panics the kernel with "Attempted to kill init!". systemd does
+# the same job natively with no initramfs hook to be incompatible with.
 if [ "$PHASE" = "overlay" ] || [ "$PHASE" = "persist" ]; then
     ROOT_OPTS=$(findmnt -no OPTIONS --target / 2>/dev/null || echo "?")
     ROOT_FS=$(findmnt -no FSTYPE --target / 2>/dev/null || echo "?")
@@ -223,14 +227,18 @@ if [ "$PHASE" = "overlay" ] || [ "$PHASE" = "persist" ]; then
           "$(if [ "$ROOT_FS" = "overlay" ]; then echo yes; else echo no; fi)" \
           "fstype=$ROOT_FS opts=${ROOT_OPTS%%,*}"
 
-    # The lower layer is what must be read-only. The overlay itself accepts
-    # writes -- into RAM -- which is the whole point, and is why "can I
-    # write to /" is NOT the check here. `persist` is where that gets
-    # settled, by finding the write gone.
-    LOWER_RO=$(findmnt -no OPTIONS /media/root-ro 2>/dev/null || true)
-    check lower-layer-read-only \
-          "$(if [ "${LOWER_RO%%,*}" = "ro" ]; then echo yes; else echo no; fi)" \
-          "/media/root-ro=${LOWER_RO:-not mounted}"
+    # The writable layer must be RAM. That is the whole security claim --
+    # a write that lands on the card outlives the power cycle, and on this
+    # device the power cycle IS the wipe. "Can I write to /" is not the
+    # check: an overlay accepts every write, which is the point. This asks
+    # where the write GOES; the persist phase then confirms it does not
+    # come back.
+    UPPER=$(findmnt -no OPTIONS --target / 2>/dev/null \
+              | tr ',' '\n' | awk -F= '/^upperdir=/{print $2}')
+    UPPER_FS=$(findmnt -no FSTYPE --target "${UPPER:-/nonexistent}" 2>/dev/null || echo "?")
+    check overlay-upper-is-ram \
+          "$(if [ "$UPPER_FS" = "tmpfs" ]; then echo yes; else echo no; fi)" \
+          "upperdir=${UPPER:-unset} fstype=$UPPER_FS"
 
     # The boot partition has to stay writable and outside the overlay, or
     # settings cannot persist at all.
