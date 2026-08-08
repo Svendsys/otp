@@ -4,20 +4,26 @@
 #
 #   ./harness/img-boot.sh image/deploy/otp-print-unit.img.xz
 #
-# FIRST RUN: 2026-08-08, image.yml run 31260949543. It did not boot.
+# HISTORY, because this took three runs and each one moved the goalposts.
 #
-# What worked, all of it fixed by review before it had ever run: the boot
-# partition was located from the MBR at sector 16384 (the old hardcoded
-# 8192 would have read the pre-partition gap), the image was padded to a
-# power of two for the sd interface, and both mcopy calls found their
-# files. What failed: qemu exited 0 having written NOTHING to the serial
-# console -- not even "Linux version" -- so all four checks reported FAIL
-# with no evidence the kernel had run at all.
+# Run 1 (31260949543): nothing at all on the serial console -- not even
+# "Linux version". The MBR-derived boot offset, the power-of-two padding
+# and both mcopy calls all worked; the kernel simply never got going.
 #
-# Two candidate causes are addressed below, and the next run distinguishes
-# them: the DTB was for the 3 Model B PLUS while `-M raspi3b` models the
-# plain 3 Model B, and only one of the two UARTs was being captured. See
-# issue #17.
+# Run 2 (31263053487): IT BOOTS. The cause was the DTB -- the script chose
+# bcm2710-rpi-3-b-PLUS.dtb, above a comment claiming that was what QEMU's
+# raspi3b models. It is not: `-M raspi3b` is the plain 3 Model B, and a
+# device tree describing hardware the emulator does not provide kills the
+# kernel before console init. With the plain dtb: ext4 root mounted, init
+# ran, systemd 257 came up, hostname set. Linux-version and systemd went
+# from FAIL to PASS.
+#
+# Run 2 then stopped at 11.4 seconds with `qemu exit: 0`, right after
+# "Detected first boot" -- a Pi OS image resizes its root filesystem on
+# first boot and reboots, and -no-reboot turned that into a clean exit.
+# That flag is gone; see the qemu invocation below.
+#
+# See issue #17.
 #
 # WHAT THIS CATCHES that the other tiers do not: whether the artifact
 # BOOTS. pi-gen assembles a filesystem and never starts it; tier 2 boots a
@@ -42,7 +48,10 @@ set -euo pipefail
 
 IMAGE_XZ="${1:?usage: img-boot.sh <image.img.xz>}"
 WORK="${OTP_IMG_WORK:-${TMPDIR:-/tmp}/otp-img}"
-TIMEOUT="${OTP_IMG_TIMEOUT:-900}"
+# Two emulated boots now, not one -- the first-boot resize reboots. Guest
+# time ran at roughly half real time in the first successful boot (11.4s of
+# guest in ~20s of wall), so this is headroom rather than an estimate.
+TIMEOUT="${OTP_IMG_TIMEOUT:-1200}"
 
 mkdir -p "$WORK"
 WORK="$(cd "$WORK" && pwd)"
@@ -136,6 +145,20 @@ set +e
 # and is a no-op on arm64, so the window before the real console comes up
 # was never being reported at all. console= for both ports for the same
 # reason as the two -serial flags.
+#
+# NO -no-reboot, deliberately. A Pi OS image resizes its root filesystem on
+# first boot and then REBOOTS; -no-reboot turned that into a clean qemu
+# exit at 11.4 seconds, which read as "the unit never started":
+#
+#   systemd[1]: Detected first boot.
+#   systemd[1]: Hostname set to <otp-unit>.
+#   systemd[1]: Initializing machine ID from random generator.
+#   [ qemu exit: 0 ]
+#
+# Letting it reboot is also what the real device does, so the run now
+# covers the same two boots an operator gets from a freshly flashed card.
+# A genuine reboot loop is still caught: it burns the timeout and exits
+# 124, which the verdict gates on.
 # -k 30 for the same reason as tier 2: bare `timeout` sends TERM and waits
 # forever for a process that ignores it, and a job killed by GitHub's own
 # timeout skips the steps that would have reported why.
@@ -146,7 +169,7 @@ timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -drive "file=$IMG,if=sd,format=raw" \
     -serial "file:$CONSOLE" \
     -serial "file:$CONSOLE2" \
-    -display none -no-reboot
+    -display none
 QEMU_RC=$?
 set -e
 
