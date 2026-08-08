@@ -13,8 +13,14 @@
 # BOOTS. pi-gen assembles a filesystem and never starts it; tier 2 boots a
 # Debian cloud image rather than this one. Between them nothing has ever
 # powered on the thing that gets flashed to a card. A missing kernel
-# module, a broken cmdline.txt, an fstab referring to a partition that
-# moved -- all invisible until something tries.
+# module, an fstab referring to a partition that moved, an initramfs that
+# does not build -- all invisible until something tries.
+#
+# NOT cmdline.txt, and not config.txt. QEMU reads neither: -append below
+# REPLACES the kernel command line wholesale, and config.txt is firmware
+# configuration the emulator has no equivalent of. So dtparam=i2c_arm=on
+# and the disable-wifi/disable-bt overlays are inert here. Do not read a
+# green tier 3 as evidence about either file.
 #
 # WHAT IT DOES NOT CATCH, and this is the important caveat: QEMU's raspi3b
 # is a Pi with nothing plugged into it. No OLED on the I2C bus, no buttons
@@ -54,15 +60,32 @@ fi
 
 # QEMU does not run the Pi's proprietary bootloader, so the kernel and the
 # device tree have to be handed to it directly. Both live on the FAT boot
-# partition, which starts at sector 8192 on a pi-gen image.
-log "Extracting the kernel and device tree from the boot partition"
-BOOT_OFFSET=$((8192 * 512))
+# partition, whose start is read from the MBR rather than hardcoded. It WAS hardcoded to sector 8192,
+# and pi-gen's arm64 branch uses ALIGN=8MiB, so the boot partition starts
+# at sector 16384 -- the extraction aimed at the zero-filled pre-partition
+# gap, both mcopy calls failed silently, and the script blamed the image
+# for a harness bug. Hardcoding 16384 instead would just move the breakage
+# to pi-gen's next ALIGN change, which is how this arose.
+log "Locating the boot partition from the partition table"
+FIRST_LBA=$(od -An -tu4 -j454 -N4 "$IMG" | tr -d ' ')
+if [ -z "$FIRST_LBA" ] || [ "$FIRST_LBA" -lt 1 ] 2>/dev/null; then
+    echo "ERROR: could not read the first partition's start from the MBR" >&2
+    exit 1
+fi
+BOOT_OFFSET=$((FIRST_LBA * 512))
+log "boot partition starts at sector $FIRST_LBA (byte $BOOT_OFFSET)"
+# Cleared, not just created: a second run against an image whose boot
+# partition cannot be read would otherwise boot the PREVIOUS image's
+# kernel and report a verdict on it.
+rm -rf "${WORK:?}/boot"
 mkdir -p "$WORK/boot"
 if command -v mcopy >/dev/null; then
-    mcopy -n -i "$IMG@@$BOOT_OFFSET" ::kernel8.img "$WORK/boot/" 2>/dev/null || true
-    # -plus is the raspi3b QEMU models; fall back to the plain 3b dtb.
-    mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b-plus.dtb "$WORK/boot/" 2>/dev/null \
-        || mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b.dtb "$WORK/boot/" 2>/dev/null || true
+    # Errors NOT silenced: "Cannot initialize '::'" is the useful message,
+    # and hiding it is what made a wrong offset look like a bad image.
+    mcopy -n -i "$IMG@@$BOOT_OFFSET" ::kernel8.img "$WORK/boot/" || true
+    # -plus is what QEMU's raspi3b models; fall back to the plain 3b dtb.
+    mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b-plus.dtb "$WORK/boot/" \
+        || mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b.dtb "$WORK/boot/" || true
 else
     echo "ERROR: mtools (mcopy) is needed to read the boot partition" >&2
     exit 1
@@ -97,18 +120,43 @@ set -e
 VERDICT="$WORK/verdict.txt"
 {
     printf 'qemu exit: %s\n' "$QEMU_RC"
-    for want in "Linux version" "systemd" "otp-unit" "Reached target"; do
-        if grep -qi -- "$want" "$CONSOLE" 2>/dev/null; then
-            printf 'IMG-CHECK %s PASS\n' "$want"
+    # NOT a bare grep for "otp-unit". The image's hostname IS otp-unit, so
+    # `Set hostname to <otp-unit>` and the `otp-unit login:` prompt both
+    # match -- proven against a synthetic console: a boot where the service
+    # failed 216/GROUP and restart-looped, and a boot where the unit was
+    # not installed at all, BOTH reported PASS. The unit's Description is
+    # "OTP pad print unit", so systemd's success line does not contain the
+    # string at all. Gate on what only a running unit emits.
+    if grep -q "Started OTP pad print unit" "$CONSOLE" 2>/dev/null; then
+        printf 'IMG-CHECK unit-started PASS\n'
+    else
+        printf 'IMG-CHECK unit-started FAIL\n'
+    fi
+    for bad in "status=216" "Failed with result" "Scheduled restart job" \
+               "Kernel panic" "Unable to mount root"; do
+        if grep -qF -- "$bad" "$CONSOLE" 2>/dev/null; then
+            printf 'IMG-CHECK no-%s FAIL\n' "$(printf '%s' "$bad" | tr ' =' '--')"
+        fi
+    done
+    for want in "Linux version" "systemd" "Reached target"; do
+        if grep -qF -- "$want" "$CONSOLE" 2>/dev/null; then
+            printf 'IMG-CHECK %s PASS\n' "$(printf '%s' "$want" | tr ' ' '-')"
         else
-            printf 'IMG-CHECK %s FAIL\n' "$want"
+            printf 'IMG-CHECK %s FAIL\n' "$(printf '%s' "$want" | tr ' ' '-')"
         fi
     done
 } > "$VERDICT"
 cat "$VERDICT"
 
-if ! grep -q "IMG-CHECK otp-unit PASS" "$VERDICT"; then
-    echo "the image did not get as far as starting the unit" >&2
+# qemu's own exit status is part of the verdict. It was printed and gated
+# on nowhere, so a run killed by the timeout still reported success.
+if [ "$QEMU_RC" != 0 ]; then
+    echo "qemu exited $QEMU_RC (124 = killed by the ${TIMEOUT}s timeout)" >&2
+    tail -n 60 "$CONSOLE" >&2
+    exit 1
+fi
+if grep -q "FAIL" "$VERDICT"; then
+    echo "the image did not boot cleanly to a started unit" >&2
     echo "--- last 60 console lines ---" >&2
     tail -n 60 "$CONSOLE" >&2
     exit 1

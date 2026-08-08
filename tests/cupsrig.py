@@ -234,6 +234,7 @@ class CupsRig:
         # symptom is not a permission error: `lpinfo -m` simply returns
         # nothing, _match_ppd finds no candidate, and the unit reports "no
         # driver" for a printer whose PPD is sitting right there.
+        self._widened = []
         for parent in self.root.parents:
             if parent == Path(parent.root):
                 break
@@ -241,6 +242,10 @@ class CupsRig:
             if mode & 0o001:
                 break                            # already traversable
             os.chmod(parent, mode | 0o011)
+            # Remembered so stop() can put them back. Leaving a 0700 tree
+            # at 0711 is permanent, and pytest keeps the last three tmp
+            # roots -- which hold complete pad PDFs.
+            self._widened.append((parent, mode))
 
     def _write_config(self) -> None:
         self._make_dirs()
@@ -359,6 +364,12 @@ FileDevice Yes
             return f"could not run it: {exc}"
 
     def stop(self) -> None:
+        for parent, mode in reversed(getattr(self, "_widened", [])):
+            try:
+                os.chmod(parent, mode)
+            except OSError:
+                pass
+        self._widened = []
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -391,7 +402,11 @@ FileDevice Yes
         """An otpunit.printer.Cups wired to this rig, otherwise untouched."""
         from otpunit import printer
 
-        return printer.Cups(run=self.run)
+        # temp_dir matters: _clear_temp() used to empty the module-level
+        # /run/cups/tmp, so the harness deleted the HOST's live CUPS
+        # scratch as root and never exercised its own. Proven by dropping
+        # a sentinel in the host's /run/cups/tmp and running one test.
+        return printer.Cups(run=self.run, temp_dir=str(self.root / "tmp"))
 
     # --- what reached the printer --------------------------------------
 

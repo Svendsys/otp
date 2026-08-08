@@ -113,11 +113,18 @@ check coredumps-off-for-the-unit \
 
 # --- the spool is where the hardening says it is ------------------------
 
-SPOOL=$(findmnt -no FSTYPE --target /var/spool/cups 2>/dev/null || echo "?")
-RUNCUPS=$(findmnt -no FSTYPE --target /run/cups 2>/dev/null || echo "?")
-check spool-on-tmpfs \
-      "$(if [ "$SPOOL" = "tmpfs" ] || [ "$RUNCUPS" = "tmpfs" ]; then echo yes; else echo no; fi)" \
-      "/var/spool/cups=$SPOOL /run/cups=$RUNCUPS"
+# Read the CONFIGURED RequestRoot and check where that lands, rather than
+# asking about /run/cups. `findmnt --target` reports the fstype of the
+# mount CONTAINING a path, /run is a tmpfs on every systemd system by
+# construction, and install.sh creates /run/cups unconditionally -- so the
+# old form answered "tmpfs" whether or not install.sh had redirected
+# anything. Reverting the three set_cups_file lines left it green.
+REQUEST_ROOT=$(awk '/^RequestRoot/{print $2}' /etc/cups/cups-files.conf 2>/dev/null)
+SPOOL_FS=$(findmnt -no FSTYPE --target "${REQUEST_ROOT:-/var/spool/cups}" 2>/dev/null || echo "?")
+check spool-redirected-to-tmpfs \
+      "$(if [ -n "$REQUEST_ROOT" ] && [ "$SPOOL_FS" = "tmpfs" ] \
+            && [ "${REQUEST_ROOT#/var}" = "$REQUEST_ROOT" ]; then echo yes; else echo no; fi)" \
+      "RequestRoot=${REQUEST_ROOT:-unset} fstype=$SPOOL_FS"
 
 # --- idempotency, which is a documented promise -------------------------
 

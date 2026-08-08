@@ -132,8 +132,14 @@ class TestTheRealPrintPath:
         has only ever been checked against a fake lpadmin.
         """
         cups = rig.cups()
-        unknown = printer.Device(
-            "usb://Nonesuch/Imaginary%20Device?serial=X", "Nonesuch Imaginary Device")
+        # An unreachable IPP URI, NOT an unknown usb:// make and model.
+        # With the latter _match_ppd returns None, _lpadmin is never
+        # called, no queue is ever created, and _remove_queue runs against
+        # a name that does not exist -- so deleting the _remove_queue call
+        # from printer.py left this test passing. An IPP URI takes the
+        # `-m everywhere` path, where lpadmin exits non-zero AND creates
+        # the queue anyway, which is the actual defect being guarded.
+        unknown = printer.Device("ipp://127.0.0.1:9/ipp/print", "Unreachable IPP")
         with pytest.raises(printer.PrinterError):
             cups.ensure_queue(unknown)
         listed = rig.run(["/usr/bin/lpstat", "-p", "OTP"])
@@ -178,13 +184,20 @@ class TestTheRealPrintPath:
         assert "OTP A" in got and "OTP B" in got
         assert to_printer(got["OTP A"]) == to_printer(got["OTP B"])
 
-    def test_the_codeword_never_reaches_the_printer(self, rig):
+    def test_the_codeword_reaches_no_uncompressed_channel(self, rig):
         """
-        The strongest form of a rule this project has only ever checked at
-        the job title. The title is not the only channel: measured here,
-        the driver embeds it in a PJL header inside the data stream, so
-        whatever is in it reaches the printer's own memory -- and the
-        manual is explicit that the printer is part of the pad.
+        The title is not the only channel: measured here, the driver embeds
+        it in a PJL header inside the data stream, so whatever is in it
+        reaches the printer's own memory -- and the manual is explicit that
+        the printer is part of the pad.
+
+        Scope, stated precisely because the earlier name overstated it.
+        This is NOT "the codeword never reaches the printer" -- it is
+        printed on every pad page by design, so a device that did not send
+        it could not print it. What this pins is that it appears in no
+        UNCOMPRESSED side channel: not the PJL job name, not the PDF Info
+        dictionary. Both were verified to make this test red when the
+        codeword is injected into them.
         """
         from otpunit import jobs
 

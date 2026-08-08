@@ -57,8 +57,11 @@ both of which are worth knowing:
 
 - **The job title is embedded in a PJL header inside the data stream**, so
   it reaches the printer's own memory. The unit's titles are deliberately
-  codeword-free; there is now a test asserting the codeword reaches
-  *nothing* the printer receives, not just that it stays out of the title.
+  codeword-free, and there is now a test covering the *uncompressed*
+  channels -- the PJL job name and the PDF Info dictionary -- rather than
+  only the title. It is not, and cannot be, a claim that the codeword
+  never reaches the printer: the codeword is printed on every pad page by
+  design, so a device that did not send it could not print it.
 - **The filter chain is deterministic.** Two submissions of one document
   differ in exactly two places, both intentional: the PJL job name and the
   PDF `/ID`. Normalising those, copy A and copy B are byte-identical all

@@ -176,6 +176,28 @@ FAILED=$(grep -c "OTP-CHECK .* FAIL" "$CONSOLE" || true)
 RESULT=$(grep -o "OTP-RESULT .*" "$CONSOLE" | tail -1 || true)
 log "${RESULT:-no result line}"
 
+# A truncated run is not a passing run. Zero FAIL lines is trivially true
+# of a guest that was killed after two checks -- and with no KVM this
+# script falls back to TCG and takes an order of magnitude longer, so that
+# is reachable. The guest echoes OTP-GUEST-DONE when it finishes; require
+# it, require qemu to have exited cleanly, and require the two numbers in
+# OTP-RESULT to agree.
+if [ "$QEMU_RC" != 0 ]; then
+    echo "qemu exited $QEMU_RC (124 = killed by the ${BOOT_TIMEOUT}s timeout)" >&2
+    exit 1
+fi
+if ! grep -q "OTP-GUEST-DONE" "$CONSOLE"; then
+    echo "the guest never finished: no OTP-GUEST-DONE marker" >&2
+    tail -n 40 "$CONSOLE" >&2
+    exit 1
+fi
+PASSED=${RESULT#OTP-RESULT }
+if [ "${PASSED%%/*}" != "${PASSED##*/}" ] || [ -z "$PASSED" ]; then
+    echo "not every check passed: ${RESULT:-no result line}" >&2
+    grep "OTP-CHECK .* FAIL" "$CONSOLE" >&2 || true
+    exit 1
+fi
+
 if [ "${FAILED:-1}" -ne 0 ]; then
     echo "$FAILED check(s) failed" >&2
     grep "OTP-CHECK .* FAIL" "$CONSOLE" >&2 || true

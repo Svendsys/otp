@@ -145,8 +145,29 @@ jobs:
         if: always()
         run: |
           echo "=== harness verdict ==="
+          # Not `grep ... | tail || echo`: under Actions' default shell
+          # (no pipefail) the pipeline's status is tail's, which is 0 on
+          # empty input, so a missing log read as a clean run.
+          if [ ! -s /tmp/harness.log ]; then
+            echo "no pytest output at all -- the harness did not run" >&2
+            exit 1
+          fi
           grep -E "^(FAILED|ERROR|SKIPPED)|passed|failed" /tmp/harness.log \
-            | tail -n 40 || echo "(no pytest output)"
+            | tail -n 40 || true
+          # A floor on what must have RUN. cupsrig.available() skips the
+          # whole CUPS half for five separate reasons -- a confined cupsd,
+          # a non-root runner, a missing binary -- and each of them left
+          # this job green at "1 passed, 20 skipped", the one pass being a
+          # bash -n syntax check. A harness that silently tests nothing is
+          # worse than a red one; that is the premise of this whole PR.
+          PASSED=$(grep -oE '[0-9]+ passed' /tmp/harness.log | tail -1 | cut -d' ' -f1)
+          echo "harness tests passed: ${PASSED:-0}"
+          if [ "${PASSED:-0}" -lt 12 ]; then
+            echo "expected at least 12 passing harness tests (the CUPS rig" >&2
+            echo "alone is 11); got ${PASSED:-0}. Something skipped silently." >&2
+            grep -E "^SKIPPED" /tmp/harness.log >&2 || true
+            exit 1
+          fi
 
   vm:
     # Tier 2: boot a real system, run device/install.sh on it, and check
