@@ -159,8 +159,12 @@ set -e
 # Written out separately so the caller can print it last. The console is
 # thousands of lines of boot chatter, and a verdict buried under that is a
 # verdict nobody reads.
+# CR-stripped. The guest reports over a serial console, which emits CRLF,
+# so every captured line carries a trailing \r. That is invisible in a log
+# and lethal to string comparison -- see the OTP-RESULT check below.
 VERDICT="$WORK/verdict.txt"
-grep -E "OTP-INSTALL|OTP-CHECK|OTP-RESULT" "$CONSOLE" > "$VERDICT" 2>/dev/null || true
+grep -E "OTP-INSTALL|OTP-CHECK|OTP-RESULT" "$CONSOLE" 2>/dev/null \
+    | tr -d '\r' > "$VERDICT" || true
 
 log "Console output"
 if grep -q "OTP-CHECK" "$CONSOLE"; then
@@ -173,7 +177,7 @@ else
 fi
 
 FAILED=$(grep -c "OTP-CHECK .* FAIL" "$CONSOLE" || true)
-RESULT=$(grep -o "OTP-RESULT .*" "$CONSOLE" | tail -1 || true)
+RESULT=$(grep -o "OTP-RESULT .*" "$CONSOLE" | tr -d '\r' | tail -1 || true)
 log "${RESULT:-no result line}"
 
 # A truncated run is not a passing run. Zero FAIL lines is trivially true
@@ -186,13 +190,20 @@ if [ "$QEMU_RC" != 0 ]; then
     echo "qemu exited $QEMU_RC (124 = killed by the ${BOOT_TIMEOUT}s timeout)" >&2
     exit 1
 fi
-if ! grep -q "OTP-GUEST-DONE" "$CONSOLE"; then
+if ! tr -d '\r' < "$CONSOLE" | grep -q "OTP-GUEST-DONE"; then
     echo "the guest never finished: no OTP-GUEST-DONE marker" >&2
     tail -n 40 "$CONSOLE" >&2
     exit 1
 fi
+# Numeric, not string. A serial console's trailing \r made "13" and "13\r"
+# unequal, so this gate -- added to catch a run killed part-way -- failed a
+# run in which all thirteen checks passed. Fixing a diagnostic and breaking
+# it in the same motion is a pattern in this file's history; hence the
+# comparison that cannot be fooled by whitespace.
 PASSED=${RESULT#OTP-RESULT }
-if [ "${PASSED%%/*}" != "${PASSED##*/}" ] || [ -z "$PASSED" ]; then
+GOT=${PASSED%%/*}
+WANT=${PASSED##*/}
+if [ -z "$PASSED" ] || ! [ "${GOT:-0}" -eq "${WANT:--1}" ] 2>/dev/null; then
     echo "not every check passed: ${RESULT:-no result line}" >&2
     grep "OTP-CHECK .* FAIL" "$CONSOLE" >&2 || true
     exit 1
