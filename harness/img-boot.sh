@@ -64,11 +64,15 @@
 # blacklisted, acquitting it of this too. The tell is a line missing
 # from EVERY run's console: "random: crng init done". The CRNG never
 # initializes -- an emulated Pi presents no credited entropy source --
-# so the first blocking getrandom() hangs forever, and the first unit
-# PID 1 starts after remount-fs is exactly systemd-random-seed. QEMU
-# models the BCM2835 hardware RNG; the fix is to load its driver before
-# that moment and credit what it reads (modules_load= and
-# rng_core.default_quality= on -append). See issue #17.
+# so the first blocking getrandom() in the sysinit window hangs
+# forever. Run 10 fixed nothing because its modules_load= was a typo
+# for systemd's modules-load= and was silently ignored; it did move
+# the freeze boundary one unit later, proving the freeze belongs to
+# the WINDOW (where random-seed and journal-flush run), not to one
+# unit. The fix trio on -append: modules-load= the BCM2835 RNG driver
+# (QEMU models the device; no console has ever shown it probing),
+# credit it via rng_core.default_quality=, and trust_bootloader for
+# any /chosen seed. See issue #17.
 #
 # WHAT THIS CATCHES that the other tiers do not: whether the artifact
 # BOOTS. pi-gen assembles a filesystem and never starts it; tier 2 boots a
@@ -231,15 +235,24 @@ set +e
 #   designed to survive (unattended mode is the default; tier 1 covers
 #   keyboard detection with a real uinput device).
 #
-# rng_core.default_quality=1000 modules_load=bcm2835_rng -- THE WEDGE
-# FIX (runs 7-9; see the header). No run ever printed "random: crng
-# init done"; PID 1 blocks in getrandom() starting systemd-random-seed,
-# the first unit after remount-fs, and the machine falls silent
-# forever. QEMU's raspi3b models the BCM2835 hardware RNG, so ask
-# systemd-modules-load (which finishes at ~28s guest, before the wedge)
-# to load its driver, and have rng-core credit what it reads so the
-# CRNG initializes. Real hardware seeds itself from firmware and the
-# SoC RNG and needs neither parameter.
+# rng_core.default_quality=1000 modules-load=bcm2835_rng
+# random.trust_bootloader=on -- THE WEDGE FIX (runs 7-10; see the
+# header). No run has ever printed "random: crng init done": the CRNG
+# never initializes, and every run freezes silently in the sysinit
+# window where systemd-random-seed and journal-flush run -- the exact
+# boundary drifts by one unit between runs (remount-fs in 7-9,
+# tmpfiles-setup-dev-early in 10), so it is the window, not one unit,
+# and the blocked call is whichever getrandom() comes first. Three
+# levers, one target, one observable (crng init done + progress past
+# 30s guest): load the driver for the BCM2835 hardware RNG that QEMU
+# models (modules-load= -- WITH THE DASH; run 10 spelled it
+# modules_load= and systemd ignored it without a word), credit what it
+# reads (rng_core.default_quality), and trust a bootloader-provided
+# seed if QEMU injects one into /chosen (random.trust_bootloader,
+# inert if absent). Zero bcm2835-rng lines in any console at loglevel 7
+# says the driver never probed -- not builtin, not loaded -- which is
+# why the module load is the load-bearing lever. Real hardware seeds
+# itself from firmware and the SoC RNG and needs none of these.
 #
 # All of these are emulation accommodations of the same kind as -append
 # itself: the DEVICE boots every one of these drivers against real
@@ -258,7 +271,7 @@ set +e
 timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -M raspi3b -m 1024 \
     -kernel "$KERNEL" -dtb "$DTB" \
-    -append "rw earlycon loglevel=7 console=ttyAMA0,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init,dwc_otg_driver_init rng_core.default_quality=1000 modules_load=bcm2835_rng root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
+    -append "rw earlycon loglevel=7 console=ttyAMA0,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init,dwc_otg_driver_init rng_core.default_quality=1000 modules-load=bcm2835_rng random.trust_bootloader=on root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
     -drive "file=$IMG,if=sd,format=raw" \
     -serial "file:$CONSOLE" \
     -serial "file:$CONSOLE2" \
@@ -278,8 +291,14 @@ while kill -0 "$QEMU_PID" 2>/dev/null; do
     ELAPSED=$((ELAPSED + SAMPLE))
     NOW=$(wc -c < "$CONSOLE" 2>/dev/null || echo 0)
     NOW2=$(wc -c < "$CONSOLE2" 2>/dev/null || echo 0)
-    printf '   %4ss  uart0=%-8s (+%-6s) uart1=%s\n' \
-           "$ELAPSED" "$NOW" "$((NOW - LAST))" "$NOW2" >&2
+    # Host-side CPU%% of the emulator, because flat output alone cannot
+    # distinguish the two kinds of stuck: a guest idle-waiting on
+    # something that will never arrive (qemu near 0%%) and a guest or
+    # emulator spinning in place (qemu pegged). Runs 6-10 all went flat
+    # at ~30s guest and this column is what finally tells those apart.
+    CPU=$(ps -o %cpu= -p "$QEMU_PID" 2>/dev/null | tr -d ' ' || echo '?')
+    printf '   %4ss  uart0=%-8s (+%-6s) uart1=%-8s qemu-cpu=%s%%\n' \
+           "$ELAPSED" "$NOW" "$((NOW - LAST))" "$NOW2" "${CPU:-?}" >&2
     LAST=$NOW
 done
 wait "$QEMU_PID"
