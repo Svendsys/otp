@@ -85,6 +85,20 @@
 # with the pm blacklist in place, and a replay of udev coldplug --
 # modprobe of every /sys modalias, the exact activity the freeze was
 # blamed on -- completes all 41 probes in 19.3s guest with zero hangs.
+#
+# Run 12, with the console finally visible, ended the hunt: the boot was
+# HEALTHY. CUPS up, the unit STARTED -- and the run still failed on two
+# measurement artifacts and one real find. "guest reached" took the
+# concat's LAST timestamp, which is uart1's ~2s bootconsole handoff once
+# uart0 became the live console; the unit-started pattern spanned
+# "Started" into the Description and cannot straddle the ANSI color
+# systemd wraps around the unit name; and the boot then parked forever
+# on userconf-pi's first-boot wizard, which pi-gen's
+# DISABLE_FIRST_BOOT_USER_RENAME=1 does not disable on a console-boot
+# image (it only deletes the desktop wizard's autostart file). The first
+# two are fixed in this file; the third is masked in install.sh, and is
+# the kind of find this tier exists for -- a flashed device would have
+# held its boot open on a whiptail dialog nobody can see.
 # See issue #17.
 #
 # WHAT THIS CATCHES that the other tiers do not: whether the artifact
@@ -218,6 +232,7 @@ log "Booting under -M raspi3b (this is emulated, not KVM -- allow minutes)"
 # it. Capturing both is what eventually made the mapping provable.
 CONSOLE2="$WORK/console-uart1.log"
 CONSOLE_ALL="$WORK/console-all.log"
+CONSOLE_TXT="$WORK/console-text.log"
 : > "$CONSOLE"
 : > "$CONSOLE2"
 set +e
@@ -302,6 +317,14 @@ set -e
 # Everything downstream reads the combination, so a boot that talks to
 # whichever port is still judged on what it said.
 cat "$CONSOLE" "$CONSOLE2" > "$CONSOLE_ALL" 2>/dev/null || true
+# The verdict greps run on an ANSI- and CR-stripped copy. systemd colors
+# the unit name in its status lines, so the raw bytes of a success line
+# are "Started ESC[0;1;39motp-unit.serviceESC[0m - ..." -- run 12's boot
+# started the unit and the verdict still said FAIL because the pattern
+# could never straddle the escape sequence.
+ESC=$(printf '\033')
+sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' \
+    "$CONSOLE_ALL" > "$CONSOLE_TXT" 2>/dev/null || cp "$CONSOLE_ALL" "$CONSOLE_TXT"
 log "uart0=$(wc -c < "$CONSOLE") bytes  uart1=$(wc -c < "$CONSOLE2") bytes"
 if [ ! -s "$CONSOLE_ALL" ]; then
     # Worth saying outright rather than leaving as a wall of FAILs. An
@@ -314,8 +337,12 @@ fi
 # --- the verdict --------------------------------------------------------
 
 VERDICT="$WORK/verdict.txt"
-LAST_TS=$(grep -oE '\[ *[0-9]+\.[0-9]+\]' "$CONSOLE_ALL" 2>/dev/null | tail -1 | tr -d '[] ')
-KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_ALL" 2>/dev/null || true)
+# Max over every timestamp in BOTH files, not the concat's last line:
+# uart1 ends at the bootconsole handoff (~2s), and with uart1 concatenated
+# second, run 12 reported "guest reached 1.9s" while the real console
+# stood at 213s.
+LAST_TS=$(grep -oE '\[ *[0-9]+\.[0-9]+\]' "$CONSOLE_TXT" 2>/dev/null | tr -d '[] ' | sort -g | tail -1)
+KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/null || true)
 {
     printf 'qemu exit: %s\n' "$QEMU_RC"
     # How far it got and how many times the kernel STARTED. Entries > 1 is
@@ -323,21 +350,24 @@ KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_ALL" 2>/dev/n
     # counts that has already been misread once.
     printf 'guest reached: %ss guest time; kernel entered %s time(s)\n' \
            "${LAST_TS:-?}" "${KERNEL_ENTRIES:-0}"
-    # NOT a bare grep for "otp-unit". The image's hostname IS otp-unit, so
-    # `Set hostname to <otp-unit>` and the `otp-unit login:` prompt both
-    # match -- proven against a synthetic console: a boot where the service
-    # failed 216/GROUP and restart-looped, and a boot where the unit was
-    # not installed at all, BOTH reported PASS. The unit's Description is
-    # "OTP pad print unit", so systemd's success line does not contain the
-    # string at all. Gate on what only a running unit emits.
-    if grep -q "Started OTP pad print unit" "$CONSOLE_ALL" 2>/dev/null; then
+    # NOT a bare grep for "otp-unit" -- the image's hostname IS otp-unit,
+    # so `Set hostname to <otp-unit>` and the login prompt both match, and
+    # both were proven to green a boot where the unit failed or was absent.
+    # And NOT the unit's Description either: systemd colors the unit name,
+    # so the raw success line is "Started ESC[..m]otp-unit.serviceESC[0m -
+    # OTP pad print unit." and a pattern spanning "Started" into the
+    # description can never match -- run 12 started the unit and still
+    # reported FAIL through that pattern. "Started otp-unit.service" on
+    # the stripped text is what only THIS unit's success line contains
+    # (otp-unit-etc-cups.service does not contain it as a substring).
+    if grep -qF "Started otp-unit.service" "$CONSOLE_TXT" 2>/dev/null; then
         printf 'IMG-CHECK unit-started PASS\n'
     else
         printf 'IMG-CHECK unit-started FAIL\n'
     fi
     for bad in "status=216" "Failed with result" "Scheduled restart job" \
                "Kernel panic" "Unable to mount root"; do
-        if grep -qF -- "$bad" "$CONSOLE_ALL" 2>/dev/null; then
+        if grep -qF -- "$bad" "$CONSOLE_TXT" 2>/dev/null; then
             printf 'IMG-CHECK no-%s FAIL\n' "$(printf '%s' "$bad" | tr ' =' '--')"
         fi
     done
@@ -347,7 +377,7 @@ KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_ALL" 2>/dev/n
     # never reached userspace at all, matching a flag this harness itself
     # added. Only PID 1 writes "systemd[1]:".
     for want in "Linux version" "systemd[1]:" "Reached target"; do
-        if grep -qF -- "$want" "$CONSOLE_ALL" 2>/dev/null; then
+        if grep -qF -- "$want" "$CONSOLE_TXT" 2>/dev/null; then
             printf 'IMG-CHECK %s PASS\n' "$(printf '%s' "$want" | tr ' ' '-')"
         else
             printf 'IMG-CHECK %s FAIL\n' "$(printf '%s' "$want" | tr ' ' '-')"
@@ -360,7 +390,8 @@ cat "$VERDICT"
 # on nowhere, so a run killed by the timeout still reported success.
 if [ "$QEMU_RC" != 0 ]; then
     echo "qemu exited $QEMU_RC (124 = killed by the ${TIMEOUT}s timeout)" >&2
-    tail -n 100 "$CONSOLE_ALL" >&2
+    echo "--- last 100 lines (ANSI stripped; uart0 is the real console) ---" >&2
+    tail -n 100 "$CONSOLE_TXT" >&2
     exit 1
 fi
 if grep -q "FAIL" "$VERDICT"; then
@@ -373,8 +404,8 @@ if grep -q "FAIL" "$VERDICT"; then
         echo "at ~${LAST_TS:-?}s guest time. The console ends at the" >&2
         echo "reset instant." >&2
     fi
-    echo "--- last 100 console lines ---" >&2
-    tail -n 100 "$CONSOLE_ALL" >&2
+    echo "--- last 100 console lines (ANSI stripped) ---" >&2
+    tail -n 100 "$CONSOLE_TXT" >&2
     exit 1
 fi
 log "the image boots and the unit starts"

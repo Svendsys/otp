@@ -377,6 +377,19 @@ systemctl enable cups.service 2>/dev/null || true
 # SD card, and the SD card is the whole device.
 systemctl enable getty@tty2.service 2>/dev/null || true
 
+# Raspberry Pi OS's first-boot user wizard (userconf-pi) decides whether
+# to prompt from get_boot_cli alone: on a console-boot image it goes
+# INTERACTIVE on every boot until someone answers a whiptail on tty8,
+# holding multi-user.target open forever ("no limit"). pi-gen's
+# DISABLE_FIRST_BOOT_USER_RENAME=1 only deletes the DESKTOP wizard's
+# autostart file; it never touches this service, so tier 3 caught the
+# built image parked on it -- and a flashed device would boot the same
+# way, a dialog nobody can see holding the boot open. The user this
+# wizard exists to create already exists (pi-gen's FIRST_USER_NAME, or
+# whoever ran this script). Mask rather than disable so a package
+# update's postinst cannot re-enable it.
+systemctl mask userconfig.service 2>/dev/null || true
+
 if [ "$IMAGE_BUILD" -eq 0 ]; then
     log "Done. Reboot to start the unit."
     cat <<'EOF'
