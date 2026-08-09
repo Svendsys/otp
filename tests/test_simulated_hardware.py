@@ -274,7 +274,7 @@ class TestTheUnattendedSequenceAgainstRealCups:
         assert cupsrig.shipped_directives().get("MaxJobs"), \
             "install.sh no longer sets MaxJobs; this test is not testing it"
         result, cups, queue = self.run_it(rig)
-        settle(cups, queue, seconds=60)
+        assert settle(cups, queue, seconds=60), "the queue never drained"
         titles = rig.titles()
         assert result == 0, f"sequence failed; printed {titles}"
         assert titles == ["OTP status", "TABULA RECTA", "OTP A",
@@ -290,12 +290,12 @@ class TestTheUnattendedSequenceAgainstRealCups:
         """
         rig.fail_jobs(True)
         result, cups, queue = self.run_it(rig)
-        settle(cups, queue, seconds=60)
+        assert settle(cups, queue, seconds=60), "the queue never drained"
         assert result == 1, "a tray that printed nothing was called a pair"
 
     def test_no_key_material_is_left_in_the_spool_afterwards(self, rig):
         result, cups, queue = self.run_it(rig)
-        settle(cups, queue, seconds=60)
+        assert settle(cups, queue, seconds=60), "the queue never drained"
         leftover = [path for path in rig.spool_files()
                     if b"SILENT" in path.read_bytes()
                     or b"OSPREY" in path.read_bytes()]
@@ -308,7 +308,7 @@ class TestTheUnattendedSequenceAgainstRealCups:
         writes: not job.cache, not printers.conf, not a log.
         """
         result, cups, queue = self.run_it(rig)
-        settle(cups, queue, seconds=60)
+        assert settle(cups, queue, seconds=60), "the queue never drained"
         rig.stop()                               # flushes job.cache
         hits = []
         for path in rig.root.rglob("*"):
@@ -403,6 +403,22 @@ class TestTheRigCanActuallyFail:
             "invocations": rig.backend_invocations(),
             "printed": rig.printed(),
         }
+
+    def test_every_mode_is_shape_checked_or_excused(self, rig):
+        """
+        SHAPES must keep pace with FAILURE_MODES, or a mode added later is
+        one the docstring above claims to cover and does not.
+
+        `retry-current` is the standing exception and cannot have a shape:
+        set_failure refuses it without `until`, and with `until` the fault
+        CLEARS, so by design it ends up looking exactly like a clean print.
+        What distinguishes it is the invocation count, which
+        test_a_transient_that_clears_is_not_left_looking_like_a_fault
+        asserts instead.
+        """
+        excused = {"retry-current"}
+        missing = set(cupsrig.CupsRig.FAILURE_MODES) - set(self.SHAPES) - excused
+        assert not missing, f"failure modes with no asserted shape: {missing}"
 
     @pytest.mark.parametrize("mode", sorted(SHAPES))
     def test_each_mode_has_the_shape_it_claims(self, rig, mode):
@@ -526,10 +542,17 @@ class TestAFailedCopyIsNeverReportedAsAPair:
         result = unattended.run(cups, settings=self.sequence_settings(),
                                 queue=queue, log=lambda *_: None,
                                 sleep=time.sleep)
-        settle(cups, queue, seconds=60)
+        assert settle(cups, queue, seconds=60), "the queue never drained"
         titles = rig.titles()
         assert result == 1, f"a run that lost copy B returned 0; got {titles}"
-        assert "OTP A" in titles, titles
+        # BOTH, and this is the point: `after=4 until=5` is only aimed at
+        # copy B if the sequence is the six sheets it is documented to be.
+        # Moving the window one earlier kills the separator instead, copy B
+        # is never submitted at all, and `result == 1` plus "OTP A" is
+        # still satisfied -- a green test for a different failure. Found by
+        # the review panel.
+        assert titles == ["OTP status", "TABULA RECTA", "OTP A",
+                          "REMOVE COPY A", "OTP B", "WHAT TO DO NOW"], titles
 
     def test_the_final_sheet_says_what_did_and_did_not_reach_paper(self, rig):
         """
@@ -542,7 +565,7 @@ class TestAFailedCopyIsNeverReportedAsAPair:
         rig.set_failure("media-empty", after=4, until=5)
         unattended.run(cups, settings=self.sequence_settings(), queue=queue,
                        log=lambda *_: None, sleep=time.sleep)
-        settle(cups, queue, seconds=60)
+        assert settle(cups, queue, seconds=60), "the queue never drained"
         final = [data for title, data in rig.printed()
                  if title == "WHAT TO DO NOW"]
         assert final, f"no final sheet reached paper; got {rig.titles()}"
@@ -567,7 +590,7 @@ class TestAFailedCopyIsNeverReportedAsAPair:
         result = unattended.run(cups, settings=self.sequence_settings(),
                                 queue=queue, log=lambda *_: None,
                                 sleep=time.sleep)
-        settle(cups, queue, seconds=60)
+        assert settle(cups, queue, seconds=60), "the queue never drained"
         got = dict(rig.printed())
         assert result == 1, f"a jammed copy B returned 0; got {rig.titles()}"
         assert "OTP A" in got and "OTP B" in got
@@ -592,7 +615,7 @@ class TestAFailedCopyIsNeverReportedAsAPair:
         result = unattended.run(cups, settings=self.sequence_settings(),
                                 queue=queue, log=lambda *_: None,
                                 sleep=time.sleep)
-        settle(cups, queue, seconds=60)
+        assert settle(cups, queue, seconds=60), "the queue never drained"
         assert result == 0, rig.titles()
         final = dict(rig.printed())["WHAT TO DO NOW"]
         assert "YOU NOW HAVE A PAD PAIR" in sheet_text(final)
@@ -634,7 +657,7 @@ class TestThePanelAgainstAFailingPrinter:
         """OK once the tray is clear, exactly as the footer instructs."""
         from otpunit.hw.buttons import Press
 
-        settle(cups, queue, seconds=60)
+        assert settle(cups, queue, seconds=60), "the queue never drained"
         return screen.press(app, Press.OK)
 
     def drive_a_pair(self, rig, tmp_path):
@@ -690,9 +713,22 @@ class TestThePanelAgainstAFailingPrinter:
         app, screen, cups, queue = self.panel(rig, tmp_path)
         screen.press(app, Press.OK)
         assert screen.stage == "printing"
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and cups.active_jobs(queue) != 1:
+        # Waits for the STOP to LAND, not for the job to appear. A merely
+        # spooled job already satisfies active_jobs == 1, so waiting on
+        # that exited 8ms after submit -- before the backend had run --
+        # and the test passed with the `stop` branch replaced by `exit 0`.
+        # Found by the review panel; the first CI run then failed on the
+        # other side of the same race, with a transient filter DEBUG line
+        # standing in for the fault.
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            reported = cups.printer_fault(queue) or ""
+            if "disabled" in reported.lower():
+                break
             time.sleep(0.2)
+        assert "disabled" in (cups.printer_fault(queue) or "").lower(), \
+            "the queue never stopped; this test would prove nothing"
+
         screen.press(app, Press.OK)
         assert screen.stage == "waiting", screen.stage
         assert not screen.queue_unknown, \
@@ -718,7 +754,7 @@ class TestThePanelAgainstAFailingPrinter:
 
         app, screen, cups, queue = self.panel(rig, tmp_path)
         screen.press(app, Press.OK)
-        settle(cups, queue, seconds=60)
+        assert settle(cups, queue, seconds=60), "the queue never drained"
         rig.stop()                               # the daemon goes away
         screen.press(app, Press.OK)
         assert screen.stage == "waiting" and screen.queue_unknown

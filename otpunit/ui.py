@@ -642,7 +642,21 @@ class RunJob(Screen):
             # will never print. The way out (hold for BACK) exists and is
             # deliberate, but an operator has to know to take it, and the
             # printer has been saying why the whole time.
-            self.queue_fault = self._fault(app) if state == "busy" else ""
+            # DISABLED only, not any passing state message. cupsd puts
+            # transient filter chatter in printer-state-message while a job
+            # runs -- measured by the review panel, mid-print, on a healthy
+            # queue: "DEBUG: cfFilterChain: universal (PID 21339) exited
+            # with no errors." A busy queue is precisely when that is
+            # there, so reporting whatever printer_fault says would put
+            # PRINTER STOPPED on the panel of a printer that is working
+            # perfectly. It did, on the first CI run of this change.
+            #
+            # The stranding case this exists for is the STOPPED queue, and
+            # cupsd says that in the header line -- which is the line
+            # printer_fault returns verbatim when it contains "disabled".
+            # Nothing transient can produce it.
+            fault = self._fault(app) if state == "busy" else ""
+            self.queue_fault = fault if "disabled" in fault.lower() else ""
             self.stage = "waiting"
             return self
         # A drained queue is necessary but NOT sufficient, and this screen

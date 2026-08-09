@@ -185,8 +185,9 @@ jobs:
           # worse than a red one; that is the premise of this whole PR.
           #
           # 33, raised from 12 when the rig learned to FAIL. The CUPS half
-          # is now 35 tests (8 print path + 4 unattended + 11 failure-mode
-          # shapes + 7 failed-copy + 5 panel), and the four kernel
+          # is now 37 tests (8 print path + 4 unattended + 12 failure-mode
+          # shapes + 7 failed-copy + 5 panel + the shipped-config check,
+          # which the first count of this forgot), and the four kernel
           # simulators add 7 more where the runner's kernel has them.
           # Measured on a runner-shaped container: 37 passed, 7 skipped for
           # absent simulators, 176s. The floor sits just under the CUPS
@@ -196,7 +197,7 @@ jobs:
           echo "harness tests passed: ${PASSED:-0}"
           if [ "${PASSED:-0}" -lt 33 ]; then
             echo "expected at least 33 passing harness tests (the CUPS rig" >&2
-            echo "alone is 35); got ${PASSED:-0}. Something skipped silently." >&2
+            echo "alone is 37); got ${PASSED:-0}. Something skipped silently." >&2
             grep -E "^SKIPPED" /tmp/harness.log >&2 || true
             exit 1
           fi
