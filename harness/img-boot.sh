@@ -46,15 +46,14 @@
 #
 # A reset at a fixed guest time regardless of boot progress is a TIMER:
 # armed early, firing ~10 seconds later -- the shape of a hardware
-# watchdog. Two built-in drivers probe QEMU's incomplete device models
-# inside the arming window: the bcm2835-pm watchdog/power cluster
-# (whose power-domain child read garbage from the stub ASB -- "register
-# ID returned 0x00000000" at ~2.2s) and dwc_otg ("Init: Power Port" at
-# ~2.0s). The -append below blacklists both initcalls; if the reset
-# stops, one of them armed it, and a 3-minute cached run can later say
-# which. Whether the blacklist TOOK is visible in the console: no "FIQ
-# FSM" lines means dwc_otg was skipped, no ASB line means bcm2835-pm
-# was. See issue #17.
+# watchdog. Run 6 blacklisted both suspects (bcm2835-pm and dwc_otg) and
+# the reset STOPPED -- first run ever where qemu outlived 40 seconds.
+# Run 7 blacklisted bcm2835-pm alone: kernel entered once, no reset,
+# 31.6s of guest time reached, systemd running, targets reached --
+# CONFIRMED. The armer is the bcm2835-pm watchdog/power cluster probing
+# QEMU's partial PM model (the same probe whose ASB read returned
+# garbage at ~2.2s); dwc_otg is innocent and boots normally. The reset
+# was never the image's fault. See issue #17.
 #
 # WHAT THIS CATCHES that the other tiers do not: whether the artifact
 # BOOTS. pi-gen assembles a filesystem and never starts it; tier 2 boots a
@@ -200,29 +199,19 @@ set +e
 # a reboot loop, and the performance story died with it. 7 keeps INFO and
 # drops only DEBUG.
 #
-# initcall_blacklist: bcm2835_pm_driver_init, and the run history of why.
-#
-# Blacklisting BOTH bcm2835-pm and dwc_otg stopped the reset -- qemu
-# stayed alive 270+ seconds where every prior run died inside 40 -- but
-# the boot then stalled silently a few guest-seconds in, output flat,
-# which is what rootwait polling for a card that never enumerated looks
-# like. So one of the two armed the watchdog and the other is needed by
-# the boot. This revision keeps ONLY the bcm2835-pm blacklist, on the
-# mechanism argument: the PM block demands a 0x5a-password on every
-# write, its power-domain child writes passworded values against QEMU's
-# partial model (the garbage ASB read at ~2.2s is that same probe), and
-# a passworded write landing where the model keeps WDOG is an armed
-# watchdog. dwc_otg has no such path to the PM block.
-#
-#   - reset gone AND boot proceeds => bcm2835-pm was the armer; dwc_otg
-#     innocent and restored. Solved.
-#   - reset returns => the armer was dwc_otg after all; swap the names.
-#   - reset gone, boot still stalls => the stall belongs to the pm
-#     blacklist itself (genpd consumers deferring); different problem,
-#     now isolated.
+# initcall_blacklist=bcm2835_pm_driver_init -- THE FIX for the ~11.5s
+# reset, confirmed by bisection (runs 6 and 7; see the header). The PM
+# block demands a 0x5a password on every write; the pm cluster's
+# power-domain child writes passworded values against QEMU's partial
+# model of that block, and one of them lands where the model keeps its
+# watchdog. Skipping the driver's initcall means nothing ever touches
+# the emulated PM block, so nothing arms it. dwc_otg was bisected
+# innocent and boots normally.
 #
 # An emulation accommodation of the same kind as -append itself: the
-# DEVICE still boots this driver, and this harness says so.
+# DEVICE still boots this driver -- on real hardware the PM block is
+# real and the writes are correct -- and this harness says so rather
+# than pretending the emulated boot is identical.
 #
 # One console on the kernel command line; BOTH captured below. Under
 # -M raspi3b, ttyAMA0 comes out of the SECOND -serial, not the first --

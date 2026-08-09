@@ -244,17 +244,18 @@ jobs:
       # safe, so a red boot costs nothing, and the boot can therefore be
       # honest about failing.
       #
-      # CAPPED AT SIX MINUTES, and that cap is a policy rather than an
-      # estimate. The budget for a cached run is ten minutes end to end;
-      # restoring and decompressing the image takes about one, so this is
-      # what is left. A boot that cannot come up inside six minutes of
-      # emulation is a boot this tier will report as failing -- which is a
-      # deliberate choice, not an oversight. If the image genuinely needs
-      # longer, that is a finding about the image, and the console-growth
-      # sampling in img-boot.sh will say whether it was progressing.
+      # 480 seconds, which spends the whole ten-minute budget on the boot
+      # after ~2 minutes of restore/decompress overhead. The bisect run
+      # proved the boot alive and progressing at 31.6s guest when the old
+      # 360s cap cut it -- systemd up, targets reached, the unit not yet
+      # started. Busy boot phases run ~11x slower than wall under TCG but
+      # idle waits advance at near wall speed, so 480 is expected to reach
+      # the unit; if it does not, the verdict's "guest reached" line says
+      # whether it was still moving, and THAT is the moment to consider
+      # masking services rather than raising the number again.
       - name: Boot the image
         env:
-          OTP_IMG_TIMEOUT: 360
+          OTP_IMG_TIMEOUT: 480
         run: |
           # apt-get update FIRST. The runner image ships an apt index that
           # is days stale, and qemu had moved 8.2.2-0ubuntu1.17 -> .18, so
