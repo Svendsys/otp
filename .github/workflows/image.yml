@@ -331,14 +331,22 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: image/deploy/*.img.xz
-          # Appended, so nothing already on the release is replaced. What
-          # the gate does and does not prove is the reader's business:
-          # img-boot.sh's header is explicit that QEMU's raspi3b is a Pi
-          # with nothing plugged into it -- no OLED, no buttons, no
-          # printer -- so a green tier 3 says the image comes up and the
-          # unit starts, and says nothing at all about the peripherals.
-          append_body: true
-          body: |
+          # SET, not appended, and deliberately so after reading the
+          # action's source. `append_body` is consulted only on the UPDATE
+          # path (src/github.ts: `input_append_body && workflowBody &&
+          # existingReleaseBody`); createRelease() ignores it. So on the
+          # first tag run -- the only run that matters, and the only one
+          # this repository has, since nothing else here creates a release
+          # -- it does nothing, and on a re-run or a workflow_dispatch
+          # against the same tag it would append this paragraph a second
+          # and third time. Plain `body` is idempotent, which is the
+          # behaviour a re-runnable workflow wants.
+          #
+          # A folded scalar, so the note reaches GitHub as one paragraph:
+          # release bodies render hard line breaks, and a block scalar
+          # would ship this at whatever width it happens to be wrapped to
+          # in this file.
+          body: >
             This image passed the tier-3 boot gate: it was booted under
             QEMU and `otp-unit.service` reached `Started`. That gate does
             not exercise the OLED, the buttons or a printer -- see the
