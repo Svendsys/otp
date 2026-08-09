@@ -54,25 +54,38 @@
 # QEMU's partial PM model (the same probe whose ASB read returned
 # garbage at ~2.2s). The reset was never the image's fault.
 #
-# Runs 7-9 then chased a SECOND, distinct fault. Every run froze at
-# the SAME EVENT -- the audit record for systemd-remount-fs success, at
-# 29.5-31.6s guest -- and run 9's sampler settled the mechanism: the
-# guest reached that point in under 60 WALL seconds (half real-time;
-# TCG speed was never the problem, and run 8's "raise the cap" push
-# bought nothing because a frozen guest does not need more time), then
-# wrote nothing for seven minutes. Run 9 froze there with dwc_otg
-# blacklisted, acquitting it of this too. The tell is a line missing
-# from EVERY run's console: "random: crng init done". The CRNG never
-# initializes -- an emulated Pi presents no credited entropy source --
-# so the first blocking getrandom() in the sysinit window hangs
-# forever. Run 10 fixed nothing because its modules_load= was a typo
-# for systemd's modules-load= and was silently ignored; it did move
-# the freeze boundary one unit later, proving the freeze belongs to
-# the WINDOW (where random-seed and journal-flush run), not to one
-# unit. The fix trio on -append: modules-load= the BCM2835 RNG driver
-# (QEMU models the device; no console has ever shown it probing),
-# credit it via rng_core.default_quality=, and trust_bootloader for
-# any /chosen seed. See issue #17.
+# Runs 7-11 then chased a SECOND fault that turned out not to exist.
+# Every run "froze" silently at ~29.5-31.6s guest, always at the same
+# structural moment -- journald just started -- and three theories died
+# against it in sequence: dwc_otg wedging coldplug (run 9 froze without
+# it), TCG slowness (the sampler showed the guest reaching 29.5s in
+# under 60 wall seconds, then NOTHING for seven minutes), and an
+# entropy stall, argued from "random: crng init done" being absent in
+# every console -- a claim that was an artifact of reading job-log
+# TAILS that begin after 8s guest, past where that line prints.
+#
+# The real fault was the harness's own console choice. On this DTB the
+# PL011 is ttyAMA1 (serial0/stdout-path point at the mini-UART, whose
+# bcm2835-aux driver fails to probe under QEMU), so console=ttyAMA0
+# named a device that does not exist. No real console ever registered:
+# kernel printk kept flowing only because the earlycon BOOTCONSOLE on
+# the mini-UART is never handed off, and userspace's /dev/console was
+# ENODEV. The moment journald started, PID 1 moved its logging into
+# the journal, the audit stream redirected to journald, and unit
+# status lines went to the dead console -- output stopped forever, AT
+# EXACTLY THAT HANDOFF IN EVERY RUN, while the boot continued
+# invisibly underneath. The "wedge" was a blindfold.
+#
+# Proven locally before being trusted, with the image's own kernel
+# (6.12.96+rpt-rpi-v8), its own DTB, and CI's QEMU (8.2.2): with
+# console=ttyAMA1 a busybox initramfs is fully visible, getrandom()
+# unblocks at 3.4s (crng init at 2.4s -- entropy was always fine, so
+# the rng_core/modules-load/trust_bootloader params runs 10-11 added
+# are gone again), the machine outlives the old 11.5s watchdog point
+# with the pm blacklist in place, and a replay of udev coldplug --
+# modprobe of every /sys modalias, the exact activity the freeze was
+# blamed on -- completes all 41 probes in 19.3s guest with zero hangs.
+# See issue #17.
 #
 # WHAT THIS CATCHES that the other tiers do not: whether the artifact
 # BOOTS. pi-gen assembles a filesystem and never starts it; tier 2 boots a
@@ -197,12 +210,12 @@ fi
 # device name beats depending on which revision of cmdline.txt this build
 # happened to produce.
 log "Booting under -M raspi3b (this is emulated, not KVM -- allow minutes)"
-# BOTH UARTs, captured separately. A Pi 3 has two -- the PL011 (ttyAMA0)
-# and the mini-UART (ttyS0) -- and which one -serial #1 lands on is exactly
-# the kind of thing to have backwards. The first run captured one port and
-# got a completely empty file, which is indistinguishable from "the kernel
-# never ran". Capturing both, and reporting how many bytes each produced,
-# tells the difference on the next run rather than the one after that.
+# BOTH UARTs, captured separately. A Pi 3 has two, and the measured QEMU
+# mapping is: FIRST -serial = the PL011 (which this DTB names ttyAMA1),
+# SECOND -serial = the mini-UART, where the earlycon bootconsole lives.
+# For six runs the first file's stubborn 0 bytes was itself the clue
+# nobody read: the PL011 never emitted because no console= ever named
+# it. Capturing both is what eventually made the mapping provable.
 CONSOLE2="$WORK/console-uart1.log"
 CONSOLE_ALL="$WORK/console-all.log"
 : > "$CONSOLE"
@@ -218,60 +231,41 @@ set +e
 # a reboot loop, and the performance story died with it. 7 keeps INFO and
 # drops only DEBUG.
 #
-# initcall_blacklist, two entries for two distinct crimes:
+# initcall_blacklist, two entries, one conviction:
 #
 #   bcm2835_pm_driver_init -- THE ~11.5s RESET, confirmed by bisection
-#   (runs 6/7). The PM block demands a 0x5a password on every write; the
-#   pm cluster writes passworded values against QEMU's partial model,
-#   and one lands where the model keeps its watchdog.
+#   (runs 6/7) and re-verified in the local rig (alive past 15s with
+#   this blacklisted; runs 1-5 without it reset at ~11.5s every time).
+#   The PM block demands a 0x5a password on every write; the pm
+#   cluster writes passworded values against QEMU's partial model, and
+#   one lands where the model keeps its watchdog. An emulation
+#   accommodation: the DEVICE boots this driver against real hardware.
 #
-#   dwc_otg_driver_init -- accused of the post-remount-fs wedge after
-#   runs 7/8, ACQUITTED by run 9, which froze at the same event with
-#   this blacklisted. It stays blacklisted for now so the entropy fix
-#   below lands against run 9's exact baseline -- one variable at a
-#   time -- but a driver convicted of nothing should boot: once the
-#   image reaches unit-started, restoring this is the next experiment.
+#   dwc_otg_driver_init -- convicted of NOTHING. Accused of the
+#   watchdog (bisected innocent, run 7), then of a coldplug wedge that
+#   turned out to be the console blindfold above. It stays blacklisted
+#   solely so the console fix lands against run 11's exact baseline;
+#   restoring it is the first follow-up once the boot is green.
 #   Blacklisted, the emulated boot has no USB, which the unit is
 #   designed to survive (unattended mode is the default; tier 1 covers
 #   keyboard detection with a real uinput device).
 #
-# rng_core.default_quality=1000 modules-load=bcm2835_rng
-# random.trust_bootloader=on -- THE WEDGE FIX (runs 7-10; see the
-# header). No run has ever printed "random: crng init done": the CRNG
-# never initializes, and every run freezes silently in the sysinit
-# window where systemd-random-seed and journal-flush run -- the exact
-# boundary drifts by one unit between runs (remount-fs in 7-9,
-# tmpfiles-setup-dev-early in 10), so it is the window, not one unit,
-# and the blocked call is whichever getrandom() comes first. Three
-# levers, one target, one observable (crng init done + progress past
-# 30s guest): load the driver for the BCM2835 hardware RNG that QEMU
-# models (modules-load= -- WITH THE DASH; run 10 spelled it
-# modules_load= and systemd ignored it without a word), credit what it
-# reads (rng_core.default_quality), and trust a bootloader-provided
-# seed if QEMU injects one into /chosen (random.trust_bootloader,
-# inert if absent). Zero bcm2835-rng lines in any console at loglevel 7
-# says the driver never probed -- not builtin, not loaded -- which is
-# why the module load is the load-bearing lever. Real hardware seeds
-# itself from firmware and the SoC RNG and needs none of these.
-#
-# All of these are emulation accommodations of the same kind as -append
-# itself: the DEVICE boots every one of these drivers against real
-# hardware, and this harness says so rather than pretending the
-# emulated boot is identical.
-#
-# One console on the kernel command line; BOTH captured below. Under
-# -M raspi3b, ttyAMA0 comes out of the SECOND -serial, not the first --
-# measured: uart0=0 bytes, uart1=175525. An earlier comment claimed the
-# opposite while citing the run that proved it. It kept working only
-# because both ports are captured and the verdict greps the
-# concatenation.
+# console=ttyAMA1 because that is what the PL011 is CALLED under this
+# DTB's aliases -- serial0 and stdout-path point at the mini-UART,
+# whose driver does not probe under QEMU, and ttyAMA0 does not exist.
+# Six runs diagnosed a "boot freeze" that was this parameter naming a
+# nonexistent device (see the header). Both ports are still captured
+# and the verdict greps the concatenation, so early bootconsole lines
+# (mini-UART, second file) and the real console (PL011, first file)
+# both land in evidence.
 #
 # systemd.show_status=1 because "Started OTP pad print unit" and
-# "Reached target" are systemd status lines, not kernel output.
+# "Reached target" are systemd status lines, not kernel output -- and
+# they need the WORKING console above to reach the capture at all.
 timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -M raspi3b -m 1024 \
     -kernel "$KERNEL" -dtb "$DTB" \
-    -append "rw earlycon loglevel=7 console=ttyAMA0,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init,dwc_otg_driver_init rng_core.default_quality=1000 modules-load=bcm2835_rng random.trust_bootloader=on root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
+    -append "rw earlycon loglevel=7 console=ttyAMA1,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init,dwc_otg_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
     -drive "file=$IMG,if=sd,format=raw" \
     -serial "file:$CONSOLE" \
     -serial "file:$CONSOLE2" \
@@ -292,11 +286,11 @@ while kill -0 "$QEMU_PID" 2>/dev/null; do
     NOW=$(wc -c < "$CONSOLE" 2>/dev/null || echo 0)
     NOW2=$(wc -c < "$CONSOLE2" 2>/dev/null || echo 0)
     # Host-side CPU%% of the emulator, because flat output alone cannot
-    # distinguish the two kinds of stuck: a guest idle-waiting on
-    # something that will never arrive (qemu near 0%%) and a guest or
-    # emulator spinning in place (qemu pegged). Runs 6-10 all went flat
-    # at ~30s guest and this column is what finally tells those apart.
-    CPU=$(ps -o %cpu= -p "$QEMU_PID" 2>/dev/null | tr -d ' ' || echo '?')
+    # distinguish a guest idle-waiting (near 0%%) from one spinning in
+    # place (pegged). $QEMU_PID is the timeout(1) wrapper, so sample its
+    # CHILD -- run 11 sampled the wrapper itself and printed a solemn
+    # column of 0.0%% while the guest was demonstrably executing.
+    CPU=$(ps -o %cpu= --ppid "$QEMU_PID" 2>/dev/null | head -1 | tr -d ' ' || true)
     printf '   %4ss  uart0=%-8s (+%-6s) uart1=%-8s qemu-cpu=%s%%\n' \
            "$ELAPSED" "$NOW" "$((NOW - LAST))" "$NOW2" "${CPU:-?}" >&2
     LAST=$NOW
