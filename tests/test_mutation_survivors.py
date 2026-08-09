@@ -290,6 +290,7 @@ class TestTheArgvHandedToLp:
         assert argv.count("-o") == 2
         assert "media=A4" in argv and "sides=one-sided" in argv
 
+    @pytest.mark.real_cups_runner
     def test_every_cups_call_is_bounded_by_a_timeout(self, monkeypatch):
         """
         A wedged cupsd must not block the UI forever with the key buffer

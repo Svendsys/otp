@@ -315,6 +315,8 @@ class RunJob(Screen):
         # Whether the last queue query came back unanswerable, so the
         # waiting screen can say which of the two situations it is.
         self.queue_unknown = False
+        # What the printer said while the queue stayed busy, if anything.
+        self.queue_fault = ""
 
     def _total_pages(self) -> int:
         """Units the progress callback counts in, for this job kind."""
@@ -375,6 +377,17 @@ class RunJob(Screen):
             outstanding = "A" if self.job and self.job.copies_done < 2 else "B"
             subject = (f"COPY {outstanding}"
                        if self.spec.carries_key_material else "THE JOB")
+            if self.queue_fault:
+                # The queue is busy AND the printer is complaining, which
+                # is what a stopped queue looks like: the job will sit
+                # there until someone deals with the printer. Saying STILL
+                # PRINTING here is not a guess, it is wrong.
+                return Frame(
+                    title="PRINTER STOPPED",
+                    lines=wrap(self.queue_fault, lines=2)
+                          + ["", f"{subject} IS STUCK."],
+                    footer="OK RECHECK  HOLD STOP",
+                )
             if self.queue_unknown:
                 # "STILL PRINTING" would be a guess, not a report. An
                 # unanswerable query is deliberately counted as busy, so
@@ -621,6 +634,15 @@ class RunJob(Screen):
         state = self.queue_state(app)
         self.queue_unknown = state == "unknown"
         if state != "idle":
+            # A busy queue is not necessarily a working one. Under
+            # CUPS_BACKEND_STOP -- an open cover, or a printer that reports
+            # an empty tray properly -- cupsd stops the queue and KEEPS the
+            # job, so active_jobs stays above zero for ever and this screen
+            # said STILL PRINTING / OK TO CHECK AGAIN at a printer that
+            # will never print. The way out (hold for BACK) exists and is
+            # deliberate, but an operator has to know to take it, and the
+            # printer has been saying why the whole time.
+            self.queue_fault = self._fault(app) if state == "busy" else ""
             self.stage = "waiting"
             return self
         # A drained queue is necessary but NOT sufficient, and this screen
@@ -633,15 +655,30 @@ class RunJob(Screen):
         # false success the whole printer_fault mechanism exists to stop,
         # and only the unattended path was ever wired to it.
         #
-        # Deliberately here and not in _proceed(). confirm_continue is the
-        # operator's manual override for a cupsd that cannot be asked at
-        # all -- and a cupsd that cannot be asked cannot report a fault
-        # either, so routing that path through this check would only ever
-        # cost them their one non-destructive way out.
+        # On the `idle` branch, which is where the queue result is
+        # interpreted. The confirm_continue override is unaffected either
+        # way and the review panel was right to say so: active_jobs and
+        # printer_fault both go through Cups._run_text, so a daemon that
+        # cannot answer one cannot answer the other, and queue_unknown
+        # already implies no fault. The placement is therefore a matter of
+        # where the reasoning belongs, not a safety property -- and the
+        # test that pins it says the same, rather than pretending to
+        # reproduce a combination the real Cups cannot produce.
         fault = self._fault(app)
         if fault:
             self.stage = "error"
             self.error = fault
+            # Banked presses, discarded -- the same reason _print_copy
+            # drains on ITS error path. Getting here means two lpstat
+            # subprocesses have just run while the operator was looking at
+            # `printing`, whose footer invites exactly the repeated OK this
+            # screen's own comments warn about. A press banked during those
+            # calls is replayed against the ERROR frame the instant it is
+            # drawn, and ERROR's handler wipes and returns HOME: the panel
+            # flashes the fault for one cycle and the operator is back at
+            # the menu with the key gone, never having read DESTROY
+            # PRINTED PAGES. Found by the review panel.
+            _drain(app)
             return self
         return self._proceed(app)
 

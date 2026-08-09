@@ -568,16 +568,112 @@ class TestADrainedQueueIsNotProofOfPrinting:
             screen.press(app, Press.OK)
         assert screen.stage == "done"
 
+    def test_a_banked_press_cannot_dismiss_the_fault_unread(self):
+        """
+        Getting to this screen costs two lpstat subprocesses, and the
+        operator spends them looking at `printing`, whose footer is OK WHEN
+        TRAY IS CLEAR. A second tap during that wait is banked by
+        GpioButtons and replayed against whatever is drawn next -- and
+        ERROR's handler wipes the key and returns HOME. The panel would
+        flash the fault for one cycle and drop them at the menu having
+        never read DESTROY PRINTED PAGES.
+
+        _print_copy has drained on its error path since round three. This
+        is the same hazard on the path added with the fault check.
+        """
+        cups = self.Reporting(after=1)
+        app = make_app([])
+        app.cups = cups
+        settings = config.Settings(pages=2)
+        screen = ui.RunJob(jobs.JobSpec(jobs.JobKind.PAD_PAIR, "SILENT-OSPREY",
+                                        settings))
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)              # -> swap
+        screen.press(app, Press.OK)              # -> copy B
+        app.buttons.push(Press.OK, Press.OK)     # impatient taps
+        screen.press(app, Press.OK)
+        assert screen.stage == "error"
+        assert app.buttons.wait(timeout=0) is None, \
+            "a banked press survived and will dismiss the fault unread"
+
+    def test_a_stopped_queue_is_not_reported_as_still_printing(self):
+        """
+        CUPS_BACKEND_STOP -- an open cover, or a printer that reports an
+        empty tray properly -- stops the queue and KEEPS the job, so
+        active_jobs never reaches zero. The panel said STILL PRINTING / OK
+        TO CHECK AGAIN at a printer that would never print, while the
+        printer had been saying why the whole time.
+        """
+        class Stopped(RecordingCups):
+            def active_jobs(self, name="OTP"):
+                return 1
+
+            def printer_fault(self, name="OTP"):
+                return "printer OTP disabled since Sun - tray open"
+
+        app, screen = self._screen(Stopped())
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "waiting"
+        shown = "\n".join(screen.frame(app).rendered()).upper()
+        assert "STILL PRINTING" not in shown, shown
+        assert "TRAY OPEN" in shown or "DISABLED" in shown, shown
+        # And the non-destructive retry must survive: this screen is not a
+        # trap, it is a report.
+        assert "HOLD" in shown
+
+    def test_a_busy_queue_with_no_fault_still_says_still_printing(self):
+        # The control for the screen above.
+        class Busy(RecordingCups):
+            def active_jobs(self, name="OTP"):
+                return 1
+
+        app, screen = self._screen(Busy())
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert "STILL PRINTING" in "\n".join(screen.frame(app).rendered())
+
+    def test_the_simulator_never_shells_out_to_a_real_printer(self):
+        """
+        `--sim` runs as a real process outside pytest, so the conftest
+        guard does not protect it. SimulatedCups must override every method
+        that would otherwise reach the host -- and printer_fault was the
+        one that got missed, so `--sim` on the unit itself, or on any dev
+        box that has run install.sh, reported the REAL OTP queue's fault
+        over a simulated pad that reached no printer at all.
+        """
+        from otpunit.__main__ import SimulatedCups
+
+        for name in ("devices", "ensure_queue", "submit", "active_jobs",
+                     "printer_fault", "purge"):
+            assert name in vars(SimulatedCups), (
+                f"SimulatedCups inherits {name}() from Cups, which shells "
+                f"out to the host's CUPS")
+
+    def test_a_cups_double_cannot_fall_through_to_the_host(self):
+        """
+        The conftest guard, pinned. Every double here is built as
+        `Cups(run=None)`, which means "use the real subprocess runner", so
+        any method left unstubbed reaches the host's lp or lpstat. That was
+        harmless only while nothing in the fast path called one -- and then
+        printer_fault did, and eleven tests failed on a machine whose real
+        OTP queue happened to be reporting a fault.
+        """
+        with pytest.raises(OSError, match="must not run"):
+            printer.Cups._subprocess_run(["/usr/bin/lpstat", "-p", "OTP"])
+
     def test_the_unanswerable_queue_keeps_its_manual_override(self):
         """
-        The override this must not break.
+        The override, pinned -- but honestly.
 
-        When the queue cannot be asked at all, `confirm_continue` is the
-        operator's only non-destructive way on. A cupsd that cannot answer
-        active_jobs cannot report a fault either, so the fault check lives
-        on the `idle` branch and this path never reaches it -- but a future
-        edit that moves it into _proceed would take the exit away and
-        strand live key material, so pin it.
+        `confirm_continue` is the operator's only non-destructive way on
+        when the queue cannot be asked at all. It is NOT actually at risk
+        from the fault check: active_jobs and printer_fault both go through
+        Cups._run_text, so a daemon that cannot answer one cannot answer
+        the other, and queue_unknown already implies no fault. The double
+        below manufactures a combination the real Cups cannot produce, and
+        is here to catch someone MOVING the check into _proceed -- not
+        because the scenario occurs.
         """
         class Mute(RecordingCups):
             def active_jobs(self, name="OTP"):

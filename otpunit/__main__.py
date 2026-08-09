@@ -44,6 +44,16 @@ class SimulatedCups(Cups):
     def active_jobs(self, name="OTP"):
         return 0
 
+    def printer_fault(self, name="OTP"):
+        # Stubbed for the same reason active_jobs is. RunJob consults this
+        # before it will call a copy finished, and the inherited one shells
+        # out to the host's `lpstat -p OTP` -- which on the unit itself, or
+        # any machine that has run install.sh, is a REAL queue. Left
+        # inherited, `--sim` reported the host printer's fault over a
+        # simulated pad that reached no printer at all, and blocked for up
+        # to Cups.TIMEOUT doing it.
+        return None
+
     def purge(self, name="OTP"):
         pass
 

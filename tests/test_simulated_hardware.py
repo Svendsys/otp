@@ -697,6 +697,14 @@ class TestThePanelAgainstAFailingPrinter:
         assert screen.stage == "waiting", screen.stage
         assert not screen.queue_unknown, \
             "a stopped queue answered; that is not the unknown case"
+        # And it must say WHY. A stopped queue keeps its job for ever, so
+        # "STILL PRINTING / OK TO CHECK AGAIN" is not a slightly optimistic
+        # reading of the situation, it is false -- the review panel was
+        # right that the first version of this test blessed that screen as
+        # intended behaviour.
+        shown = "\n".join(screen.frame(app).rendered()).upper()
+        assert "STILL PRINTING" not in shown, shown
+        assert "DISABLED" in shown or "TRAY OPEN" in shown, shown
 
     def test_an_unanswerable_queue_is_still_not_treated_as_a_fault(self, rig, tmp_path):
         """
