@@ -44,13 +44,21 @@ to `MAX_PAGES` -- 9999, reachable only by hand-editing otp-unit.conf on
 the SD card. Two tiers on purpose: the supported configuration gets the
 tight budget, the hand-edited one only has to not kill the board.
 
-MEASURED here, no TRNG, x86-64, CPython + reportlab, peak VmHWM in MiB:
+MEASURED here, no TRNG, x86-64, CPython + reportlab, peak VmHWM in MiB.
+Every figure is at the EXPENSIVE end of each panel-reachable setting --
+`training` stamps a rotated watermark on every page and `auth_size` takes
+its largest choice, together worth about 1.3 MiB at 1000 pages:
 
     format   100 pages   250 pages   1000 pages   PDF at 1000
-    A6           28.0        31.0         43.5       2.15 MiB
+    A6           28.0        31.0         45.0       2.15 MiB
     A4           27.6        29.6         39.9       1.67 MiB
     A7           27.2        28.9         36.7       1.24 MiB
     (interpreter + imports alone: 26.0 MiB)
+
+And generate() is not the end of it: `Cups.submit` hands `bytes(data)` to
+subprocess, a second full copy held across the call, once per copy. The
+whole PadPairJob -- generate, submit A, submit B -- peaks about 4% above
+the generate figure, and that is what the process really costs.
 
 A6 is the worst case and not by accident: A4 and A7 impose four and two
 pad pages onto one sheet, so a 1000-page pad is 250 or 500 PDF page
@@ -162,7 +170,9 @@ sys.path.insert(0, {repo!r})
 _PAD_BODY = r"""
 from otpunit import config, jobs
 base = rss_mib()
-settings = config.Settings(pages={pages}, paper={paper!r}, a7={a7!r})
+settings = config.Settings(pages={pages}, paper={paper!r}, a7={a7!r},
+                           training={training!r}, auth_size={auth_size},
+                           with_auth=True)
 buffer = jobs.generate(jobs.JobSpec(jobs.JobKind.PAD_PAIR, "RUSTED-BADGER",
                                     settings))
 peak = rss_mib()
@@ -177,8 +187,16 @@ base = rss_mib()
 # under CPython, but writing to it removes any doubt.
 block = bytearray({mib} * 1024 * 1024)
 block[::4096] = b"x" * (len(block) // 4096 + (1 if len(block) % 4096 else 0))
+# FREED before sampling, deliberately. A high-water mark still reports it;
+# a reading of CURRENT residency does not. That is the entire difference
+# between VmHWM and the VmRSS line one row above it in /proc/self/status,
+# and without this `del` the swap between the two passes every assertion in
+# this file -- while quietly understating the pad's real peak by 5% at 1000
+# pages and 12% at 4000, because reportlab frees its intermediates before
+# generate() returns.
+del block
 peak = rss_mib()
-print(json.dumps({{"base": base, "peak": peak, "pdf": len(block),
+print(json.dumps({{"base": base, "peak": peak, "pdf": {mib} * 1024 * 1024,
                    "rusage": rusage_mib(), "chars_per_page": 0}}))
 """
 
@@ -205,8 +223,56 @@ def child(body: str, hwrng: str = NO_TRNG) -> dict:
 
 
 def pad(pages: int, paper: str = "A6", a7: bool = False,
-        hwrng: str = NO_TRNG) -> dict:
-    return child(_PAD_BODY.format(pages=pages, paper=paper, a7=a7), hwrng)
+        hwrng: str = NO_TRNG, training: bool = True,
+        auth_size: int = max(config.AUTH_SIZE_CHOICES)) -> dict:
+    """One pad, measured in a fresh interpreter.
+
+    The defaults are the EXPENSIVE end of every panel-reachable setting,
+    not config.Settings()'s defaults: `training` stamps a rotated
+    watermark on every page and `auth_size` lengthens the draw, and the
+    first version of this file varied only pages/paper/a7 while its
+    docstring claimed to measure the worst supported case. Measured at
+    1000 A6 pages: 43.6 plain, 44.7 with training, 45.0 with both.
+    """
+    return child(_PAD_BODY.format(pages=pages, paper=paper, a7=a7,
+                                  training=training, auth_size=auth_size),
+                 hwrng)
+
+
+_SUBMIT_BODY = r"""
+from otpunit import config, jobs, printer
+import types
+base = rss_mib()
+settings = config.Settings(pages={pages}, paper="A6", training=True,
+                           auth_size=max(config.AUTH_SIZE_CHOICES))
+
+class Recording:
+    # Enough of Cups for PadPairJob, and nothing that leaves the process.
+    def __init__(self):
+        self.sizes = []
+    def submit(self, data, name="OTP", title="OTP", options=None):
+        # The line that matters: printer.Cups.submit hands `bytes(data)` to
+        # subprocess, which is a SECOND full copy of the pad held across the
+        # call. Reproduced here rather than mocked away.
+        blob = bytes(data)
+        self.sizes.append(len(blob))
+        return "job-1"
+    def purge(self, name="OTP"):
+        pass
+
+cups = Recording()
+job = jobs.PadPairJob(jobs.JobSpec(jobs.JobKind.PAD_PAIR, "RUSTED-BADGER",
+                                   settings), cups, "OTP")
+job.generate()
+after_generate = rss_mib()
+job.print_next_copy()
+job.print_next_copy()
+peak = rss_mib()
+job.finish()
+print(json.dumps({{"base": base, "peak": peak, "pdf": cups.sizes[0],
+                   "after_generate": after_generate, "copies": len(cups.sizes),
+                   "rusage": rusage_mib(), "chars_per_page": 0}}))
+"""
 
 
 @pytest.fixture(scope="module")
@@ -219,6 +285,7 @@ def measured():
     return {
         "a6-250": pad(250),
         "a6-1000": pad(1000),
+        "submit-1000": child(_SUBMIT_BODY.format(pages=1000)),
     }
 
 
@@ -233,6 +300,27 @@ def test_the_largest_pad_the_panel_offers_fits_the_process_budget(measured):
         f"{seen['peak']:.1f} MiB against a {PROCESS_CEILING_MIB} MiB budget "
         f"on a board with {AVAILABLE_MIB} MiB to spare and no swap. "
         f"Read this module's docstring before raising the number.")
+
+
+def test_the_whole_job_fits_it_too_and_not_just_the_generate(measured):
+    """
+    generate() is not the process peak, and the headline above measures
+    only generate(). `Cups.submit` hands `bytes(data)` to subprocess -- a
+    SECOND full copy of the pad, held live across the call -- and it does
+    that once per copy. Measured through the real PadPairJob: 44.6 MiB
+    after generate against 46.4 after both copies at 1000 pages.
+
+    Four percent, so it changes no conclusion. It is here because the
+    number the file reports should be the one the board actually has to
+    find, and because a change that made submit hold three copies instead
+    of two would otherwise be invisible.
+    """
+    seen = measured["submit-1000"]
+    assert seen["copies"] == 2, "a pad is a PAIR; both copies must be submitted"
+    assert seen["peak"] >= seen["after_generate"], seen
+    assert seen["peak"] < PROCESS_CEILING_MIB, (
+        f"the full pad-pair job peaked at {seen['peak']:.1f} MiB against a "
+        f"{PROCESS_CEILING_MIB} MiB budget")
 
 
 def test_the_measurement_saw_a_pad_and_not_an_empty_buffer(measured):
