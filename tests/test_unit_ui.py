@@ -470,6 +470,132 @@ class TestRunJobFlow:
         assert "OUT OF PAPER" in "\n".join(screen.frame(app).rendered())
 
 
+class TestADrainedQueueIsNotProofOfPrinting:
+    """
+    lp accepting a job is not paper, and neither is the queue emptying.
+
+    The unit ships `ErrorPolicy abort-job` precisely so a failed job cannot
+    wedge a MaxJobs-bounded queue -- which means a job that FAILED is
+    discarded exactly as promptly as one that printed. unattended.run has
+    consulted printer_fault since that combination handed an operator "YOUR
+    PAD PAIR IS PRINTED" over an empty tray. RunJob never did: it advanced
+    on `active_jobs == 0` alone, so the panel said COPY A DONE over the
+    same empty tray, then PAIR COMPLETE, and wiped the key on the strength
+    of it.
+
+    Driven here with doubles so the fast suite owns the regression; the
+    same sequence runs against a real cupsd and a real failing backend in
+    tests/test_simulated_hardware.py.
+    """
+
+    class Reporting(RecordingCups):
+        """A queue that drains and a printer that says it failed anyway."""
+
+        def __init__(self, fault="out of paper", after=0):
+            super().__init__()
+            self._fault = fault
+            self.after = after                   # copies to let through
+
+        def printer_fault(self, name="OTP"):
+            if len(self.submitted) <= self.after:
+                return None
+            return self._fault
+
+    def _screen(self, cups):
+        app = make_app([])
+        app.cups = cups
+        settings = config.Settings(pages=2)
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "SILENT-OSPREY", settings)
+        return app, ui.RunJob(spec)
+
+    def test_a_failed_copy_a_is_not_reported_as_copy_a_done(self):
+        cups = self.Reporting()
+        app, screen = self._screen(cups)
+        screen.press(app, Press.OK)             # confirm -> copy A
+        screen.press(app, Press.OK)             # tray clear?
+        assert screen.stage == "error", \
+            "the panel offered the swap prompt over a tray that got nothing"
+        text = "\n".join(screen.frame(app).rendered())
+        assert "REMOVE THE STACK" not in text
+        assert "OUT OF PAPER" in text.upper()
+
+    def test_a_failed_copy_b_is_not_reported_as_a_complete_pair(self):
+        cups = self.Reporting(after=1)          # copy A prints, copy B does not
+        app, screen = self._screen(cups)
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "swap"
+        screen.press(app, Press.OK)             # -> copy B
+        screen.press(app, Press.OK)             # tray clear?
+        assert screen.stage == "error", \
+            "the panel called a lost copy B a complete pair"
+        text = "\n".join(screen.frame(app).rendered())
+        assert "PAIR COMPLETE" not in text
+        # Copy A is in their hand and can never be matched. Say so.
+        assert "DESTROY PRINTED PAGES" in text
+
+    def test_a_healthy_pair_is_still_reported_as_one(self):
+        # The control. Everything above is satisfied by a panel that calls
+        # every job a failure, and that panel would be useless.
+        cups = RecordingCups()
+        app, screen = self._screen(cups)
+        for _ in range(4):
+            screen.press(app, Press.OK)
+        assert screen.stage == "done"
+        assert "PAIR COMPLETE" in "\n".join(screen.frame(app).rendered())
+
+    def test_a_cups_that_cannot_report_faults_still_finishes(self):
+        """
+        Silence is not trouble. A wedged cupsd, and any Cups predating
+        printer_fault, must fall back to the queue result rather than send
+        someone to burn a pair that printed perfectly.
+        """
+        class Old(RecordingCups):
+            printer_fault = None                 # not even callable
+
+        app, screen = self._screen(Old())
+        for _ in range(4):
+            screen.press(app, Press.OK)
+        assert screen.stage == "done"
+
+    def test_a_raising_printer_fault_does_not_take_the_panel_down(self):
+        class Exploding(RecordingCups):
+            def printer_fault(self, name="OTP"):
+                raise RuntimeError("lpstat went away")
+
+        app, screen = self._screen(Exploding())
+        for _ in range(4):
+            screen.press(app, Press.OK)
+        assert screen.stage == "done"
+
+    def test_the_unanswerable_queue_keeps_its_manual_override(self):
+        """
+        The override this must not break.
+
+        When the queue cannot be asked at all, `confirm_continue` is the
+        operator's only non-destructive way on. A cupsd that cannot answer
+        active_jobs cannot report a fault either, so the fault check lives
+        on the `idle` branch and this path never reaches it -- but a future
+        edit that moves it into _proceed would take the exit away and
+        strand live key material, so pin it.
+        """
+        class Mute(RecordingCups):
+            def active_jobs(self, name="OTP"):
+                return None                      # "cannot tell"
+
+            def printer_fault(self, name="OTP"):
+                return "out of paper"            # must not be consulted here
+
+        app, screen = self._screen(Mute())
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "waiting" and screen.queue_unknown
+        screen.press(app, Press.DOWN)
+        assert screen.stage == "confirm_continue"
+        screen.press(app, Press.OK)
+        assert screen.stage == "swap", screen.stage
+
+
 class TestSettings:
     def test_defaults_are_valid(self):
         assert config.Settings().validate() == []

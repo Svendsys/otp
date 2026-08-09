@@ -18,6 +18,18 @@ PreserveJobFiles -- are parsed out of the provisioning script at run time.
 A rig with its own copy of those numbers would have gone on passing after
 somebody changed the shipped value, which is exactly the class of bug this
 exists to catch.
+
+**It can fail, and in more than one shape.** For its first several rounds
+the backend recorded its bytes and exited 0, so every real printing
+failure was unexercised -- and the one that had already bitten was a false
+SUCCESS: under `ErrorPolicy abort-job` an empty tray drains the queue just
+as promptly as a finished job, so the unit printed "YOUR PAD PAIR IS
+PRINTED" over nothing and wiped the key. `set_failure()` injects the modes
+a real printer actually produces (see `CupsRig.FAILURE_MODES`), and they
+differ in shape, not only in degree: abort-job DRAINS the queue, STOP
+disables it and keeps the job, RETRY leaves it pending forever. Code that
+reads "the queue is empty" as "it printed" passes one of those three and
+fails the others.
 """
 from __future__ import annotations
 
@@ -83,10 +95,39 @@ BACKEND = r"""#!/bin/sh
 # With no arguments cupsd is asking what is attached, so answer with one
 # device. With arguments it is a job: copy it somewhere the test can read
 # and assert on the bytes that actually reached the printer.
+#
+# It can also be told to FAIL, and that half is the point. A backend that
+# can only ever succeed leaves every real-world printing failure
+# unexercised, and the asymmetry is what makes that dangerous: a false
+# failure wastes paper, a false success destroys key material the operator
+# believes is on a page in their hand.
+#
+# The mode is read FRESH on every invocation, so a test can change it
+# mid-sequence -- which is how "copy A reached paper and copy B did not"
+# gets modelled at all.
+MODE=$(cat "{outdir}/.mode" 2>/dev/null || echo "")
+AFTER=$(cat "{outdir}/.after" 2>/dev/null || echo 0)
+UNTIL=$(cat "{outdir}/.until" 2>/dev/null || echo 0)
+
 if [ $# -eq 0 ]; then
+    # A printer that has been unplugged advertises nothing. This is what
+    # makes cups.devices() go empty mid-sequence, which is the only signal
+    # the unattended path has that the cable came out.
+    if [ -f "{outdir}/.unplugged" ]; then
+        exit 0
+    fi
     echo 'direct {uri} "{make}" "{make}" "MFG:OTP;MDL:Simulated Laser;"'
     exit 0
 fi
+
+# INVOCATIONS, not jobs: a RETRY re-runs the backend against the same job,
+# and both windows below have to be expressible in the same counter.
+# cupsd runs one backend at a time per printer, so no locking is needed --
+# and if that ever stops being true the count going wrong is visible in
+# backend_invocations() rather than silent.
+COUNT=$(cat "{outdir}/.count" 2>/dev/null || echo 0)
+COUNT=$((COUNT + 1))
+printf '%s\n' "$COUNT" > "{outdir}/.count"
 
 OUT="{outdir}/job-$1-$(date +%s%N)"
 if [ -n "$6" ] && [ -f "$6" ]; then
@@ -98,14 +139,78 @@ fi
 # on the ORDER sheets reached paper without parsing PDFs.
 printf '%s\n' "$3" > "$OUT.title"
 
-# A tray that can be made to fail on demand, which is the interesting case:
-# under ErrorPolicy abort-job a failed job leaves the queue as empty as a
-# successful one.
-if [ -f "{outdir}/.fail" ]; then
+# Outside the window the printer is well. `.after` lets the first N
+# invocations through; `.until` ends the fault, which is what lets a RETRY
+# mode terminate instead of spinning for as long as a test will wait.
+if [ "$COUNT" -le "$AFTER" ]; then
+    MODE=""
+fi
+if [ "$UNTIL" -gt 0 ] && [ "$COUNT" -gt "$UNTIL" ]; then
+    MODE=""
+fi
+
+case "$MODE" in
+"")
+    ;;
+media-empty)
+    # CUPS_BACKEND_FAILED. What happens next is the queue's ErrorPolicy,
+    # and the unit ships abort-job -- so the job is DISCARDED and the queue
+    # drains exactly as fast as a successful one. That is the bug class
+    # this rig exists for, and the one that already nearly wiped a key.
     echo "STATE: +media-empty-error" >&2
     echo "ERROR: out of paper" >&2
     exit 1
-fi
+    ;;
+stop)
+    # CUPS_BACKEND_STOP: cupsd stops the QUEUE and keeps the job for
+    # reprinting rather than consulting ErrorPolicy. This is what a
+    # printer that reports an open cover or an empty tray properly looks
+    # like, and its shape is the opposite of abort-job's -- the queue does
+    # not drain and lpstat says the printer is disabled.
+    echo "STATE: +media-empty-error" >&2
+    echo "ERROR: tray open" >&2
+    exit 4
+    ;;
+retry)
+    # CUPS_BACKEND_RETRY: transient. cupsd holds the job for a later
+    # attempt, so the queue never empties. The danger here is the mirror
+    # image of abort-job's: not a false success but an unbounded wait.
+    echo "ERROR: printer busy" >&2
+    exit 6
+    ;;
+retry-current)
+    # CUPS_BACKEND_RETRY_CURRENT: retried immediately, in a loop, for as
+    # long as the fault persists. Only safe to inject with `until` set,
+    # which set_failure() enforces rather than trusting.
+    echo "ERROR: printer busy, retrying now" >&2
+    exit 7
+    ;;
+disconnect)
+    # The bytes were accepted and THEN the device vanished. Everything
+    # after this point sees no usb:// device at all.
+    touch "{outdir}/.unplugged"
+    echo "ERROR: USB device disappeared" >&2
+    exit 1
+    ;;
+truncate)
+    # Some of it reached paper and then it stopped. Recorded as a SHORT
+    # file, deliberately: "some pages printed" is the state an operator
+    # most needs the truth about, and a test that reads only the exit code
+    # cannot tell it from "nothing printed".
+    SIZE=$(wc -c < "$OUT.data")
+    head -c $((SIZE / 2)) "$OUT.data" > "$OUT.data.part" \
+        && mv "$OUT.data.part" "$OUT.data"
+    echo "STATE: +media-jam-error" >&2
+    echo "ERROR: jammed after partial delivery" >&2
+    exit 1
+    ;;
+*)
+    # A typo in a mode name must not read as a healthy printer.
+    echo "ERROR: rig given an unknown failure mode: $MODE" >&2
+    exit 1
+    ;;
+esac
+
 # Optional dwell, so a test can model lp returning before the paper does.
 if [ -f "{outdir}/.slow" ]; then
     sleep "$(cat "{outdir}/.slow")"
@@ -422,13 +527,85 @@ FileDevice Yes
     def titles(self) -> list:
         return [title for title, _ in self.printed()]
 
+    # What the backend understands, and what each mode is modelling. Kept
+    # as a table rather than bare strings at the call sites so that a typo
+    # is a ValueError here instead of a test quietly passing against a
+    # printer that never failed -- which is the same defect class as a
+    # backend that can only succeed.
+    FAILURE_MODES = {
+        "media-empty": "CUPS_BACKEND_FAILED; ErrorPolicy decides, and "
+                       "abort-job discards the job",
+        "stop": "CUPS_BACKEND_STOP; the queue is stopped and the job kept",
+        "retry": "CUPS_BACKEND_RETRY; the job waits for a later attempt",
+        "retry-current": "CUPS_BACKEND_RETRY_CURRENT; retried immediately",
+        "disconnect": "the bytes are accepted, then the usb device vanishes",
+        "truncate": "half the bytes are accepted, then a jam",
+    }
+
+    def set_failure(self, mode: str = "", *, after: int = 0,
+                    until: int = 0) -> None:
+        """
+        Make the printer fail the way `mode` describes. "" refills the tray.
+
+        `after=N` lets the first N backend invocations succeed before the
+        fault begins. That is how "copy A reached paper and copy B did not"
+        is modelled, and it is the state an operator is most likely to be
+        told about wrongly: a queue that printed one of two copies drains
+        exactly like a queue that printed both.
+
+        `until=N` ends the fault after invocation N, which is what lets a
+        retry mode terminate. Required for retry-current, because cupsd
+        re-runs that one immediately and would otherwise spin for as long
+        as the test was willing to wait.
+
+        Counted in INVOCATIONS rather than jobs, since a retry re-runs the
+        backend against a job it already saw.
+        """
+        if mode and mode not in self.FAILURE_MODES:
+            raise ValueError(
+                f"unknown failure mode {mode!r}; known modes: "
+                + ", ".join(sorted(self.FAILURE_MODES)))
+        if mode == "retry-current" and until <= 0:
+            raise ValueError(
+                "retry-current is retried immediately and forever; pass "
+                "until=N so the fault clears and the test can terminate")
+        if after < 0 or until < 0:
+            raise ValueError("after and until count invocations from 1")
+        if until and after >= until:
+            raise ValueError(
+                f"after={after} until={until} leaves no invocation to fail")
+        self.jobs.mkdir(parents=True, exist_ok=True)
+        (self.jobs / ".mode").write_text(mode)
+        (self.jobs / ".after").write_text(str(after))
+        (self.jobs / ".until").write_text(str(until))
+        if not mode:
+            # Plugging the printer back in is part of refilling the tray.
+            # Leaving `.unplugged` behind would make every later mode look
+            # like a disconnect, which is a fixture that lies.
+            unplugged = self.jobs / ".unplugged"
+            if unplugged.exists():
+                unplugged.unlink()
+
     def fail_jobs(self, failing: bool = True) -> None:
         """Make the tray run out of paper, or refill it."""
-        flag = self.jobs / ".fail"
-        if failing:
-            flag.touch()
-        elif flag.exists():
-            flag.unlink()
+        self.set_failure("media-empty" if failing else "")
+
+    def backend_invocations(self) -> int:
+        """
+        How many times cupsd actually ran the backend.
+
+        The discriminator for the retry modes: a job that was retried three
+        times and one that was submitted three times look identical from
+        the job files alone.
+        """
+        try:
+            return int((self.jobs / ".count").read_text().strip())
+        except (OSError, ValueError):
+            return 0
+
+    def plugged_in(self) -> bool:
+        """Whether the backend is still advertising a device."""
+        return not (self.jobs / ".unplugged").exists()
 
     def slow_jobs(self, seconds: float) -> None:
         """Make the backend dwell, so lp returns well before the paper does."""

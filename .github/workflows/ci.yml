@@ -183,11 +183,20 @@ jobs:
           # this job green at "1 passed, 20 skipped", the one pass being a
           # bash -n syntax check. A harness that silently tests nothing is
           # worse than a red one; that is the premise of this whole PR.
+          #
+          # 33, raised from 12 when the rig learned to FAIL. The CUPS half
+          # is now 35 tests (8 print path + 4 unattended + 11 failure-mode
+          # shapes + 7 failed-copy + 5 panel), and the four kernel
+          # simulators add 7 more where the runner's kernel has them.
+          # Measured on a runner-shaped container: 37 passed, 7 skipped for
+          # absent simulators, 176s. The floor sits just under the CUPS
+          # half deliberately -- it is there to catch that half vanishing,
+          # not to police the exact count, which every new test changes.
           PASSED=$(grep -oE '[0-9]+ passed' /tmp/harness.log | tail -1 | cut -d' ' -f1)
           echo "harness tests passed: ${PASSED:-0}"
-          if [ "${PASSED:-0}" -lt 12 ]; then
-            echo "expected at least 12 passing harness tests (the CUPS rig" >&2
-            echo "alone is 11); got ${PASSED:-0}. Something skipped silently." >&2
+          if [ "${PASSED:-0}" -lt 33 ]; then
+            echo "expected at least 33 passing harness tests (the CUPS rig" >&2
+            echo "alone is 35); got ${PASSED:-0}. Something skipped silently." >&2
             grep -E "^SKIPPED" /tmp/harness.log >&2 || true
             exit 1
           fi

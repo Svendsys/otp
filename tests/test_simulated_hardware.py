@@ -323,6 +323,403 @@ class TestTheUnattendedSequenceAgainstRealCups:
         assert not hits, f"codeword reached {hits}"
 
 
+# --- printers that fail, which is most printers --------------------------
+
+
+def sheet_text(data: bytes) -> str:
+    """The text of a sheet the backend recorded, uppercased for matching.
+
+    The Generic PDF Printer filter chain passes the PDF through unaltered
+    behind a PJL header, so what reached "paper" can be read back.
+    """
+    import io
+
+    import pypdf
+
+    body = data[data.find(b"%PDF"):] if b"%PDF" in data else data
+    found = []
+    for page in pypdf.PdfReader(io.BytesIO(body)).pages:
+        found.append(page.extract_text() or "")
+    return " ".join(" ".join(found).split()).upper()
+
+
+@needs_cups
+class TestTheRigCanActuallyFail:
+    """
+    The guard on the guard, and it has to come first.
+
+    For its first several rounds the rig's backend recorded its bytes and
+    exited 0, so the only failure the harness could produce was one flag's
+    worth of "out of paper" and everything else was untested. Each mode
+    below is asserted to be observably DIFFERENT from a clean print --
+    because a mode that quietly degrades to success turns every test after
+    it into a check that cannot fail, which is the exact defect this
+    repository keeps rediscovering.
+
+    The three shapes matter as much as the count. abort-job DRAINS the
+    queue; STOP disables it and keeps the job; RETRY leaves it pending.
+    Code that reads "the queue is empty" as "it printed" passes the first
+    and fails the other two, so a harness carrying only one of them cannot
+    tell a correct implementation from that bug.
+    """
+
+    # mode -> (queue drains, printer reports a fault, devices still listed)
+    SHAPES = {
+        "": (True, False, 1),
+        # The dangerous one: indistinguishable from success by drain alone.
+        "media-empty": (True, True, 1),
+        "stop": (False, True, 1),
+        "retry": (False, True, 1),
+        "disconnect": (True, True, 0),
+        "truncate": (True, True, 1),
+    }
+
+    def observe(self, rig, mode="", wait=30, **kwargs) -> dict:
+        from otpunit import jobs
+
+        cups = rig.cups()
+        queue = cups.ensure_queue(cups.devices()[0])
+        rig.set_failure(mode, **kwargs)
+        card = bytes(jobs.generate(
+            jobs.JobSpec(jobs.JobKind.TABULA, "", config.Settings())))
+        cups.submit(bytearray(card), name=queue, title="PROBE",
+                    options={"media": "A4"})
+        # Waits for the BACKEND to have run and cupsd to have recorded the
+        # outcome -- NOT for the queue to drain. Two of these modes never
+        # drain, and waiting for something that cannot happen would cost
+        # the suite a minute per mode and teach nobody anything.
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if rig.backend_invocations() and (
+                    cups.printer_fault(queue) is not None
+                    or cups.active_jobs(queue) == 0):
+                break
+            time.sleep(0.2)
+        time.sleep(0.5)
+        return {
+            "drained": cups.active_jobs(queue) == 0,
+            "fault": cups.printer_fault(queue),
+            "devices": len(cups.devices()),
+            "invocations": rig.backend_invocations(),
+            "printed": rig.printed(),
+        }
+
+    @pytest.mark.parametrize("mode", sorted(SHAPES))
+    def test_each_mode_has_the_shape_it_claims(self, rig, mode):
+        drains, faults, devices = self.SHAPES[mode]
+        seen = self.observe(rig, mode)
+        assert seen["invocations"] == 1, "the backend never ran"
+        assert seen["drained"] is drains, seen
+        assert bool(seen["fault"]) is faults, seen
+        assert seen["devices"] == devices, seen
+        if mode:
+            assert (seen["drained"], bool(seen["fault"]), seen["devices"]) \
+                != self.SHAPES[""], f"{mode} is indistinguishable from success"
+
+    def test_a_stopped_queue_says_so_in_the_words_lpstat_uses(self, rig):
+        # printer_fault special-cases "disabled" on the header line, which
+        # is a different code path from a state-reason on a later line.
+        # STOP is the only mode that reaches it.
+        assert "disabled" in (self.observe(rig, "stop")["fault"] or "")
+
+    def test_truncate_records_a_short_job_rather_than_no_job(self, rig):
+        """
+        "Some pages printed" is the state an operator most needs the truth
+        about, and a rig that recorded nothing could not tell it from
+        "nothing printed". Measured inside one rig so the comparison is
+        against this filter chain's own output rather than a guess.
+        """
+        whole = self.observe(rig)["printed"]
+        assert len(whole) == 1 and whole[0][1]
+        partial = self.observe(rig, "truncate")["printed"]
+        assert len(partial) == 2, "the second job was never recorded"
+        assert 0 < len(partial[1][1]) < len(whole[0][1])
+
+    def test_a_transient_that_clears_is_not_left_looking_like_a_fault(self, rig):
+        """
+        The other half of failure injection: a rig that could only fail
+        permanently would make "the printer recovered" untestable, and a
+        false FAILURE has its own cost -- it sends someone to burn a pair
+        that printed perfectly.
+        """
+        seen = self.observe(rig, "retry-current", until=2)
+        assert seen["invocations"] == 3, "cupsd did not retry the job"
+        assert seen["drained"] and not seen["fault"], seen
+
+    def test_an_unknown_mode_is_refused_rather_than_ignored(self, rig):
+        # A typo in a mode name must not read as a healthy printer, which
+        # is how a test that asserts a failure ends up asserting nothing.
+        with pytest.raises(ValueError):
+            rig.set_failure("out-of-paper")
+        with pytest.raises(ValueError):
+            rig.set_failure("retry-current")     # unbounded; would spin
+
+    def test_refilling_the_tray_plugs_the_printer_back_in(self, rig):
+        # A leftover `.unplugged` would make every later mode in the same
+        # rig look like a disconnect -- a fixture that lies.
+        assert self.observe(rig, "disconnect")["devices"] == 0
+        rig.set_failure("")
+        assert rig.plugged_in()
+        assert self.observe(rig)["devices"] == 1
+
+
+@needs_cups
+class TestAFailedCopyIsNeverReportedAsAPair:
+    """
+    The asymmetry that makes this P1: a false failure wastes paper, a
+    false success destroys key material the operator believes is on a page
+    in their hand.
+
+    The sequence is fixed and known -- status, tabula, copy A, separator,
+    copy B, final sheet -- so `after=4 until=5` fails exactly copy B and
+    leaves the sheet that has to explain it printable. That is the state
+    most likely to be reported wrongly, because a queue that printed one
+    of two copies drains exactly like a queue that printed both.
+    """
+
+    def wired(self, rig):
+        cups = rig.cups()
+        return cups, cups.ensure_queue(cups.devices()[0])
+
+    def card(self):
+        from otpunit import jobs
+
+        return bytes(jobs.generate(
+            jobs.JobSpec(jobs.JobKind.TABULA, "", config.Settings())))
+
+    def sequence_settings(self, **kwargs):
+        base = dict(pages=2, auto_delay=0, auto_swap_delay=0,
+                    auto_manual=False, auto_codeword="SILENT-OSPREY")
+        base.update(kwargs)
+        return config.Settings(**base)
+
+    # --- the two shapes that do not drain -------------------------------
+
+    def test_a_stopped_queue_is_never_reported_as_drained(self, rig):
+        """
+        drain() returning True is what authorises the purge and the "pair
+        printed" claim. A stopped queue keeps the job, so True here would
+        be a lie -- and the timeout path is the one that must be taken.
+        """
+        cups, queue = self.wired(rig)
+        rig.set_failure("stop")
+        cups.submit(bytearray(self.card()), name=queue, title="DOOMED",
+                    options={"media": "A4"})
+        assert unattended.drain(cups, queue, sleep=time.sleep,
+                                log=lambda *_: None, timeout=8) is False
+        assert cups.printer_fault(queue)
+
+    def test_a_retrying_queue_is_never_reported_as_drained(self, rig):
+        cups, queue = self.wired(rig)
+        rig.set_failure("retry")
+        cups.submit(bytearray(self.card()), name=queue, title="DOOMED",
+                    options={"media": "A4"})
+        assert unattended.drain(cups, queue, sleep=time.sleep,
+                                log=lambda *_: None, timeout=8) is False
+        assert cups.printer_fault(queue)
+
+    # --- the shapes that drain, which is where the danger is ------------
+
+    def test_copy_b_failing_is_not_called_a_pair(self, rig):
+        cups, queue = self.wired(rig)
+        rig.set_failure("media-empty", after=4, until=5)
+        result = unattended.run(cups, settings=self.sequence_settings(),
+                                queue=queue, log=lambda *_: None,
+                                sleep=time.sleep)
+        settle(cups, queue, seconds=60)
+        titles = rig.titles()
+        assert result == 1, f"a run that lost copy B returned 0; got {titles}"
+        assert "OTP A" in titles, titles
+
+    def test_the_final_sheet_says_what_did_and_did_not_reach_paper(self, rig):
+        """
+        The operator is holding copy A of a pair that can never be
+        completed. The sheet has to say that, name what the printer said,
+        and not repeat the DONE sheet's promise that the two copies are
+        identical.
+        """
+        cups, queue = self.wired(rig)
+        rig.set_failure("media-empty", after=4, until=5)
+        unattended.run(cups, settings=self.sequence_settings(), queue=queue,
+                       log=lambda *_: None, sleep=time.sleep)
+        settle(cups, queue, seconds=60)
+        final = [data for title, data in rig.printed()
+                 if title == "WHAT TO DO NOW"]
+        assert final, f"no final sheet reached paper; got {rig.titles()}"
+        text = sheet_text(final[-1])
+        assert "NOT USABLE" in text, text[:400]
+        assert "DESTROY" in text
+        # The printer knew why. A sheet that only says "something went
+        # wrong" ends nothing.
+        assert "OUT OF PAPER" in text, text[:400]
+        # And it must not carry the DONE sheet's claim.
+        assert "THEY ARE IDENTICAL" not in text
+        assert "YOU NOW HAVE A PAD PAIR" not in text
+
+    def test_a_partial_copy_b_is_not_called_a_pair(self, rig):
+        """
+        Bytes reached the printer and then it jammed. The queue drains and
+        a job file exists, so both of the cheap proxies for "it printed"
+        say yes.
+        """
+        cups, queue = self.wired(rig)
+        rig.set_failure("truncate", after=4, until=5)
+        result = unattended.run(cups, settings=self.sequence_settings(),
+                                queue=queue, log=lambda *_: None,
+                                sleep=time.sleep)
+        settle(cups, queue, seconds=60)
+        got = dict(rig.printed())
+        assert result == 1, f"a jammed copy B returned 0; got {rig.titles()}"
+        assert "OTP A" in got and "OTP B" in got
+        assert len(got["OTP B"]) < len(got["OTP A"]), \
+            "the rig recorded copy B whole; the jam was not modelled"
+
+    def test_a_disconnected_printer_is_not_called_a_pair(self, rig):
+        cups, queue = self.wired(rig)
+        rig.set_failure("disconnect", after=4)
+        result = unattended.run(cups, settings=self.sequence_settings(),
+                                queue=queue, log=lambda *_: None,
+                                sleep=time.sleep)
+        assert result == 1
+        assert not cups.devices(), "the printer is still being advertised"
+
+    def test_a_healthy_run_still_reports_the_pair_it_printed(self, rig):
+        """
+        The control. Every assertion above is satisfied by a unit that
+        calls everything a failure, and that unit would be useless.
+        """
+        cups, queue = self.wired(rig)
+        result = unattended.run(cups, settings=self.sequence_settings(),
+                                queue=queue, log=lambda *_: None,
+                                sleep=time.sleep)
+        settle(cups, queue, seconds=60)
+        assert result == 0, rig.titles()
+        final = dict(rig.printed())["WHAT TO DO NOW"]
+        assert "YOU NOW HAVE A PAD PAIR" in sheet_text(final)
+
+
+@needs_cups
+class TestThePanelAgainstAFailingPrinter:
+    """
+    The same question asked of the INTERACTIVE path, which had no answer.
+
+    unattended.run has consulted printer_fault since the empty-tray
+    incident. RunJob never did: it advanced on `active_jobs == 0` alone,
+    and under the shipped ErrorPolicy abort-job a failed job drains the
+    queue exactly as fast as a printed one. So the panel showed COPY A
+    DONE over an empty tray, then PAIR COMPLETE, and wiped the key -- the
+    identical defect, in the path an operator with a panel actually uses.
+
+    These drive the real RunJob state machine against the real daemon.
+    """
+
+    def panel(self, rig, tmp_path, codeword="RUSTED-BADGER"):
+        from otpunit import jobs, ui
+        from otpunit.hw.buttons import FakeButtons
+        from otpunit.hw.display import FakeDisplay
+
+        cups = rig.cups()
+        queue = cups.ensure_queue(cups.devices()[0])
+        settings = config.Settings(pages=2)
+        app = ui.App(display=FakeDisplay(), buttons=FakeButtons([]),
+                     cups=cups, settings=settings,
+                     config_path=str(tmp_path / "otp-unit.conf"),
+                     poll_seconds=0)
+        app.queue = queue
+        screen = ui.RunJob(jobs.JobSpec(jobs.JobKind.PAD_PAIR, codeword,
+                                        settings))
+        return app, screen, cups, queue
+
+    def advance(self, app, screen, cups, queue):
+        """OK once the tray is clear, exactly as the footer instructs."""
+        from otpunit.hw.buttons import Press
+
+        settle(cups, queue, seconds=60)
+        return screen.press(app, Press.OK)
+
+    def drive_a_pair(self, rig, tmp_path):
+        """confirm -> copy A -> swap -> copy B -> whatever comes next."""
+        from otpunit.hw.buttons import Press
+
+        app, screen, cups, queue = self.panel(rig, tmp_path)
+        screen.press(app, Press.OK)              # confirm -> generate + copy A
+        assert screen.stage == "printing", screen.stage
+        self.advance(app, screen, cups, queue)   # copy A landed?
+        first = screen.stage
+        if first == "swap":
+            screen.press(app, Press.OK)          # -> copy B
+            self.advance(app, screen, cups, queue)
+        return app, screen, first
+
+    def test_a_healthy_pair_still_reaches_pair_complete(self, rig, tmp_path):
+        # The control, and it comes first: a panel that called every job a
+        # failure would satisfy every other test in this class.
+        app, screen, after_a = self.drive_a_pair(rig, tmp_path)
+        assert after_a == "swap", after_a
+        assert screen.stage == "done", screen.error
+        assert "PAIR COMPLETE" in "\n".join(screen.frame(app).rendered())
+
+    def test_a_failed_copy_a_does_not_say_copy_a_done(self, rig, tmp_path):
+        rig.set_failure("media-empty")
+        app, screen, after_a = self.drive_a_pair(rig, tmp_path)
+        assert after_a == "error", \
+            f"the panel said {after_a!r} over a tray that got nothing"
+        shown = "\n".join(screen.frame(app).rendered()).upper()
+        assert "REMOVE THE STACK" not in shown
+        assert "OUT OF PAPER" in shown, shown
+
+    def test_a_failed_copy_b_does_not_say_pair_complete(self, rig, tmp_path):
+        # Copy A prints; copy B does not. The operator is holding half a
+        # pair and the panel used to congratulate them on it.
+        rig.set_failure("media-empty", after=1)
+        app, screen, after_a = self.drive_a_pair(rig, tmp_path)
+        assert after_a == "swap", after_a
+        assert screen.stage == "error", \
+            "the panel called a lost copy B a complete pair"
+        shown = "\n".join(screen.frame(app).rendered()).upper()
+        assert "PAIR COMPLETE" not in shown
+        assert "DESTROY PRINTED PAGES" in shown, shown
+
+    def test_a_stopped_printer_leaves_the_panel_waiting_not_finished(self, rig, tmp_path):
+        # STOP keeps the job, so the queue never empties. The panel must
+        # sit on `waiting` -- which has a confirmed way out -- rather than
+        # declare anything.
+        from otpunit.hw.buttons import Press
+
+        rig.set_failure("stop")
+        app, screen, cups, queue = self.panel(rig, tmp_path)
+        screen.press(app, Press.OK)
+        assert screen.stage == "printing"
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and cups.active_jobs(queue) != 1:
+            time.sleep(0.2)
+        screen.press(app, Press.OK)
+        assert screen.stage == "waiting", screen.stage
+        assert not screen.queue_unknown, \
+            "a stopped queue answered; that is not the unknown case"
+
+    def test_an_unanswerable_queue_is_still_not_treated_as_a_fault(self, rig, tmp_path):
+        """
+        The override this fix must not break. When cupsd cannot be asked at
+        all, `confirm_continue` is the operator's only non-destructive way
+        on -- and a daemon that cannot answer active_jobs cannot report a
+        fault either, so routing that path through the fault check would
+        cost them the exit and leave live key material with nowhere to go.
+        """
+        from otpunit.hw.buttons import Press
+
+        app, screen, cups, queue = self.panel(rig, tmp_path)
+        screen.press(app, Press.OK)
+        settle(cups, queue, seconds=60)
+        rig.stop()                               # the daemon goes away
+        screen.press(app, Press.OK)
+        assert screen.stage == "waiting" and screen.queue_unknown
+        screen.press(app, Press.DOWN)
+        assert screen.stage == "confirm_continue"
+        screen.press(app, Press.OK)
+        assert screen.stage == "swap", screen.stage
+
+
 # --- the panel, against the kernel rather than a double ------------------
 
 

@@ -623,7 +623,41 @@ class RunJob(Screen):
         if state != "idle":
             self.stage = "waiting"
             return self
+        # A drained queue is necessary but NOT sufficient, and this screen
+        # used to treat it as both. The unit ships ErrorPolicy abort-job,
+        # so a job that FAILED is discarded exactly as promptly as one that
+        # printed: measured against a real cupsd with the tray empty, the
+        # queue went to zero in under a second and this transition then
+        # said COPY A DONE over an empty tray, and PAIR COMPLETE after
+        # copy B, and wiped the key on the strength of it. That is the
+        # false success the whole printer_fault mechanism exists to stop,
+        # and only the unattended path was ever wired to it.
+        #
+        # Deliberately here and not in _proceed(). confirm_continue is the
+        # operator's manual override for a cupsd that cannot be asked at
+        # all -- and a cupsd that cannot be asked cannot report a fault
+        # either, so routing that path through this check would only ever
+        # cost them their one non-destructive way out.
+        fault = self._fault(app)
+        if fault:
+            self.stage = "error"
+            self.error = fault
+            return self
         return self._proceed(app)
+
+    def _fault(self, app) -> str:
+        """
+        What the printer says is wrong, or "" if it says nothing or cannot.
+
+        Silence is deliberately not trouble, on the same reasoning as
+        unattended._fault: a wedged cupsd, and any Cups predating
+        printer_fault, must fall back to the queue result rather than send
+        someone to burn a pair that printed perfectly.
+        """
+        try:
+            return app.cups.printer_fault(app.queue) or ""
+        except Exception:                        # noqa: BLE001
+            return ""
 
     def _proceed(self, app):
         """Take the transition, having established the queue is clear."""
