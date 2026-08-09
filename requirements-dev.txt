@@ -6,3 +6,11 @@
 reportlab
 pytest
 pypdf
+
+# The panel's pixels. tests/test_panel_pixels.py drives the real
+# Ssd1306Display drawing code through luma's `dummy` device, which renders
+# to a PIL image -- so the 128x64 layout is asserted without an I2C bus.
+# luma.core, not luma.oled: the ssd1306 class is only touched by the
+# constructor the test bypasses, and this pulls in Pillow, which is the
+# part that actually matters.
+luma.core

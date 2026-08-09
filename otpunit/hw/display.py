@@ -14,9 +14,58 @@ from dataclasses import dataclass, field
 WIDTH = 128
 HEIGHT = 64
 
-# The 6x8 bitmap font that luma/PIL gives us by default: 21 columns, 8 rows.
+# The 6x8 bitmap font this panel's geometry is built on: 21 columns, 8 rows.
+# See _panel_font() -- it is no longer what PIL hands out by default, and
+# every number in this file depends on it.
 COLS = 21
 ROWS = 8
+# Pixels between the tops of consecutive rows. 8 * 8 = 64, exactly the panel.
+ROW_HEIGHT = 8
+# And two pixels up, which is not a fudge -- it is the only offset that
+# fits. Measured over the whole printable set in this font: ink occupies
+# cell rows 2..9 for capitals, digits and the punctuation the panel uses,
+# and 1..10 once lowercase descenders are counted. Eight rows at a pitch of
+# 8 therefore span 7*8 + 8 = 64 pixels of capital ink, which is the panel
+# exactly -- but only if the block starts at -2. At the shipped 0 the last
+# row ran to 67 and every footer lost its bottom pixels.
+#
+#   ROW_TOP    0    -1    -2    -3
+#   off bottom 3     2     1     0
+#   off top    0     0     0     2
+#
+# -2 is the minimum, and the pixel it still loses belongs to a lowercase
+# descender on the LAST row only -- where the unit only ever puts an
+# uppercase footer. tests/test_panel_pixels.py asserts the RESULT over
+# every real screen rather than this reasoning, so a font change is caught
+# even if the comment rots.
+ROW_TOP = -2
+
+
+def _panel_font():
+    """
+    The 6x8 bitmap font, explicitly -- NOT ImageFont.load_default().
+
+    Pillow 10.1 changed what load_default() returns: where FreeType is
+    available it now hands back Aileron, a PROPORTIONAL TrueType face. The
+    unit installs python3-pil from apt (device/packages.txt), so it gets
+    whatever the distro ships. Measured against Aileron on Pillow 12.3:
+
+        'X' * 21    126 px   fits
+        'M' * 21    189 px   61 px past the right edge
+        'W' * 21    210 px   82 px past the right edge
+
+    Frame.rendered() truncates to 21 CHARACTERS, which is the correct unit
+    only for a monospace font. With a proportional one the panel silently
+    cut lines off at the right edge -- and the taller face also pushed 43
+    pixels of the footer off the bottom of a 64-pixel screen.
+
+    load_default_imagefont() is Pillow 11+. Older Pillow has no TTF default
+    to avoid, so load_default() is already this font there.
+    """
+    from PIL import ImageFont
+
+    loader = getattr(ImageFont, "load_default_imagefont", None)
+    return loader() if loader is not None else ImageFont.load_default()
 
 
 @dataclass
@@ -136,17 +185,30 @@ class Ssd1306Display(Display):
     def __init__(self, port: int = 1, address: int = 0x3C, rotate: int = 0):
         from luma.core.interface.serial import i2c
         from luma.oled.device import ssd1306
-        from PIL import ImageFont
 
         self._device = ssd1306(i2c(port=port, address=address), rotate=rotate)
-        self._font = ImageFont.load_default()
+        self._font = _panel_font()
 
     def show(self, frame: Frame) -> None:
         from luma.core.render import canvas
 
         with canvas(self._device) as draw:
-            for row, text in enumerate(frame.rendered()):
-                draw.text((0, row * 8), text.rstrip(), font=self._font, fill=255)
+            self.draw_frame(draw, frame)
+
+    def draw_frame(self, draw, frame: Frame) -> None:
+        """
+        Put a frame on a PIL draw context.
+
+        Split out of show() so a test can drive the real drawing against a
+        framebuffer it can read back. Everything above this module deals in
+        characters; this is the only place the panel becomes pixels, and
+        until tests/test_panel_pixels.py it was the only place with no
+        coverage at all -- the SSD1306 init sequence ran under i2c-stub and
+        nothing was ever drawn.
+        """
+        for row, text in enumerate(frame.rendered()):
+            draw.text((0, row * ROW_HEIGHT + ROW_TOP), text.rstrip(),
+                      font=self._font, fill=255)
 
     def close(self) -> None:
         try:
