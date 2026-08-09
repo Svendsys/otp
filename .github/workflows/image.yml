@@ -1,21 +1,108 @@
 name: Build image
 
-# Deliberately not on every push: the pi-gen build takes roughly half an
-# hour and needs ~10GB of disk. Run it by hand, or on a tag to attach an
-# image to a release.
+# Deliberately not on every push: the pi-gen build needs ~10GB of disk.
+# Run it by hand, or on a tag to attach an image to a release.
+#
+# ...but ALSO on any pull request that touches what goes into the image.
+# Until this was added, nothing checked the image on the PR that broke it:
+# a change to install.sh or the pi-gen stage sailed through CI and was
+# found at release time, or on a Pi. Path-filtered so the cost falls only
+# on the PRs that can actually cause it -- everything else still gets the
+# five fast jobs in ci.yml and nothing here.
+#
+# Not otpunit/** on purpose. The image bakes the package in, but a change
+# there breaks the UNIT, not the image build, and tiers 1 and 2 answer that
+# in seconds. (It IS in the cache key below -- see the note there.)
+#
+# THE BUDGET IS TEN MINUTES. Not per job -- per PR, wall clock, for a
+# change that does not alter what goes into the image. Two things buy that,
+# and both are below: the image is CACHED on the inputs that actually
+# affect it, and the boot is CAPPED.
+#
+# There used to be an honest exception here: a PR that really changes the
+# image pays for a full pi-gen build, and on x86 that could not fit in ten
+# minutes. On a native arm64 runner it does -- measured 8m24s end to end,
+# 7m24s of it pi-gen, against 55m45s for the same work on x86. The budget
+# holds for both cases, so the exception is gone.
+#
+# `push: master` exists to populate that cache. Caches created on a PR
+# branch are visible only to that PR; caches on the base branch are visible
+# to every PR. Without a master build the first run on each new PR would
+# always miss, which is most of the cost this is trying to remove. It also
+# validates the image just after a merge, which nothing did before.
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+    branches: [master]
+  pull_request:
+    paths:
+      - "image/**"
+      - "device/**"
+      - "harness/img-boot.sh"
+      - ".github/workflows/image.yml"
+
+# Same reasoning as ci.yml. Leaving a superseded pi-gen run going burns
+# runner time producing an image for a commit that has already been
+# replaced. Tag and dispatch runs are never cancelled -- those produce
+# artifacts people keep.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   image:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # NATIVE arm64, not x86 emulating it. This repository is public, and
+    # GitHub's arm64 runners are free for public repositories.
+    #
+    # pi-gen builds an arm64 filesystem. On an x86 runner every binary it
+    # executes goes through qemu-user, which is where the bulk of a
+    # thirty-three minute build went -- and it needs four steps of
+    # binfmt_misc setup, with a comment block longer than most of this file,
+    # to work at all. Natively none of that applies: the steps below are
+    # kept but skipped, so the workflow still runs on x86 if it has to.
+    runs-on: ubuntu-24.04-arm
+    # The job cap must always lose the race to the script timeout, or a
+    # timeout costs the diagnosis as well as the run -- learned the hard
+    # way when a 15-minute cap fired before the boot script's own timeout,
+    # cancelled qemu mid-experiment, and skipped the verdict and the
+    # evidence upload (failure() is false on cancellation). Sized from
+    # measured worst case: ~10 minutes of non-boot work on a cache-miss
+    # rebuild (checkout, apt, pi-gen at 7m24s, cache save, upload,
+    # decompress) + the 600s boot backstop + timeout's 30s kill grace +
+    # verdict overhead = ~21.5; 25 leaves real margin. Healthy runs never
+    # go near this: the harness stops qemu at the unit's success line
+    # (~4.5 minutes cached, run 14 measured).
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
+      # --- can we skip the expensive half entirely? -------------------
+      #
+      # Keyed on what actually ends up IN the image. A change to
+      # harness/img-boot.sh, to a test, or to a doc leaves this key alone,
+      # so the boot runs against the same image the previous run built --
+      # which is exactly right, and skips the build entirely.
+      #
+      # human_bias.png is in the key because otp.md embeds it and
+      # render-manual.sh bakes it into the manual PDFs inside the image --
+      # a chart-only change must not green-certify (or tag-release) a
+      # stale image. Found by the review panel.
+      #
+      # otpunit/ and the codewords ARE included even though they are not in
+      # the PR trigger. They are baked into the image, so an image built
+      # before they changed is the wrong image to boot, even if the build
+      # would have succeeded either way. The trigger answers "is this worth
+      # checking"; the key answers "is this image still current".
+      - name: Restore a previously built image
+        id: imgcache
+        uses: actions/cache/restore@v4
+        with:
+          path: image/deploy
+          key: otp-image-${{ runner.arch }}-${{ hashFiles('image/**', 'device/**', 'otpunit/**', 'codewords/**', 'otp_generator.py', 'otp.md', 'human_bias.png') }}
+
       - name: Free up disk space
+        if: steps.imgcache.outputs.cache-hit != 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           df -h /
@@ -45,6 +132,7 @@ jobs:
       # `2>/dev/null || true` -- so an unmounted binfmt_misc produces no
       # error at all, just the arm64-unsupported failure two steps later.
       - name: Mount binfmt_misc on the host
+        if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
           sudo modprobe binfmt_misc || true
           mountpoint -q /proc/sys/fs/binfmt_misc \
@@ -64,6 +152,7 @@ jobs:
       # grep in build-docker.sh, which looks for /usr/bin/qemu-aarch64 and
       # never sees that wrapper path.
       - name: Install the qemu interpreter on the host PATH
+        if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-user
@@ -76,6 +165,7 @@ jobs:
       # Registered LAST, so nothing can overwrite it, and with exactly one
       # handler for the magic so there is no precedence question at all.
       - name: Register arm64 binfmt with the fix-binary flag
+        if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
           if [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
             echo "removing pre-existing registration"
@@ -91,6 +181,7 @@ jobs:
       # that is the only thing that actually proves the registration is
       # usable from another mount namespace.
       - name: Prove arm64 emulation works from inside a container
+        if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
           echo "== registrations visible on the host =="
           for f in /proc/sys/fs/binfmt_misc/qemu-aarch64*; do
@@ -105,31 +196,30 @@ jobs:
           '
 
       - name: Install manual rendering tools
-        run: sudo apt-get install -y pandoc weasyprint
+        if: steps.imgcache.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y pandoc weasyprint
 
       - name: Build
+        if: steps.imgcache.outputs.cache-hit != 'true'
         run: ./image/build.sh
 
-      # Tier 3 of the harness: boot the artifact that was just built. Once
-      # per image, not per commit -- it is emulated, so it is slow, and its
-      # peripheral coverage is WORSE than tier 1's simulators. It answers
-      # exactly one question nothing else can: does the thing that gets
-      # flashed to a card actually come up? pi-gen assembles a filesystem
-      # and never starts it. See harness/README.md.
-      - name: Boot the image
-        continue-on-error: true
-        run: |
-          sudo apt-get install -y --no-install-recommends \
-            qemu-system-arm mtools xz-utils
-          OTP_IMG_WORK=${{ runner.temp }}/otp-img \
-            ./harness/img-boot.sh image/deploy/*.img.xz
-      - name: Boot verdict
-        if: always()
-        run: |
-          echo "=== tier 3 verdict ==="
-          cat ${{ runner.temp }}/otp-img/verdict.txt 2>/dev/null \
-            || echo "(the image never reported)"
+      # Saved HERE, immediately after the build -- not by actions/cache's
+      # automatic post step, which runs under `post-if: success()`. With
+      # the combined action, every run whose BOOT failed skipped the save,
+      # so the cache stayed empty precisely while tier 3 was red -- which
+      # is exactly when cheap iteration on the boot matters. Measured: two
+      # consecutive runs each built the identical image for seven minutes
+      # because the first one's save was silently skipped.
+      - name: Save the image to the cache
+        if: steps.imgcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: image/deploy
+          key: ${{ steps.imgcache.outputs.cache-primary-key }}
 
+      # The artifact is uploaded and attached BEFORE the image is booted, so
+      # that a failing boot can be reported honestly without costing anyone
+      # the image. See the boot step below for why that ordering matters.
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
@@ -142,3 +232,118 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: image/deploy/*.img.xz
+
+      # Tier 3 of the harness: boot the artifact that was just built. Once
+      # per image, not per commit -- it is emulated, so it is slow, and its
+      # peripheral coverage is WORSE than tier 1's simulators. It answers
+      # exactly one question nothing else can: does the thing that gets
+      # flashed to a card actually come up? pi-gen assembles a filesystem
+      # and never starts it. See harness/README.md.
+      #
+      # LAST, AND ALLOWED TO FAIL LOUDLY. This step used to run before the
+      # upload with `continue-on-error: true`, so that an unvalidated check
+      # could not cost anyone the image. The effect on its first real run
+      # was worse than the problem it solved: tier 3 exited 1, and the job
+      # went green with the GitHub API reporting this step's conclusion as
+      # `success`. Anyone reading the status rather than the log would have
+      # concluded the image booted. That is a check that cannot fail --
+      # exactly what the rest of this harness exists to eliminate.
+      #
+      # Moving it after the upload gets both things: the artifact is already
+      # safe, so a red boot costs nothing, and the boot can therefore be
+      # honest about failing.
+      #
+      # 600 seconds, and it is a BACKSTOP, not a budget: the harness stops
+      # qemu the moment the unit's success line appears (run 14: 4m22s
+      # boot step), so only a boot that never gets there pays this number.
+      # It was 480 when reaching the unit still raced the cap -- run 13's
+      # success line landed ~420s in -- and the early stop is what made
+      # raising it free. If a run does hit 600, the verdict's "guest
+      # reached" line says whether the guest was still moving, and the
+      # sampler's qemu-cpu column says whether it was idle or spinning.
+      - name: Boot the image
+        env:
+          OTP_IMG_TIMEOUT: 600
+        run: |
+          # apt-get update FIRST. The runner image ships an apt index that
+          # is days stale, and qemu had moved 8.2.2-0ubuntu1.17 -> .18, so
+          # the install 404'd and the boot step died in two seconds. On the
+          # x86 path this was free -- the binfmt step ran `apt-get update`
+          # on the way past -- and making that step skip on arm64 took the
+          # update with it.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-arm mtools xz-utils
+          OTP_IMG_WORK=${{ runner.temp }}/otp-img \
+            ./harness/img-boot.sh image/deploy/*.img.xz
+      - name: Boot verdict
+        if: always()
+        # Also to the step summary, which is on the run's landing page. The
+        # verdict being in the log was not enough: the one line that
+        # explained the first failure was thirty lines up and easy to scroll
+        # past, and this repository keeps rediscovering that a diagnostic
+        # nobody can find is not a diagnostic.
+        run: |
+          echo "=== tier 3 verdict ==="
+          CACHED='${{ steps.imgcache.outputs.cache-hit }}'
+          if [ "$CACHED" = "true" ]; then
+            BUILT="restored from cache (no pi-gen build)"
+          else
+            BUILT="built from source (pi-gen ran)"
+          fi
+          {
+            echo "## Tier 3 — booting the built image"
+            echo
+            echo "Image: **$BUILT**"
+            echo
+            echo '```'
+            cat ${{ runner.temp }}/otp-img/verdict.txt 2>/dev/null \
+              || echo "(the image never reported)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The bar, stated where it can be seen. Ten minutes is the budget for
+      # a run that did not have to rebuild the image; a run that did is
+      # expected to exceed it and says so rather than failing for it.
+      # Reported rather than enforced: failing an otherwise-good job for
+      # being slow teaches people to ignore the number.
+      - name: Time budget
+        if: always()
+        run: |
+          CACHED='${{ steps.imgcache.outputs.cache-hit }}'
+          {
+            echo
+            echo "Budget: healthy boots stop at the unit start line"
+              echo "(~4.5 minutes wall, run 14 measured); 600s is the"
+              echo "backstop only broken boots pay."
+            echo
+            if [ "$CACHED" = "true" ]; then
+              echo "This run restored the image from cache and went straight"
+              echo "to the boot."
+            else
+              echo "This run rebuilt the image from source. On a native"
+              echo "arm64 runner that is around seven minutes, so it fits"
+              echo "the budget too -- the carve-out this text used to claim"
+              echo "was written for x86 timings, where the same build took"
+              echo "thirty-three."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The job log shows the last hundred console lines; this carries
+      # everything -- both UARTs in full, the verdict, and the boot
+      # partition's own cmdline.txt and config.txt, so the divergence
+      # between what the device would boot and what this harness booted is
+      # part of the record. Two diagnoses this week were built on a
+      # truncated tail; this is the end of that.
+      - name: Upload the boot evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier3-boot-evidence
+          path: |
+            ${{ runner.temp }}/otp-img/console*.log
+            ${{ runner.temp }}/otp-img/verdict.txt
+            ${{ runner.temp }}/otp-img/boot/cmdline.txt
+            ${{ runner.temp }}/otp-img/boot/config.txt
+          retention-days: 7
+          if-no-files-found: ignore
