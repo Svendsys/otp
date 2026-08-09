@@ -54,15 +54,21 @@
 # QEMU's partial PM model (the same probe whose ASB read returned
 # garbage at ~2.2s). The reset was never the image's fault.
 #
-# Runs 7 and 8 then exposed a SECOND, distinct fault. Run 7 (360s cap)
-# reached 31.62s guest; run 8 (480s cap) reached 30.37s -- 120 extra
-# wall seconds bought ZERO guest progress, and both stopped at the same
-# instant: systemd-remount-fs just finished, udev's coldplug sweep just
-# beginning. That is not slowness, it is a wedge. Both wedged runs are
-# the runs with dwc_otg present: bisected INNOCENT of the watchdog, it
-# is separately accused of hard-wedging the emulator when udev coldplug
-# initializes USB -- its FIQ path is the classic raspi-under-QEMU wedge.
-# Hence both initcalls are blacklisted below. See issue #17.
+# Runs 7-9 then chased a SECOND, distinct fault. Every run froze at
+# the SAME EVENT -- the audit record for systemd-remount-fs success, at
+# 29.5-31.6s guest -- and run 9's sampler settled the mechanism: the
+# guest reached that point in under 60 WALL seconds (half real-time;
+# TCG speed was never the problem, and run 8's "raise the cap" push
+# bought nothing because a frozen guest does not need more time), then
+# wrote nothing for seven minutes. Run 9 froze there with dwc_otg
+# blacklisted, acquitting it of this too. The tell is a line missing
+# from EVERY run's console: "random: crng init done". The CRNG never
+# initializes -- an emulated Pi presents no credited entropy source --
+# so the first blocking getrandom() hangs forever, and the first unit
+# PID 1 starts after remount-fs is exactly systemd-random-seed. QEMU
+# models the BCM2835 hardware RNG; the fix is to load its driver before
+# that moment and credit what it reads (modules_load= and
+# rng_core.default_quality= on -append). See issue #17.
 #
 # WHAT THIS CATCHES that the other tiers do not: whether the artifact
 # BOOTS. pi-gen assembles a filesystem and never starts it; tier 2 boots a
@@ -215,18 +221,30 @@ set +e
 #   pm cluster writes passworded values against QEMU's partial model,
 #   and one lands where the model keeps its watchdog.
 #
-#   dwc_otg_driver_init -- THE WEDGE. Bisected innocent of the watchdog,
-#   but runs 7 and 8 both froze at the same guest instant (~30.4s, the
-#   start of udev coldplug) with dwc_otg present, and 120 extra wall
-#   seconds bought zero guest progress. Skipping it means the emulated
-#   boot has NO USB -- which the unit is DESIGNED to survive: unattended
-#   mode is the default precisely because a headless unit with nothing
-#   attached must print pads anyway, and tier 1 covers the keyboard-
-#   detection path with a real uinput device.
+#   dwc_otg_driver_init -- accused of the post-remount-fs wedge after
+#   runs 7/8, ACQUITTED by run 9, which froze at the same event with
+#   this blacklisted. It stays blacklisted for now so the entropy fix
+#   below lands against run 9's exact baseline -- one variable at a
+#   time -- but a driver convicted of nothing should boot: once the
+#   image reaches unit-started, restoring this is the next experiment.
+#   Blacklisted, the emulated boot has no USB, which the unit is
+#   designed to survive (unattended mode is the default; tier 1 covers
+#   keyboard detection with a real uinput device).
 #
-# Both are emulation accommodations of the same kind as -append itself:
-# the DEVICE boots both drivers against real hardware, and this harness
-# says so rather than pretending the emulated boot is identical.
+# rng_core.default_quality=1000 modules_load=bcm2835_rng -- THE WEDGE
+# FIX (runs 7-9; see the header). No run ever printed "random: crng
+# init done"; PID 1 blocks in getrandom() starting systemd-random-seed,
+# the first unit after remount-fs, and the machine falls silent
+# forever. QEMU's raspi3b models the BCM2835 hardware RNG, so ask
+# systemd-modules-load (which finishes at ~28s guest, before the wedge)
+# to load its driver, and have rng-core credit what it reads so the
+# CRNG initializes. Real hardware seeds itself from firmware and the
+# SoC RNG and needs neither parameter.
+#
+# All of these are emulation accommodations of the same kind as -append
+# itself: the DEVICE boots every one of these drivers against real
+# hardware, and this harness says so rather than pretending the
+# emulated boot is identical.
 #
 # One console on the kernel command line; BOTH captured below. Under
 # -M raspi3b, ttyAMA0 comes out of the SECOND -serial, not the first --
@@ -240,7 +258,7 @@ set +e
 timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -M raspi3b -m 1024 \
     -kernel "$KERNEL" -dtb "$DTB" \
-    -append "rw earlycon loglevel=7 console=ttyAMA0,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init,dwc_otg_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
+    -append "rw earlycon loglevel=7 console=ttyAMA0,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init,dwc_otg_driver_init rng_core.default_quality=1000 modules_load=bcm2835_rng root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
     -drive "file=$IMG,if=sd,format=raw" \
     -serial "file:$CONSOLE" \
     -serial "file:$CONSOLE2" \
