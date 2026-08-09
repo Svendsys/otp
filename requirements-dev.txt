@@ -6,3 +6,4 @@
 reportlab
 pytest
 pypdf
+pyyaml
