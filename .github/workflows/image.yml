@@ -62,10 +62,14 @@ jobs:
     # to work at all. Natively none of that applies: the steps below are
     # kept but skipped, so the workflow still runs on x86 if it has to.
     runs-on: ubuntu-24.04-arm
-    # Was 120. A budget nobody can exceed is not a budget. Measured on
-    # arm64: 8m24s for a full rebuild, and a cached run skips most of that.
-    # 15 is the outer backstop, roughly double the observed worst case.
-    timeout-minutes: 15
+    # 20, up from 15 -- and the 15 was a self-inflicted wound. It was sized
+    # against a run whose BOOT failed in two seconds; a rebuild plus a
+    # full 360-second boot is ~16, so the job cap fired BEFORE the boot
+    # script's own timeout, cancelled qemu mid-experiment, and skipped the
+    # verdict and the evidence upload. The job cap must always lose the
+    # race to the script timeout, or a timeout costs the diagnosis as well
+    # as the run.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

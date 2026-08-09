@@ -200,13 +200,29 @@ set +e
 # a reboot loop, and the performance story died with it. 7 keeps INFO and
 # drops only DEBUG.
 #
-# initcall_blacklist is the reset hypothesis made testable: the
-# bcm2835-pm watchdog/power cluster and dwc_otg both probe QEMU's
-# incomplete models inside the watchdog-arming window, neither is needed
-# to answer this tier's one question, and neither has real hardware here
-# to drive. An emulation accommodation of exactly the same kind as
-# -append itself -- the DEVICE still boots both drivers, and this harness
-# says so rather than pretending otherwise.
+# initcall_blacklist: bcm2835_pm_driver_init, and the run history of why.
+#
+# Blacklisting BOTH bcm2835-pm and dwc_otg stopped the reset -- qemu
+# stayed alive 270+ seconds where every prior run died inside 40 -- but
+# the boot then stalled silently a few guest-seconds in, output flat,
+# which is what rootwait polling for a card that never enumerated looks
+# like. So one of the two armed the watchdog and the other is needed by
+# the boot. This revision keeps ONLY the bcm2835-pm blacklist, on the
+# mechanism argument: the PM block demands a 0x5a-password on every
+# write, its power-domain child writes passworded values against QEMU's
+# partial model (the garbage ASB read at ~2.2s is that same probe), and
+# a passworded write landing where the model keeps WDOG is an armed
+# watchdog. dwc_otg has no such path to the PM block.
+#
+#   - reset gone AND boot proceeds => bcm2835-pm was the armer; dwc_otg
+#     innocent and restored. Solved.
+#   - reset returns => the armer was dwc_otg after all; swap the names.
+#   - reset gone, boot still stalls => the stall belongs to the pm
+#     blacklist itself (genpd consumers deferring); different problem,
+#     now isolated.
+#
+# An emulation accommodation of the same kind as -append itself: the
+# DEVICE still boots this driver, and this harness says so.
 #
 # One console on the kernel command line; BOTH captured below. Under
 # -M raspi3b, ttyAMA0 comes out of the SECOND -serial, not the first --
@@ -220,7 +236,7 @@ set +e
 timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -M raspi3b -m 1024 \
     -kernel "$KERNEL" -dtb "$DTB" \
-    -append "rw earlycon loglevel=7 console=ttyAMA0,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init,dwc_otg_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
+    -append "rw earlycon loglevel=7 console=ttyAMA0,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
     -drive "file=$IMG,if=sd,format=raw" \
     -serial "file:$CONSOLE" \
     -serial "file:$CONSOLE2" \
