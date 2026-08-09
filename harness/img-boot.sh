@@ -52,8 +52,17 @@
 # 31.6s of guest time reached, systemd running, targets reached --
 # CONFIRMED. The armer is the bcm2835-pm watchdog/power cluster probing
 # QEMU's partial PM model (the same probe whose ASB read returned
-# garbage at ~2.2s); dwc_otg is innocent and boots normally. The reset
-# was never the image's fault. See issue #17.
+# garbage at ~2.2s). The reset was never the image's fault.
+#
+# Runs 7 and 8 then exposed a SECOND, distinct fault. Run 7 (360s cap)
+# reached 31.62s guest; run 8 (480s cap) reached 30.37s -- 120 extra
+# wall seconds bought ZERO guest progress, and both stopped at the same
+# instant: systemd-remount-fs just finished, udev's coldplug sweep just
+# beginning. That is not slowness, it is a wedge. Both wedged runs are
+# the runs with dwc_otg present: bisected INNOCENT of the watchdog, it
+# is separately accused of hard-wedging the emulator when udev coldplug
+# initializes USB -- its FIQ path is the classic raspi-under-QEMU wedge.
+# Hence both initcalls are blacklisted below. See issue #17.
 #
 # WHAT THIS CATCHES that the other tiers do not: whether the artifact
 # BOOTS. pi-gen assembles a filesystem and never starts it; tier 2 boots a
@@ -80,7 +89,7 @@ IMAGE_XZ="${1:?usage: img-boot.sh <image.img.xz>}"
 WORK="${OTP_IMG_WORK:-${TMPDIR:-/tmp}/otp-img}"
 # A GENEROUS DEFAULT FOR A HUMAN, a tight cap in CI. Someone running this
 # by hand is debugging and wants the room; CI has a ten-minute budget and
-# sets OTP_IMG_TIMEOUT=360 in image.yml. The two numbers are meant to
+# sets OTP_IMG_TIMEOUT=480 in image.yml. The two numbers are meant to
 # differ, and the CI one is the one that expresses policy.
 TIMEOUT="${OTP_IMG_TIMEOUT:-1200}"
 
@@ -199,19 +208,25 @@ set +e
 # a reboot loop, and the performance story died with it. 7 keeps INFO and
 # drops only DEBUG.
 #
-# initcall_blacklist=bcm2835_pm_driver_init -- THE FIX for the ~11.5s
-# reset, confirmed by bisection (runs 6 and 7; see the header). The PM
-# block demands a 0x5a password on every write; the pm cluster's
-# power-domain child writes passworded values against QEMU's partial
-# model of that block, and one of them lands where the model keeps its
-# watchdog. Skipping the driver's initcall means nothing ever touches
-# the emulated PM block, so nothing arms it. dwc_otg was bisected
-# innocent and boots normally.
+# initcall_blacklist, two entries for two distinct crimes:
 #
-# An emulation accommodation of the same kind as -append itself: the
-# DEVICE still boots this driver -- on real hardware the PM block is
-# real and the writes are correct -- and this harness says so rather
-# than pretending the emulated boot is identical.
+#   bcm2835_pm_driver_init -- THE ~11.5s RESET, confirmed by bisection
+#   (runs 6/7). The PM block demands a 0x5a password on every write; the
+#   pm cluster writes passworded values against QEMU's partial model,
+#   and one lands where the model keeps its watchdog.
+#
+#   dwc_otg_driver_init -- THE WEDGE. Bisected innocent of the watchdog,
+#   but runs 7 and 8 both froze at the same guest instant (~30.4s, the
+#   start of udev coldplug) with dwc_otg present, and 120 extra wall
+#   seconds bought zero guest progress. Skipping it means the emulated
+#   boot has NO USB -- which the unit is DESIGNED to survive: unattended
+#   mode is the default precisely because a headless unit with nothing
+#   attached must print pads anyway, and tier 1 covers the keyboard-
+#   detection path with a real uinput device.
+#
+# Both are emulation accommodations of the same kind as -append itself:
+# the DEVICE boots both drivers against real hardware, and this harness
+# says so rather than pretending the emulated boot is identical.
 #
 # One console on the kernel command line; BOTH captured below. Under
 # -M raspi3b, ttyAMA0 comes out of the SECOND -serial, not the first --
@@ -225,7 +240,7 @@ set +e
 timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -M raspi3b -m 1024 \
     -kernel "$KERNEL" -dtb "$DTB" \
-    -append "rw earlycon loglevel=7 console=ttyAMA0,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
+    -append "rw earlycon loglevel=7 console=ttyAMA0,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init,dwc_otg_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
     -drive "file=$IMG,if=sd,format=raw" \
     -serial "file:$CONSOLE" \
     -serial "file:$CONSOLE2" \
