@@ -46,7 +46,7 @@ BASE="$WORK/base.qcow2"
 # Three boots now, not one, each with a 45s settle inside it. Under KVM the
 # whole run is around eight minutes; this is headroom, not an estimate.
 #
-# Deliberately WELL under the workflow's timeout-minutes (45). The gap is
+# Deliberately WELL under the workflow's timeout-minutes (15). The gap is
 # not slack, it is the budget for the failure path: a job killed by
 # GitHub's timeout skips its remaining steps, so the console dump and the
 # verdict would never run and the diagnosis would be lost. This timeout has
@@ -93,9 +93,10 @@ qemu-img create -q -f qcow2 -b "$BASE" -F qcow2 "$WORK/overlay.qcow2" 12G
 # --- the repository, as a disk ------------------------------------------
 
 # A tar handed to the guest as a raw block device. Simpler than 9p or
-# virtiofs and it needs no filesystem driver on either side: tar reads
-# straight from /dev/vdb and stops at the archive's end marker, ignoring
-# the padding QEMU rounds the device up to.
+# virtiofs and it needs no filesystem driver on either side: the guest
+# resolves the disk by serial (/dev/disk/by-id/virtio-otprepo -- names,
+# not numbers, per the trap list below) and tar stops at the archive's
+# end marker, ignoring the padding QEMU rounds the device up to.
 log "Packing the repository"
 tar -C "$REPO" --exclude=.git --exclude='image/pi-gen' --exclude='__pycache__' \
     -cf "$WORK/repo.tar" .

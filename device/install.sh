@@ -384,11 +384,33 @@ systemctl enable getty@tty2.service 2>/dev/null || true
 # DISABLE_FIRST_BOOT_USER_RENAME=1 only deletes the DESKTOP wizard's
 # autostart file; it never touches this service, so tier 3 caught the
 # built image parked on it -- and a flashed device would boot the same
-# way, a dialog nobody can see holding the boot open. The user this
-# wizard exists to create already exists (pi-gen's FIRST_USER_NAME, or
-# whoever ran this script). Mask rather than disable so a package
-# update's postinst cannot re-enable it.
-systemctl mask userconfig.service 2>/dev/null || true
+# way, a dialog nobody can see holding the boot open.
+#
+# NOT masked, though an earlier fix did -- the review panel caught what
+# that broke: userconf-service is also the ONLY consumer of the
+# documented headless credential file /boot/firmware/userconf.txt, and
+# masking it silently ignored operator-provided credentials, leaving
+# the tty2 recovery getty below with no knowable login. The drop-in
+# keeps both properties instead:
+#
+#   - the ConditionPathExists |= pair: the service runs ONLY when an
+#     operator actually seeded userconf(.txt), so an unseeded boot
+#     skips it instantly instead of prompting, and a seeded one gets
+#     the stock non-interactive apply-and-delete path.
+#   - StandardInput=null: a MALFORMED seed file would fall back to the
+#     interactive prompt; with no tty it fails fast instead, the boot
+#     completes (wanted-by, not required-by), and the file is left
+#     renamed failed_userconf.txt on the boot partition as evidence.
+systemctl unmask userconfig.service 2>/dev/null || true
+install -d /etc/systemd/system/userconfig.service.d
+cat > /etc/systemd/system/userconfig.service.d/otp-appliance.conf <<'DROPIN'
+[Unit]
+ConditionPathExists=|/boot/firmware/userconf
+ConditionPathExists=|/boot/firmware/userconf.txt
+
+[Service]
+StandardInput=null
+DROPIN
 
 if [ "$IMAGE_BUILD" -eq 0 ]; then
     log "Done. Reboot to start the unit."

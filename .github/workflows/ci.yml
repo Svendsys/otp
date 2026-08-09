@@ -62,7 +62,15 @@ jobs:
     # -- six rounds of reading the code did not, and a daemon did in four
     # seconds. See harness/README.md.
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 18 so the pytest step's own `timeout 600` below always fires first:
+    # setup (apt, the cups stack, linux-modules-extra, pips, sim bring-up)
+    # runs ~2-4 minutes, so the inner cap lands by ~14 and the failure()
+    # diagnostics still have room. Under a cap smaller than setup + inner
+    # timeout, a hung test gets the JOB cancelled instead -- failure() is
+    # false on cancellation, so the CUPS error-log step is skipped and the
+    # hang loses its diagnosis. Found by the review panel: the previous
+    # 15 made the old inner `timeout 900` unreachable dead code.
+    timeout-minutes: 18
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -133,7 +141,7 @@ jobs:
         run: |
           set -o pipefail
           sudo -E env "PATH=$PATH" \
-            timeout 900 python3 -m pytest -m hardware -v -p no:randomly \
+            timeout 600 python3 -m pytest -m hardware -v -p no:randomly \
               --tb=short -rfs 2>&1 | tee /tmp/harness.log
       - name: The CUPS error log, if anything failed
         if: failure()

@@ -62,14 +62,18 @@ jobs:
     # to work at all. Natively none of that applies: the steps below are
     # kept but skipped, so the workflow still runs on x86 if it has to.
     runs-on: ubuntu-24.04-arm
-    # 20, up from 15 -- and the 15 was a self-inflicted wound. It was sized
-    # against a run whose BOOT failed in two seconds; a rebuild plus a
-    # full 360-second boot is ~16, so the job cap fired BEFORE the boot
-    # script's own timeout, cancelled qemu mid-experiment, and skipped the
-    # verdict and the evidence upload. The job cap must always lose the
-    # race to the script timeout, or a timeout costs the diagnosis as well
-    # as the run.
-    timeout-minutes: 20
+    # The job cap must always lose the race to the script timeout, or a
+    # timeout costs the diagnosis as well as the run -- learned the hard
+    # way when a 15-minute cap fired before the boot script's own timeout,
+    # cancelled qemu mid-experiment, and skipped the verdict and the
+    # evidence upload (failure() is false on cancellation). Sized from
+    # measured worst case: ~10 minutes of non-boot work on a cache-miss
+    # rebuild (checkout, apt, pi-gen at 7m24s, cache save, upload,
+    # decompress) + the 600s boot backstop + timeout's 30s kill grace +
+    # verdict overhead = ~21.5; 25 leaves real margin. Healthy runs never
+    # go near this: the harness stops qemu at the unit's success line
+    # (~4.5 minutes cached, run 14 measured).
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -79,6 +83,11 @@ jobs:
       # harness/img-boot.sh, to a test, or to a doc leaves this key alone,
       # so the boot runs against the same image the previous run built --
       # which is exactly right, and skips the build entirely.
+      #
+      # human_bias.png is in the key because otp.md embeds it and
+      # render-manual.sh bakes it into the manual PDFs inside the image --
+      # a chart-only change must not green-certify (or tag-release) a
+      # stale image. Found by the review panel.
       #
       # otpunit/ and the codewords ARE included even though they are not in
       # the PR trigger. They are baked into the image, so an image built
@@ -90,7 +99,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: image/deploy
-          key: otp-image-${{ runner.arch }}-${{ hashFiles('image/**', 'device/**', 'otpunit/**', 'codewords/**', 'otp_generator.py', 'otp.md') }}
+          key: otp-image-${{ runner.arch }}-${{ hashFiles('image/**', 'device/**', 'otpunit/**', 'codewords/**', 'otp_generator.py', 'otp.md', 'human_bias.png') }}
 
       - name: Free up disk space
         if: steps.imgcache.outputs.cache-hit != 'true'
@@ -244,15 +253,14 @@ jobs:
       # safe, so a red boot costs nothing, and the boot can therefore be
       # honest about failing.
       #
-      # 480 seconds, which spends the whole ten-minute budget on the boot
-      # after ~2 minutes of restore/decompress overhead. The bisect run
-      # proved the boot alive and progressing at 31.6s guest when the old
-      # 360s cap cut it -- systemd up, targets reached, the unit not yet
-      # started. Busy boot phases run ~11x slower than wall under TCG but
-      # idle waits advance at near wall speed, so 480 is expected to reach
-      # the unit; if it does not, the verdict's "guest reached" line says
-      # whether it was still moving, and THAT is the moment to consider
-      # masking services rather than raising the number again.
+      # 600 seconds, and it is a BACKSTOP, not a budget: the harness stops
+      # qemu the moment the unit's success line appears (run 14: 4m22s
+      # boot step), so only a boot that never gets there pays this number.
+      # It was 480 when reaching the unit still raced the cap -- run 13's
+      # success line landed ~420s in -- and the early stop is what made
+      # raising it free. If a run does hit 600, the verdict's "guest
+      # reached" line says whether the guest was still moving, and the
+      # sampler's qemu-cpu column says whether it was idle or spinning.
       - name: Boot the image
         env:
           OTP_IMG_TIMEOUT: 600
@@ -305,8 +313,9 @@ jobs:
           CACHED='${{ steps.imgcache.outputs.cache-hit }}'
           {
             echo
-            echo "Budget: healthy boots stop at the unit start line (~7-8"
-              echo "minutes wall); 600s is the backstop only broken boots pay."
+            echo "Budget: healthy boots stop at the unit start line"
+              echo "(~4.5 minutes wall, run 14 measured); 600s is the"
+              echo "backstop only broken boots pay."
             echo
             if [ "$CACHED" = "true" ]; then
               echo "This run restored the image from cache and went straight"

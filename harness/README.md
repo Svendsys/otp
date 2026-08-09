@@ -213,7 +213,9 @@ arm64-specific half is covered elsewhere — the image build runs
 This tier is about what happens *after* boot.
 
 The repository reaches the guest as a tar handed over as a raw block
-device (`tar -xf /dev/vdb`). That needs no filesystem driver on either
+device, resolved by serial (`/dev/disk/by-id/virtio-otprepo`) rather than
+by number -- adding a disk once renumbered `vdb` to `vdd` and tar quietly
+unpacked a blank partition. That needs no filesystem driver on either
 side, which is one less thing to be wrong.
 
 **`python3-lgpio` is deliberately absent** in the guest — it comes from
@@ -226,12 +228,19 @@ unattended rather than failing to start.
 `./harness/img-boot.sh <image.img.xz>`, or the `Boot the image` step in
 `image.yml`.
 
-**First run: 2026-08-08. It did not boot.** Everything the review fixed
-before it had ever executed did work — the boot partition was found from
-the MBR at sector 16384 (the old hardcoded 8192 read the pre-partition
-gap), the image was padded to a power of two, and both `mcopy` calls found
-their files. Then QEMU exited 0 having written **nothing** to the serial
-console, not even `Linux version`. Tracked in issue #17.
+**First run: 2026-08-08. It did not boot** — QEMU exited 0 having
+written nothing to either UART. Fifteen runs later it goes green in
+~4.5 minutes: the wrong DTB (raspi3b vs the B+ tree), a watchdog in
+QEMU's partial PM model resetting the guest at 11.5s
+(`initcall_blacklist=bcm2835_pm_driver_init`), a console parameter
+naming a device this DTB doesn't have (`ttyAMA1`, not `ttyAMA0` — six
+runs diagnosed a "freeze" that was a dead console), and Raspberry Pi
+OS's first-boot wizard holding `multi-user.target` open forever — a
+real bug that would have shipped to hardware, now handled by a
+systemd drop-in in `install.sh`. The harness stops the emulator the
+moment the unit's success line appears and judges the boot on
+ANSI-stripped console evidence, not qemu's exit code. The full
+fifteen-run narrative lives in `img-boot.sh`'s header and issue #17.
 
 It no longer carries `continue-on-error`. It used to, so that an
 unvalidated step could not cost anyone the image — and the effect on its

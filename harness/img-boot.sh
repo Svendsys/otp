@@ -4,7 +4,7 @@
 #
 #   ./harness/img-boot.sh image/deploy/otp-print-unit.img.xz
 #
-# HISTORY, because this took three runs and each one moved the goalposts.
+# HISTORY, because this took fifteen runs and each one moved the goalposts.
 #
 # Run 1 (31260949543): nothing at all on the serial console -- not even
 # "Linux version". The MBR-derived boot offset, the power-of-two padding
@@ -356,7 +356,13 @@ VERDICT="$WORK/verdict.txt"
 # uart1 ends at the bootconsole handoff (~2s), and with uart1 concatenated
 # second, run 12 reported "guest reached 1.9s" while the real console
 # stood at 213s.
-LAST_TS=$(grep -oE '\[ *[0-9]+\.[0-9]+\]' "$CONSOLE_TXT" 2>/dev/null | tr -d '[] ' | sort -g | tail -1)
+# `|| true` because a console with no kernel timestamp at all -- qemu
+# failed to launch, or run 1's zero-byte symptom -- makes grep exit 1,
+# and under pipefail+errexit an unguarded substitution here killed the
+# script BEFORE verdict.txt was written: no IMG-CHECK lines, no rc
+# report, no console tail, precisely in the no-evidence case. Found by
+# the review panel; the identical guard was already on the next line.
+LAST_TS=$(grep -oE '\[ *[0-9]+\.[0-9]+\]' "$CONSOLE_TXT" 2>/dev/null | tr -d '[] ' | sort -g | tail -1 || true)
 KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/null || true)
 {
     printf 'qemu exit: %s\n' "$QEMU_RC"
