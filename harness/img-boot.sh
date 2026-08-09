@@ -247,7 +247,7 @@ set +e
 # a reboot loop, and the performance story died with it. 7 keeps INFO and
 # drops only DEBUG.
 #
-# initcall_blacklist, two entries, one conviction:
+# initcall_blacklist, one entry, one conviction:
 #
 #   bcm2835_pm_driver_init -- THE ~11.5s RESET, confirmed by bisection
 #   (runs 6/7) and re-verified in the local rig (alive past 15s with
@@ -257,14 +257,13 @@ set +e
 #   one lands where the model keeps its watchdog. An emulation
 #   accommodation: the DEVICE boots this driver against real hardware.
 #
-#   dwc_otg_driver_init -- convicted of NOTHING. Accused of the
-#   watchdog (bisected innocent, run 7), then of a coldplug wedge that
-#   turned out to be the console blindfold above. It stays blacklisted
-#   solely so the console fix lands against run 11's exact baseline;
-#   restoring it is the first follow-up once the boot is green.
-#   Blacklisted, the emulated boot has no USB, which the unit is
-#   designed to survive (unattended mode is the default; tier 1 covers
-#   keyboard detection with a real uinput device).
+#   dwc_otg is deliberately NOT here. It spent runs 6-14 blacklisted on
+#   precaution and was convicted of nothing in that time -- the reset
+#   was the pm driver (bisected, run 7), and the "coldplug wedge" it
+#   was suspected of was the dead-console blindfold. Run 15 restored
+#   it; if the downstream USB driver ever does misbehave against
+#   QEMU's controller model, the working console will print the line
+#   that convicts it, which is more than any of its accusations had.
 #
 # console=ttyAMA1 because that is what the PL011 is CALLED under this
 # DTB's aliases -- serial0 and stdout-path point at the mini-UART,
@@ -281,7 +280,7 @@ set +e
 timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
     -M raspi3b -m 1024 \
     -kernel "$KERNEL" -dtb "$DTB" \
-    -append "rw earlycon loglevel=7 console=ttyAMA1,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init,dwc_otg_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
+    -append "rw earlycon loglevel=7 console=ttyAMA1,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
     -drive "file=$IMG,if=sd,format=raw" \
     -serial "file:$CONSOLE" \
     -serial "file:$CONSOLE2" \
