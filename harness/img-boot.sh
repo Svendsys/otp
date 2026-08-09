@@ -124,10 +124,11 @@ set -euo pipefail
 
 IMAGE_XZ="${1:?usage: img-boot.sh <image.img.xz>}"
 WORK="${OTP_IMG_WORK:-${TMPDIR:-/tmp}/otp-img}"
-# A GENEROUS DEFAULT FOR A HUMAN, a tight cap in CI. Someone running this
-# by hand is debugging and wants the room; CI has a ten-minute budget and
-# sets OTP_IMG_TIMEOUT=480 in image.yml. The two numbers are meant to
-# differ, and the CI one is the one that expresses policy.
+# A BACKSTOP, not a target. Healthy boots end at the unit start line --
+# the sampler stops the emulator the moment it appears (~430s wall under
+# TCG), so this cap is only ever paid by a boot that never got there.
+# CI sets OTP_IMG_TIMEOUT=600; the local default is roomier because
+# someone running this by hand is debugging.
 TIMEOUT="${OTP_IMG_TIMEOUT:-1200}"
 
 mkdir -p "$WORK"
@@ -295,11 +296,27 @@ QEMU_PID=$!
 SAMPLE=30
 ELAPSED=0
 LAST=0
+EARLY_STOP=
+ESC=$(printf '\033')
 while kill -0 "$QEMU_PID" 2>/dev/null; do
     sleep "$SAMPLE"
     ELAPSED=$((ELAPSED + SAMPLE))
     NOW=$(wc -c < "$CONSOLE" 2>/dev/null || echo 0)
     NOW2=$(wc -c < "$CONSOLE2" 2>/dev/null || echo 0)
+    # A healthy boot of this image never ends by itself: the unit comes
+    # up and the guest idles. Waiting out the full cap after the success
+    # line has already been printed adds minutes and, worse, puts the
+    # verdict in a race with the cap -- run 13's success line landed
+    # around 420s of a 480s cap. Once the line is visible, give the
+    # console a few seconds to drain and stop the emulator ourselves.
+    if [ -z "$EARLY_STOP" ] && \
+       sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' "$CONSOLE" 2>/dev/null \
+           | grep -qF "Started otp-unit.service"; then
+        EARLY_STOP=$ELAPSED
+        printf '   unit start line visible at %ss wall; draining 10s, then stopping qemu\n' "$ELAPSED" >&2
+        sleep 10
+        kill "$QEMU_PID" 2>/dev/null || true
+    fi
     # Host-side CPU%% of the emulator, because flat output alone cannot
     # distinguish a guest idle-waiting (near 0%%) from one spinning in
     # place (pegged). $QEMU_PID is the timeout(1) wrapper, so sample its
@@ -322,7 +339,6 @@ cat "$CONSOLE" "$CONSOLE2" > "$CONSOLE_ALL" 2>/dev/null || true
 # are "Started ESC[0;1;39motp-unit.serviceESC[0m - ..." -- run 12's boot
 # started the unit and the verdict still said FAIL because the pattern
 # could never straddle the escape sequence.
-ESC=$(printf '\033')
 sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' \
     "$CONSOLE_ALL" > "$CONSOLE_TXT" 2>/dev/null || cp "$CONSOLE_ALL" "$CONSOLE_TXT"
 log "uart0=$(wc -c < "$CONSOLE") bytes  uart1=$(wc -c < "$CONSOLE2") bytes"
@@ -376,6 +392,14 @@ KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/n
     # carries systemd.show_status=1 -- so this check passed on a boot that
     # never reached userspace at all, matching a flag this harness itself
     # added. Only PID 1 writes "systemd[1]:".
+    # A boot that succeeded, reset, and looped would still have the
+    # success line in its console. Entries != 1 is that loop stated
+    # directly, and it fails the run no matter what else passed.
+    if [ "${KERNEL_ENTRIES:-0}" = "1" ]; then
+        printf 'IMG-CHECK single-kernel-entry PASS\n'
+    else
+        printf 'IMG-CHECK single-kernel-entry FAIL\n'
+    fi
     for want in "Linux version" "systemd[1]:" "Reached target"; do
         if grep -qF -- "$want" "$CONSOLE_TXT" 2>/dev/null; then
             printf 'IMG-CHECK %s PASS\n' "$(printf '%s' "$want" | tr ' ' '-')"
@@ -386,13 +410,19 @@ KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/n
 } > "$VERDICT"
 cat "$VERDICT"
 
-# qemu's own exit status is part of the verdict. It was printed and gated
-# on nowhere, so a run killed by the timeout still reported success.
-if [ "$QEMU_RC" != 0 ]; then
-    echo "qemu exited $QEMU_RC (124 = killed by the ${TIMEOUT}s timeout)" >&2
-    echo "--- last 100 lines (ANSI stripped; uart0 is the real console) ---" >&2
-    tail -n 100 "$CONSOLE_TXT" >&2
-    exit 1
+# qemu's exit code is CONTEXT, not the verdict. A healthy boot of this
+# image never exits the emulator -- the unit starts and the guest idles,
+# so the only endings are our own early stop (SIGTERM once the success
+# line appears) or the backstop timeout. Run 13 booted, started the
+# unit, passed every console check, and was failed here on rc=124: the
+# exit code of the stopwatch. The console evidence decides; the rc is
+# reported so a crash mid-run still shows up in the record.
+if [ -n "$EARLY_STOP" ]; then
+    echo "qemu stopped by the harness at ${EARLY_STOP}s wall, after the unit start line appeared (rc=$QEMU_RC)" >&2
+elif [ "$QEMU_RC" = 124 ]; then
+    echo "qemu ran to the ${TIMEOUT}s backstop without the unit start line (rc=124)" >&2
+else
+    echo "qemu exited rc=$QEMU_RC before the backstop" >&2
 fi
 if grep -q "FAIL" "$VERDICT"; then
     echo "the image did not boot cleanly to a started unit" >&2

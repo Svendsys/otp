@@ -255,7 +255,7 @@ jobs:
       # masking services rather than raising the number again.
       - name: Boot the image
         env:
-          OTP_IMG_TIMEOUT: 480
+          OTP_IMG_TIMEOUT: 600
         run: |
           # apt-get update FIRST. The runner image ships an apt index that
           # is days stale, and qemu had moved 8.2.2-0ubuntu1.17 -> .18, so
@@ -305,7 +305,8 @@ jobs:
           CACHED='${{ steps.imgcache.outputs.cache-hit }}'
           {
             echo
-            echo "Budget: **10 minutes**, and it applies to both cases."
+            echo "Budget: healthy boots stop at the unit start line (~7-8"
+              echo "minutes wall); 600s is the backstop only broken boots pay."
             echo
             if [ "$CACHED" = "true" ]; then
               echo "This run restored the image from cache and went straight"
