@@ -56,9 +56,14 @@ its largest choice, together worth about 1.3 MiB at 1000 pages:
     (interpreter + imports alone: 26.0 MiB)
 
 And generate() is not the end of it: `Cups.submit` hands `bytes(data)` to
-subprocess, a second full copy held across the call, once per copy. The
-whole PadPairJob -- generate, submit A, submit B -- peaks about 4% above
-the generate figure, and that is what the process really costs.
+subprocess, a second full copy held across the call, once per copy. That
+extra copy does NOT raise the process high-water mark at these sizes --
+measured, the whole PadPairJob peaks at exactly the generate figure,
+because the submit copy fits under reportlab's own transient peak. It is
+still real, and it is still measured: the submit phase is timed against a
+REBASED VmHWM (see _SUBMIT_BODY) and costs 1.00 pads of live memory over
+what generate leaves resident. An earlier version of this file claimed
+"about 4% above" from a reading that could not distinguish the two.
 
 A6 is the worst case and not by accident: A4 and A7 impose four and two
 pad pages onto one sheet, so a 1000-page pad is 250 or 500 PDF page
@@ -66,8 +71,10 @@ objects against A6's 1000. `test_a6_is_still_the_worst_format` exists so
 that if that ever inverts, the headline test gets retargeted by a red run
 rather than quietly measuring the second-worst case.
 
-The slope is ~17 KiB per pad page and flat, which is the number that
-generalises: at MAX_PAGES it projects to about 193 MiB, inside the 288.
+The slope is ~18.5 KiB per pad page and flat, which is the number that
+generalises: at MAX_PAGES it projects to about 210 MiB, inside the 288.
+`PER_PAGE_KIB` is the budget for it and is deliberately near the
+measurement rather than double it -- see the constant.
 
 WHAT NOT TO MEASURE IT WITH
 ---------------------------
@@ -110,6 +117,16 @@ sys.path.insert(0, str(REPO))
 
 from otpunit import config                        # noqa: E402
 
+# Every measurement here reads /proc/self/status, and the ru_maxrss test
+# asserts a Linux exec detail outright. Without this the whole module turned
+# into nine hard failures on macOS or Windows, each reported as "the
+# measurement child died; nothing was measured" -- a misleading diagnosis
+# for what is really an unsupported platform. tests/test_simulated_hardware
+# guards its kernel dependencies the same way.
+pytestmark = pytest.mark.skipif(
+    not Path("/proc/self/status").exists(),
+    reason="the memory budget is measured through /proc, which is Linux-only")
+
 # --- the budget ----------------------------------------------------------
 
 BOARD_MIB = 512
@@ -120,16 +137,31 @@ AVAILABLE_MIB = LINUX_MIB - SYSTEM_ALLOWANCE_MIB
 
 #: What a job the panel can ask for may peak at.
 PROCESS_CEILING_MIB = 128
-#: Marginal cost per pad page. Measured at ~17.8 KiB; this is the growth
-#: guard, and the one that generalises past the sizes actually measured.
-PER_PAGE_KIB = 40
+#: Marginal cost per pad page. Measured repeatedly at 18.4-18.5 KiB on this
+#: machine (250 -> 1000 pages), and this is the growth guard -- the one that
+#: generalises past the sizes actually measured.
+#:
+#: 25, not 40. At 40 the budget sat at 2.17x the measured slope, so a
+#: regression that DOUBLED per-page retention -- unambiguously "it now keeps
+#: something per page" -- landed at 36 KiB and passed, and its 1000-page
+#: peak of ~61 MiB also cleared the 128 MiB ceiling. Nothing in the file
+#: went red. 25 leaves 35% headroom over the measurement, which covers
+#: reportlab version drift without covering a doubling.
+PER_PAGE_KIB = 25
 
 NO_TRNG = "/nonexistent/hwrng-under-test"
 
-# Killing the child rather than hanging the suite. Generous: a runner three
-# times slower than this machine still finishes a 1000-page pad well inside
-# it, and anything past that is a hang worth failing on.
-CHILD_TIMEOUT = 300
+# Killing the child rather than hanging the suite.
+#
+# 60, not 300. The failure this bounds is the unpinned-TRNG one in the
+# module docstring: 205 seconds for a 1000-page pad against 2.7 pinned. At
+# 300 no single child could exceed the timeout, so instead the eight
+# pad-generating children summed to roughly 640 seconds and CI's own
+# `timeout 600 pytest -q` killed the whole run with no test name and no
+# output -- a hang that loses its diagnosis, which is the outcome the
+# timeout exists to prevent. 60 is still 20x the pinned figure and lands
+# well below the documented bad case.
+CHILD_TIMEOUT = 60
 
 
 # --- measuring -----------------------------------------------------------
@@ -152,13 +184,23 @@ def rss_mib():
     # passed on its own file and reported base == peak == 63.8 MiB under
     # the full suite -- the same number for a 250-page pad and a 1000-page
     # one, because both were really pytest's own footprint.
-    # test_a_large_parent_does_not_inflate_the_childs_reading pins it.
+    # test_a_large_parent_does_not_inflate_the_reading pins it.
     #
     # VmHWM is the current mm's peak only, so exec resets it.
     for line in open("/proc/self/status"):
         if line.startswith("VmHWM:"):
             return int(line.split()[1]) / 1024.0
     raise AssertionError("no VmHWM in /proc/self/status")
+
+def rss_now_mib():
+    # VmRSS: what is resident RIGHT NOW, not the high-water mark. The peak
+    # answers "how much did this ever need"; this answers "how much is
+    # still held", which is the question when the next phase is about to
+    # add to it.
+    for line in open("/proc/self/status"):
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1]) / 1024.0
+    raise AssertionError("no VmRSS in /proc/self/status")
 
 def rusage_mib():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -173,11 +215,21 @@ base = rss_mib()
 settings = config.Settings(pages={pages}, paper={paper!r}, a7={a7!r},
                            training={training!r}, auth_size={auth_size},
                            with_auth=True)
+import otp_generator
+otp_generator.TALLY.reset()
 buffer = jobs.generate(jobs.JobSpec(jobs.JobKind.PAD_PAIR, "RUSTED-BADGER",
                                     settings))
 peak = rss_mib()
+# Which source actually served the draws. Reported so a test that means to
+# exercise the TRNG path can CHECK that it did: _hwrng_bytes returns None
+# on an OSError, a short read or a _looks_alive rejection, and
+# get_random_bytes then falls back to os.urandom with no signal at all. A
+# comparison of "with TRNG" against "without" is otherwise satisfied by
+# comparing the CSPRNG path against itself.
 print(json.dumps({{"base": base, "peak": peak, "pdf": len(buffer),
                    "rusage": rusage_mib(),
+                   "hardware_draws": otp_generator.TALLY.hardware,
+                   "software_draws": otp_generator.TALLY.software,
                    "chars_per_page": settings.chars_per_page}}))
 """
 
@@ -209,8 +261,14 @@ def child(body: str, hwrng: str = NO_TRNG) -> dict:
     every test module, so measuring in-process would report the suite's
     peak and call it the pad's.
     """
+    # PREPENDED, not assigned. Overwriting PYTHONPATH discarded whatever
+    # the runner had set -- a vendored dependency directory, a tox path --
+    # and the child then failed its reportlab import and reported "the
+    # measurement child died" for a reason with nothing to do with memory.
     environment = dict(os.environ, OTP_HWRNG_PATH=hwrng,
-                       PYTHONPATH=str(REPO))
+                       PYTHONPATH=os.pathsep.join(
+                           p for p in (str(REPO), os.environ.get("PYTHONPATH"))
+                           if p))
     result = subprocess.run(
         [sys.executable, "-c", _REPORT.format(repo=str(REPO), body=body)],
         capture_output=True, timeout=CHILD_TIMEOUT, env=environment,
@@ -219,7 +277,19 @@ def child(body: str, hwrng: str = NO_TRNG) -> dict:
         raise AssertionError(
             "the measurement child died; nothing was measured:\n"
             + result.stderr.decode("utf-8", "replace")[-2000:])
-    return json.loads(result.stdout.decode())
+    # The LAST line, and a diagnosis if it will not parse. A child that
+    # exits 0 having also written something else to stdout -- a deprecation
+    # notice routed there, a progress reporter reintroduced -- otherwise
+    # raised a bare JSONDecodeError naming neither the child nor what it
+    # printed.
+    out = result.stdout.decode("utf-8", "replace")
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError) as exc:
+        raise AssertionError(
+            f"the measurement child printed something that is not the "
+            f"report ({exc}).\nstdout:\n{out[-2000:]}\nstderr:\n"
+            + result.stderr.decode("utf-8", "replace")[-2000:]) from exc
 
 
 def pad(pages: int, paper: str = "A6", a7: bool = False,
@@ -240,8 +310,7 @@ def pad(pages: int, paper: str = "A6", a7: bool = False,
 
 
 _SUBMIT_BODY = r"""
-from otpunit import config, jobs, printer
-import types
+from otpunit import config, jobs
 base = rss_mib()
 settings = config.Settings(pages={pages}, paper="A6", training=True,
                            auth_size=max(config.AUTH_SIZE_CHOICES))
@@ -265,12 +334,29 @@ job = jobs.PadPairJob(jobs.JobSpec(jobs.JobKind.PAD_PAIR, "RUSTED-BADGER",
                                    settings), cups, "OTP")
 job.generate()
 after_generate = rss_mib()
+# REBASE the high-water mark before the submits, so what follows measures
+# the submit phase and not the tallest thing reportlab did on the way here.
+#
+# Without this the submit test could not fail. VmHWM only ever rises, so
+# `peak >= after_generate` is true by construction -- and it measured 0.00
+# MiB of difference at 1000 pages, against a docstring claiming 1.8. A
+# regression to three live copies per submit stayed comfortably under
+# generate's own transient peak and every assertion passed.
+#
+# clear_refs "5" resets VmHWM to the current VmRSS (Linux 4.0+). Verified
+# in this environment: 128.3 -> 8.3 immediately after freeing a 120 MiB
+# buffer.
+resident_after_generate = rss_now_mib()
+open("/proc/self/clear_refs", "w").write("5")
 job.print_next_copy()
 job.print_next_copy()
-peak = rss_mib()
+submit_peak = rss_mib()
+peak = max(after_generate, submit_peak)
 job.finish()
 print(json.dumps({{"base": base, "peak": peak, "pdf": cups.sizes[0],
                    "after_generate": after_generate, "copies": len(cups.sizes),
+                   "submit_peak": submit_peak,
+                   "resident_after_generate": resident_after_generate,
                    "rusage": rusage_mib(), "chars_per_page": 0}}))
 """
 
@@ -307,17 +393,37 @@ def test_the_whole_job_fits_it_too_and_not_just_the_generate(measured):
     generate() is not the process peak, and the headline above measures
     only generate(). `Cups.submit` hands `bytes(data)` to subprocess -- a
     SECOND full copy of the pad, held live across the call -- and it does
-    that once per copy. Measured through the real PadPairJob: 44.6 MiB
-    after generate against 46.4 after both copies at 1000 pages.
+    that once per copy.
 
-    Four percent, so it changes no conclusion. It is here because the
-    number the file reports should be the one the board actually has to
-    find, and because a change that made submit hold three copies instead
-    of two would otherwise be invisible.
+    Measured against the SUBMIT PHASE IN ISOLATION, with VmHWM rebased
+    after generate (see _SUBMIT_BODY). At 1000 pages the pad is 2.23 MiB
+    and the phase costs 2.23 MiB over what generate left resident: exactly
+    one extra copy, live at its widest point.
+
+    The earlier form of this test could not fail. It asserted
+    `peak >= after_generate` on a high-water mark, which only ever rises --
+    true by construction. At 1000 pages the two were EQUAL to the
+    hundredth of a MiB, because the submit copy fits under reportlab's own
+    transient peak, and the docstring's "44.6 against 46.4" did not
+    reproduce. A regression to three live copies passed every assertion.
     """
     seen = measured["submit-1000"]
     assert seen["copies"] == 2, "a pad is a PAIR; both copies must be submitted"
-    assert seen["peak"] >= seen["after_generate"], seen
+    pad_mib = seen["pdf"] / (1024.0 * 1024.0)
+    extra = seen["submit_peak"] - seen["resident_after_generate"]
+    # One pad of headroom, plus half a pad of slack for interpreter noise
+    # and the page-granularity of RSS. Two copies would be 2.0 pads.
+    assert extra < 1.5 * pad_mib, (
+        f"the submit phase needed {extra:.2f} MiB on top of the "
+        f"{seen['resident_after_generate']:.1f} MiB generate left resident, "
+        f"which is {extra / pad_mib:.2f} copies of a {pad_mib:.2f} MiB pad. "
+        f"submit is holding more of the pad live than the one bytes() copy "
+        f"it hands to subprocess.")
+    assert extra > 0.5 * pad_mib, (
+        f"the submit phase cost only {extra:.2f} MiB for a {pad_mib:.2f} MiB "
+        f"pad. bytes(data) should copy it, so either submit stopped being "
+        f"called or this measurement stopped seeing it -- both make the "
+        f"bound above vacuous.")
     assert seen["peak"] < PROCESS_CEILING_MIB, (
         f"the full pad-pair job peaked at {seen['peak']:.1f} MiB against a "
         f"{PROCESS_CEILING_MIB} MiB budget")
@@ -385,7 +491,12 @@ def test_a6_is_still_the_worst_format(measured):
         "A4": pad(200, paper="A4")["peak"],
         "A7": pad(200, a7=True)["peak"],
     }
-    assert peaks["A6"] == max(peaks.values()), peaks
+    runner_up = max(v for k, v in peaks.items() if k != "A6")
+    # STRICT, and by a stated margin. `==  max(...)` was satisfied by a
+    # tie, so the ordering could collapse to equality -- the point at
+    # which A6 stops being the worst case -- without going red. Measured
+    # separation is ~1.1 MiB against ~0.2 MiB of run-to-run noise.
+    assert peaks["A6"] > runner_up + 0.5, peaks
 
 
 def test_a_present_trng_does_not_change_the_shape_of_the_cost():
@@ -398,6 +509,15 @@ def test_a_present_trng_does_not_change_the_shape_of_the_cost():
     A regular file stands in for /dev/hwrng: O_NONBLOCK is a no-op on one,
     so reads always succeed and the throttling that dominates a real VM's
     /dev/hwrng cannot skew this.
+
+    The tally is checked, not assumed. `_hwrng_bytes` returns None on an
+    OSError, a short read, or a `_looks_alive` rejection, and
+    `get_random_bytes` then falls back to os.urandom silently -- so every
+    way this setup can fail to reach the fake device (a renamed env var, a
+    file the child cannot read, content that looks stuck) degrades the test
+    into comparing the CSPRNG path against itself and passing. Filling the
+    file with zeros instead of urandom makes `_looks_alive` reject it and
+    was measured to leave the old assertions green.
     """
     import tempfile
 
@@ -406,6 +526,18 @@ def test_a_present_trng_does_not_change_the_shape_of_the_cost():
         fake.flush()
         with_trng = pad(250, hwrng=fake.name)
     without = pad(250)
+
+    assert with_trng["hardware_draws"] > 0, (
+        "the TRNG path was never taken, so this compared the CSPRNG "
+        "against itself: " + repr(with_trng))
+    assert with_trng["software_draws"] == 0, (
+        f"{with_trng['software_draws']} draws fell back to the CSPRNG; the "
+        f"fake device was not serving all of them")
+    assert without["hardware_draws"] == 0, (
+        "the no-TRNG control found hardware anyway, so NO_TRNG is not "
+        "pointing at a nonexistent path: " + repr(without))
+    assert without["software_draws"] > 0, without
+
     assert with_trng["peak"] < PROCESS_CEILING_MIB
     # Within a megabyte of each other. Measured identical to 0.1 MiB.
     assert abs(with_trng["peak"] - without["peak"]) < 1.0, \
