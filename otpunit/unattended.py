@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import time
 
-from otpunit import diagnostics, jobs
+from otpunit import diagnostics, jobs, printer
 from otpunit.codewords import Vocabulary
 from otpunit.config import Settings
 
@@ -361,19 +361,12 @@ def _first(cups):
     return devices[0] if devices else None
 
 
-def _fault(cups, queue) -> str:
-    """
-    What the printer says is wrong, or "" if it says nothing or cannot say.
-
-    Silence is deliberately not read as trouble. A cupsd that cannot be
-    asked, and an older Cups without this method at all, must fall back to
-    the drain result rather than send someone to burn a pad that printed
-    perfectly.
-    """
-    try:
-        return cups.printer_fault(queue) or ""
-    except Exception:                            # noqa: BLE001
-        return ""
+# One definition, in printer.py next to printer_fault itself. This used to
+# be a verbatim copy of the UI's helper -- docstring reasoning included --
+# so a change to what counts as "cannot tell" had to land in both places or
+# the panel and the headless run would disagree about the only question
+# either of them asks.
+_fault = printer.reported_fault
 
 
 MANUAL_PAGES = 28          # the rendered A5 manual, for the paper estimate

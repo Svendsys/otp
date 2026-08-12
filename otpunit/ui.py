@@ -523,6 +523,18 @@ class RunJob(Screen):
                 self.stage = "confirm_continue"
                 return self
             if press is Press.OK:
+                # On a STOPPED queue, re-enable it first. Nothing else does:
+                # CUPS_BACKEND_STOP disables the queue and holds the job
+                # until something runs `lpadmin -E`, and the only place the
+                # unit did that was ensure_queue at startup. So OK RECHECK
+                # on the PRINTER STOPPED screen rechecked a queue that could
+                # not have changed, and the operator who had just closed the
+                # cover was left with one working exit -- the one that wipes
+                # the key. Safe to do unconditionally on the recheck: it
+                # keeps the held job, and on a queue that is not stopped it
+                # is a no-op.
+                if self.queue_fault:
+                    self._resume(app)
                 return self._advance(app)
             return self
 
@@ -642,21 +654,20 @@ class RunJob(Screen):
             # will never print. The way out (hold for BACK) exists and is
             # deliberate, but an operator has to know to take it, and the
             # printer has been saying why the whole time.
-            # DISABLED only, not any passing state message. cupsd puts
-            # transient filter chatter in printer-state-message while a job
-            # runs -- measured by the review panel, mid-print, on a healthy
-            # queue: "DEBUG: cfFilterChain: universal (PID 21339) exited
-            # with no errors." A busy queue is precisely when that is
-            # there, so reporting whatever printer_fault says would put
-            # PRINTER STOPPED on the panel of a printer that is working
-            # perfectly. It did, on the first CI run of this change.
+            # A STOPPED queue only, not any passing state message. cupsd
+            # puts transient filter chatter in printer-state-message while a
+            # job runs -- measured mid-print on a healthy queue: "DEBUG:
+            # cfFilterChain: universal (PID 21339) exited with no errors."
+            # A busy queue is precisely when that is there, so reporting
+            # whatever printer_fault says would put PRINTER STOPPED on the
+            # panel of a printer working perfectly. It did, on the first CI
+            # run of this change.
             #
-            # The stranding case this exists for is the STOPPED queue, and
-            # cupsd says that in the header line -- which is the line
-            # printer_fault returns verbatim when it contains "disabled".
-            # Nothing transient can produce it.
-            fault = self._fault(app) if state == "busy" else ""
-            self.queue_fault = fault if "disabled" in fault.lower() else ""
+            # Asked of the IPP state reasons rather than the header text.
+            # The header is _cupsLangPrintf output, so "disabled" only
+            # appears in English; "paused" is an IPP keyword and does not
+            # move with the locale.
+            self.queue_fault = self._stopped_because(app) if state == "busy" else ""
             self.stage = "waiting"
             return self
         # A drained queue is necessary but NOT sufficient, and this screen
@@ -678,10 +689,22 @@ class RunJob(Screen):
         # where the reasoning belongs, not a safety property -- and the
         # test that pins it says the same, rather than pretending to
         # reproduce a combination the real Cups cannot produce.
-        fault = self._fault(app)
-        if fault:
+        # BLOCKING reasons only. This branch destroys a pad pair when it
+        # fires, so the bar is "the printer says it cannot print", not "the
+        # printer said something". printer_fault returns any non-benign line
+        # of printer-state-message, which on a healthy queue includes a
+        # laser's standing "Toner low." and cupsd's own filter chatter --
+        # driven against the real RunJob, both sent a pair that printed
+        # perfectly to ERROR / DESTROY PRINTED PAGES, and the next OK wiped
+        # the key. IPP severity suffixes are what separate the two, and they
+        # are keywords rather than prose.
+        blocking = self._blocking(app)
+        if blocking:
             self.stage = "error"
-            self.error = fault
+            # The reasons, then whatever the printer said in words. The
+            # keyword is the part that is always present and always
+            # meaningful; the message is a nicety when it fits.
+            self.error = _reasons_as_text(blocking) or self._fault(app)
             # Banked presses, discarded -- the same reason _print_copy
             # drains on ITS error path. Getting here means two lpstat
             # subprocesses have just run while the operator was looking at
@@ -691,24 +714,53 @@ class RunJob(Screen):
             # drawn, and ERROR's handler wipes and returns HOME: the panel
             # flashes the fault for one cycle and the operator is back at
             # the menu with the key gone, never having read DESTROY
-            # PRINTED PAGES. Found by the review panel.
+            # PRINTED PAGES.
             _drain(app)
             return self
+        # And the same drain on the way THROUGH. Two blocking lpstat calls
+        # have just run here as well, and _proceed lands on `swap` -- whose
+        # OK handler spools copy B. A double-tap at `printing` therefore put
+        # copy B into a tray still holding copy A, with the operator never
+        # shown COPY A DONE / REMOVE THE STACK. Reproduced: one banked OK
+        # survived _advance into `swap`. The error path above was drained
+        # from the start; the success path was not.
+        _drain(app)
         return self._proceed(app)
 
     def _fault(self, app) -> str:
-        """
-        What the printer says is wrong, or "" if it says nothing or cannot.
+        """What the printer says is wrong, or "" if it says nothing."""
+        return printer_mod.reported_fault(app.cups, app.queue)
 
-        Silence is deliberately not trouble, on the same reasoning as
-        unattended._fault: a wedged cupsd, and any Cups predating
-        printer_fault, must fall back to the queue result rather than send
-        someone to burn a pair that printed perfectly.
-        """
+    def _blocking(self, app) -> list[str]:
+        """The IPP reasons this queue cannot print, as keywords."""
+        return printer_mod.blocking_reasons(app.cups, app.queue)
+
+    def _resume(self, app) -> None:
+        """Ask cupsd to re-enable the queue; never raise into the loop."""
+        resume = getattr(app.cups, "resume", None)
+        if resume is None:
+            return
         try:
-            return app.cups.printer_fault(app.queue) or ""
+            resume(app.queue)
         except Exception:                        # noqa: BLE001
+            pass
+
+    def _stopped_because(self, app) -> str:
+        """
+        Panel text for a stopped queue, or "" if it is not stopped.
+
+        The reasons, not the header. printer_fault returns lpstat's header
+        line for a disabled queue -- measured against the rig's cupsd,
+        "printer OTP disabled since Wed Aug 12 20:21:35 2026 -", with the
+        actual reason on the NEXT line, which it discards. Wrapped to two
+        panel rows that renders as "PRINTER OTP DISABLED / SINCE WED AUG 12
+        20>", so the screen whose entire job is saying what is wrong showed
+        a printer name and a truncated date. The Alerts line for the same
+        queue read "media-empty-error paused".
+        """
+        if not printer_mod.queue_stopped(app.cups, app.queue):
             return ""
+        return _reasons_as_text(self._blocking(app)) or "QUEUE STOPPED"
 
     def _proceed(self, app):
         """Take the transition, having established the queue is clear."""
@@ -752,6 +804,27 @@ def gen_cancelled():
     import otp_generator
 
     return otp_generator.GenerationCancelled
+
+
+
+def _reasons_as_text(reasons: list[str]) -> str:
+    """
+    IPP state-reason keywords as something an operator can read.
+
+    "media-empty-error" is precise and never translated, which is why the
+    decisions are made on it, but it is not what you want on a panel in
+    front of someone holding a stack of paper. The severity suffix carries
+    no information once we have already decided these are blocking, so it
+    goes; the rest becomes words.
+    """
+    words = []
+    for reason in reasons:
+        for suffix in ("-error", "-warning", "-report"):
+            if reason.endswith(suffix):
+                reason = reason[:-len(suffix)]
+                break
+        words.append(reason.replace("-", " ").upper())
+    return ", ".join(words)
 
 
 def _drain(app) -> None:

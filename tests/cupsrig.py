@@ -558,8 +558,15 @@ FileDevice Yes
         re-runs that one immediately and would otherwise spin for as long
         as the test was willing to wait.
 
-        Counted in INVOCATIONS rather than jobs, since a retry re-runs the
-        backend against a job it already saw.
+        Both are counted in INVOCATIONS rather than jobs, since a retry
+        re-runs the backend against a job it already saw, and both are
+        counted FROM THIS CALL -- the invocation counter is reset here.
+        They used to be absolute numbers since the rig started, so a test
+        that printed anything before calling set_failure("...", after=1)
+        got a window that had already elapsed, the fault never fired, and
+        the test asserting a failure passed while exercising nothing. That
+        is the silent green this rig exists to eliminate, so the counter
+        rebases and the docstring's "the first N invocations" is true.
         """
         if mode and mode not in self.FAILURE_MODES:
             raise ValueError(
@@ -578,13 +585,19 @@ FileDevice Yes
         (self.jobs / ".mode").write_text(mode)
         (self.jobs / ".after").write_text(str(after))
         (self.jobs / ".until").write_text(str(until))
-        if not mode:
-            # Plugging the printer back in is part of refilling the tray.
-            # Leaving `.unplugged` behind would make every later mode look
-            # like a disconnect, which is a fixture that lies.
-            unplugged = self.jobs / ".unplugged"
-            if unplugged.exists():
-                unplugged.unlink()
+        # after/until are relative to this call, so the counter rebases.
+        (self.jobs / ".count").write_text("0")
+        # Plugging the printer back in is part of ANY reconfiguration, not
+        # just refilling the tray. Scoped to mode == "" it meant switching
+        # from "disconnect" straight to another mode left .unplugged on
+        # disk: lpinfo -v kept reporting nothing, devices() stayed empty,
+        # and a test that believed it was exercising CUPS_BACKEND_STOP was
+        # really exercising a disconnect -- or hung waiting for a printer
+        # the rig thought it had healed. Same for a `disconnect` with an
+        # `until` window, which by its own contract has recovered.
+        unplugged = self.jobs / ".unplugged"
+        if unplugged.exists():
+            unplugged.unlink()
 
     def fail_jobs(self, failing: bool = True) -> None:
         """Make the tray run out of paper, or refill it."""
@@ -592,11 +605,16 @@ FileDevice Yes
 
     def backend_invocations(self) -> int:
         """
-        How many times cupsd actually ran the backend.
+        How many times cupsd ran the backend SINCE THE LAST set_failure.
 
         The discriminator for the retry modes: a job that was retried three
         times and one that was submitted three times look identical from
         the job files alone.
+
+        Rebased by set_failure, for the same reason after/until are: a
+        window expressed relative to the call is the only one a test can
+        reason about without knowing what every earlier test did to the
+        same rig.
         """
         try:
             return int((self.jobs / ".count").read_text().strip())

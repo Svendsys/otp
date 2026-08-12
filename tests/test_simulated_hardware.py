@@ -384,18 +384,38 @@ class TestTheRigCanActuallyFail:
             jobs.JobSpec(jobs.JobKind.TABULA, "", config.Settings())))
         cups.submit(bytearray(card), name=queue, title="PROBE",
                     options={"media": "A4"})
-        # Waits for the BACKEND to have run and cupsd to have recorded the
-        # outcome -- NOT for the queue to drain. Two of these modes never
-        # drain, and waiting for something that cannot happen would cost
-        # the suite a minute per mode and teach nobody anything.
+        # Waits for the BACKEND to have run and the picture to STOP MOVING
+        # -- NOT for the queue to drain. Two of these modes never drain, and
+        # waiting for something that cannot happen would cost the suite a
+        # minute per mode and teach nobody anything.
+        #
+        # Stability, rather than the old "printer_fault is not None". That
+        # condition fired on cupsd's mid-print filter chatter -- "DEBUG:
+        # cfFilterChain: universal (PID 21339) exited with no errors." is a
+        # printer-state-message on a perfectly healthy queue -- so observe()
+        # returned while the backend was still running. For retry-current
+        # that meant breaking after invocation 1 of 3 and then asserting on
+        # a count that had not happened yet; for truncate it could land
+        # between the backend writing $OUT.data and the head -c that
+        # shortens it, so the "partial" file read back at full length. Both
+        # are CI flakes whose failure mode is "the mode quietly degraded to
+        # success", which is what this class exists to rule out.
+        #
+        # The printed sizes are part of the sample precisely because of
+        # truncate: a file still being rewritten is the picture moving.
         deadline = time.monotonic() + wait
+        previous, unchanged = None, 0
         while time.monotonic() < deadline:
-            if rig.backend_invocations() and (
-                    cups.printer_fault(queue) is not None
-                    or cups.active_jobs(queue) == 0):
+            sample = (cups.active_jobs(queue) == 0,
+                      cups.printer_fault(queue),
+                      len(cups.devices()),
+                      rig.backend_invocations(),
+                      [len(body) for _, body in rig.printed()])
+            unchanged = unchanged + 1 if sample == previous else 0
+            previous = sample
+            if sample[3] and unchanged >= 2:
                 break
-            time.sleep(0.2)
-        time.sleep(0.5)
+            time.sleep(0.4)
         return {
             "drained": cups.active_jobs(queue) == 0,
             "fault": cups.printer_fault(queue),
@@ -689,7 +709,11 @@ class TestThePanelAgainstAFailingPrinter:
             f"the panel said {after_a!r} over a tray that got nothing"
         shown = "\n".join(screen.frame(app).rendered()).upper()
         assert "REMOVE THE STACK" not in shown
-        assert "OUT OF PAPER" in shown, shown
+        # The IPP reason, from the Alerts line real cupsd prints: measured
+        # here as "media-empty-error". Previously the prose from
+        # printer-state-message ("out of paper"), which the rig happens to
+        # set but a real printer need not.
+        assert "MEDIA EMPTY" in shown, shown
 
     def test_a_failed_copy_b_does_not_say_pair_complete(self, rig, tmp_path):
         # Copy A prints; copy B does not. The operator is holding half a
@@ -720,13 +744,14 @@ class TestThePanelAgainstAFailingPrinter:
         # Found by the review panel; the first CI run then failed on the
         # other side of the same race, with a transient filter DEBUG line
         # standing in for the fault.
+        # Waits on the IPP reason, not the header text. "paused" is a
+        # keyword; "disabled" is _cupsLangPrintf output and only English.
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
-            reported = cups.printer_fault(queue) or ""
-            if "disabled" in reported.lower():
+            if cups.queue_stopped(queue):
                 break
             time.sleep(0.2)
-        assert "disabled" in (cups.printer_fault(queue) or "").lower(), \
+        assert cups.queue_stopped(queue), \
             "the queue never stopped; this test would prove nothing"
 
         screen.press(app, Press.OK)
@@ -740,7 +765,17 @@ class TestThePanelAgainstAFailingPrinter:
         # intended behaviour.
         shown = "\n".join(screen.frame(app).rendered()).upper()
         assert "STILL PRINTING" not in shown, shown
-        assert "DISABLED" in shown or "TRAY OPEN" in shown, shown
+        # The REASON. The previous assertion was `"DISABLED" in shown or
+        # "TRAY OPEN" in shown`, and against this same real cupsd it passed
+        # on the first disjunct alone -- because printer_fault returned
+        # lpstat's header, "printer OTP disabled since Wed Aug 12 20:21:35
+        # 2026 -", whose reason is on the NEXT line and was discarded. The
+        # panel read "PRINTER OTP DISABLED / SINCE WED AUG 12 20>": a name
+        # and a truncated date, on the one screen whose entire job is
+        # telling a stranded operator what is wrong.
+        assert "MEDIA EMPTY" in shown, shown
+        assert not any(char.isdigit() for char in shown.replace("COPY A", "")), \
+            f"a timestamp is on the panel where a reason should be: {shown}"
 
     def test_an_unanswerable_queue_is_still_not_treated_as_a_fault(self, rig, tmp_path):
         """
