@@ -59,13 +59,41 @@ def _panel_font():
     cut lines off at the right edge -- and the taller face also pushed 43
     pixels of the footer off the bottom of a 64-pixel screen.
 
-    load_default_imagefont() is Pillow 11+. Older Pillow has no TTF default
-    to avoid, so load_default() is already this font there.
+    Three eras, and the middle one is the trap:
+
+        Pillow < 10.1    load_default() is already the bitmap font.
+        Pillow 10.1-10.3 load_default() is Aileron and there is NO
+                         load_default_imagefont() to ask for instead.
+        Pillow >= 10.4   load_default_imagefont() returns the bitmap font.
+
+    load_default_imagefont() arrived in 10.4, not 11 -- verified against the
+    sdists: absent from 10.3.0/src/PIL/ImageFont.py, present at line 909 of
+    10.4.0's. So on 10.1-10.3 there is nothing to fall back TO, and a
+    getattr() fallback lands on the exact face this function exists to
+    refuse. Ubuntu 24.04's python3-pil is 10.2.0, squarely inside the window.
+
+    Hence the type check rather than a version check: whatever we are handed
+    has to BE the bitmap font, and if it is not we refuse to start. A panel
+    that quietly cuts "DESTROY PRINTED PAGES" off at the right edge is worse
+    than a unit that will not boot and says why.
     """
     from PIL import ImageFont
 
     loader = getattr(ImageFont, "load_default_imagefont", None)
-    return loader() if loader is not None else ImageFont.load_default()
+    font = loader() if loader is not None else ImageFont.load_default()
+    # FreeTypeFont and ImageFont are siblings, not parent and child, so this
+    # is an exact test for "the bitmap face" and not a subclass accident.
+    if not isinstance(font, ImageFont.ImageFont):
+        import PIL
+
+        raise RuntimeError(
+            f"Pillow {PIL.__version__} gave the panel a {type(font).__name__} "
+            f"where the 6x8 bitmap font was required; a proportional face "
+            f"overruns the 128x64 panel by up to 82px per row. Install "
+            f"Pillow >= 10.4 (which has load_default_imagefont) or < 10.1 "
+            f"(whose load_default is still the bitmap font)."
+        )
+    return font
 
 
 @dataclass
@@ -182,7 +210,25 @@ class ConsoleDisplay(Display):
 class Ssd1306Display(Display):
     """The real panel: 128x64 SSD1306 over I2C, via luma.oled."""
 
+    # 90 and 270 degrees turn the 128x64 panel into a 64x128 one, and every
+    # number above -- COLS=21, ROWS=8, the whole grid -- is landscape. luma
+    # swaps width and height for odd rotations, so draw_frame's 126px rows
+    # were being cut to 64px: measured against a rotated dummy device, the
+    # ink bbox for a full screen is (64,0,127,64) at rotate=1 and (1,0,64,64)
+    # at rotate=3, i.e. half of every line gone and the other half of the
+    # panel dark. Refused rather than half-drawn.
+    SQUARE_ON = (0, 2)
+
     def __init__(self, port: int = 1, address: int = 0x3C, rotate: int = 0):
+        # Before the hardware imports: a bad argument should be rejected
+        # without opening a bus, and the check is worth testing on a machine
+        # that has no luma.oled at all.
+        if rotate not in self.SQUARE_ON:
+            raise ValueError(
+                f"rotate={rotate} gives a {HEIGHT}x{WIDTH} portrait panel, "
+                f"but the {COLS}x{ROWS} character grid this UI is built on "
+                f"needs {WIDTH}x{HEIGHT}; only {self.SQUARE_ON} are supported")
+
         from luma.core.interface.serial import i2c
         from luma.oled.device import ssd1306
 

@@ -73,8 +73,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="OTP pad print unit")
     parser.add_argument("--sim", action="store_true",
                         help="run in the terminal with a simulated printer")
-    parser.add_argument("--rotate", type=int, default=0, choices=(0, 1, 2, 3),
-                        help="rotate the OLED by N*90 degrees")
+    # 1 and 3 are absent deliberately: they give a 64x128 portrait panel and
+    # the 21x8 character grid is landscape, so half of every row was being
+    # cut off. See Ssd1306Display.SQUARE_ON.
+    parser.add_argument("--rotate", type=int, default=0, choices=(0, 2),
+                        help="rotate the OLED by N*180 degrees")
     parser.add_argument("--config", default=config.CONFIG_PATH,
                         help="settings file (default: %(default)s)")
     parser.add_argument("--diagnostic", action="store_true",
