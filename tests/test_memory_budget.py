@@ -60,10 +60,11 @@ subprocess, a second full copy held across the call, once per copy. That
 extra copy does NOT raise the process high-water mark at these sizes --
 measured, the whole PadPairJob peaks at exactly the generate figure,
 because the submit copy fits under reportlab's own transient peak. It is
-still real, and it is still measured: the submit phase is timed against a
-REBASED VmHWM (see _SUBMIT_BODY) and costs 1.00 pads of live memory over
-what generate leaves resident. An earlier version of this file claimed
-"about 4% above" from a reading that could not distinguish the two.
+still real, and it is still measured -- with tracemalloc rather than RSS,
+because the allocator can serve that copy from arena space generate just
+freed and fault no new page. It comes to 1.00 pads exactly. An earlier
+version of this file claimed "about 4% above" from a reading that could
+not distinguish one copy from three.
 
 A6 is the worst case and not by accident: A4 and A7 impose four and two
 pad pages onto one sheet, so a 1000-page pad is 250 or 500 PDF page
@@ -191,16 +192,6 @@ def rss_mib():
         if line.startswith("VmHWM:"):
             return int(line.split()[1]) / 1024.0
     raise AssertionError("no VmHWM in /proc/self/status")
-
-def rss_now_mib():
-    # VmRSS: what is resident RIGHT NOW, not the high-water mark. The peak
-    # answers "how much did this ever need"; this answers "how much is
-    # still held", which is the question when the next phase is about to
-    # add to it.
-    for line in open("/proc/self/status"):
-        if line.startswith("VmRSS:"):
-            return int(line.split()[1]) / 1024.0
-    raise AssertionError("no VmRSS in /proc/self/status")
 
 def rusage_mib():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -334,29 +325,34 @@ job = jobs.PadPairJob(jobs.JobSpec(jobs.JobKind.PAD_PAIR, "RUSTED-BADGER",
                                    settings), cups, "OTP")
 job.generate()
 after_generate = rss_mib()
-# REBASE the high-water mark before the submits, so what follows measures
-# the submit phase and not the tallest thing reportlab did on the way here.
+# tracemalloc for the COPY COUNT, VmHWM for the process ceiling. They are
+# different questions and RSS can only answer the second one.
 #
-# Without this the submit test could not fail. VmHWM only ever rises, so
-# `peak >= after_generate` is true by construction -- and it measured 0.00
-# MiB of difference at 1000 pages, against a docstring claiming 1.8. A
-# regression to three live copies per submit stayed comfortably under
-# generate's own transient peak and every assertion passed.
+# The obvious form -- compare the process high-water mark before and after
+# the submits -- cannot count copies. VmHWM only ever rises, so the old
+# `peak >= after_generate` was true by construction. Rebasing it with
+# /proc/self/clear_refs looked like the fix and measured 1.00 pads here,
+# but CI measured 0.00 for the same code: generate frees a great deal on
+# its way out, so the allocator can serve bytes(data) from arena space
+# that is ALREADY resident and no new page is ever faulted. Whether a copy
+# shows up in RSS is a property of the allocator's free lists, not of how
+# many copies are live.
 #
-# clear_refs "5" resets VmHWM to the current VmRSS (Linux 4.0+). Verified
-# in this environment: 128.3 -> 8.3 immediately after freeing a 120 MiB
-# buffer.
-resident_after_generate = rss_now_mib()
-open("/proc/self/clear_refs", "w").write("5")
+# tracemalloc counts Python-level allocation and is exact. Verified across
+# a mutation: holding 1, 2 and 3 copies per submit reports 1.00, 2.00 and
+# 3.00 pads, on the nose.
+import tracemalloc
+tracemalloc.start()
+traced_base, _ = tracemalloc.get_traced_memory()
 job.print_next_copy()
 job.print_next_copy()
-submit_peak = rss_mib()
-peak = max(after_generate, submit_peak)
+_, traced_peak = tracemalloc.get_traced_memory()
+tracemalloc.stop()
+peak = max(after_generate, rss_mib())
 job.finish()
 print(json.dumps({{"base": base, "peak": peak, "pdf": cups.sizes[0],
                    "after_generate": after_generate, "copies": len(cups.sizes),
-                   "submit_peak": submit_peak,
-                   "resident_after_generate": resident_after_generate,
+                   "submit_bytes": traced_peak - traced_base,
                    "rusage": rusage_mib(), "chars_per_page": 0}}))
 """
 
@@ -395,10 +391,8 @@ def test_the_whole_job_fits_it_too_and_not_just_the_generate(measured):
     SECOND full copy of the pad, held live across the call -- and it does
     that once per copy.
 
-    Measured against the SUBMIT PHASE IN ISOLATION, with VmHWM rebased
-    after generate (see _SUBMIT_BODY). At 1000 pages the pad is 2.23 MiB
-    and the phase costs 2.23 MiB over what generate left resident: exactly
-    one extra copy, live at its widest point.
+    Counted with tracemalloc over the submit phase, in pads. One extra
+    copy is correct and is what it measures: 1.00, exactly.
 
     The earlier form of this test could not fail. It asserted
     `peak >= after_generate` on a high-water mark, which only ever rises --
@@ -406,24 +400,26 @@ def test_the_whole_job_fits_it_too_and_not_just_the_generate(measured):
     hundredth of a MiB, because the submit copy fits under reportlab's own
     transient peak, and the docstring's "44.6 against 46.4" did not
     reproduce. A regression to three live copies passed every assertion.
+
+    RSS cannot answer this even with the high-water mark rebased: generate
+    frees enough on its way out that the allocator can serve bytes(data)
+    from already-resident arena space, faulting no new page. That form
+    measured 1.00 pads on one machine and 0.00 on CI for identical code.
+    Whether a copy shows up in RSS is a property of the free lists;
+    tracemalloc counts the allocation itself.
     """
     seen = measured["submit-1000"]
     assert seen["copies"] == 2, "a pad is a PAIR; both copies must be submitted"
-    pad_mib = seen["pdf"] / (1024.0 * 1024.0)
-    extra = seen["submit_peak"] - seen["resident_after_generate"]
-    # One pad of headroom, plus half a pad of slack for interpreter noise
-    # and the page-granularity of RSS. Two copies would be 2.0 pads.
-    assert extra < 1.5 * pad_mib, (
-        f"the submit phase needed {extra:.2f} MiB on top of the "
-        f"{seen['resident_after_generate']:.1f} MiB generate left resident, "
-        f"which is {extra / pad_mib:.2f} copies of a {pad_mib:.2f} MiB pad. "
-        f"submit is holding more of the pad live than the one bytes() copy "
-        f"it hands to subprocess.")
-    assert extra > 0.5 * pad_mib, (
-        f"the submit phase cost only {extra:.2f} MiB for a {pad_mib:.2f} MiB "
-        f"pad. bytes(data) should copy it, so either submit stopped being "
-        f"called or this measurement stopped seeing it -- both make the "
-        f"bound above vacuous.")
+    copies_live = seen["submit_bytes"] / seen["pdf"]
+    # Between half a pad and one and a half. The floor matters as much as
+    # the ceiling: at zero the measurement has stopped seeing the copy and
+    # the ceiling below becomes vacuous.
+    assert 0.5 < copies_live < 1.5, (
+        f"the submit phase allocated {copies_live:.2f} copies of the "
+        f"{seen['pdf'] / 1048576:.2f} MiB pad; one is expected -- the "
+        f"bytes(data) handed to subprocess. Below 0.5 the measurement is "
+        f"not seeing the copy at all; above 1.5 submit is holding more of "
+        f"the pad live than it needs to.")
     assert seen["peak"] < PROCESS_CEILING_MIB, (
         f"the full pad-pair job peaked at {seen['peak']:.1f} MiB against a "
         f"{PROCESS_CEILING_MIB} MiB budget")
