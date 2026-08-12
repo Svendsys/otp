@@ -35,7 +35,8 @@ from pathlib import Path
 import yaml
 
 REPO = Path(__file__).resolve().parent.parent
-WORKFLOW = REPO / ".github" / "workflows" / "image.yml"
+WORKFLOWS = REPO / ".github" / "workflows"
+WORKFLOW = WORKFLOWS / "image.yml"
 
 BOOT = "Boot the image"
 ATTACH = "Attach to the release"
@@ -76,21 +77,38 @@ def step_named(steps, name) -> dict:
     return steps[index_of(steps, name)]
 
 
-def release_publishers() -> list:
+# A step publishes a release if it USES a release action or if it SHELLS
+# OUT to one. Matching only on `uses:` missed the second kind entirely: a
+# `run: gh release upload "$TAG" image/deploy/*.img.xz` placed before the
+# boot is a publisher by any measure and left all eight tests green.
+PUBLISHING_ACTIONS = ("gh-release", "create-release", "upload-release")
+PUBLISHING_COMMANDS = ("gh release create", "gh release upload",
+                       "hub release", "/releases/assets", "/releases }}",
+                       "softprops/action-gh-release")
+
+
+def release_publishers(paths=None) -> list:
     """
-    Every step in the whole file that can create a release, by what it
-    USES rather than what it is called.
+    Every step in EVERY workflow file that can create a release or attach
+    an asset to one, by what it uses or runs rather than what it is called.
 
     Name-based lookup cannot see a second publisher under another name --
     `Publish the release asset`, placed before the boot, was invisible to
-    the first version of this file and shipped the image ungated.
+    the first version of this file and shipped the image ungated. Scanning
+    only image.yml has the same hole one level up: ci.yml runs on every
+    push to master and has no boot gate at all, so a publisher added there
+    would never meet one.
     """
     found = []
-    for job_name, job in workflow()["jobs"].items():
-        for position, step in enumerate(job.get("steps", [])):
-            uses = str(step.get("uses", ""))
-            if "gh-release" in uses or "create-release" in uses:
-                found.append((job_name, position, step))
+    for path in sorted(paths if paths is not None else WORKFLOWS.glob("*.yml")):
+        document = yaml.safe_load(path.read_text())
+        for job_name, job in (document.get("jobs") or {}).items():
+            for position, step in enumerate(job.get("steps", [])):
+                uses = str(step.get("uses", ""))
+                runs = str(step.get("run", ""))
+                if (any(a in uses for a in PUBLISHING_ACTIONS)
+                        or any(c in runs for c in PUBLISHING_COMMANDS)):
+                    found.append((f"{path.name}:{job_name}", position, step))
     return found
 
 
@@ -111,10 +129,11 @@ def test_there_is_exactly_one_thing_that_can_publish_a_release():
         "more than one step can create a release; every one of them is a "
         f"way past the boot gate: {[(j, s.get('name')) for j, _, s in publishers]}")
     job, _, step = publishers[0]
-    assert job == "image", (
-        f"the publisher moved to the {job!r} job. That may be fine, but the "
-        f"ordering assertions here only see the `image` job -- update them "
-        f"deliberately rather than letting this pass.")
+    assert job == "image.yml:image", (
+        f"the publisher moved to {job!r}. That may be fine, but the ordering "
+        f"assertions here only see image.yml's `image` job -- update them "
+        f"deliberately rather than letting this pass. A publisher in ci.yml "
+        f"in particular meets no boot gate at all.")
     assert step.get("name") == ATTACH, step.get("name")
 
 
@@ -184,16 +203,23 @@ def test_the_asset_is_the_image():
     assert attach["with"]["files"] == "image/deploy/*.img.xz", attach["with"]
 
 
-def test_the_note_is_set_rather_than_appended():
+def test_the_note_is_appended_so_it_cannot_eat_the_release_notes():
     """
-    `append_body` is consulted only on the action's UPDATE path; the create
-    path ignores it. So on a first tag run it does nothing, and on a re-run
-    or a workflow_dispatch against the same tag it would append the same
-    paragraph again. Plain `body` is idempotent.
+    The action's update path is `body = workflowBody || existingReleaseBody`
+    unless append_body is set. Publishing a release through the GitHub UI
+    creates the release AND the tag, and the tag push is what starts this
+    workflow -- so the release already exists when the step runs, making
+    the update path the normal case rather than the exotic one.
+
+    Without append_body the caveat paragraph therefore REPLACES whatever
+    changelog the maintainer wrote. An earlier version of this test pinned
+    append_body out, on the reasoning that only the create path mattered,
+    and so held the defect in place.
     """
     attach = step_named(image_steps(), ATTACH)["with"]
-    assert "append_body" not in attach, \
-        "append_body duplicates the note on any re-run; see the comment in image.yml"
+    assert attach.get("append_body") is True, \
+        ("without append_body the note REPLACES the maintainer's release "
+         "notes on the UI-publish path; see the comment in image.yml")
     body = attach["body"]
     assert "harness/img-boot.sh" in body, \
         "the note must point at the file that states the gate's limits"

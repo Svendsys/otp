@@ -331,16 +331,26 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: image/deploy/*.img.xz
-          # SET, not appended, and deliberately so after reading the
-          # action's source. `append_body` is consulted only on the UPDATE
-          # path (src/github.ts: `input_append_body && workflowBody &&
-          # existingReleaseBody`); createRelease() ignores it. So on the
-          # first tag run -- the only run that matters, and the only one
-          # this repository has, since nothing else here creates a release
-          # -- it does nothing, and on a re-run or a workflow_dispatch
-          # against the same tag it would append this paragraph a second
-          # and third time. Plain `body` is idempotent, which is the
-          # behaviour a re-runnable workflow wants.
+          # APPENDED. An earlier version set `body` plainly, reasoning that
+          # append_body is consulted only on the action's UPDATE path and
+          # that the first tag run -- a create -- was the only one that
+          # mattered here. That weighed the wrong case. Publishing a release
+          # through the GitHub UI creates the release AND the tag, and the
+          # tag push is what starts this workflow, so by the time this step
+          # runs the release already exists and the action takes the update
+          # path (verified against src/github.ts):
+          #
+          #   if (input_append_body && workflowBody && existingReleaseBody)
+          #     body = existingReleaseBody + "\n" + workflowBody;
+          #   else
+          #     body = workflowBody || existingReleaseBody;
+          #
+          # With append_body unset and a non-empty body, that else branch
+          # REPLACES the maintainer's changelog with the paragraph below.
+          # Silently destroying someone's release notes is worse than what
+          # appending costs: this paragraph appearing twice if the same
+          # tag's workflow is re-run, which is visible and editable.
+          append_body: true
           #
           # A folded scalar, so the note reaches GitHub as one paragraph:
           # release bodies render hard line breaks, and a block scalar
