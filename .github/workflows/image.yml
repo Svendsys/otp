@@ -123,14 +123,17 @@ jobs:
     # timeout costs the diagnosis as well as the run -- learned the hard
     # way when a 15-minute cap fired before the boot script's own timeout,
     # cancelled qemu mid-experiment, and skipped the verdict and the
-    # evidence upload (failure() is false on cancellation). Sized from
-    # measured worst case: ~10 minutes of non-boot work on a cache-miss
-    # rebuild (checkout, apt, pi-gen at 7m24s, cache save, upload,
-    # decompress) + the 600s boot backstop + timeout's 30s kill grace +
-    # verdict overhead = ~21.5; 25 leaves real margin. Healthy runs never
-    # go near this: the harness stops qemu at the unit's success line
-    # (~4.5 minutes cached, run 14 measured).
-    timeout-minutes: 25
+    # evidence upload (failure() is false on cancellation).
+    #
+    # TWO boots now, for the read-only overlay (issue #9): the second is a
+    # power-cycle of the same card, and the backstop is per boot. The
+    # arithmetic that sizes this: ~10 minutes of non-boot work on a
+    # cache-miss rebuild (checkout, apt, pi-gen at 7m24s, cache save,
+    # upload, decompress) + 2 x (600s backstop + timeout's 30s kill grace)
+    # + verdict overhead = ~31.5, so 40 keeps the same kind of margin 25
+    # gave one boot. Healthy runs never go near it: the harness stops each
+    # boot the moment the guest check reports done.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -312,14 +315,14 @@ jobs:
       # safe, so a red boot costs nothing, and the boot can therefore be
       # honest about failing.
       #
-      # 600 seconds, and it is a BACKSTOP, not a budget: the harness stops
-      # qemu the moment the unit's success line appears (run 14: 4m22s
-      # boot step), so only a boot that never gets there pays this number.
-      # It was 480 when reaching the unit still raced the cap -- run 13's
-      # success line landed ~420s in -- and the early stop is what made
-      # raising it free. If a run does hit 600, the verdict's "guest
-      # reached" line says whether the guest was still moving, and the
-      # sampler's qemu-cpu column says whether it was idle or spinning.
+      # 600 seconds PER BOOT, and it is a BACKSTOP, not a budget: the
+      # harness stops each boot the moment its guest check reports done, so
+      # only a boot that never gets there pays this number. It was 480 when
+      # reaching the unit still raced the cap -- run 13's success line
+      # landed ~420s in -- and the early stop is what made raising it free.
+      # If a boot does hit 600, the verdict's "guest reached" line says
+      # whether the guest was still moving, and the sampler's qemu-cpu
+      # column says whether it was idle or spinning.
       - name: Boot the image
         env:
           OTP_IMG_TIMEOUT: 600
@@ -415,8 +418,11 @@ jobs:
           # in this file.
           body: >
             This image passed the tier-3 boot gate: it was booted under
-            QEMU and `otp-unit.service` reached `Started`. That gate does
-            not exercise the OLED, the buttons or a printer -- see the
+            QEMU twice, `otp-unit.service` reached `Started` on both, the
+            root filesystem was a RAM overlay over a read-only card, a file
+            written to `/` in the first boot was gone in the second, and a
+            setting written to `/boot/firmware` was still there. That gate
+            does not exercise the OLED, the buttons or a printer -- see the
             header of `harness/img-boot.sh` for exactly what it does and
             does not prove.
 
@@ -431,9 +437,9 @@ jobs:
           CACHED='${{ steps.imgcache.outputs.cache-hit }}'
           {
             echo
-            echo "Budget: healthy boots stop at the unit start line"
-              echo "(~4.5 minutes wall, run 14 measured); 600s is the"
-              echo "backstop only broken boots pay."
+            echo "Budget: each of the two boots stops as soon as the"
+              echo "guest check reports done; 600s per boot is the"
+              echo "backstop only a boot that never reports pays."
             echo
             if [ "$CACHED" = "true" ]; then
               echo "This run restored the image from cache and went straight"
@@ -447,19 +453,22 @@ jobs:
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # The job log shows the last hundred console lines; this carries
-      # everything -- both UARTs in full, the verdict, and the boot
-      # partition's own cmdline.txt and config.txt, so the divergence
-      # between what the device would boot and what this harness booted is
-      # part of the record. Two diagnoses this week were built on a
-      # truncated tail; this is the end of that.
+      # The job log shows the last eighty console lines per boot; this
+      # carries everything -- both UARTs of both boots in full, the verdict,
+      # and the boot partition's own cmdline.txt and config.txt, so the
+      # divergence between what the device would boot and what this harness
+      # booted is part of the record. Two diagnoses this week were built on
+      # a truncated tail; this is the end of that.
+      #
+      # The consoles moved into a directory per boot when tier 3 grew a
+      # second one, so the glob has a level in it that the old path did not.
       - name: Upload the boot evidence
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: tier3-boot-evidence
           path: |
-            ${{ runner.temp }}/otp-img/console*.log
+            ${{ runner.temp }}/otp-img/*/console*.log
             ${{ runner.temp }}/otp-img/verdict.txt
             ${{ runner.temp }}/otp-img/boot/cmdline.txt
             ${{ runner.temp }}/otp-img/boot/config.txt

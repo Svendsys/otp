@@ -222,14 +222,14 @@ systemd colors the unit name, so the raw bytes of the success line are
 and the verdict still said FAIL, because no pattern can straddle that
 escape.
 
-The same strip is what the guest gate reads through. Every line
-otp-unit-imgcheck.service prints arrives over a serial console with a
-trailing CR, and the phase patterns end at a word boundary the CR sits on --
-so removing this now also takes the overlay checks out with it, which is why
-the list below is longer than the one line about ANSI."""
+The guest gate reads through the same strip and does NOT depend on it, which
+was worth measuring rather than assuming: with this edit applied, only the
+healthy-boot test goes red. Every line otp-unit-imgcheck.service prints
+arrives over the serial console with a trailing CR, but \\r is in
+[[:space:]], so the phase patterns match across it and `grep -oE` never puts
+it in front of a comparison. The ANSI half is what is load-bearing here."""
 tests = [
   "tests/test_img_verdict.py::test_a_healthy_two_boot_run_passes",
-  "tests/test_img_verdict.py::test_the_second_boot_must_report_too",
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
@@ -616,8 +616,43 @@ tests = [
 ]
 [[mutation.edit]]
 file = "device/install.sh"
-find = '''        if lsinitramfs "$candidate" 2>/dev/null | grep -q "scripts/overlay"; then'''
-replace = '''        if true; then'''
+find = '''        case "$LISTING" in
+            *scripts/overlay*)'''
+replace = '''        case "anything" in
+            *)'''
+
+
+[[mutation]]
+name = "install-overlay-listing-piped-into-grep-q"
+tier = "fast"
+guard = """
+The check reads the listing into a variable instead of piping it, and that
+is not a style choice. install.sh runs under pipefail; `grep -q` closes the
+pipe on its first match, lsinitramfs dies of SIGPIPE, and the pipeline
+returns 141 -- so the condition is false for exactly the initramfs that
+passes and the build fails on a good image. Measured with a 300k-line
+producer: `NO MATCH (rc of pipeline was nonzero)`, rc=141.
+
+This is the form the check was FIRST WRITTEN IN, and a three-line fixture
+never catches it: the producer finishes before grep can exit. The listing
+in tests/test_overlay_root.py is 20k lines with scripts/overlay near the
+top for that reason, and this row is what keeps it that size."""
+tests = [
+  "tests/test_overlay_root.py::test_a_good_initramfs_passes_the_verification",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''        LISTING=$(lsinitramfs "$candidate" 2>/dev/null || true)
+        case "$LISTING" in
+            *scripts/overlay*)
+                OVERLAY_INITRAMFS="$candidate"
+                break
+                ;;
+        esac'''
+replace = '''        if lsinitramfs "$candidate" 2>/dev/null | grep -q "scripts/overlay"; then
+            OVERLAY_INITRAMFS="$candidate"
+            break
+        fi'''
 
 
 [[mutation]]

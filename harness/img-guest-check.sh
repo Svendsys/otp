@@ -27,11 +27,12 @@
 #
 # An absence proves nothing on its own: a boot1 that never ran, a sentinel
 # written to the wrong path, or a check looking somewhere else all produce
-# the same missing file. So boot2 states a presence with the same fixture
-# first. The setting written in boot1 has to be readable in boot2 before the
-# sentinel's absence is allowed to mean anything, and the sentinel is written
-# again afterwards and confirmed visible, which proves the path and the test
-# would have found it had it survived.
+# the same missing file. So boot2 states two presences with the same fixture
+# first, and the discard check is reported last, after both. The sentinel is
+# rewritten and read back, which proves the path is writable and that this
+# check would have found the file had it survived; and the setting boot1
+# wrote is read back through config.load(), which proves boot1 ran and got
+# far enough to write things down.
 #
 # Prints one line per check in the format the host greps for:
 #
@@ -124,15 +125,6 @@ if printf 'phase=%s stamp=%s\n' "$PHASE" "$(date -u +%s 2>/dev/null)" \
 fi
 check root-write-lands-and-is-readable "$WROTE" "$SENTINEL"
 
-if [ "$PHASE" = "boot2" ]; then
-    # The overlay is really discarding rather than merely mounted. Ordered
-    # after the write above so that a failure here cannot be read as "the
-    # harness could not write to / anyway".
-    check root-writes-discarded-by-the-power-cycle \
-          "$(if [ "$SENTINEL_SURVIVED" = "no" ]; then echo yes; else echo no; fi)" \
-          "$SENTINEL before this boot: ${SENTINEL_WAS:-absent}"
-fi
-
 # --- the unit, on a read-only root ----------------------------------------
 
 # Polled rather than slept through. otp-unit-imgcheck.service is only
@@ -203,6 +195,18 @@ PY
     check settings-survive-the-power-cycle \
           "$(if [ "$KEPT" = "$MARK_PAGES" ]; then echo yes; else echo no; fi)" \
           "pages=$KEPT want=$MARK_PAGES from ${BOOTDIR}/otp-unit.conf"
+
+    # LAST, and that ordering is the point. This is the only check in the
+    # run whose evidence is a file NOT being there, and an absence is
+    # equally satisfied by a boot1 that never ran, by a sentinel written
+    # somewhere else, and by a rig that cannot write to / at all. The two
+    # checks above it rule all three out with the same fixture: the setting
+    # boot1 persisted is readable, and a sentinel written this boot is
+    # readable back from the path this check looks at. The value read here
+    # was taken before anything in this script wrote anything.
+    check root-writes-discarded-by-the-power-cycle \
+          "$(if [ "$SENTINEL_SURVIVED" = "no" ]; then echo yes; else echo no; fi)" \
+          "$SENTINEL before this boot: ${SENTINEL_WAS:-absent}"
 fi
 
 # Through config.save() at its real CONFIG_PATH, in both phases. That code is

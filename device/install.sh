@@ -609,13 +609,26 @@ OVERLAY
     # that was never written, an initramfs written before the overlay script
     # existed, a boot= token that never reached the file -- each of them
     # leaves a unit that boots read-write and says nothing at all about it.
+    #
+    # NOT `lsinitramfs "$candidate" | grep -q scripts/overlay`, which is how
+    # this was first written. This script runs under pipefail; `grep -q`
+    # closes the pipe on its first match, lsinitramfs dies of SIGPIPE, and
+    # the pipeline returns 141 -- so the condition is FALSE for exactly the
+    # initramfs that passes. Measured with a 300k-line producer: `NO MATCH
+    # (rc of pipeline was nonzero)`, rc=141. A real listing is thousands of
+    # lines and scripts/overlay sorts early in it, so this would have failed
+    # the build on a good image every time -- the sign-flipped version of
+    # issue #14's defect, aimed at the release gate.
     OVERLAY_INITRAMFS=""
     for candidate in "$BOOT_DIR"/initramfs*; do
         [ -f "$candidate" ] || continue
-        if lsinitramfs "$candidate" 2>/dev/null | grep -q "scripts/overlay"; then
-            OVERLAY_INITRAMFS="$candidate"
-            break
-        fi
+        LISTING=$(lsinitramfs "$candidate" 2>/dev/null || true)
+        case "$LISTING" in
+            *scripts/overlay*)
+                OVERLAY_INITRAMFS="$candidate"
+                break
+                ;;
+        esac
     done
     if [ -z "$OVERLAY_INITRAMFS" ]; then
         echo "ERROR: no initramfs in $BOOT_DIR contains scripts/overlay, so" >&2

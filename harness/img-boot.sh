@@ -373,7 +373,7 @@ boot_phase() {
     # and telling them apart cost a 55-minute build and still ended in a
     # guess. The growth column answers it directly: still climbing means
     # slow, flat for minutes means stuck.
-    local sample=30 elapsed=0 last=0 early_stop= now now2 cpu
+    local sample=30 elapsed=0 last=0 early_stop= now now2 cpu seen
     while kill -0 "$qemu_pid" 2>/dev/null; do
         sleep "$sample"
         elapsed=$((elapsed + sample))
@@ -391,9 +391,16 @@ boot_phase() {
         # emulator off before the thing this tier exists to observe had said
         # anything. A boot where the guest check never runs pays the
         # backstop, which is the correct price for having no report.
-        if [ -z "$early_stop" ] && \
-           sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' "$console" 2>/dev/null \
-               | grep -qF "OTP-GUEST-DONE $phase"; then
+        #
+        # grep -c, not grep -q, and this script runs under pipefail. `-q`
+        # closes the pipe on its first match, so sed dies of SIGPIPE and the
+        # pipeline returns 141 -- measured at 141 against a producer still
+        # writing when grep left. With `-q` the early stop simply never
+        # fires on a console large enough to lose that race, and every boot
+        # pays the full backstop instead. `-c` reads to the end.
+        seen=$(sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' "$console" 2>/dev/null \
+               | grep -cF "OTP-GUEST-DONE $phase" || true)
+        if [ -z "$early_stop" ] && [ "${seen:-0}" != "0" ]; then
             early_stop=$elapsed
             printf '   %s reported done at %ss wall; draining 10s, then stopping qemu\n' \
                    "$phase" "$elapsed" >&2

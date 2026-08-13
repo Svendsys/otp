@@ -189,7 +189,8 @@ follow with a laptop and easy to follow with a dedicated box:
 - **No swap**, so nothing holding key material can be paged to disk.
 - **Volatile logs**, no core dumps, and job metadata only.
 - **Read-only root with a RAM overlay** — see [docs/IMAGE.md](docs/IMAGE.md).
-  This is one manual step after first boot, not the state you are handed.
+  On from the first boot: `install.sh` enables it, so the image ships with
+  it. It was a manual step nobody had ever tested until issue #9.
 
 Be clear about what is *not* claimed. Key material is not scrubbed from RAM
 when a job ends: the working buffer is zeroed, but reportlab's intermediates

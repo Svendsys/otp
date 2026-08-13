@@ -21,11 +21,6 @@ ExecStart=/opt/otp-unit/img-guest-check.sh
 # with the guest.
 StandardOutput=journal+console
 StandardError=journal+console
-# The script reports failures rather than exiting on them, and the harness
-# judges the console. A nonzero exit here would add nothing and would put a
-# failed unit in the console for the verdict's `Failed with result` check to
-# trip over.
-SuccessExitStatus=0
 
 [Install]
 WantedBy=multi-user.target

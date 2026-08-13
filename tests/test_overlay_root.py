@@ -122,8 +122,22 @@ VERIFY_BLOCK = ('    OVERLAY_INITRAMFS=""',
                 '    log "  overlay initramfs: $OVERLAY_INITRAMFS"')
 
 
+# A REAL-SIZED listing, with scripts/overlay early in it and a long tail
+# after. Both details are load-bearing. install.sh runs under pipefail, and
+# the first version of the check piped lsinitramfs into `grep -q`: grep
+# closes the pipe on its first match, the producer dies of SIGPIPE, and the
+# pipeline returns 141 -- so the check failed on exactly the initramfs that
+# should pass. A three-line listing never reproduces it, because the producer
+# is finished before grep can exit. Measured with the piped form and this
+# fixture: NO MATCH, rc 141.
+GOOD_LISTING = ("scripts/local\nscripts/overlay\n"
+                + "".join(f"usr/lib/modules/6.12.96/kernel/drivers/x{i}.ko\n"
+                          for i in range(20000)))
+NO_OVERLAY_LISTING = GOOD_LISTING.replace("scripts/overlay\n", "")
+
+
 def run_verification(tmp_path, *, initramfs_names=("initramfs8",),
-                     listing="scripts/local\nscripts/overlay\nbin/sh\n",
+                     listing=GOOD_LISTING,
                      cmdline="boot=overlay console=tty1\n"):
     boot = tmp_path / "boot"
     boot.mkdir(exist_ok=True)
@@ -166,7 +180,7 @@ def test_an_initramfs_without_the_overlay_script_fails_the_install(tmp_path):
     and boot=overlay is then read by nothing, so the unit comes up on a
     writable root and says nothing about it.
     """
-    proc = run_verification(tmp_path, listing="scripts/local\nbin/sh\n")
+    proc = run_verification(tmp_path, listing=NO_OVERLAY_LISTING)
     assert proc.returncode != 0
     assert "would come up on a writable root" in proc.stderr, proc.stderr
 
@@ -281,14 +295,16 @@ def test_the_probe_checks_the_sentinel_before_it_writes_one():
         "root-writes-discarded-by-the-power-cycle can never fail")
 
 
-def test_the_probe_states_a_presence_before_it_asserts_an_absence():
+def test_the_probe_states_two_presences_before_it_asserts_an_absence():
     """
     "The file is gone" is satisfied by a boot1 that never ran, by a path
-    that does not exist and by a rig that cannot write to / at all. The
-    phase writes the sentinel and reads it back, and reads the setting
-    boot1 persisted, before the absence is allowed to mean anything.
+    that does not exist and by a rig that cannot write to / at all. Both
+    controls are reported before it, with the same fixture: a sentinel
+    written this boot and read back, and the setting boot1 persisted read
+    back through config.load().
     """
     text = GUEST_CHECK.read_text()
-    control = text.index("check root-write-lands-and-is-readable")
     absence = text.index("check root-writes-discarded-by-the-power-cycle")
-    assert control < absence
+    for control in ("check root-write-lands-and-is-readable",
+                    "check settings-survive-the-power-cycle"):
+        assert text.index(control) < absence, control
