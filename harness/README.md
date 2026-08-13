@@ -170,7 +170,9 @@ itself mutation-tested: reverting it to last-phase-only, or dropping the
 finished / reported-twice / FAIL-line / qemu-exit checks, each turns the
 right tests red. That is deliberate — four harness checks that could not
 fail have been found in this repository so far, and reading did not catch
-any of them.
+any of them. Those mutations are no longer applied by hand: they are rows in
+`tests/mutations.toml`, and CI runs them on every pull request. See
+[proving the guards can fail](#proving-the-guards-can-fail).
 
 ### The read-only overlay is NOT tested here — issue #9
 
@@ -270,6 +272,79 @@ which pi-gen's output never is.
 **Its peripheral coverage is worse than tier 1's**, and that is not a
 defect in the plan — a QEMU Pi is a Pi with nothing plugged into it. Once
 per image, not per commit.
+
+## Proving the guards can fail
+
+Every tier above is a check, and a check has one failure mode that nothing
+else in CI can see: **it stops being able to fail**. A broken unit test goes
+red and somebody fixes it. A broken guard goes green and nobody hears
+anything.
+
+Five have been found here, one per audit round (issue #14): a boot offset
+hardcoded at sector 8192 while pi-gen's arm64 branch aligns at 16384, so both
+`mcopy` calls read a zero-filled gap; a tier-3 verdict that grepped for
+`otp-unit`, which is the image's *hostname*; a tier-2 spool check using
+`findmnt --target`, which reports the containing mount, and `/run` is always
+tmpfs; a truncated-run gate satisfied by zero FAIL lines, which is trivially
+true of a guest killed after two checks; and a group guard that matched the
+*text* of a `for group in …; do` header and never ran the body. Each was
+found by hand and mutated by hand, and the next one was found the same way a
+round later.
+
+`tests/mutations.toml` is that round as a table, and `tests/mutation_gate.py`
+runs it: for each row it applies exact edits to the shipped files, runs the
+tests named as having to notice, restores the tree, and fails if the suite
+stayed green.
+
+```sh
+python3 tests/mutation_gate.py --list
+python3 tests/mutation_gate.py --tier fast       # 19 rows, 11s
+sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
+```
+
+**Runtime decided the trigger.** The issue expected nightly or
+label-triggered; measured, the fast tier is eleven seconds — cheaper than the
+suite it audits — so it runs per pull request as its own `mutation` job, and
+the ordinary suite's wall clock does not move. The three CUPS-rig rows run in
+the existing `hardware` job, the only place with a real `cupsd`, for 36
+seconds on top of about eight minutes.
+
+Every way this could rot into a no-op is a loud failure rather than a skip: a
+`find` string that no longer matches (the fast suite checks that much without
+running anything), a `find` that matches twice, tests that were already red
+before the mutation, tests that all *skipped*, a run that hangs, and a tier
+that was not selected — which is named in the summary with its row count, so
+a partial run cannot read as a complete one.
+
+Two rows carry **two edits**, and those are the interesting output so far.
+Both were single-edit rows that survived:
+
+- the tier-2 CR strip. Removing it left all 17 tier-2 tests green, because
+  `grep -oE` prints only the matched text and the pattern ends at `[0-9]+`,
+  so the `\r` never reaches the comparison. The property has two defences and
+  the row now removes both.
+- `MaxJobs`. Putting the shipped value back to 1 — the defect that made the
+  unit unable to print a pad at all — leaves the whole hardware tier green,
+  because `send()` now drains the queue before every submit. Removing that
+  drain alone also survives, at MaxJobs 4, because generating a pad is slower
+  than printing one. Together they are red in 3.8 seconds. The number stopped
+  being what protects that sequence; the wait is.
+
+**What is not covered.** No row needs a booted guest, and the tier-2 checks
+that only exist *inside* the guest — the spool redirect above, tty1
+ownership, the persistence phases — cannot be mutated from here. Proving
+those needs a `vm` tier with its own trigger; tiers carry their own pytest
+arguments and timeout, so adding one is a table entry rather than a change to
+the runner. None is seeded, because a row whose red was never observed is
+worse than no row at all.
+
+**Restoring the tree.** Not `git checkout` — a hand-run round used it and
+destroyed an uncommitted fix. Not `git stash push` + `git stash drop` either:
+measured, that reverts the file to HEAD and carries the working copy's edits
+into the dropped stash, which is the same defect one step removed. The runner
+reads each file's bytes before mutating and writes exactly those back, so a
+tree with work in progress in it comes out unchanged; `git stash create`
+takes a recoverable snapshot at the start without touching the worktree.
 
 ## What none of this gives you
 

@@ -1,0 +1,499 @@
+# The mutations that must not survive.
+#
+# Each row says: THIS GUARD EXISTS TO CATCH X -- here is X, spelled as exact
+# edits to the shipped files, and here are the tests that must go red for it.
+# tests/mutation_gate.py applies them one at a time and fails if the suite
+# stays green. Read that file's header for the mechanism, and for why the
+# tree is restored the way it is.
+#
+# WHY THESE ROWS AND NOT A MUTMUT RUN. A whole-codebase mutation run is slow,
+# noisy, and mostly uninteresting -- and it would not have found any of the
+# five defects in issue #14, because every one of them lives in a HARNESS
+# GUARD rather than in product code. That asymmetry is the point: a broken
+# unit test goes red and someone fixes it; a broken guard goes green and
+# nobody hears anything. So this table is curated, and it is weighted at the
+# guards -- the tier-2 and tier-3 verdict blocks, the provisioning checks,
+# the release gate, and the CUPS rig's habit of reading its configuration out
+# of install.sh rather than restating it.
+#
+# ADDING A ROW. Earn it the way these were earned: make the edit by hand, run
+# the tests, see which ones go red, and write those node ids down. A row
+# whose tests were never observed red is a row that will be believed and
+# should not be. `guard` says what the check is FOR -- not what the mutation
+# does, which the edit already says.
+#
+# MORE THAN ONE EDIT IN A ROW means the property is defended twice and no
+# single edit can turn the suite red. tier2-crlf-not-stripped is the case:
+# stating the redundancy beats dropping the row.
+#
+# WHAT IS NOT HERE. Nothing that needs a booted guest. The tier-2 checks that
+# only exist INSIDE the guest -- the spool redirect (row 3 of issue #14), tty1
+# ownership, the persistence phases -- cannot be mutated from a machine that
+# is not running them, so proving those needs a `vm` tier with its own
+# trigger. Tiers carry their own pytest arguments and timeout, so adding one
+# is an entry here rather than a change to the runner. None is seeded because
+# none could be OBSERVED red while writing this, and a row whose red was
+# never observed is worse than no row: it is a green line in a report.
+#
+# ROT IS A FAILURE, NOT A SKIP. If a `find` no longer matches its file
+# exactly `occurrences` times, the run fails loudly. That is deliberate: the
+# failure mode this mechanism exists to prevent is a check that has quietly
+# stopped checking, and a table that silently skipped its rotted rows would
+# be one more of those. tests/test_mutation_gate.py asserts every row still
+# applies, so `pytest -q` catches a rotted table too, without running it.
+
+[tiers.fast]
+description = "no privileges, no daemons -- the same tests `pytest -q` runs"
+pytest_args = []
+
+[tiers.hardware]
+description = "needs root and a real cupsd (see harness/README.md); the CUPS rig"
+# The rig's tests carry `pytestmark = pytest.mark.hardware` and pytest.ini
+# deselects that marker by default. These args land after addopts, so this
+# -m is the one that wins. `-p no:randomly` for the reason ci.yml gives: a
+# failure has to reproduce.
+pytest_args = ["-m", "hardware", "-p", "no:randomly"]
+
+
+# --- tier 2: the three-boot gate in harness/vm-check.sh -------------------
+#
+# The gate that makes three boots mean anything. A boot that never happened
+# produces no output, which is indistinguishable from a boot with nothing to
+# say -- so most of these rows are a way for the gate to accept a run that
+# did not happen.
+
+[[mutation]]
+name = "tier2-gate-looks-only-at-the-last-phase"
+tier = "fast"
+guard = """
+Every expected phase must have reported. The form this replaced took
+`tail -1` of the result line, so a guest that rebooted and never came back
+left the PREVIOUS phase's success standing as the whole answer."""
+tests = [
+  "tests/test_vm_verdict.py::TestTheGateFails::test_a_phase_that_never_reported_fails[provision]",
+  "tests/test_vm_verdict.py::TestTheGateFails::test_a_phase_that_never_reported_fails[reboot]",
+]
+[[mutation.edit]]
+file = "harness/vm-check.sh"
+find = "for phase in $EXPECTED_PHASES; do"
+replace = "for phase in persist; do"
+
+
+[[mutation]]
+name = "tier2-unfinished-phase-accepted"
+tier = "fast"
+guard = """
+OTP-GUEST-DONE is the only evidence a phase RAN OUT rather than being killed
+part way through. Results printed with no DONE line is a guest that died
+mid-phase, and its counts agree with themselves right up to the axe."""
+tests = [
+  "tests/test_vm_verdict.py::TestTheGateFails::test_a_phase_that_started_but_never_finished_fails",
+]
+[[mutation.edit]]
+file = "harness/vm-check.sh"
+find = '''    if ! grep -qE "OTP-GUEST-DONE[[:space:]]+$phase([[:space:]]|\$)" "$CLEAN"; then'''
+replace = "    if false; then"
+
+
+[[mutation]]
+name = "tier2-boot-loop-accepted"
+tier = "fast"
+guard = """
+Exactly once, not at least once. The guest reboots itself between phases, so
+a failed state write loops it on one phase forever -- and "it reported" stays
+true of a machine doing nothing else."""
+tests = [
+  "tests/test_vm_verdict.py::TestTheGateFails::test_a_phase_reporting_twice_fails",
+]
+[[mutation.edit]]
+file = "harness/vm-check.sh"
+find = '''    if [ "${count:-0}" -gt 1 ]; then'''
+replace = '''    if [ "${count:-0}" -gt 99 ]; then'''
+
+
+[[mutation]]
+name = "tier2-fail-lines-ignored"
+tier = "fast"
+guard = """
+Belt and braces over the counts, which come from the guest -- the thing under
+test. A guest that miscounts must not be able to talk its way to a green run,
+so a single OTP-CHECK FAIL line fails the tier on its own. Row 4 of issue #14
+is the other half of this: zero FAIL lines is trivially true of a guest
+killed after two checks, which is what the phase gates above are for."""
+tests = [
+  "tests/test_vm_verdict.py::TestTheGateFails::test_a_fail_line_fails_even_when_the_counts_agree",
+]
+[[mutation.edit]]
+file = "harness/vm-check.sh"
+find = '''if [ "${FAILED:-1}" -ne 0 ]; then'''
+replace = "if false; then"
+
+
+[[mutation]]
+name = "tier2-killed-qemu-accepted"
+tier = "fast"
+guard = """
+124 is the timeout. A run killed by it can leave a complete-looking
+transcript for whichever phases finished before the axe fell, which is
+exactly the run that must not pass."""
+tests = [
+  "tests/test_vm_verdict.py::TestTheGateFails::test_a_nonzero_qemu_exit_fails",
+]
+[[mutation.edit]]
+file = "harness/vm-check.sh"
+find = '''if [ "$QEMU_RC" != 0 ]; then'''
+replace = "if false; then"
+
+
+[[mutation]]
+name = "tier2-marker-anchored-to-the-line-start"
+tier = "fast"
+guard = """
+The marker is matched wherever it appears in a line, not as a line prefix.
+Every guest line arrives through cloud-init with a timestamp in front of it,
+so an anchored pattern sees no results at all and fails a run in which
+everything passed."""
+tests = [
+  "tests/test_vm_verdict.py::TestASharedSerialConsole::test_a_marker_with_a_timestamp_prefix_is_still_read",
+]
+[[mutation.edit]]
+file = "harness/vm-check.sh"
+find = '''    count=$(grep -cE "$pattern" "$CLEAN" || true)'''
+replace = '''    count=$(grep -cE "^$pattern" "$CLEAN" || true)'''
+
+
+[[mutation]]
+name = "tier2-crlf-not-stripped"
+tier = "fast"
+guard = """
+The guest reports over a serial console, which emits CRLF, so every captured
+line carries a trailing \\r. It is invisible in a log and lethal to
+comparison: it once made "13" and "13\\r" unequal and failed a run in which
+everything passed.
+
+TWO EDITS, because the first run of this gate measured that ONE is not
+enough: with the `tr -d` removed and nothing else changed, all 17 tier-2
+tests stayed green. `grep -oE` prints only the matched text and the pattern
+ends at [0-9]+, so the \\r never reaches the comparison either way. The
+property has two defenses; this row removes both, and is the record that
+neither one alone is load-bearing."""
+tests = [
+  "tests/test_vm_verdict.py::TestTheGatePasses::test_a_clean_three_phase_run_passes",
+  "tests/test_vm_verdict.py::TestTheGateIsNotFooledByWhitespace::test_crlf_does_not_break_the_count_comparison",
+]
+[[mutation.edit]]
+file = "harness/vm-check.sh"
+find = '''tr -d '\r' < "$CONSOLE" > "$CLEAN"'''
+replace = '''cp "$CONSOLE" "$CLEAN"'''
+[[mutation.edit]]
+file = "harness/vm-check.sh"
+find = '''    counts=$(grep -oE "$pattern" "$CLEAN" | tail -1)'''
+replace = '''    counts=$(grep -E "$pattern" "$CLEAN" | tail -1)'''
+
+
+# --- tier 3: the image boot verdict in harness/img-boot.sh ----------------
+
+[[mutation]]
+name = "tier3-verdict-greps-the-hostname"
+tier = "fast"
+guard = """
+The unit's success line, and only it. The image's HOSTNAME is otp-unit, so a
+bare grep for that matches `Set hostname to <otp-unit>` and the login prompt
+-- and both were proven to green a boot where the unit restart-looped on
+216/GROUP, and a boot where it was not installed at all. Row 2 of issue
+#14."""
+tests = [
+  "tests/test_img_verdict.py::test_hostname_and_login_prompt_do_not_count_as_the_unit",
+  "tests/test_img_verdict.py::test_starting_line_is_not_started",
+  "tests/test_img_verdict.py::test_the_etc_cups_unit_is_not_the_unit",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if grep -qF "Started otp-unit.service" "$CONSOLE_TXT" 2>/dev/null; then'''
+replace = '''    if grep -qF "otp-unit" "$CONSOLE_TXT" 2>/dev/null; then'''
+
+
+[[mutation]]
+name = "tier3-ansi-not-stripped"
+tier = "fast"
+guard = """
+systemd colors the unit name, so the raw bytes of the success line are
+"Started ESC[0;1;39motp-unit.serviceESC[0m - ...". Run 12 started the unit
+and the verdict still said FAIL, because no pattern can straddle that
+escape."""
+tests = [
+  "tests/test_img_verdict.py::test_healthy_boot_passes_on_console_evidence_despite_rc_124",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' \
+    "$CONSOLE_ALL" > "$CONSOLE_TXT" 2>/dev/null || cp "$CONSOLE_ALL" "$CONSOLE_TXT"'''
+replace = '''cp "$CONSOLE_ALL" "$CONSOLE_TXT"'''
+
+
+[[mutation]]
+name = "tier3-reboot-loop-accepted"
+tier = "fast"
+guard = """
+A boot that succeeded, reset and looped still carries the success line in its
+console. Kernel entries != 1 states the loop as a number and fails the run
+whatever else passed."""
+tests = [
+  "tests/test_img_verdict.py::test_a_boot_reset_loop_fails_even_with_a_successful_lap",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ "${KERNEL_ENTRIES:-0}" = "1" ]; then'''
+replace = '''    if [ "${KERNEL_ENTRIES:-0}" != "999" ]; then'''
+
+
+[[mutation]]
+name = "tier3-no-evidence-kills-the-verdict"
+tier = "fast"
+guard = """
+The `|| true` on the timestamp scan. A console with no kernel timestamp at
+all -- qemu failed to launch, or run 1's zero-byte boot -- makes grep exit 1,
+and under pipefail+errexit that killed the script BEFORE verdict.txt was
+written: no checks, no rc report, no console tail, precisely in the case
+where there is no other evidence."""
+tests = [
+  "tests/test_img_verdict.py::test_empty_consoles_still_produce_a_verdict",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = "| sort -g | tail -1 || true)"
+replace = "| sort -g | tail -1)"
+
+
+[[mutation]]
+name = "tier3-guest-reached-is-the-last-line-not-the-max"
+tier = "fast"
+guard = """
+How far the guest got is the MAX timestamp over both UARTs. uart1 ends at the
+bootconsole handoff (~2s) and concatenates second, so the last line in file
+order is the small one: run 12 reported "guest reached 1.9s" while the real
+console stood at 213s, and a healthy boot was diagnosed as an early freeze."""
+tests = [
+  "tests/test_img_verdict.py::test_guest_reached_is_the_max_not_the_concats_last_line",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = "| tr -d '[] ' | sort -g | tail -1 || true)"
+replace = "| tr -d '[] ' | tail -1 || true)"
+
+
+# --- what the device is provisioned with ----------------------------------
+
+[[mutation]]
+name = "install-creates-no-groups"
+tier = "fast"
+guard = """
+otp-unit.service names SupplementaryGroups the unit cannot start without:
+systemd fails it 216/GROUP and Restart=on-failure loops it forever, on a
+device whose journal is deliberately volatile. Row 5 of issue #14 -- the
+first version of this guard matched the TEXT of the `for group in ...; do`
+header and never ran the body, so replacing the body with `:` still reported
+4 passed. The guard runs the block now, and this is the mutation that says
+so."""
+tests = [
+  "tests/test_service_unit.py::TestTheUnitCanActuallyStart::test_install_sh_creates_every_group_the_service_needs",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''    if ! getent group "$group" >/dev/null 2>&1; then
+        groupadd --system "$group"
+        log "  created missing group: $group"
+    fi
+'''
+replace = '''    :
+'''
+
+
+[[mutation]]
+name = "unit-core-dump-limit-commented-out"
+tier = "fast"
+guard = """
+LimitCORE=0 is what stops a crash writing a complete copy of the pad in
+memory to disk. The coredump.conf install.sh also writes binds only when
+systemd-coredump is the registered handler, and in a booted VM
+kernel.core_pattern was plain `core`. Commenting the directive out satisfies
+a substring search over the file, which is what this guard used to be."""
+tests = [
+  "tests/test_service_unit.py::TestTheUnitCanActuallyStart::test_the_unit_still_bans_core_dumps_itself",
+]
+[[mutation.edit]]
+file = "device/systemd/otp-unit.service"
+find = "LimitCORE=0"
+replace = "#LimitCORE=0"
+
+
+[[mutation]]
+name = "unit-restartsec-inside-the-burst-limit"
+tier = "fast"
+guard = """
+RestartSec must clear systemd's 5-starts-in-10s burst limit, or a unit that
+cannot start yet -- a display slow to appear on the I2C bus -- goes
+permanently `failed` and never comes back. 500ms is inside the window, and a
+bare \\d+ regex read it as 500 seconds and passed it."""
+tests = [
+  "tests/test_service_unit.py::TestTheUnitCanActuallyStart::test_restart_on_failure_is_paired_with_a_backoff",
+]
+[[mutation.edit]]
+file = "device/systemd/otp-unit.service"
+find = "RestartSec=15"
+replace = "RestartSec=500ms"
+
+
+# --- what a tag is allowed to publish -------------------------------------
+
+[[mutation]]
+name = "release-gate-or-instead-of-and"
+tier = "fast"
+guard = """
+The release asset is attached only after the boot passes. One character --
+&& to || -- drops the gate entirely and publishes a release named after
+whatever branch was pushed, while keeping every token a substring check looks
+for. That is how it survived the first version of that test file."""
+tests = [
+  "tests/test_image_workflow.py::test_the_gate_is_exactly_the_expression_it_should_be",
+]
+[[mutation.edit]]
+file = ".github/workflows/image.yml"
+find = "if: success() && startsWith(github.ref, 'refs/tags/')"
+replace = "if: success() || startsWith(github.ref, 'refs/tags/')"
+
+
+[[mutation]]
+name = "release-boot-step-swallows-failure"
+tier = "fast"
+guard = """
+The gate is worth nothing if the step it gates on cannot go red. `|| true` on
+the invocation is one token, leaves every structural property of the step
+intact, and ships an image that does not boot."""
+tests = [
+  "tests/test_image_workflow.py::test_the_boot_step_can_still_fail_the_job",
+]
+[[mutation.edit]]
+file = ".github/workflows/image.yml"
+find = "            ./harness/img-boot.sh image/deploy/*.img.xz"
+replace = "            ./harness/img-boot.sh image/deploy/*.img.xz || true"
+
+
+[[mutation]]
+name = "release-artifact-upload-shrugs-at-a-missing-image"
+tier = "fast"
+guard = """
+An upload that finds no image must fail rather than shrug. The artifact is
+the only copy of a failed image anyone can debug, so a silently empty upload
+costs the evidence as well as the gate."""
+tests = [
+  "tests/test_image_workflow.py::test_the_plain_artifact_is_still_uploaded_before_the_boot",
+]
+[[mutation.edit]]
+file = ".github/workflows/image.yml"
+find = "if-no-files-found: error"
+replace = "if-no-files-found: warn"
+
+
+[[mutation]]
+name = "release-note-replaces-the-changelog"
+tier = "fast"
+guard = """
+Without append_body the action's update path is
+`body = workflowBody || existingReleaseBody`, and publishing a release
+through the GitHub UI creates the release AND the tag -- so the update path
+is the normal case and the caveat note silently replaces whatever changelog
+the maintainer wrote."""
+tests = [
+  "tests/test_image_workflow.py::test_the_note_is_appended_so_it_cannot_eat_the_release_notes",
+]
+[[mutation.edit]]
+file = ".github/workflows/image.yml"
+find = "append_body: true"
+replace = "append_body: false"
+
+
+# --- tier 1: the CUPS rig -------------------------------------------------
+#
+# Needs root and a real cupsd, so these are not in the per-PR tier. Each one
+# attacks the rig's own honesty rather than the unit's code: a rig that has
+# stopped reproducing the shipped configuration, or stopped being able to
+# make a job fail, is a green job that tested nothing -- which is worse than
+# a red one.
+
+[[mutation]]
+name = "sequence-submits-without-waiting-for-the-queue"
+tier = "hardware"
+guard = """
+Every sheet must reach the printer whatever MaxJobs is. cupsd does not queue
+past MaxJobs, it REFUSES -- `lp: Too many active jobs` -- and that is the
+defect that made the shipped unit useless: the operator got a status sheet
+promising a pad pair and then silence. Six rounds of reading missed it and a
+real daemon found it in four seconds.
+
+TWO EDITS, and the pair was arrived at by measuring, not by taste:
+
+  MaxJobs 1 alone            survives -- the whole hardware tier stays green
+                             (14 passed), because send() drains the queue
+                             before every submit and no second job is ever
+                             active. The shipped NUMBER stopped being what
+                             protects this; the wait is.
+  the drain removed alone    survives at the shipped MaxJobs 4 -- measured
+                             2/2 green, because generating a pad is slower
+                             than printing one and four never pile up.
+  both                       red in 3.8s, 3/3 runs.
+
+So the row states the real dependency: the sequence is independent of MaxJobs
+BECAUSE of the drain. Take the drain out and the old number back, and the rig
+must still see the operator lose the pad."""
+tests = [
+  "tests/test_simulated_hardware.py::TestTheUnattendedSequenceAgainstRealCups::test_every_sheet_reaches_the_printer_under_the_shipped_maxjobs",
+]
+[[mutation.edit]]
+file = "otpunit/unattended.py"
+find = '''        drain(cups, queue, sleep, log, timeout=_drain_timeout(settings))
+        cups.submit(data, name=queue, title=title,'''
+replace = '''        cups.submit(data, name=queue, title=title,'''
+[[mutation.edit]]
+file = "device/install.sh"
+find = "set_cupsd MaxJobs 4"
+replace = "set_cupsd MaxJobs 1"
+
+
+[[mutation]]
+name = "cups-rig-directives-stop-coming-from-install-sh"
+tier = "hardware"
+guard = """
+If the parse of install.sh stops matching, the rig quietly configures cupsd's
+DEFAULTS and every test above it becomes decorative -- PreserveJobFiles
+reverts to Yes and ErrorPolicy to stop-printer, which are the opposite of
+what the unit ships. The failure is silent by construction: an empty parse
+result is a perfectly valid dict."""
+tests = [
+  "tests/test_simulated_hardware.py::test_the_rig_uses_the_shipped_cups_configuration",
+]
+[[mutation.edit]]
+file = "tests/cupsrig.py"
+find = '''    for key, value in re.findall(r"^\s*set_cupsd\s+(\S+)\s+(\S+)\s*$",
+                                 text, re.M):'''
+replace = '''    for key, value in re.findall(r"^\s*set_cups_d\s+(\S+)\s+(\S+)\s*$",
+                                 text, re.M):'''
+
+
+[[mutation]]
+name = "cups-rig-tray-failure-is-not-injected"
+tier = "hardware"
+guard = """
+The empty-tray test rests entirely on the rig being able to make the backend
+fail. If the flag stops arriving, the job succeeds, the unit reports a
+printed pair, and the test asserting that it must NOT reports a pass -- a
+fixture that lies, which this rig has produced once already: a stale
+.unplugged file made a test believing it exercised a CUPS_BACKEND_STOP
+exercise a disconnect instead."""
+tests = [
+  "tests/test_simulated_hardware.py::TestTheUnattendedSequenceAgainstRealCups::test_an_empty_tray_does_not_produce_a_sheet_claiming_a_pair",
+]
+[[mutation.edit]]
+file = "tests/cupsrig.py"
+find = '''        flag = self.jobs / ".fail"'''
+replace = '''        flag = self.jobs / ".fail-disabled"'''
