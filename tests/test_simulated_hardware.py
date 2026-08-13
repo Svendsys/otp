@@ -709,11 +709,13 @@ class TestThePanelAgainstAFailingPrinter:
             f"the panel said {after_a!r} over a tray that got nothing"
         shown = "\n".join(screen.frame(app).rendered()).upper()
         assert "REMOVE THE STACK" not in shown
-        # The IPP reason, from the Alerts line real cupsd prints: measured
-        # here as "media-empty-error". Previously the prose from
-        # printer-state-message ("out of paper"), which the rig happens to
-        # set but a real printer need not.
-        assert "MEDIA EMPTY" in shown, shown
+        # The printer's own words, which is what the panel shows: the prose
+        # in printer-state-message is the channel that DECIDES (see
+        # Cups.ADVISORY_STEMS -- the usb backend reports no IPP reason at
+        # any severity), and it is also the more actionable of the two.
+        # Either wording is acceptable here; what must not happen is a
+        # drained queue reading as a printed copy.
+        assert "OUT OF PAPER" in shown or "MEDIA EMPTY" in shown, shown
 
     def test_a_failed_copy_b_does_not_say_pair_complete(self, rig, tmp_path):
         # Copy A prints; copy B does not. The operator is holding half a
