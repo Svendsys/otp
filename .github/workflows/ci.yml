@@ -185,15 +185,24 @@ jobs:
           # worse than a red one; that is the premise of this whole PR.
           PASSED=$(grep -oE '[0-9]+ passed' /tmp/harness.log | tail -1 | cut -d' ' -f1)
           echo "harness tests passed: ${PASSED:-0}"
-          # 24, up from 12. Measured on the last run before the board
-          # identity was forged: 17 passed, the three button tests among
-          # the skips. Ten more can run now, so 27 is the expectation and
-          # 24 leaves room for the ones that may skip for a stated reason
-          # -- a machine too slow to bounce a line inside the debounce
-          # window, a gpio-sim chip that did not land on the number
-          # gpiozero's default opens, luma refusing the i2c stub.
-          if [ "${PASSED:-0}" -lt 24 ]; then
-            echo "expected at least 24 passing harness tests (the CUPS rig" >&2
+          # 26, up from 12. The arithmetic, from run 31699840801 -- the
+          # first run in which the panel executed at all:
+          #
+          #   28 ran there (24 passed, 3 button failures since fixed, 1
+          #      luma skip), of which 10 were this PR's board identity
+          #      and press tests;
+          #   +5 for TestTheFactoryTeardownBetweenPanels, which needs no
+          #      kernel simulator at all -- only gpiozero, which this job
+          #      installs -- so it runs wherever this job runs.
+          #
+          # 32 is therefore the expectation. 26 leaves room for six to
+          # skip for a stated reason: a machine too slow to bounce a line
+          # inside the debounce window, a gpio-sim chip that did not land
+          # on the number gpiozero's default opens, luma refusing the i2c
+          # stub, or a runner kernel without modules-extra losing
+          # i2c-stub, vkms and uinput together.
+          if [ "${PASSED:-0}" -lt 26 ]; then
+            echo "expected at least 26 passing harness tests (the CUPS rig" >&2
             echo "alone is 11); got ${PASSED:-0}. Something skipped silently." >&2
             grep -E "^SKIPPED" /tmp/harness.log >&2 || true
             exit 1
