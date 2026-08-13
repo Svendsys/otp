@@ -108,11 +108,33 @@
 # module, an fstab referring to a partition that moved, an initramfs that
 # does not build -- all invisible until something tries.
 #
-# NOT cmdline.txt, and not config.txt. QEMU reads neither: -append below
-# REPLACES the kernel command line wholesale, and config.txt is firmware
-# configuration the emulator has no equivalent of. So dtparam=i2c_arm=on
-# and the disable-wifi/disable-bt overlays are inert here. Do not read a
-# green tier 3 as evidence about either file.
+# THE READ-ONLY OVERLAY, and why this now boots the image TWICE. Issue #9:
+# nothing anywhere had ever booted a machine with the overlay engaged. The
+# image did not enable it, install.sh printed advice, and the two mechanisms
+# tried in the tier-2 Debian guest both failed -- one of them by panicking
+# the kernel. device/install.sh enables it at provisioning time now, so the
+# artifact this boots has it, and the questions it raises can only be
+# answered by a machine that has been powered off and on again:
+#
+#   boot1  the overlay is engaged. otp-unit-imgcheck.service reports what
+#          the root filesystem is, that the unit and cupsd came up on it,
+#          and writes a sentinel to / and a setting to /boot/firmware.
+#   boot2  the SAME card image, booted again. The sentinel must be gone and
+#          the setting must still be there.
+#
+# The two boots share one image file on purpose: writes that reach the card
+# in boot1 are there in boot2, and writes that only reached the overlay's
+# tmpfs are not. That difference is the entire claim.
+#
+# PARTLY cmdline.txt and config.txt now, where it used to be neither. QEMU
+# still reads no firmware configuration -- -append below REPLACES the kernel
+# command line wholesale, and dtparam=i2c_arm=on and the disable-wifi/bt
+# overlays remain inert here. But the two things the overlay rides on are
+# taken out of those files rather than invented: `boot=overlay` is copied
+# from the image's cmdline.txt into -append, and the initramfs the firmware
+# would auto-load is pulled off the boot partition and handed over with
+# -initrd. An image built without the overlay therefore boots without it
+# here too, and fails the verdict rather than being quietly compensated for.
 #
 # WHAT IT DOES NOT CATCH, and this is the important caveat: QEMU's raspi3b
 # is a Pi with nothing plugged into it. No OLED on the I2C bus, no buttons
@@ -134,7 +156,12 @@ TIMEOUT="${OTP_IMG_TIMEOUT:-1200}"
 mkdir -p "$WORK"
 WORK="$(cd "$WORK" && pwd)"
 IMG="$WORK/card.img"
-CONSOLE="$WORK/console.log"
+ESC=$(printf '\033')
+# ONE image file for both boots. Boot 2 is a power-cycle of the same card,
+# and that is the only reason "the setting survived and the sentinel did
+# not" says anything: a fresh copy of the image would answer both questions
+# with the image build's own contents.
+PHASES="${OTP_IMG_PHASES:-boot1 boot2}"
 
 log() { printf '\n== %s\n' "$*" >&2; }
 
@@ -191,11 +218,12 @@ if command -v mcopy >/dev/null; then
     # before console init looks like.
     mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b.dtb "$WORK/boot/" \
         || mcopy -n -i "$IMG@@$BOOT_OFFSET" ::bcm2710-rpi-3-b-plus.dtb "$WORK/boot/" || true
-    # Evidence, not execution: the image's own cmdline.txt and config.txt
-    # ship in the artifact and neither is consulted here (see the header).
-    # They ride along into the failure artifact so the divergence between
-    # what the device would boot and what this harness booted is part of
-    # the record rather than a thing to remember.
+    # Read, not merely carried along. -append still replaces the kernel
+    # command line wholesale, so the firmware's own use of these files does
+    # not happen here -- but the overlay tokens come OUT of cmdline.txt and
+    # the initramfs name comes out of config.txt, below. They also ride into
+    # the failure artifact, so the divergence between what the device would
+    # boot and what this harness booted stays part of the record.
     mcopy -n -i "$IMG@@$BOOT_OFFSET" ::cmdline.txt "$WORK/boot/" || true
     mcopy -n -i "$IMG@@$BOOT_OFFSET" ::config.txt "$WORK/boot/" || true
 else
@@ -211,8 +239,43 @@ if [ ! -f "$KERNEL" ] || [ -z "$DTB" ]; then
     exit 1
 fi
 log "kernel=$KERNEL dtb=$DTB"
+IMG_CMDLINE=""
 if [ -s "$WORK/boot/cmdline.txt" ]; then
-    log "the image's own cmdline.txt (replaced wholesale by -append): $(tr -d '\r\n' < "$WORK/boot/cmdline.txt")"
+    IMG_CMDLINE=$(tr -d '\r\n' < "$WORK/boot/cmdline.txt")
+    log "the image's own cmdline.txt (replaced wholesale by -append): $IMG_CMDLINE"
+fi
+
+# --- what the image says about the overlay -------------------------------
+
+# COPIED from the image, never assumed. Adding boot=overlay here when the
+# image's own cmdline.txt does not carry it would test a configuration no
+# device has -- the harness would be proving its own -append line.
+OVERLAY_TOKENS=""
+case " $IMG_CMDLINE " in
+    *" boot=overlay "*) OVERLAY_TOKENS="boot=overlay" ;;
+esac
+
+# QEMU does not run the Pi's firmware, so auto_initramfs=1 does nothing here:
+# the initrd has to be pulled off the FAT partition and handed over with
+# -initrd, exactly as the kernel and the DTB are. Its name comes from the two
+# places the firmware itself would look -- an explicit `initramfs <file>` line
+# in config.txt, or the auto_initramfs convention of initramfs8 sitting next
+# to kernel8.img.
+INITRD_NAME=$(sed -n -E 's/^[[:space:]]*initramfs[[:space:]]+([^[:space:]]+).*/\1/p' \
+              "$WORK/boot/config.txt" 2>/dev/null | tail -1)
+[ -n "$INITRD_NAME" ] || INITRD_NAME=initramfs8
+mcopy -n -i "$IMG@@$BOOT_OFFSET" "::$INITRD_NAME" "$WORK/boot/" || true
+INITRD="$WORK/boot/$INITRD_NAME"
+if [ -s "$INITRD" ]; then
+    log "initramfs=$INITRD ($(wc -c < "$INITRD") bytes) overlay tokens='${OVERLAY_TOKENS:-none}'"
+else
+    # NOT fatal, and deliberately so. Booting anyway is the more useful
+    # failure: the guest comes up on a plain read-write root, says so, and
+    # the verdict names both missing halves. Aborting here would produce no
+    # verdict.txt at all, which is the state the evidence pipeline is worst
+    # at explaining.
+    log "no $INITRD_NAME on the boot partition: booting WITHOUT an initramfs"
+    INITRD=""
 fi
 
 # root=/dev/mmcblk0p2 rather than cmdline.txt's root=PARTUUID=..., but not
@@ -224,19 +287,29 @@ fi
 # quiet, neither wanted here), so root= must be restated -- and an explicit
 # device name beats depending on which revision of cmdline.txt this build
 # happened to produce.
-log "Booting under -M raspi3b (this is emulated, not KVM -- allow minutes)"
-# BOTH UARTs, captured separately. A Pi 3 has two, and the measured QEMU
-# mapping is: FIRST -serial = the PL011 (which this DTB names ttyAMA1),
-# SECOND -serial = the mini-UART, where the earlycon bootconsole lives.
-# For six runs the first file's stubborn 0 bytes was itself the clue
-# nobody read: the PL011 never emitted because no console= ever named
-# it. Capturing both is what eventually made the mapping provable.
-CONSOLE2="$WORK/console-uart1.log"
-CONSOLE_ALL="$WORK/console-all.log"
-CONSOLE_TXT="$WORK/console-text.log"
-: > "$CONSOLE"
-: > "$CONSOLE2"
-set +e
+# One boot, into its own directory. Everything a phase produces -- both
+# consoles, qemu's exit code, whether the harness stopped it -- is written
+# down there, so the verdict below is a function of files on disk rather
+# than of variables that happen to still be set. That is also what lets
+# tests/test_img_verdict.py run the real verdict block over synthetic
+# consoles instead of over a copy of it.
+boot_phase() {
+    local phase="$1"
+    local dir="$WORK/$phase"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    # BOTH UARTs, captured separately. A Pi 3 has two, and the measured QEMU
+    # mapping is: FIRST -serial = the PL011 (which this DTB names ttyAMA1),
+    # SECOND -serial = the mini-UART, where the earlycon bootconsole lives.
+    # For six runs the first file's stubborn 0 bytes was itself the clue
+    # nobody read: the PL011 never emitted because no console= ever named
+    # it. Capturing both is what eventually made the mapping provable.
+    local console="$dir/console.log"
+    local console2="$dir/console-uart1.log"
+    : > "$console"
+    : > "$console2"
+    log "Booting $phase under -M raspi3b (emulated, not KVM -- allow minutes)"
+    set +e
 # THE COMMAND LINE, and what previous revisions of it got wrong.
 #
 # loglevel=7, not 6 and not 8. KERN_INFO is where a boot narrates itself
@@ -277,81 +350,112 @@ set +e
 # systemd.show_status=1 because "Started OTP pad print unit" and
 # "Reached target" are systemd status lines, not kernel output -- and
 # they need the WORKING console above to reach the capture at all.
-timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
-    -M raspi3b -m 1024 \
-    -kernel "$KERNEL" -dtb "$DTB" \
-    -append "rw earlycon loglevel=7 console=ttyAMA1,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait" \
-    -drive "file=$IMG,if=sd,format=raw" \
-    -serial "file:$CONSOLE" \
-    -serial "file:$CONSOLE2" \
-    -display none -no-reboot &
-QEMU_PID=$!
+#
+# otp.imgcheck=<phase> is what wakes otp-unit-imgcheck.service, whose
+# ConditionKernelCommandLine is that word. It ships in the image and is
+# inert on a flashed card, where nothing puts the word there.
+#
+# $OVERLAY_TOKENS is boot=overlay, copied out of the image's own
+# cmdline.txt above, or empty when the image does not carry it.
+    timeout -k 30 "$TIMEOUT" qemu-system-aarch64 \
+        -M raspi3b -m 1024 \
+        -kernel "$KERNEL" -dtb "$DTB" \
+        ${INITRD:+-initrd "$INITRD"} \
+        -append "rw earlycon loglevel=7 console=ttyAMA1,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait $OVERLAY_TOKENS otp.imgcheck=$phase" \
+        -drive "file=$IMG,if=sd,format=raw" \
+        -serial "file:$console" \
+        -serial "file:$console2" \
+        -display none -no-reboot &
+    local qemu_pid=$!
 
-# Sample the console while it boots. A guest grinding slowly along and a
-# guest wedged solid look identical from outside once the output stops, and
-# telling them apart cost a 55-minute build and still ended in a guess. The
-# growth column answers it directly: still climbing means slow, flat for
-# minutes means stuck.
-SAMPLE=30
-ELAPSED=0
-LAST=0
-EARLY_STOP=
-ESC=$(printf '\033')
-while kill -0 "$QEMU_PID" 2>/dev/null; do
-    sleep "$SAMPLE"
-    ELAPSED=$((ELAPSED + SAMPLE))
-    NOW=$(wc -c < "$CONSOLE" 2>/dev/null || echo 0)
-    NOW2=$(wc -c < "$CONSOLE2" 2>/dev/null || echo 0)
-    # A healthy boot of this image never ends by itself: the unit comes
-    # up and the guest idles. Waiting out the full cap after the success
-    # line has already been printed adds minutes and, worse, puts the
-    # verdict in a race with the cap -- run 13's success line landed
-    # around 420s of a 480s cap. Once the line is visible, give the
-    # console a few seconds to drain and stop the emulator ourselves.
-    if [ -z "$EARLY_STOP" ] && \
-       sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' "$CONSOLE" 2>/dev/null \
-           | grep -qF "Started otp-unit.service"; then
-        EARLY_STOP=$ELAPSED
-        printf '   unit start line visible at %ss wall; draining 10s, then stopping qemu\n' "$ELAPSED" >&2
-        sleep 10
-        kill "$QEMU_PID" 2>/dev/null || true
-    fi
-    # Host-side CPU%% of the emulator, because flat output alone cannot
-    # distinguish a guest idle-waiting (near 0%%) from one spinning in
-    # place (pegged). $QEMU_PID is the timeout(1) wrapper, so sample its
-    # CHILD -- run 11 sampled the wrapper itself and printed a solemn
-    # column of 0.0%% while the guest was demonstrably executing.
-    CPU=$(ps -o %cpu= --ppid "$QEMU_PID" 2>/dev/null | head -1 | tr -d ' ' || true)
-    printf '   %4ss  uart0=%-8s (+%-6s) uart1=%-8s qemu-cpu=%s%%\n' \
-           "$ELAPSED" "$NOW" "$((NOW - LAST))" "$NOW2" "${CPU:-?}" >&2
-    LAST=$NOW
+    # Sample the console while it boots. A guest grinding slowly along and a
+    # guest wedged solid look identical from outside once the output stops,
+    # and telling them apart cost a 55-minute build and still ended in a
+    # guess. The growth column answers it directly: still climbing means
+    # slow, flat for minutes means stuck.
+    local sample=30 elapsed=0 last=0 early_stop= now now2 cpu
+    while kill -0 "$qemu_pid" 2>/dev/null; do
+        sleep "$sample"
+        elapsed=$((elapsed + sample))
+        now=$(wc -c < "$console" 2>/dev/null || echo 0)
+        now2=$(wc -c < "$console2" 2>/dev/null || echo 0)
+        # A healthy boot of this image never ends by itself: the unit comes
+        # up and the guest idles. Waiting out the full cap after the phase
+        # has already finished adds minutes and, worse, puts the verdict in
+        # a race with the cap -- run 13's success line landed around 420s of
+        # a 480s cap.
+        #
+        # The marker is the GUEST CHECK's own done line, not the unit's
+        # start line it used to be. The overlay checks run after the unit is
+        # up, so stopping at "Started otp-unit.service" would now cut the
+        # emulator off before the thing this tier exists to observe had said
+        # anything. A boot where the guest check never runs pays the
+        # backstop, which is the correct price for having no report.
+        if [ -z "$early_stop" ] && \
+           sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' "$console" 2>/dev/null \
+               | grep -qF "OTP-GUEST-DONE $phase"; then
+            early_stop=$elapsed
+            printf '   %s reported done at %ss wall; draining 10s, then stopping qemu\n' \
+                   "$phase" "$elapsed" >&2
+            sleep 10
+            kill "$qemu_pid" 2>/dev/null || true
+        fi
+        # Host-side CPU%% of the emulator, because flat output alone cannot
+        # distinguish a guest idle-waiting (near 0%%) from one spinning in
+        # place (pegged). $qemu_pid is the timeout(1) wrapper, so sample its
+        # CHILD -- run 11 sampled the wrapper itself and printed a solemn
+        # column of 0.0%% while the guest was demonstrably executing.
+        cpu=$(ps -o %cpu= --ppid "$qemu_pid" 2>/dev/null | head -1 | tr -d ' ' || true)
+        printf '   %-5s %4ss  uart0=%-8s (+%-6s) uart1=%-8s qemu-cpu=%s%%\n' \
+               "$phase" "$elapsed" "$now" "$((now - last))" "$now2" "${cpu:-?}" >&2
+        last=$now
+    done
+    wait "$qemu_pid"
+    local rc=$?
+    set -e
+    printf '%s\n' "$rc" > "$dir/qemu-rc"
+    printf '%s' "$early_stop" > "$dir/early-stop"
+    log "$phase: uart0=$(wc -c < "$console") bytes  uart1=$(wc -c < "$console2") bytes  rc=$rc"
+    # A power-cycle, not a reset button: the emulator is gone and the image
+    # file is flushed before the next phase opens it again.
+    sync 2>/dev/null || true
+}
+
+for phase in $PHASES; do
+    boot_phase "$phase"
 done
-wait "$QEMU_PID"
-QEMU_RC=$?
-set -e
-
-# Everything downstream reads the combination, so a boot that talks to
-# whichever port is still judged on what it said.
-cat "$CONSOLE" "$CONSOLE2" > "$CONSOLE_ALL" 2>/dev/null || true
-# The verdict greps run on an ANSI- and CR-stripped copy. systemd colors
-# the unit name in its status lines, so the raw bytes of a success line
-# are "Started ESC[0;1;39motp-unit.serviceESC[0m - ..." -- run 12's boot
-# started the unit and the verdict still said FAIL because the pattern
-# could never straddle the escape sequence.
-sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' \
-    "$CONSOLE_ALL" > "$CONSOLE_TXT" 2>/dev/null || cp "$CONSOLE_ALL" "$CONSOLE_TXT"
-log "uart0=$(wc -c < "$CONSOLE") bytes  uart1=$(wc -c < "$CONSOLE2") bytes"
-if [ ! -s "$CONSOLE_ALL" ]; then
-    # Worth saying outright rather than leaving as a wall of FAILs. An
-    # empty console is not "the unit did not start" -- it is "there is no
-    # evidence the kernel ever ran", and the two have entirely different
-    # causes.
-    log "NEITHER uart produced any output: no evidence the kernel ran at all"
-fi
 
 # --- the verdict --------------------------------------------------------
 
+# Everything downstream reads the combination, so a boot that talks to
+# whichever port is still judged on what it said.
 VERDICT="$WORK/verdict.txt"
+
+# The evidence one phase left behind, named. Nothing below reads a variable
+# the boot happened to leave set: a phase is a directory, and the verdict is
+# a function of what is in it. That is also what lets
+# tests/test_img_verdict.py drive this block over synthetic consoles.
+phase_paths() {
+    local phase="$1"
+    CONSOLE="$WORK/$phase/console.log"
+    CONSOLE2="$WORK/$phase/console-uart1.log"
+    CONSOLE_ALL="$WORK/$phase/console-all.log"
+    CONSOLE_TXT="$WORK/$phase/console-text.log"
+    QEMU_RC=$(cat "$WORK/$phase/qemu-rc" 2>/dev/null || echo "?")
+    EARLY_STOP=$(cat "$WORK/$phase/early-stop" 2>/dev/null || true)
+    cat "$CONSOLE" "$CONSOLE2" > "$CONSOLE_ALL" 2>/dev/null || true
+    # The verdict greps run on an ANSI- and CR-stripped copy. systemd colors
+    # the unit name in its status lines, so the raw bytes of a success line
+    # are "Started ESC[0;1;39motp-unit.serviceESC[0m - ..." -- run 12's boot
+    # started the unit and the verdict still said FAIL because the pattern
+    # could never straddle the escape sequence. The guest check's own lines
+    # arrive over the same serial console and carry the same CRs.
+    sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' \
+        "$CONSOLE_ALL" > "$CONSOLE_TXT" 2>/dev/null || cp "$CONSOLE_ALL" "$CONSOLE_TXT"
+}
+
+per_boot_verdict() {
+    local phase="$1"
 # Max over every timestamp in BOTH files, not the concat's last line:
 # uart1 ends at the bootconsole handoff (~2s), and with uart1 concatenated
 # second, run 12 reported "guest reached 1.9s" while the real console
@@ -364,7 +468,6 @@ VERDICT="$WORK/verdict.txt"
 # the review panel; the identical guard was already on the next line.
 LAST_TS=$(grep -oE '\[ *[0-9]+\.[0-9]+\]' "$CONSOLE_TXT" 2>/dev/null | tr -d '[] ' | sort -g | tail -1 || true)
 KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/null || true)
-{
     printf 'qemu exit: %s\n' "$QEMU_RC"
     # How far it got and how many times the kernel STARTED. Entries > 1 is
     # a reboot loop stated as a number, instead of an inference from byte
@@ -382,14 +485,14 @@ KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/n
     # the stripped text is what only THIS unit's success line contains
     # (otp-unit-etc-cups.service does not contain it as a substring).
     if grep -qF "Started otp-unit.service" "$CONSOLE_TXT" 2>/dev/null; then
-        printf 'IMG-CHECK unit-started PASS\n'
+        printf 'IMG-CHECK %s unit-started PASS\n' "$phase"
     else
-        printf 'IMG-CHECK unit-started FAIL\n'
+        printf 'IMG-CHECK %s unit-started FAIL\n' "$phase"
     fi
     for bad in "status=216" "Failed with result" "Scheduled restart job" \
                "Kernel panic" "Unable to mount root"; do
         if grep -qF -- "$bad" "$CONSOLE_TXT" 2>/dev/null; then
-            printf 'IMG-CHECK no-%s FAIL\n' "$(printf '%s' "$bad" | tr ' =' '--')"
+            printf 'IMG-CHECK %s no-%s FAIL\n' "$phase" "$(printf '%s' "$bad" | tr ' =' '--')"
         fi
     done
     # "systemd[1]:" and not "systemd". The bare string matches the
@@ -401,9 +504,9 @@ KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/n
     # success line in its console. Entries != 1 is that loop stated
     # directly, and it fails the run no matter what else passed.
     if [ "${KERNEL_ENTRIES:-0}" = "1" ]; then
-        printf 'IMG-CHECK single-kernel-entry PASS\n'
+        printf 'IMG-CHECK %s single-kernel-entry PASS\n' "$phase"
     else
-        printf 'IMG-CHECK single-kernel-entry FAIL\n'
+        printf 'IMG-CHECK %s single-kernel-entry FAIL\n' "$phase"
     fi
     # THE ENTROPY EVIDENCE -- the only place it is observed on the real
     # artifact rather than injected into a unit test. See issue #16.
@@ -440,9 +543,9 @@ KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/n
     for want in "Linux version" "systemd[1]:" "Reached target" \
                 "crng init done" "hwrng registered"; do
         if grep -qF -- "$want" "$CONSOLE_TXT" 2>/dev/null; then
-            printf 'IMG-CHECK %s PASS\n' "$(printf '%s' "$want" | tr ' ' '-')"
+            printf 'IMG-CHECK %s %s PASS\n' "$phase" "$(printf '%s' "$want" | tr ' ' '-')"
         else
-            printf 'IMG-CHECK %s FAIL\n' "$(printf '%s' "$want" | tr ' ' '-')"
+            printf 'IMG-CHECK %s %s FAIL\n' "$phase" "$(printf '%s' "$want" | tr ' ' '-')"
         fi
     done
     # Quoted back as well as gated, so the next kernel bump shows WHICH
@@ -454,35 +557,139 @@ KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/n
             "$(grep -ioE '.{0,40}(hwrng|hw_random|rng_core).{0,44}' \
                  "$CONSOLE_TXT" 2>/dev/null | head -1)"
     fi
-} > "$VERDICT"
+}
+
+# --- what the guest said about the overlay -------------------------------
+
+# The checks tier 3 CLAIMS the guest made, named. A gate that only requires
+# the ABSENCE of FAIL lines is satisfied by a guest that ran no checks at all
+# -- that is row 4 of issue #14 arriving somewhere new, and it is why the
+# names are listed here as well as counted. A check deleted from
+# harness/img-guest-check.sh now fails the run instead of quietly shrinking
+# what this tier proves; tests/test_img_verdict.py holds the two lists
+# against each other so they cannot drift apart in the other direction.
+GUEST_CHECKS_COMMON="root-is-overlay root-write-lands-and-is-readable \
+unit-active unit-not-restart-looping etc-cups-is-its-own-tmpfs cups-running \
+cupsd-config-valid boot-partition-separate setting-saved-to-the-boot-partition"
+GUEST_CHECKS_BOOT2="root-writes-discarded-by-the-power-cycle \
+settings-survive-the-power-cycle"
+
+guest_gate() {
+    local phase="$1" count counts passed total missing want
+
+    # Exactly once, not at least once. A guest that reported twice is one
+    # that rebooted underneath the harness, and "it reported" stays true of
+    # a machine doing nothing else -- the same trap tier 2's gate is built
+    # around.
+    count=$(grep -cE "OTP-RESULT[[:space:]]+$phase[[:space:]]" "$CONSOLE_TXT" 2>/dev/null || true)
+    if [ "${count:-0}" = "1" ]; then
+        printf 'IMG-CHECK %s guest-reported-once PASS\n' "$phase"
+    else
+        printf 'IMG-CHECK %s guest-reported-once FAIL %s OTP-RESULT lines\n' \
+               "$phase" "${count:-0}"
+    fi
+
+    # OTP-GUEST-DONE is the only evidence the phase RAN OUT rather than
+    # being killed part way through, and this tier kills the emulator by
+    # hand the moment it sees that line. Counts printed without it are a
+    # guest that died mid-phase, whose numbers agree with themselves right
+    # up to the axe.
+    count=$(grep -cE "OTP-GUEST-DONE[[:space:]]+$phase([[:space:]]|\$)" "$CONSOLE_TXT" 2>/dev/null || true)
+    if [ "${count:-0}" = "1" ]; then
+        printf 'IMG-CHECK %s guest-finished PASS\n' "$phase"
+    else
+        printf 'IMG-CHECK %s guest-finished FAIL %s OTP-GUEST-DONE lines\n' \
+               "$phase" "${count:-0}"
+    fi
+
+    counts=$(grep -oE "OTP-RESULT[[:space:]]+$phase[[:space:]]+[0-9]+/[0-9]+" \
+             "$CONSOLE_TXT" 2>/dev/null | tail -1 || true)
+    passed=${counts##* }
+    total=${passed##*/}
+    passed=${passed%%/*}
+    if [ -n "$counts" ] && [ "${passed:-0}" = "${total:-1}" ] && [ "${total:-0}" -gt 0 ] 2>/dev/null; then
+        printf 'IMG-CHECK %s guest-checks-all-passed PASS %s/%s\n' "$phase" "$passed" "$total"
+    else
+        printf 'IMG-CHECK %s guest-checks-all-passed FAIL %s\n' \
+               "$phase" "${counts:-no OTP-RESULT line}"
+    fi
+
+    # Belt and braces over the counts, which come from the guest -- the
+    # thing under test. A guest that miscounts must not be able to talk its
+    # way to a green run, so one FAIL line fails the phase on its own.
+    count=$(grep -cE "OTP-CHECK[[:space:]]+$phase[[:space:]].*[[:space:]]FAIL([[:space:]]|\$)" \
+            "$CONSOLE_TXT" 2>/dev/null || true)
+    if [ "${count:-1}" = "0" ]; then
+        printf 'IMG-CHECK %s guest-no-fail-lines PASS\n' "$phase"
+    else
+        printf 'IMG-CHECK %s guest-no-fail-lines FAIL %s\n' "$phase" "${count:-?}"
+        grep -E "OTP-CHECK[[:space:]]+$phase[[:space:]].*[[:space:]]FAIL([[:space:]]|\$)" \
+             "$CONSOLE_TXT" 2>/dev/null | sed 's/^/  /' || true
+    fi
+
+    missing=""
+    want="$GUEST_CHECKS_COMMON"
+    if [ "$phase" = "boot2" ]; then
+        want="$want $GUEST_CHECKS_BOOT2"
+    fi
+    for name in $want; do
+        grep -qE "OTP-CHECK[[:space:]]+$phase[[:space:]]+$name[[:space:]]+PASS" \
+             "$CONSOLE_TXT" 2>/dev/null || missing="$missing $name"
+    done
+    if [ -z "$missing" ]; then
+        printf 'IMG-CHECK %s guest-ran-every-named-check PASS\n' "$phase"
+    else
+        printf 'IMG-CHECK %s guest-ran-every-named-check FAIL missing:%s\n' \
+               "$phase" "$missing"
+    fi
+}
+
+: > "$VERDICT"
+for phase in $PHASES; do
+    phase_paths "$phase"
+    if [ ! -s "$CONSOLE_ALL" ]; then
+        # Worth saying outright rather than leaving as a wall of FAILs. An
+        # empty console is not "the unit did not start" -- it is "there is
+        # no evidence the kernel ever ran", and the two have entirely
+        # different causes.
+        log "$phase: NEITHER uart produced any output: no evidence the kernel ran"
+    fi
+    {
+        printf -- '--- %s ---\n' "$phase"
+        per_boot_verdict "$phase"
+        guest_gate "$phase"
+    } >> "$VERDICT"
+    # qemu's exit code is CONTEXT, not the verdict. A healthy boot of this
+    # image never exits the emulator -- the unit starts, the guest check
+    # reports, and the guest idles -- so the only endings are our own early
+    # stop (SIGTERM once the done line appears) or the backstop timeout. Run
+    # 13 booted, started the unit, passed every console check, and was
+    # failed on rc=124: the exit code of the stopwatch. The console evidence
+    # decides; the rc is reported so a crash mid-run still shows up.
+    if [ -n "$EARLY_STOP" ]; then
+        echo "$phase: qemu stopped by the harness at ${EARLY_STOP}s wall, after the guest reported done (rc=$QEMU_RC)" >&2
+    elif [ "$QEMU_RC" = 124 ]; then
+        echo "$phase: qemu ran to the ${TIMEOUT}s backstop without a guest report (rc=124)" >&2
+    else
+        echo "$phase: qemu exited rc=$QEMU_RC before the backstop" >&2
+    fi
+done
 cat "$VERDICT"
 
-# qemu's exit code is CONTEXT, not the verdict. A healthy boot of this
-# image never exits the emulator -- the unit starts and the guest idles,
-# so the only endings are our own early stop (SIGTERM once the success
-# line appears) or the backstop timeout. Run 13 booted, started the
-# unit, passed every console check, and was failed here on rc=124: the
-# exit code of the stopwatch. The console evidence decides; the rc is
-# reported so a crash mid-run still shows up in the record.
-if [ -n "$EARLY_STOP" ]; then
-    echo "qemu stopped by the harness at ${EARLY_STOP}s wall, after the unit start line appeared (rc=$QEMU_RC)" >&2
-elif [ "$QEMU_RC" = 124 ]; then
-    echo "qemu ran to the ${TIMEOUT}s backstop without the unit start line (rc=124)" >&2
-else
-    echo "qemu exited rc=$QEMU_RC before the backstop" >&2
-fi
 if grep -q "FAIL" "$VERDICT"; then
-    echo "the image did not boot cleanly to a started unit" >&2
-    if [ "$QEMU_RC" = 0 ]; then
-        # Exit 0 before the timeout + -no-reboot = the GUEST reset or
-        # powered itself off. The reset instant is the end of the console
-        # below -- this is not a hang and not a timeout.
-        echo "qemu exited 0 before the timeout: the guest reset itself" >&2
-        echo "at ~${LAST_TS:-?}s guest time. The console ends at the" >&2
-        echo "reset instant." >&2
-    fi
-    echo "--- last 100 console lines (ANSI stripped) ---" >&2
-    tail -n 100 "$CONSOLE_TXT" >&2
+    echo "the image did not boot cleanly to a started unit on a read-only overlay" >&2
+    for phase in $PHASES; do
+        phase_paths "$phase"
+        if [ "$QEMU_RC" = 0 ] && [ -z "$EARLY_STOP" ]; then
+            # Exit 0 before the timeout + -no-reboot = the GUEST reset or
+            # powered itself off. The reset instant is the end of the
+            # console below -- this is not a hang and not a timeout.
+            echo "$phase: qemu exited 0 before the timeout: the guest reset itself." >&2
+            echo "The console below ends at the reset instant." >&2
+        fi
+        echo "--- $phase: last 80 console lines (ANSI stripped) ---" >&2
+        tail -n 80 "$CONSOLE_TXT" >&2
+    done
     exit 1
 fi
-log "the image boots and the unit starts"
+log "the image boots twice on a read-only overlay, and the unit starts on both"

@@ -11,7 +11,12 @@ STAGING=/tmp/otp-src
 install -d "${ROOTFS_DIR}${STAGING}"
 
 # Everything install.sh reads, and nothing else. Notably not .git.
-for item in otpunit codewords device otp_generator.py otp.md assets; do
+#
+# `harness` is in the list for one file: img-guest-check.sh, which
+# install.sh puts in /opt/otp-unit for otp-unit-imgcheck.service to run. The
+# whole staging directory is deleted below, so the rest of the harness never
+# reaches the image.
+for item in otpunit codewords device harness otp_generator.py otp.md assets; do
 	if [ -e "${REPO_SRC}/${item}" ]; then
 		cp -a "${REPO_SRC}/${item}" "${ROOTFS_DIR}${STAGING}/"
 	fi

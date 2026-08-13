@@ -220,15 +220,22 @@ guard = """
 systemd colors the unit name, so the raw bytes of the success line are
 "Started ESC[0;1;39motp-unit.serviceESC[0m - ...". Run 12 started the unit
 and the verdict still said FAIL, because no pattern can straddle that
-escape."""
+escape.
+
+The same strip is what the guest gate reads through. Every line
+otp-unit-imgcheck.service prints arrives over a serial console with a
+trailing CR, and the phase patterns end at a word boundary the CR sits on --
+so removing this now also takes the overlay checks out with it, which is why
+the list below is longer than the one line about ANSI."""
 tests = [
-  "tests/test_img_verdict.py::test_healthy_boot_passes_on_console_evidence_despite_rc_124",
+  "tests/test_img_verdict.py::test_a_healthy_two_boot_run_passes",
+  "tests/test_img_verdict.py::test_the_second_boot_must_report_too",
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
-find = '''sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' \
-    "$CONSOLE_ALL" > "$CONSOLE_TXT" 2>/dev/null || cp "$CONSOLE_ALL" "$CONSOLE_TXT"'''
-replace = '''cp "$CONSOLE_ALL" "$CONSOLE_TXT"'''
+find = '''    sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' \
+        "$CONSOLE_ALL" > "$CONSOLE_TXT" 2>/dev/null || cp "$CONSOLE_ALL" "$CONSOLE_TXT"'''
+replace = '''    cp "$CONSOLE_ALL" "$CONSOLE_TXT"'''
 
 
 [[mutation]]

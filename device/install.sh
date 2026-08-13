@@ -333,6 +333,22 @@ install -m 0644 "$REPO_DIR/device/systemd/otp-unit.service" \
 install -m 0644 "$REPO_DIR/device/systemd/otp-unit-etc-cups.service" \
     /etc/systemd/system/otp-unit-etc-cups.service
 
+# The tier-3 image boot's eyes inside the guest. Inert on a real unit: the
+# service runs only when the kernel command line carries otp.imgcheck, which
+# nothing but harness/img-boot.sh puts there. Installed unconditionally
+# anyway, so the image tier 3 boots is the image that ships rather than a
+# variant built for testing -- an overlay check that ran against a specially
+# prepared image would prove nothing about the artifact people flash.
+if [ -f "$REPO_DIR/harness/img-guest-check.sh" ]; then
+    install -m 0755 "$REPO_DIR/harness/img-guest-check.sh" \
+        "$PREFIX/img-guest-check.sh"
+    install -m 0644 "$REPO_DIR/device/systemd/otp-unit-imgcheck.service" \
+        /etc/systemd/system/otp-unit-imgcheck.service
+else
+    echo "NOTE: harness/img-guest-check.sh is absent, so a tier-3 boot of"
+    echo "      this system would have nothing to report with."
+fi
+
 if [ ! -f "$BOOT_DIR/otp-unit.conf" ]; then
     install -m 0644 "$REPO_DIR/device/boot/otp-unit.conf.example" \
         "$BOOT_DIR/otp-unit.conf"
@@ -368,6 +384,9 @@ rm -rf /etc/cups/ppd
 systemctl daemon-reload
 systemctl enable otp-unit-etc-cups.service
 systemctl enable otp-unit.service
+if [ -f /etc/systemd/system/otp-unit-imgcheck.service ]; then
+    systemctl enable otp-unit-imgcheck.service 2>/dev/null || true
+fi
 systemctl enable cups.service 2>/dev/null || true
 
 # otp-unit takes tty1 to use as its front panel, so the login prompt that
@@ -412,18 +431,218 @@ ConditionPathExists=|/boot/firmware/userconf.txt
 StandardInput=null
 DROPIN
 
+# --- the read-only root overlay ------------------------------------------
+
+# This section used to be a paragraph of advice printed at the end telling
+# the operator to run raspi-config themselves. Nothing enabled the overlay:
+# not this script, not the pi-gen stage, not the image. So the property the
+# whole design rests on -- a power-cycle is a full reset -- existed only on
+# units whose owner had followed a printed instruction, and no tier of the
+# harness had ever booted a machine that had one. That is issue #9.
+#
+# NOT `raspi-config nonint enable_overlayfs`, and that is why this is
+# hand-rolled rather than a one-line call. On bookworm and later raspi-config
+# implements the overlay by installing Debian's `overlayroot` package and
+# putting `overlayroot=tmpfs` on the kernel command line. overlayroot's
+# initramfs script moves the root aside with `mount --move`, and the mount(8)
+# an initramfs-tools initrd actually contains is klibc's, which has no such
+# option:
+#
+#     $ /usr/lib/klibc/bin/mount --move /a /b
+#     mount: invalid option --
+#
+# -- run against the klibc-utils 2.0.14-1 binary from trixie. That is the
+# string the tier-2 guest printed immediately before `Kernel panic - not
+# syncing: Attempted to kill init!` (issue #9's first comment), and it is not
+# a property of that guest: Raspberry Pi OS trixie installs the same
+# overlayroot and builds its initrd with the same initramfs-tools. It
+# survives only where busybox happens to have been packed into the initramfs,
+# because busybox's mount does accept --move. Whether this appliance boots is
+# not allowed to depend on that.
+#
+# What runs instead is what raspi-config itself did before that switch, and
+# it is initramfs-tools' own documented mechanism rather than anything
+# invented here: `boot=overlay` makes the initrd source /scripts/overlay
+# (mkinitramfs copies /etc/initramfs-tools/scripts into the image; init
+# sources /scripts/${BOOT} before calling mountroot), and that file overrides
+# local_mount_root to mount the card read-only and lay a tmpfs overlay over
+# it. Every mount it runs is one klibc's mount accepts -- measured, including
+# `-t overlay -o lowerdir=...,upperdir=...,workdir=...`.
+#
+# The failure modes are the right way round too. If the initramfs is missing
+# or unreadable the firmware boots the kernel without one, `boot=overlay` is
+# read by nothing, and the unit comes up on a writable root -- which tier 3
+# now fails on. overlayroot's failure mode is a kernel panic on a device with
+# no console.
+CMDLINE_TXT="$BOOT_DIR/cmdline.txt"
+if [ ! -f "$CMDLINE_TXT" ]; then
+    # The overlay is configured through the Raspberry Pi boot firmware, so
+    # there is nothing to configure on a machine that has no cmdline.txt --
+    # the tier-2 Debian guest, whose /boot/firmware is a bare FAT partition
+    # made to mirror the Pi's geometry, is exactly that machine.
+    if [ "$IMAGE_BUILD" -eq 1 ]; then
+        echo "ERROR: no $CMDLINE_TXT in the image being built, so the" >&2
+        echo "       read-only overlay cannot be enabled. An image without" >&2
+        echo "       it keeps everything a session writes on the card." >&2
+        exit 1
+    fi
+    log "No $CMDLINE_TXT here, so the read-only overlay was NOT enabled"
+    echo "This machine keeps a writable root. That is correct for anything"
+    echo "that is not a Raspberry Pi; on a Pi it means the boot partition is"
+    echo "not mounted where this script looked."
+else
+    log "Enabling the read-only root overlay"
+    install -d /etc/initramfs-tools/scripts
+    # A copy of initramfs-tools 0.148.4's own local_mount_root with the
+    # overlay steps inserted, rather than of raspi-config's older copy of the
+    # same function: the version in trixie grew a check for a missing root=
+    # and handles ROOTFSTYPE=auto, and a stale copy of a function this
+    # important is a bug waiting for a kernel bump.
+    cat > /etc/initramfs-tools/scripts/overlay <<'OVERLAY'
+# Mount the root filesystem read-only under a RAM overlay.  -*- shell-script -*-
+#
+# initramfs-tools sources this file instead of nothing when the kernel
+# command line says boot=overlay, after /scripts/local and before mountroot.
+# Overriding local_mount_root is how mountroot reaches this code.
+
+. /scripts/local
+
+local_mount_root()
+{
+	local_top
+	if [ -z "${ROOT}" ]; then
+		panic "No root device specified. Boot arguments must include a root= parameter."
+	fi
+	local_device_setup "${ROOT}" "root file system"
+	ROOT="${DEV}"
+
+	if [ -z "${ROOTFSTYPE}" ] || [ "${ROOTFSTYPE}" = auto ]; then
+		FSTYPE=$(get_fstype "${ROOT}")
+	else
+		FSTYPE=${ROOTFSTYPE}
+	fi
+
+	local_premount
+
+	checkfs "${ROOT}" root "${FSTYPE}"
+
+	mkdir -p /lower /upper
+
+	# -r, and this is the line that makes the card read-only for the whole
+	# life of the boot: the running system never has a writable handle on
+	# the filesystem it booted from.
+	# shellcheck disable=SC2086
+	if ! mount -r ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${ROOT}" /lower; then
+		panic "Failed to mount ${ROOT} read-only as the overlay's lower layer."
+	fi
+
+	# A no-op when overlayfs is built in. /etc/initramfs-tools/modules names
+	# it as well, so init has already loaded it where it is a module.
+	modprobe overlay || true
+
+	if ! mount -t tmpfs tmpfs /upper; then
+		panic "Failed to mount the overlay's upper layer in RAM."
+	fi
+	mkdir -p /upper/data /upper/work
+
+	# PANIC rather than fall back to mounting the card read-write. A unit
+	# that quietly came up without the overlay would keep on the card
+	# everything the session wrote, which is the one thing this mechanism
+	# exists to prevent, and it would say nothing about it.
+	if ! mount -t overlay \
+	     -o lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work \
+	     overlay "${rootmnt?}"; then
+		panic "Failed to assemble the root overlay."
+	fi
+}
+OVERLAY
+    grep -qxF overlay /etc/initramfs-tools/modules 2>/dev/null \
+        || echo overlay >> /etc/initramfs-tools/modules
+
+    # Every installed kernel, read out of /lib/modules rather than from
+    # `uname -r`. In pi-gen's chroot uname reports the BUILD HOST's kernel,
+    # for which there are no modules and no initramfs can be built -- that is
+    # what raspi-config's enable_overlayfs does, and the reason it cannot be
+    # run at image-build time at all. The image also carries a second kernel
+    # for the Pi 5, so this is a loop rather than a single version.
+    KERNELS=""
+    for moddir in /lib/modules/*; do
+        [ -f "$moddir/modules.dep" ] || continue
+        KERNELS="$KERNELS ${moddir##*/}"
+    done
+    if [ -z "$KERNELS" ]; then
+        echo "ERROR: no kernel found under /lib/modules, so no initramfs" >&2
+        echo "       can be built and the overlay cannot be enabled." >&2
+        exit 1
+    fi
+    for kern in $KERNELS; do
+        # -c, not -u. pi-gen sets update_initramfs=no in
+        # update-initramfs.conf so kernel installs do not build one, and
+        # update-initramfs honours that setting on its update path only --
+        # `-u` would print "Not updating initramfs." and exit 0, leaving the
+        # overlay out of an initramfs that already existed.
+        update-initramfs -c -k "$kern"
+    done
+
+    # The firmware is what loads it. auto_initramfs=1 makes it pick up
+    # /boot/firmware/initramfs8 next to kernel8.img without naming a file, and
+    # raspi-firmware's /etc/initramfs/post-update.d hook is what puts it
+    # there. pi-gen's stage1 config.txt already carries this line; set_config
+    # only adds it if some other config.txt does not.
+    set_config "auto_initramfs=1"
+
+    if ! grep -q "boot=overlay" "$CMDLINE_TXT"; then
+        sed -i -e "s|^|boot=overlay |" "$CMDLINE_TXT"
+    fi
+
+    # pi-gen grows the root filesystem on first boot, keyed on this token and
+    # on rpi-resize.service. An online resize of a filesystem mounted
+    # read-only as the overlay's lower layer cannot work, and a first-boot
+    # service that fails and reboots is a loop rather than a message. The
+    # appliance has nothing to grow: what it writes is RAM, and the card is
+    # never written after provisioning.
+    sed -i -E 's/(^| )resize( |$)/\1/g' "$CMDLINE_TXT"
+    systemctl disable rpi-resize.service 2>/dev/null || true
+
+    # PROVE it rather than trust the sequence above, because every way this
+    # can go wrong is silent. config.txt asking the firmware for an initramfs
+    # that was never written, an initramfs written before the overlay script
+    # existed, a boot= token that never reached the file -- each of them
+    # leaves a unit that boots read-write and says nothing at all about it.
+    OVERLAY_INITRAMFS=""
+    for candidate in "$BOOT_DIR"/initramfs*; do
+        [ -f "$candidate" ] || continue
+        if lsinitramfs "$candidate" 2>/dev/null | grep -q "scripts/overlay"; then
+            OVERLAY_INITRAMFS="$candidate"
+            break
+        fi
+    done
+    if [ -z "$OVERLAY_INITRAMFS" ]; then
+        echo "ERROR: no initramfs in $BOOT_DIR contains scripts/overlay, so" >&2
+        echo "       boot=overlay would be read by nothing and the unit" >&2
+        echo "       would come up on a writable root." >&2
+        ls -la "$BOOT_DIR" >&2
+        exit 1
+    fi
+    if ! grep -q "boot=overlay" "$CMDLINE_TXT"; then
+        echo "ERROR: boot=overlay is not in $CMDLINE_TXT" >&2
+        exit 1
+    fi
+    log "  overlay initramfs: $OVERLAY_INITRAMFS"
+fi
+
 if [ "$IMAGE_BUILD" -eq 0 ]; then
     log "Done. Reboot to start the unit."
     cat <<'EOF'
 
-Before this is a real appliance, enable the read-only overlay:
-
-    sudo raspi-config nonint enable_overlayfs
-    sudo reboot
-
-After that the root filesystem is read-only with a RAM overlay, so a
+The root filesystem is now a read-only overlay: the card is mounted
+read-only and everything written to / goes to a tmpfs on top of it, so a
 power-cycle is a full reset and nothing a session touched survives it.
-Settings still persist -- they live on the boot partition.
+Settings still persist -- they live on the boot partition, which is outside
+the overlay.
+
+To change the software afterwards, take `boot=overlay` back out of
+/boot/firmware/cmdline.txt, reboot, edit, and rerun this script.
 EOF
 else
     log "Image build complete"
