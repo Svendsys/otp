@@ -35,6 +35,45 @@ jobs:
       - name: Run tests
         run: timeout 600 pytest -q
 
+  mutation:
+    # Break each load-bearing guard on purpose and require a test to go red.
+    # Five checks in this repository have been found unable to fail, one per
+    # audit round, and every one was found by hand -- see issue #14 and
+    # tests/mutations.toml.
+    #
+    # PER PR, not nightly, and that is measured rather than assumed: the fast
+    # tier is 19 mutations in 11 seconds, which is cheaper than the suite it
+    # audits. The issue expected nightly or label-triggered; at this price
+    # that would be the wrong call, because a gate that reports on the commit
+    # which broke the guard is worth several that report the next morning. A
+    # separate job rather than a step in `test`, so the ordinary suite's wall
+    # clock does not move at all.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # 3.11+ for tomllib, which is why the table is TOML: it costs no
+          # new dependency.
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      # Bounded like the suite above, and this one has a second way to hang:
+      # a mutation can wedge a test rather than fail it. The runner caps each
+      # mutated run itself; this is the backstop. `timeout` sends SIGTERM,
+      # which the runner turns into an unwind so the tree is put back --
+      # verified, because the first version of it did NOT and left
+      # device/install.sh mutated in the worktree.
+      - name: Prove the guards can still fail
+        run: timeout 600 python3 tests/mutation_gate.py --tier fast
+      # A mutated file left behind would be invisible here -- nothing else in
+      # this job reads those files -- and is the worst bug this runner could
+      # have. One line, and it is the property everything else rests on.
+      - name: The tree must be exactly as it was
+        if: always()
+        run: git diff --exit-code
+
   shellcheck:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -143,6 +182,20 @@ jobs:
           sudo -E env "PATH=$PATH" \
             timeout 600 python3 -m pytest -m hardware -v -p no:randomly \
               --tb=short -rfs 2>&1 | tee /tmp/harness.log
+      # The rig's own honesty, checked the same way the fast guards are: a
+      # rig that has stopped reproducing the shipped configuration, or
+      # stopped being able to make a job fail, is a green job that tested
+      # nothing -- which is worse than a red one, and is the premise of this
+      # whole harness. Here rather than in the `mutation` job because this is
+      # the only place with a working cupsd, and it costs 36 seconds measured
+      # against a job that runs in about eight minutes.
+      - name: Prove the rig's guards can still fail
+        run: |
+          sudo -E env "PATH=$PATH" \
+            timeout 600 python3 tests/mutation_gate.py --tier hardware
+      - name: The tree must be exactly as it was
+        if: always()
+        run: git diff --exit-code
       - name: The CUPS error log, if anything failed
         if: failure()
         # Tightly capped. CUPS dumps its whole debug trace for a failed job
@@ -183,6 +236,16 @@ jobs:
           # this job green at "1 passed, 20 skipped", the one pass being a
           # bash -n syntax check. A harness that silently tests nothing is
           # worse than a red one; that is the premise of this whole PR.
+          #
+          # 33, raised from 12 when the rig learned to FAIL. The CUPS half
+          # is now 37 tests (8 print path + 4 unattended + 12 failure-mode
+          # shapes + 7 failed-copy + 5 panel + the shipped-config check,
+          # which the first count of this forgot), and the four kernel
+          # simulators add 7 more where the runner's kernel has them.
+          # Measured on a runner-shaped container: 37 passed, 7 skipped for
+          # absent simulators, 176s. The floor sits just under the CUPS
+          # half deliberately -- it is there to catch that half vanishing,
+          # not to police the exact count, which every new test changes.
           PASSED=$(grep -oE '[0-9]+ passed' /tmp/harness.log | tail -1 | cut -d' ' -f1)
           echo "harness tests passed: ${PASSED:-0}"
           # 30, up from 12. Counted from `pytest -m hardware

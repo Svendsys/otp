@@ -290,6 +290,7 @@ class TestTheArgvHandedToLp:
         assert argv.count("-o") == 2
         assert "media=A4" in argv and "sides=one-sided" in argv
 
+    @pytest.mark.real_cups_runner
     def test_every_cups_call_is_bounded_by_a_timeout(self, monkeypatch):
         """
         A wedged cupsd must not block the UI forever with the key buffer
@@ -309,6 +310,16 @@ class TestTheArgvHandedToLp:
         monkeypatch.setattr(printer.subprocess, "run", fake_run)
         printer.Cups()._run([printer.LPSTAT, "-p"])
         assert seen.get("timeout") == printer.Cups.TIMEOUT
+        # And the locale, one line further on. Half of what lpstat prints is
+        # _cupsLangPrintf output, so on a unit installed in a non-English
+        # locale every English match against it silently stops matching --
+        # which is how the whole PRINTER STOPPED screen would disappear.
+        # Deleting the env kwarg left the entire fast suite green: this was
+        # the only test that saw the call at all, and it stopped one line
+        # short of pinning it.
+        assert (seen.get("env") or {}).get("LC_ALL") == "C", (
+            "CUPS is being queried in the host's locale; lpstat's header is "
+            "translated and nothing that reads it will match")
 
 
 class TestAdvisoryQueriesNeverEscape:

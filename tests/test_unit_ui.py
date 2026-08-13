@@ -4,6 +4,7 @@ These push scripted button presses through a real App and assert on what the
 panel would show, so the whole flow is covered without an OLED, a Pi, or a
 printer.
 """
+import inspect
 import io
 import sys
 from pathlib import Path
@@ -468,6 +469,550 @@ class TestRunJobFlow:
         screen.press(app, Press.OK)
         assert screen.stage == "error"
         assert "OUT OF PAPER" in "\n".join(screen.frame(app).rendered())
+
+
+class TestADrainedQueueIsNotProofOfPrinting:
+    """
+    lp accepting a job is not paper, and neither is the queue emptying.
+
+    The unit ships `ErrorPolicy abort-job` precisely so a failed job cannot
+    wedge a MaxJobs-bounded queue -- which means a job that FAILED is
+    discarded exactly as promptly as one that printed. unattended.run has
+    consulted printer_fault since that combination handed an operator "YOUR
+    PAD PAIR IS PRINTED" over an empty tray. RunJob never did: it advanced
+    on `active_jobs == 0` alone, so the panel said COPY A DONE over the
+    same empty tray, then PAIR COMPLETE, and wiped the key on the strength
+    of it.
+
+    Driven here with doubles so the fast suite owns the regression; the
+    same sequence runs against a real cupsd and a real failing backend in
+    tests/test_simulated_hardware.py.
+    """
+
+    class Reporting(RecordingCups):
+        """A queue that drains and a printer that says it failed anyway.
+
+        Reports BOTH channels, because the real one does and they mean
+        different things: printer-state-message is the prose lpstat prints,
+        printer-state-reasons are the IPP keywords that carry severity.
+        A double that only answered the first let the panel's decision rest
+        on prose, which is how "Toner low." came to destroy a pad pair.
+        """
+
+        def __init__(self, fault="out of paper",
+                     reasons=("media-empty-error",), after=0):
+            super().__init__()
+            self._fault = fault
+            self._reasons = list(reasons)
+            self.after = after                   # copies to let through
+
+        def _yet(self):
+            return len(self.submitted) > self.after
+
+        def printer_fault(self, name="OTP"):
+            return self._fault if self._yet() else None
+
+        def state_reasons(self, name="OTP"):
+            return list(self._reasons) if self._yet() else []
+
+    def _screen(self, cups):
+        app = make_app([])
+        app.cups = cups
+        settings = config.Settings(pages=2)
+        spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "SILENT-OSPREY", settings)
+        return app, ui.RunJob(spec)
+
+    def test_a_failed_copy_a_is_not_reported_as_copy_a_done(self):
+        cups = self.Reporting()
+        app, screen = self._screen(cups)
+        screen.press(app, Press.OK)             # confirm -> copy A
+        screen.press(app, Press.OK)             # tray clear?
+        assert screen.stage == "error", \
+            "the panel offered the swap prompt over a tray that got nothing"
+        text = "\n".join(screen.frame(app).rendered())
+        assert "REMOVE THE STACK" not in text
+        # The printer's own words. The IPP keyword is the fallback: "out
+        # of paper" is something an operator can act on, "MEDIA EMPTY" is
+        # what it boils down to.
+        assert "OUT OF PAPER" in text.upper()
+
+    def test_a_failed_copy_b_is_not_reported_as_a_complete_pair(self):
+        cups = self.Reporting(after=1)          # copy A prints, copy B does not
+        app, screen = self._screen(cups)
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "swap"
+        screen.press(app, Press.OK)             # -> copy B
+        screen.press(app, Press.OK)             # tray clear?
+        assert screen.stage == "error", \
+            "the panel called a lost copy B a complete pair"
+        text = "\n".join(screen.frame(app).rendered())
+        assert "PAIR COMPLETE" not in text
+        # Copy A is in their hand and can never be matched. Say so.
+        assert "DESTROY PRINTED PAGES" in text
+
+    def test_a_healthy_pair_is_still_reported_as_one(self):
+        # The control. Everything above is satisfied by a panel that calls
+        # every job a failure, and that panel would be useless.
+        cups = RecordingCups()
+        app, screen = self._screen(cups)
+        for _ in range(4):
+            screen.press(app, Press.OK)
+        assert screen.stage == "done"
+        assert "PAIR COMPLETE" in "\n".join(screen.frame(app).rendered())
+
+    def test_a_cups_that_cannot_report_faults_still_finishes(self):
+        """
+        Silence is not trouble. A wedged cupsd, and any Cups predating
+        printer_fault, must fall back to the queue result rather than send
+        someone to burn a pair that printed perfectly.
+        """
+        class Old(RecordingCups):
+            printer_fault = None                 # not even callable
+
+        app, screen = self._screen(Old())
+        for _ in range(4):
+            screen.press(app, Press.OK)
+        assert screen.stage == "done"
+
+    def test_a_raising_printer_fault_does_not_take_the_panel_down(self):
+        class Exploding(RecordingCups):
+            def printer_fault(self, name="OTP"):
+                raise RuntimeError("lpstat went away")
+
+        app, screen = self._screen(Exploding())
+        for _ in range(4):
+            screen.press(app, Press.OK)
+        assert screen.stage == "done"
+
+    def test_a_banked_press_cannot_dismiss_the_fault_unread(self):
+        """
+        Getting to this screen costs two lpstat subprocesses, and the
+        operator spends them looking at `printing`, whose footer is OK WHEN
+        TRAY IS CLEAR. A second tap during that wait is banked by
+        GpioButtons and replayed against whatever is drawn next -- and
+        ERROR's handler wipes the key and returns HOME. The panel would
+        flash the fault for one cycle and drop them at the menu having
+        never read DESTROY PRINTED PAGES.
+
+        _print_copy has drained on its error path since round three. This
+        is the same hazard on the path added with the fault check.
+        """
+        cups = self.Reporting(after=1)
+        app = make_app([])
+        app.cups = cups
+        settings = config.Settings(pages=2)
+        screen = ui.RunJob(jobs.JobSpec(jobs.JobKind.PAD_PAIR, "SILENT-OSPREY",
+                                        settings))
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)              # -> swap
+        screen.press(app, Press.OK)              # -> copy B
+        app.buttons.push(Press.OK, Press.OK)     # impatient taps
+        screen.press(app, Press.OK)
+        assert screen.stage == "error"
+        assert app.buttons.wait(timeout=0) is None, \
+            "a banked press survived and will dismiss the fault unread"
+
+    def test_a_stopped_queue_is_not_reported_as_still_printing(self):
+        """
+        CUPS_BACKEND_STOP -- an open cover, or a printer that reports an
+        empty tray properly -- stops the queue and KEEPS the job, so
+        active_jobs never reaches zero. The panel said STILL PRINTING / OK
+        TO CHECK AGAIN at a printer that would never print, while the
+        printer had been saying why the whole time.
+        """
+        class Stopped(RecordingCups):
+            def active_jobs(self, name="OTP"):
+                return 1
+
+            def printer_fault(self, name="OTP"):
+                # What real lpstat returns for a disabled queue: the header
+                # line, with the reason on the NEXT line, which printer.py
+                # discards. Measured against the rig's cupsd. The panel must
+                # not be reduced to showing this.
+                return ("printer OTP disabled since Wed Aug 12 20:21:35 "
+                        "2026 -")
+
+            def state_reasons(self, name="OTP"):
+                return ["media-empty-error", "paused"]
+
+        app, screen = self._screen(Stopped())
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "waiting"
+        shown = "\n".join(screen.frame(app).rendered()).upper()
+        assert "STILL PRINTING" not in shown, shown
+        # The REASON, not the header. "or DISABLED" would have been
+        # satisfied by the timestamp row of a screen that never said what
+        # was wrong -- which is what it was doing.
+        assert "MEDIA EMPTY" in shown, shown
+        assert "2026" not in shown, \
+            f"the panel is showing lpstat's timestamp instead of a reason: {shown}"
+        # And the non-destructive retry must survive: this screen is not a
+        # trap, it is a report.
+        assert "HOLD" in shown
+
+    def test_ok_on_a_stopped_queue_re_enables_it(self):
+        """
+        OK RECHECK has to be able to succeed, or the only working exit is
+        the one that destroys the pair.
+
+        CUPS_BACKEND_STOP disables the queue and holds the job until
+        something runs `lpadmin -E`. The unit did that once, in ensure_queue
+        at startup, and never again -- so an operator who closed the cover
+        and pressed OK got PRINTER STOPPED for ever.
+        """
+        class Stopped(RecordingCups):
+            def __init__(self):
+                super().__init__()
+                self.resumed = 0
+                self.stopped = True
+
+            def active_jobs(self, name="OTP"):
+                return 1 if self.stopped else 0
+
+            def state_reasons(self, name="OTP"):
+                return ["media-empty-error", "paused"] if self.stopped else []
+
+            def resume(self, name="OTP"):
+                self.resumed += 1
+                self.stopped = False             # the cover was closed
+                return True
+
+        cups = Stopped()
+        app, screen = self._screen(cups)
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "waiting"
+        assert cups.resumed == 0, "resumed before the operator asked"
+        screen.press(app, Press.OK)              # OK RECHECK
+        assert cups.resumed == 1, "OK RECHECK did not re-enable the queue"
+        assert screen.stage == "swap", \
+            "the queue recovered and the panel stayed on PRINTER STOPPED"
+
+    def test_one_ok_press_costs_at_most_two_cups_subprocesses(self):
+        """
+        Every CUPS query is a subprocess bounded by Cups.TIMEOUT = 120s, and
+        the panel is frozen with the key resident for the whole of it. The
+        count is therefore a safety property, not a performance one.
+
+        Two is the budget: one active_jobs to decide busy/idle, one
+        state_reasons to decide what the printer says about it. The
+        stopped-queue path briefly cost THREE -- asking for the reasons
+        once to decide it was stopped and again to say why -- which put a
+        wedged-but-answering cupsd at six minutes of dead panel per press.
+        """
+        for label, busy, reasons in [
+            ("busy, healthy", True, []),
+            ("busy, stopped", True, ["media-empty-error", "paused"]),
+            ("idle, healthy", False, []),
+            ("idle, real fault", False, ["media-empty-error"]),
+        ]:
+            calls = []
+
+            class Counting(RecordingCups):
+                def active_jobs(self, name="OTP"):
+                    calls.append("active_jobs")
+                    return 1 if busy else 0
+
+                def printer_fault(self, name="OTP"):
+                    calls.append("printer_fault")
+                    return None
+
+                def state_reasons(self, name="OTP"):
+                    calls.append("state_reasons")
+                    return list(reasons)
+
+            app, screen = self._screen(Counting())
+            screen.press(app, Press.OK)          # confirm -> copy A
+            calls.clear()
+            screen.press(app, Press.OK)          # the press under test
+            assert len(calls) <= 2, (
+                f"{label}: one OK press ran {len(calls)} CUPS subprocesses "
+                f"({calls}); at Cups.TIMEOUT={printer.Cups.TIMEOUT}s each "
+                f"that is up to {len(calls) * printer.Cups.TIMEOUT}s of "
+                f"frozen panel holding key material")
+
+    def test_a_backend_that_reports_no_reasons_is_still_believed(self):
+        """
+        The unit's OWN hardware path, which a reasons-based decision could
+        not see at all.
+
+            $ strings /usr/lib/cups/backend/usb | grep -c 'media-'
+            0
+
+        The usb backend -- and usb:// is what Cups.devices() hands back for
+        a directly attached laser -- reports no media state ever; its only
+        state keywords are connecting-to-device. An earlier version of this
+        decided faults from printer-state-reasons alone, so on the shipped
+        printer an empty tray produced no reasons, no fault, and PAIR
+        COMPLETE over a tray holding nothing.
+        """
+        cups = self.Reporting(fault="out of paper", reasons=[])
+        app, screen = self._screen(cups)
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "error", \
+            "a printer that reports prose but no IPP reasons was believed " \
+            "to have printed"
+        assert "OUT OF PAPER" in "\n".join(screen.frame(app).rendered()).upper()
+
+    def test_a_warning_severity_media_fault_still_stops_the_pair(self):
+        """
+        CUPS' SNMP supplies code emits the conditions that mean NOTHING
+        PRINTED at "-warning" severity:
+
+            $ strings /usr/lib/cups/backend/{socket,ipp,lpd} | grep media-
+            media-empty-warning
+            media-jam-warning
+
+        Reading the suffix as the severity therefore discarded exactly the
+        faults that matter, on every SNMP-capable printer. The stem is what
+        carries the meaning.
+        """
+        for reason in ("media-empty-warning", "media-jam-warning",
+                       "toner-empty-warning", "cover-open-warning"):
+            cups = self.Reporting(fault="out of paper", reasons=[reason])
+            app, screen = self._screen(cups)
+            screen.press(app, Press.OK)
+            screen.press(app, Press.OK)
+            assert screen.stage == "error", \
+                f"{reason} was treated as advisory; it means nothing printed"
+
+    def test_a_sticky_reason_does_not_condemn_every_later_pair(self):
+        """
+        printer-state-reasons OUTLIVE the job that set them: after one
+        empty-tray event, `lpstat -l -p` keeps reporting media-empty-error
+        on a queue that is printing perfectly, and `lpadmin -E` clears only
+        `paused`. A decision resting on reasons therefore sent every later
+        pair to DESTROY PRINTED PAGES for the lifetime of the daemon.
+
+        The prose does not stick -- measured against the rig, printer_fault
+        returns to None once the tray is refilled -- which is the other
+        reason it is the channel that decides.
+        """
+        cups = self.Reporting(fault=None, reasons=["media-empty-error"])
+        app, screen = self._screen(cups)
+        for _ in range(4):
+            screen.press(app, Press.OK)
+        assert screen.stage == "done", \
+            "a stale state reason condemned a pair that printed"
+
+    def test_a_resumed_job_warns_that_pages_may_repeat(self):
+        """
+        Re-enabling a stopped queue re-sends the WHOLE held job. Measured
+        against the rig: after OK RECHECK the backend had received copy A
+        twice. On real paper that is pages 1..N from before the cover
+        opened followed by pages 1..M of the same key -- and the ordinary
+        swap prompt says "REMOVE THE STACK AND KEEP IT TOGETHER", which is
+        the wrong instruction over a stack with duplicate key material in
+        it. The operator is the only one who can see the tray.
+        """
+        class Stopped(RecordingCups):
+            def __init__(self):
+                super().__init__()
+                self.stopped = True
+
+            def active_jobs(self, name="OTP"):
+                return 1 if self.stopped else 0
+
+            def state_reasons(self, name="OTP"):
+                return ["media-empty-error", "paused"] if self.stopped else []
+
+            def resume(self, name="OTP"):
+                self.stopped = False
+                return True
+
+        app, screen = self._screen(Stopped())
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "waiting"
+        screen.press(app, Press.OK)              # OK RECHECK -> resume
+        assert screen.stage == "swap"
+        shown = "\n".join(screen.frame(app).rendered()).upper()
+        assert "REPEATED PAGES" in shown, shown
+        assert "KEEP IT TOGETHER" not in shown, \
+            "the stack may hold the same key pages twice; do not tell the " \
+            "operator to keep it together without checking"
+
+    def test_the_panel_and_the_headless_run_agree(self):
+        """
+        One decision, not one helper. The two modes had a fault helper each;
+        merging them shared the helper but left the DECISION split -- the
+        panel weighed IPP reasons, unattended read raw prose -- so on the
+        same printer they disagreed in both directions: a standing "Toner
+        low." aborted the headless pair while the panel finished it, and an
+        SNMP empty tray did the reverse.
+        """
+        from otpunit import unattended
+
+        cases = [
+            ("Toner low.", ["toner-low-report"], False),
+            ("out of paper", [], True),
+            ("out of paper", ["media-empty-warning"], True),
+            ("DEBUG: cfFilterChain: universal exited with no errors.",
+             [], False),
+            (None, ["media-empty-error"], False),
+        ]
+        for prose, reasons, is_fault in cases:
+            cups = self.Reporting(fault=prose, reasons=reasons)
+            cups.submitted.append({"title": "x"})   # past `after`
+            headless = bool(unattended._fault(cups, "OTP"))
+            panel = bool(printer.blocking_in(
+                printer.reported_fault(cups, "OTP"),
+                printer.state_reasons(cups, "OTP")))
+            assert headless == panel == is_fault, (
+                f"{prose!r} / {reasons}: panel says {panel}, headless says "
+                f"{headless}, expected {is_fault}")
+
+    def test_an_advisory_reason_does_not_destroy_a_good_pair(self):
+        """
+        The severity suffix is the whole point. A laser reporting
+        toner-low-report all day is working, and cupsd puts its own filter
+        chatter in printer-state-message on a perfectly healthy queue --
+        measured mid-print: "DEBUG: cfFilterChain: universal (PID 21339)
+        exited with no errors."
+
+        Both used to reach the panel as ERROR / DESTROY PRINTED PAGES on a
+        pair that printed, and the next OK wiped the key. Deciding on any
+        non-empty printer-state-message is what made that possible.
+        """
+        for prose, reasons in [
+            ("Toner low.", ["toner-low-report"]),
+            ("Toner is low.", ["marker-supply-low-report"]),
+            ("DEBUG: cfFilterChain: universal (PID 21339) exited with "
+             "no errors.", []),
+        ]:
+            cups = self.Reporting(fault=prose, reasons=reasons)
+            app, screen = self._screen(cups)
+            for _ in range(4):
+                screen.press(app, Press.OK)
+            assert screen.stage == "done", (
+                f"{prose!r} / {reasons} sent a healthy pair to "
+                f"{screen.stage!r}")
+
+    def test_a_banked_press_cannot_spool_copy_b_over_copy_a(self):
+        """
+        The success path banks presses exactly as the error path does.
+
+        Reaching `swap` costs two blocking lpstat subprocesses, spent with
+        the operator looking at `printing` and its OK WHEN TRAY IS CLEAR
+        footer. A second tap is queued by GpioButtons and replayed against
+        SWAP the instant it is drawn -- and SWAP's OK handler spools copy B.
+        Both halves of the pair then land in one tray, with COPY A DONE /
+        REMOVE THE STACK never shown. The error path was drained from the
+        start; this one was not.
+        """
+        cups = RecordingCups()
+        app = make_app([])
+        app.cups = cups
+        settings = config.Settings(pages=2)
+        screen = ui.RunJob(jobs.JobSpec(jobs.JobKind.PAD_PAIR,
+                                        "SILENT-OSPREY", settings))
+        screen.press(app, Press.OK)              # confirm -> copy A
+        app.buttons.push(Press.OK, Press.OK)     # impatient taps
+        screen.press(app, Press.OK)              # tray clear? -> swap
+        assert screen.stage == "swap"
+        assert app.buttons.wait(timeout=0) is None, \
+            "a banked press survived and will spool copy B over copy A"
+
+    def test_a_busy_queue_with_no_fault_still_says_still_printing(self):
+        # The control for the screen above.
+        class Busy(RecordingCups):
+            def active_jobs(self, name="OTP"):
+                return 1
+
+        app, screen = self._screen(Busy())
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert "STILL PRINTING" in "\n".join(screen.frame(app).rendered())
+
+    def test_the_simulator_never_shells_out_to_a_real_printer(self):
+        """
+        `--sim` runs as a real process outside pytest, so the conftest
+        guard does not protect it. SimulatedCups must override every method
+        that would otherwise reach the host -- and printer_fault was the
+        one that got missed, so `--sim` on the unit itself, or on any dev
+        box that has run install.sh, reported the REAL OTP queue's fault
+        over a simulated pad that reached no printer at all.
+        """
+        from otpunit.__main__ import SimulatedCups
+        from otpunit import printer as printer_mod
+
+        # DERIVED from Cups, not a list written out here. The hand-written
+        # version named six methods and missed _clear_temp(), which is
+        # reachable from --sim through unattended.run's finally block and
+        # unlinks every file in the host's live /run/cups/tmp as root. A
+        # completeness test that has to be kept complete by hand is not one.
+        reaches_host = {
+            name for name, value in vars(printer_mod.Cups).items()
+            if callable(value) and not name.startswith("__")
+            and name not in ("_subprocess_run", "_text", "_run_text")
+            # A staticmethod has no self, so it cannot reach self._run.
+            # reason_stem is pure string work on an IPP keyword.
+            and not isinstance(
+                inspect.getattr_static(printer_mod.Cups, name), staticmethod)
+        }
+        covered = set(vars(SimulatedCups))
+        # _clear_temp is neutralised by pointing temp_dir at a scratch
+        # directory rather than by overriding the method, which covers
+        # every caller instead of the one that was remembered.
+        assert SimulatedCups().temp_dir != printer_mod.TEMP_DIR, \
+            "SimulatedCups would empty the host cupsd's TempDir"
+        by_temp_dir = {"_clear_temp"}
+        # Private helpers of ensure_queue, which IS overridden, so nothing
+        # in --sim can reach them. Named individually rather than excusing
+        # everything underscored, because _clear_temp is underscored too and
+        # is exactly the one that mattered.
+        unreachable = {"_lpadmin", "_match_ppd", "_remove_queue"}
+        for name in unreachable:
+            assert name in reaches_host, \
+                f"{name}() is gone from Cups; drop it from the excuse list"
+        missing = reaches_host - covered - by_temp_dir - unreachable
+        assert not missing, (
+            f"SimulatedCups inherits {sorted(missing)} from Cups, which "
+            f"shell out to the host's CUPS")
+
+    def test_a_cups_double_cannot_fall_through_to_the_host(self):
+        """
+        The conftest guard, pinned. Every double here is built as
+        `Cups(run=None)`, which means "use the real subprocess runner", so
+        any method left unstubbed reaches the host's lp or lpstat. That was
+        harmless only while nothing in the fast path called one -- and then
+        printer_fault did, and eleven tests failed on a machine whose real
+        OTP queue happened to be reporting a fault.
+        """
+        with pytest.raises(OSError, match="must not run"):
+            printer.Cups._subprocess_run(["/usr/bin/lpstat", "-p", "OTP"])
+
+    def test_the_unanswerable_queue_keeps_its_manual_override(self):
+        """
+        The override, pinned -- but honestly.
+
+        `confirm_continue` is the operator's only non-destructive way on
+        when the queue cannot be asked at all. It is NOT actually at risk
+        from the fault check: active_jobs and printer_fault both go through
+        Cups._run_text, so a daemon that cannot answer one cannot answer
+        the other, and queue_unknown already implies no fault. The double
+        below manufactures a combination the real Cups cannot produce, and
+        is here to catch someone MOVING the check into _proceed -- not
+        because the scenario occurs.
+        """
+        class Mute(RecordingCups):
+            def active_jobs(self, name="OTP"):
+                return None                      # "cannot tell"
+
+            def printer_fault(self, name="OTP"):
+                return "out of paper"            # must not be consulted here
+
+        app, screen = self._screen(Mute())
+        screen.press(app, Press.OK)
+        screen.press(app, Press.OK)
+        assert screen.stage == "waiting" and screen.queue_unknown
+        screen.press(app, Press.DOWN)
+        assert screen.stage == "confirm_continue"
+        screen.press(app, Press.OK)
+        assert screen.stage == "swap", screen.stage
 
 
 class TestSettings:

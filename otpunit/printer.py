@@ -67,8 +67,15 @@ class Cups:
 
     @staticmethod
     def _subprocess_run(argv, stdin: bytes | None = None):
+        # LC_ALL=C, because half of what lpstat prints is translated. The
+        # header comes from _cupsLangPrintf, so on a unit installed in a
+        # non-English locale "disabled since ..." arrives as "desactivee
+        # depuis ..." and any English match against it silently stops
+        # matching. otp-unit.service sets no locale, so the unit gets
+        # whatever the image was built with.
         return subprocess.run(argv, input=stdin, capture_output=True,
-                              timeout=Cups.TIMEOUT)
+                              timeout=Cups.TIMEOUT,
+                              env=dict(os.environ, LC_ALL="C"))
 
     def _text(self, argv) -> str:
         # A wedged cupsd hits Cups.TIMEOUT and raises. Queries are advisory,
@@ -198,6 +205,26 @@ class Cups:
             return False
         return result.returncode == 0
 
+    def resume(self, name: str = QUEUE) -> bool:
+        """
+        Re-enable a queue cupsd stopped, keeping the held job.
+
+        CUPS_BACKEND_STOP disables the queue and KEEPS the job, and nothing
+        clears that by itself -- not time, not the fault going away. The
+        only place the unit ran `lpadmin -E` was ensure_queue, once, at
+        startup, so an operator who closed the cover and pressed OK RECHECK
+        got PRINTER STOPPED again for ever and the sole working exit was the
+        one that wipes the key. A recoverable jam cost a pad pair.
+
+        `lpadmin -p NAME -E` rather than cupsenable: -E after -p is enable
+        AND accept-jobs, and lpadmin is already on the unit's path.
+        """
+        try:
+            result = self._run([LPADMIN, "-p", name, "-E"])
+        except Exception:                        # noqa: BLE001
+            return False
+        return result.returncode == 0
+
     def _match_ppd(self, device: Device) -> str | None:
         """
         Pick a PPD for a printer CUPS has no driverless queue for.
@@ -294,6 +321,93 @@ class Cups:
                                                 in self.BENIGN_REASONS]:
                 return line
         return None
+
+    # IPP printer-state-reasons. Unlike printer-state-message -- which is
+    # free text, translated, and where cupsd also puts filter chatter like
+    # "DEBUG: cfFilterChain: universal (PID 21339) exited with no errors."
+    # -- these are IPP keyword constants and carry their own severity as a
+    # suffix. Measured against the rig's cupsd:
+    #
+    #   healthy          Alerts: none
+    #   tray empty       Alerts: media-empty-error
+    #   backend STOP     Alerts: media-empty-error paused
+    #
+    # The SUFFIX IS NOT THE SEVERITY, whatever it looks like. That was the
+    # first design here and it was wrong in the dangerous direction:
+    #
+    #   $ strings /usr/lib/cups/backend/{socket,ipp,lpd} | grep media-
+    #   media-empty-warning
+    #   media-jam-warning
+    #   toner-empty-warning
+    #
+    # CUPS' SNMP supplies code emits out-of-paper and paper-jam as
+    # "-warning", so treating "-warning" as advisory discarded exactly the
+    # conditions that mean nothing printed, and the panel said PAIR
+    # COMPLETE over an empty tray.
+    #
+    #   $ strings /usr/lib/cups/backend/usb | grep -c media-
+    #   0
+    #
+    # Worse, the usb backend -- which is what THIS unit runs, on usb://
+    # device URIs -- reports no media state at all, ever. Its only state
+    # keywords are connecting-to-device. So on the unit's own hardware
+    # path, reasons are empty whatever is wrong with the printer, and a
+    # fault decision resting on them cannot see anything.
+    #
+    # Hence: reasons never CREATE a fault, they only EXCUSE one. The prose
+    # in printer-state-message stays the decision channel, because it is
+    # the only one the usb backend populates -- and because reasons are
+    # STICKY, surviving the job that set them and every healthy job after
+    # it, so a single empty tray would otherwise condemn every later pair
+    # for the lifetime of the daemon.
+    #
+    # Matched on the STEM, with the suffix stripped, since the same
+    # condition arrives as -error from one backend and -warning from
+    # another.
+    ADVISORY_STEMS = (
+        "toner-low", "marker-supply-low", "marker-waste-almost-full",
+        "media-low", "cups-waiting-for-job-completed",
+    )
+    NOT_A_REASON = ("none",)
+
+    @staticmethod
+    def reason_stem(reason: str) -> str:
+        """An IPP state reason without its severity suffix."""
+        for suffix in ("-error", "-warning", "-report"):
+            if reason.endswith(suffix):
+                return reason[:-len(suffix)]
+        return reason
+
+    def state_reasons(self, name: str = QUEUE) -> list[str] | None:
+        """
+        The queue's IPP state reasons, or None if it could not be asked.
+
+        None is "cannot tell" and must not be read as "nothing wrong"; see
+        active_jobs for why that distinction is load-bearing here.
+        """
+        text = self._run_text([LPSTAT, "-l", "-p", name])
+        if text is None:
+            return None
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Alerts:"):
+                return [word for word in stripped[len("Alerts:"):].split()
+                        if word not in self.NOT_A_REASON]
+        # No Alerts line at all: an lpstat too old to print one. Unknown,
+        # not clean -- claiming clean here is the false success this whole
+        # mechanism exists to prevent.
+        return None
+
+    def queue_stopped(self, name: str = QUEUE) -> bool | None:
+        """
+        Whether cupsd has disabled the queue, or None if it cannot be asked.
+
+        "paused" is the IPP keyword and is not translated. The UI used to
+        decide this by looking for the substring "disabled" in the header
+        line, which is _cupsLangPrintf output and therefore only English.
+        """
+        reasons = self.state_reasons(name)
+        return None if reasons is None else "paused" in reasons
 
     def active_jobs(self, name: str = QUEUE) -> int | None:
         """
@@ -412,3 +526,127 @@ def _tokens(text: str) -> list[str]:
     for chunk in re.split(r"[^A-Za-z0-9]+", text.lower()):
         words.extend(part for part in re.findall(r"[a-z]+|[0-9]+", chunk) if part)
     return words
+
+
+def reported_fault(cups, queue: str = QUEUE) -> str:
+    """
+    What the printer says is wrong, or "" if it says nothing or cannot say.
+
+    Silence is deliberately not read as trouble. A cupsd that cannot be
+    asked, and an older Cups without this method at all, must fall back to
+    the drain result rather than send someone to burn a pad that printed
+    perfectly.
+
+    One copy, called from both the UI and the unattended path. They had a
+    verbatim duplicate of this each, docstring reasoning included, so a
+    change to what counts as "cannot tell" had to be made twice or the panel
+    and the headless run would disagree about the only question either asks.
+    """
+    try:
+        return cups.printer_fault(queue) or ""
+    except Exception:                            # noqa: BLE001
+        return ""
+
+
+def state_reasons(cups, queue: str = QUEUE):
+    """
+    The queue's IPP state reasons, or None if it could not be asked.
+
+    Split from the two questions asked OF it -- "can this queue print" and
+    "has cupsd stopped it" -- because each is an lpstat subprocess bounded
+    by Cups.TIMEOUT, and the caller usually wants both answers about the
+    same moment. Asking twice put three blocking subprocesses on a single
+    OK press.
+
+    None means "could not tell" and must not be read as "nothing wrong".
+    """
+    query = getattr(cups, "state_reasons", None)
+    if query is None:
+        return None
+    try:
+        return query(queue)
+    except Exception:                            # noqa: BLE001
+        return None
+
+
+# Prose that means the printer is chatting, not failing. cupsd puts filter
+# output in printer-state-message on a perfectly healthy queue -- measured
+# mid-print: "DEBUG: cfFilterChain: universal (PID 21339) exited with no
+# errors." Matched with LC_ALL=C in force, so this is stable English.
+_CHATTER = ("debug:", "info:")
+_ADVISORY_PROSE = ("toner low", "toner is low", "supply low", "media low",
+                   "paper low", "ready to print")
+
+
+def blocking_in(prose: str, reasons) -> list[str]:
+    """
+    Why this queue cannot print; empty if nothing says it cannot.
+
+    The PROSE decides. `reasons` -- whatever state_reasons() returned, None
+    included -- can only excuse it, never create it. Both are passed in
+    rather than fetched, because each is an lpstat subprocess bounded by
+    Cups.TIMEOUT and the caller must be able to ask for each at most once. See Cups.ADVISORY_STEMS
+    for why that asymmetry is not squeamishness: the usb backend this unit
+    runs reports no reasons at all, and the ones other backends do report
+    are sticky and outlive the job that caused them.
+
+    So the failure mode of a printer nobody can classify is "the operator
+    is told to destroy a pair that was probably fine", not "the operator is
+    told a pair printed when the tray was empty". Only the second leaves
+    someone relying on key material they do not have.
+    """
+    prose = (prose or "").strip()
+    if not prose:
+        return []
+    lowered = prose.lower()
+    if lowered.startswith(_CHATTER):
+        return []
+    if any(phrase in lowered for phrase in _ADVISORY_PROSE):
+        return []
+    # An excuse needs reasons that are ALL advisory. Silence excuses
+    # nothing: on the usb backend silence is the normal state.
+    if reasons:
+        stems = {Cups.reason_stem(reason) for reason in reasons}
+        if stems and stems <= set(Cups.ADVISORY_STEMS):
+            return []
+        blocking = [r for r in reasons
+                    if Cups.reason_stem(r) not in Cups.ADVISORY_STEMS]
+        if blocking:
+            return blocking
+    return ["print-error"]
+
+
+def fault_text(cups, queue: str = QUEUE) -> str:
+    """
+    Why this printer did not print, in its own words, or "" if it did.
+
+    THE decision, and the only one either caller should make. The panel and
+    the unattended path had a fault helper each: after they were merged the
+    helper was shared but the DECISION was not, so the panel excused a
+    laser's standing "Toner low." while the headless run aborted a pair on
+    it -- and on an SNMP printer with an empty tray they swapped sides.
+    Two answers to the one question either of them asks.
+
+    Costs up to two lpstat subprocesses, and only reaches the second when
+    the first says something; callers that need the parts separately (the
+    panel, which is also asking whether the queue is stopped) compose
+    reported_fault, state_reasons and blocking_in themselves.
+    """
+    prose = reported_fault(cups, queue)
+    if not prose.strip():
+        return ""
+    return prose if blocking_in(prose, state_reasons(cups, queue)) else ""
+
+
+def stopped_in(reasons, cups, queue: str = QUEUE) -> bool:
+    """
+    Whether cupsd has disabled the queue, given its state reasons.
+
+    "paused" is the IPP keyword and is not translated. The UI used to
+    decide this by looking for the substring "disabled" in lpstat's header,
+    which is _cupsLangPrintf output and therefore English only; that
+    fallback survives here for a Cups that cannot report reasons at all.
+    """
+    if reasons is None:
+        return "disabled" in reported_fault(cups, queue).lower()
+    return "paused" in reasons

@@ -9,9 +9,9 @@ without touching hardware.
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,7 +28,19 @@ class SimulatedCups(Cups):
     """A printer that always exists and swallows jobs, for --sim."""
 
     def __init__(self):
-        super().__init__(run=None)
+        # temp_dir to a scratch path, NOT the inherited /run/cups/tmp.
+        # _clear_temp is reachable from --sim without being overridden:
+        # unattended.run's finally block calls job.finish(purge=False)
+        # whenever anything raises before `purge = drained` is assigned, and
+        # finish() calls cups._clear_temp(). On the unit itself, or any dev
+        # box that has run install.sh, that unlinks every file in the REAL
+        # daemon's live spool scratch, as root, destroying another job's
+        # in-flight filter output. Overriding the DIRECTORY fixes every path
+        # that can reach it, rather than the one method someone remembered
+        # to stub -- which is how this was missed: the completeness test
+        # listed six method names by hand and _clear_temp was not among them.
+        super().__init__(run=None,
+                         temp_dir=tempfile.mkdtemp(prefix="otp-sim-cups-"))
         self.submitted = []
 
     def devices(self):
@@ -43,6 +55,29 @@ class SimulatedCups(Cups):
 
     def active_jobs(self, name="OTP"):
         return 0
+
+    def printer_fault(self, name="OTP"):
+        # Stubbed for the same reason active_jobs is. RunJob consults this
+        # before it will call a copy finished, and the inherited one shells
+        # out to the host's `lpstat -p OTP` -- which on the unit itself, or
+        # any machine that has run install.sh, is a REAL queue. Left
+        # inherited, `--sim` reported the host printer's fault over a
+        # simulated pad that reached no printer at all, and blocked for up
+        # to Cups.TIMEOUT doing it.
+        return None
+
+    def state_reasons(self, name="OTP"):
+        # [] and not None. None means "could not ask", which the UI is
+        # required to treat as unknown rather than as clean, and a simulated
+        # printer that reports "I could not be asked" would park --sim on
+        # the recovery path for a queue that does not exist.
+        return []
+
+    def queue_stopped(self, name="OTP"):
+        return False
+
+    def resume(self, name="OTP"):
+        return True
 
     def purge(self, name="OTP"):
         pass
@@ -73,8 +108,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="OTP pad print unit")
     parser.add_argument("--sim", action="store_true",
                         help="run in the terminal with a simulated printer")
-    parser.add_argument("--rotate", type=int, default=0, choices=(0, 1, 2, 3),
-                        help="rotate the OLED by N*90 degrees")
+    # 1 and 3 are absent deliberately: they give a 64x128 portrait panel and
+    # the 21x8 character grid is landscape, so half of every row was being
+    # cut off. See Ssd1306Display.SQUARE_ON.
+    # luma counts rotate in NINETY-degree steps (angle = rotate * -90), so
+    # 2 is half a turn. Saying "N*180" here was arithmetically wrong and
+    # pointed at the value that is no longer accepted: someone wanting an
+    # upside-down panel reads it, computes N=1, and argparse exits 2 --
+    # which under Restart=on-failure with RestartSec=15 is an unbounded
+    # restart loop on an appliance with no console to read the error on.
+    parser.add_argument("--rotate", type=int, default=0, choices=(0, 2),
+                        help="0 for upright, 2 for upside-down (180 degrees). "
+                             "90 and 270 need a portrait layout the 21x8 "
+                             "character grid does not have")
     parser.add_argument("--config", default=config.CONFIG_PATH,
                         help="settings file (default: %(default)s)")
     parser.add_argument("--diagnostic", action="store_true",

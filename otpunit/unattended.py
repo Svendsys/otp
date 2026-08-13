@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import time
 
-from otpunit import diagnostics, jobs
+from otpunit import diagnostics, jobs, printer
 from otpunit.codewords import Vocabulary
 from otpunit.config import Settings
 
@@ -172,14 +172,20 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
     paper = {"media": _media(settings)}
 
     def send(data, title, options=None):
-        # Wait for the queue before adding to it. The unit ships with
-        # MaxJobs 1, so cupsd REJECTS a second job while one is active --
-        # `lp: Too many active jobs.` Measured against a real cupsd with
-        # the shipped config: the manual spooled, then the tabula, copy A,
-        # the separator and the final sheet were all refused in turn, and
-        # the operator got a status sheet promising a pad followed by
-        # nothing at all. Every gap in this sequence needs the wait, not
-        # just the two that had it.
+        # Wait for the queue before adding to it. cupsd does not queue past
+        # MaxJobs, it REJECTS -- `lp: Too many active jobs.` The unit shipped
+        # MaxJobs 1 when that was found: measured against a real cupsd, the
+        # manual spooled, then the tabula, copy A, the separator and the
+        # final sheet were all refused in turn, and the operator got a status
+        # sheet promising a pad followed by nothing at all. Every gap in this
+        # sequence needs the wait, not just the two that had it.
+        #
+        # install.sh ships MaxJobs 4 now, and THIS WAIT is what makes the
+        # sequence independent of that number rather than the number itself
+        # -- measured by the mutation gate (tests/mutations.toml,
+        # sequence-submits-without-waiting-for-the-queue): with the drain
+        # here, MaxJobs back at 1 leaves the whole hardware tier green; with
+        # it gone, the same value loses the pair in under four seconds.
         drain(cups, queue, sleep, log, timeout=_drain_timeout(settings))
         cups.submit(data, name=queue, title=title,
                     options=paper if options is None else options)
@@ -416,19 +422,16 @@ def _first(cups):
     return devices[0] if devices else None
 
 
-def _fault(cups, queue) -> str:
-    """
-    What the printer says is wrong, or "" if it says nothing or cannot say.
-
-    Silence is deliberately not read as trouble. A cupsd that cannot be
-    asked, and an older Cups without this method at all, must fall back to
-    the drain result rather than send someone to burn a pad that printed
-    perfectly.
-    """
-    try:
-        return cups.printer_fault(queue) or ""
-    except Exception:                            # noqa: BLE001
-        return ""
+# One definition, in printer.py next to printer_fault itself. This used to
+# be a verbatim copy of the UI's helper -- docstring reasoning included --
+# so a change to what counts as "cannot tell" had to land in both places or
+# the panel and the headless run would disagree about the only question
+# either of them asks.
+# The shared DECISION, not just a shared helper -- see
+# printer.fault_text. Deciding on raw printer-state-message here
+# while the panel weighed the IPP reasons meant the two modes
+# disagreed about the same printer in both directions.
+_fault = printer.fault_text
 
 
 MANUAL_PAGES = 28          # the rendered A5 manual, for the paper estimate
