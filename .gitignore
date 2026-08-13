@@ -14,3 +14,8 @@ image/deploy/
 *.img
 *.img.xz
 *.deb
+
+# Isolated git worktrees created for subagents. Full checkouts of
+# this repository -- 3.2MB each -- and pure tooling scratch. One got as
+# far as being offered for commit before this line existed.
+.claude/worktrees/
