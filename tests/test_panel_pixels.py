@@ -472,6 +472,22 @@ def longest_codeword(app) -> str:
                    max(app.vocabulary.all_nouns, key=len))
 
 
+@contextlib.contextmanager
+def _generator_returning(stub):
+    """Swap ui.generator() for something with a fixed entropy reading.
+
+    A real reading is whatever the machine's pool happens to hold when
+    the suite runs, which is neither the widest case nor reproducible --
+    and the widest case is the only one worth asserting about.
+    """
+    was = ui.generator
+    ui.generator = lambda: stub
+    try:
+        yield
+    finally:
+        ui.generator = was
+
+
 def every_screen(app):
     """(label, Frame) for everything the panel can show.
 
@@ -498,6 +514,33 @@ def every_screen(app):
     yield tagged(ui.TextEntry("MODIFIER", lambda a, v: None), "modifier")
     yield tagged(ui.Message("NO PRINTER", ["PLUG ONE IN AND", "POWER-CYCLE"]),
                  "no-printer")
+
+    # WaitForEntropy, which arrived with the entropy gate. Its footer is
+    # the only panel string built from a number the KERNEL supplies, and
+    # it shares that line with a spinner, so the width depends on two
+    # things this file cannot see from one frame. Hence every spinner
+    # glyph against every shape the count can take: "?" when the kernel
+    # has no entropy_avail to read, 0 at a cold boot, 256 for a modern
+    # pool, and 4096 for the older larger one -- the widest it goes.
+    #
+    # This screen is shown while the unit waits to be able to make key
+    # material, to an operator whose alternative is pulling the power and
+    # discarding every bit collected so far. A footer that runs off the
+    # edge here costs exactly the thing the screen exists to prevent.
+    class _Pool:
+        def __init__(self, bits):
+            self.bits = bits
+
+        def entropy_bits(self):
+            return self.bits
+
+    entropy = ui.WaitForEntropy()
+    for bits in (None, 0, 256, 4096):
+        pool = _Pool(bits)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_generator_returning(pool))
+            for phase in range(4):
+                yield tagged(entropy, f"{bits}-bits[{phase}]")
 
     for name, menu in (("main", ui.main_menu()), ("settings", ui.settings_menu())):
         for index in range(len(menu.items)):
@@ -825,3 +868,36 @@ class TestTheMeasurementCanSeeClipping:
         assert measure.textlength("W" * COLS, font=default) > WIDTH, (
             "load_default() now fits 21 columns; if it is monospace again, "
             "_panel_font() may no longer be needed")
+
+
+def test_the_entropy_footer_keeps_its_spinner_at_every_width():
+    """
+    The bit count and the spinner must BOTH survive rendering.
+
+    Not a pixel question, and that is the point: Frame truncates to 21
+    characters, so an over-wide footer never overflows the panel -- it
+    loses its tail quietly. Measured, with the footer widened by a dozen
+    characters, every pixel assertion in this file still passed while the
+    rendered line read
+
+        '4096 BITS COLLECTED S'
+
+    with the spinner gone. That spinner is the only moving thing on the
+    screen, and the screen exists to stop an operator concluding the unit
+    is wedged and pulling the power -- which discards every bit of
+    entropy collected so far and starts the wait from zero. Losing it is
+    the exact failure the screen was written to prevent, and no amount of
+    pixel coverage would have said so.
+    """
+    app = make_app()
+    for label, frame in every_screen(app):
+        if not label.startswith("WaitForEntropy/"):
+            continue
+        footer = frame.rendered()[-1]
+        assert footer.rstrip()[-1:] in set("|/-\\"), (
+            f"{label}: the spinner was truncated away; footer renders as "
+            f"{footer!r}")
+        count = label.split("/", 1)[1].split("-bits")[0]
+        expected = "?" if count == "None" else count
+        assert f"{expected} BITS" in footer, (
+            f"{label}: the bit count did not survive rendering: {footer!r}")
