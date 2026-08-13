@@ -36,11 +36,6 @@ on:
     tags: ["v*"]
     branches: [master]
   pull_request:
-    paths:
-      - "image/**"
-      - "device/**"
-      - "harness/img-boot.sh"
-      - ".github/workflows/image.yml"
 
 # Same reasoning as ci.yml. Leaving a superseded pi-gen run going burns
 # runner time producing an image for a commit that has already been
@@ -51,7 +46,65 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  image:
+  # Branch protection requires a check called `image`, and this workflow
+  # used to be path-filtered at the trigger. A PR touching none of those
+  # paths therefore never ran it, the required check never reported, and
+  # the PR could not be merged at all -- not "merged without the image
+  # being built", merged never. Five were stuck behind it.
+  #
+  # Dropping the requirement would have been the easy fix and the wrong
+  # one: the tier-3 boot verdict is a release gate (issue #19) and
+  # weakening it to unblock a merge queue is the trade this repository
+  # exists to refuse. So the filter moved from the trigger, where it
+  # suppressed the report, to a job, where it only suppresses the WORK:
+  #
+  #   changes -> did anything that goes into the image change?
+  #   build   -> the expensive arm64 pi-gen build and boot, if it did
+  #   image   -> always runs, always reports, and is the required check
+  #
+  # The cost profile is unchanged -- a docs-only PR still pays for no
+  # pi-gen build, just for one cheap ubuntu-latest job that says so.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.filter.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The diff needs a base to compare against, and the default
+          # shallow clone does not have one.
+          fetch-depth: 0
+      - name: Does anything in this change reach the image?
+        id: filter
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            # A tag, a push to master (which populates the cache every
+            # PR then restores from), or a manual dispatch. All three
+            # want the real thing.
+            echo "${{ github.event_name }}: building unconditionally"
+            echo "image=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="${{ github.base_ref }}"
+          git fetch --no-tags --prune origin \
+            "+refs/heads/$base:refs/remotes/origin/$base"
+          # merge-base, not a two-dot diff: what THIS branch changed,
+          # not everything that landed on master since it forked.
+          changed=$(git diff --name-only \
+            "$(git merge-base "origin/$base" HEAD)" HEAD)
+          echo "$changed"
+          # The same four paths the trigger used to carry.
+          if printf '%s\n' "$changed" | grep -qE \
+              '^(image/|device/|harness/img-boot\.sh$|\.github/workflows/image\.yml$)'
+          then
+            echo "image=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "nothing here goes into the image"
+            echo "image=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
     # NATIVE arm64, not x86 emulating it. This repository is public, and
     # GitHub's arm64 runners are free for public repositories.
     #
@@ -61,6 +114,10 @@ jobs:
     # binfmt_misc setup, with a comment block longer than most of this file,
     # to work at all. Natively none of that applies: the steps below are
     # kept but skipped, so the workflow still runs on x86 if it has to.
+    needs: changes
+    # The expensive half, and the only part that is conditional. When
+    # this is skipped the `image` job below still runs and still reports.
+    if: needs.changes.outputs.image == 'true'
     runs-on: ubuntu-24.04-arm
     # The job cap must always lose the race to the script timeout, or a
     # timeout costs the diagnosis as well as the run -- learned the hard
@@ -408,3 +465,52 @@ jobs:
             ${{ runner.temp }}/otp-img/boot/config.txt
           retention-days: 7
           if-no-files-found: ignore
+
+  # The required check. It runs on every pull request, whatever the diff
+  # touched, so branch protection always has something to read.
+  #
+  # Fail-closed on purpose, in all three directions: a build that failed
+  # fails this, a `changes` job that could not work out an answer fails
+  # this, and a build that ran when it should not have fails this too.
+  # The only green path is one where the reason for it is stated.
+  image:
+    needs: [changes, build]
+    # Without always(), a skipped `build` skips this too -- and a skipped
+    # required check never reports, which is the exact bug being fixed.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verdict
+        run: |
+          set -euo pipefail
+          detected='${{ needs.changes.result }}'
+          changed='${{ needs.changes.outputs.image }}'
+          built='${{ needs.build.result }}'
+          echo "changes job:        $detected"
+          echo "image paths touched: ${changed:-<unset>}"
+          echo "build job:          $built"
+
+          if [ "$detected" != "success" ]; then
+            echo "could not determine whether the image needed building," >&2
+            echo "so this cannot certify that it did not. Failing." >&2
+            exit 1
+          fi
+
+          if [ "$changed" != "true" ]; then
+            if [ "$built" != "skipped" ]; then
+              echo "no image path changed, yet the build job is '$built'." >&2
+              echo "One of the two is wrong; not certifying either." >&2
+              exit 1
+            fi
+            echo "Nothing that goes into the image changed, so there is"
+            echo "nothing to build and nothing to boot."
+            exit 0
+          fi
+
+          if [ "$built" = "success" ]; then
+            echo "The image built and the boot verdict passed."
+            exit 0
+          fi
+          echo "the image job ended '$built'; see its log for the" >&2
+          echo "IMG-CHECK lines and the boot evidence artifact." >&2
+          exit 1

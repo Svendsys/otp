@@ -154,9 +154,25 @@ def _networks():
 
 
 def _entropy():
-    avail = int(_read("/proc/sys/kernel/random/entropy_avail"))
-    verdict = "ok" if avail >= 256 else "LOW"
-    return f"{avail} bits ({verdict})"
+    """
+    Whether the kernel CSPRNG is seeded, with the raw estimate as context.
+
+    The seeded state is the finding. The bit count is not, and this row
+    used to be only the count with an "ok"/"LOW" verdict attached at 256
+    -- which invited an operator to sit and wait for a number that has
+    not gated anything since Linux 5.6. getrandom() blocks until the CRNG
+    is initialised and ignores the estimate afterwards, and the estimate
+    is clamped to the pool size, so on a healthy machine it reads its own
+    maximum for ever (measured: 256, pinned, on an idle 6.18 kernel).
+    Kept alongside because while the CRNG is NOT seeded it does climb,
+    and then it is the only progress an operator can see.
+    """
+    bits = gen.entropy_bits()
+    count = "unknown" if bits is None else f"{bits} bits"
+    if gen.crng_seeded():
+        return f"CRNG seeded (correct); kernel estimate {count}"
+    return (f"CRNG NOT SEEDED -- no key material can be drawn yet, and "
+            f"anything that tries will block. Kernel estimate {count}.")
 
 
 def _entropy_source():
@@ -347,7 +363,7 @@ def collect(settings=None, printer=None, queue=None, driver=None,
         ("Swap", _try(_swap)),
         ("Root filesystem", _try(_root_filesystem)),
         ("Network links", _try(_networks)),
-        ("Entropy", _try(_entropy)),
+        ("Kernel CSPRNG", _try(_entropy)),
         ("Disk", _try(_disk)),
     ]))
 
