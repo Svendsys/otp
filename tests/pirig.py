@@ -464,7 +464,8 @@ def release_gpiozero() -> None:
     """
     Put gpiozero back the way an untouched process would find it.
 
-    Two steps beyond dropping the factory, both of them learned from run
+    Three steps beyond dropping the factory, the first two of them
+    learned from run
     31699840801, where the first panel worked and every panel after it
     received no edges at all: UP passed, DOWN/OK/BACK each sat out their
     timeout with an empty queue, and the debounce test "passed" only
@@ -493,6 +494,13 @@ def release_gpiozero() -> None:
     claims its alert on a dead handle, and no edge ever arrives.
     Silently -- which is the one outcome this harness exists to refuse.
 
+    **And close the factory even when silencing it failed.** silence()
+    raising means a callback may still be armed; skipping close() over
+    that adds a leaked gpiochip handle to the same problem rather than
+    containing it. The cancel is attempted first and the close happens
+    regardless, so the worst case is one loud teardown rather than a
+    process whose next Button(5) cannot claim the line.
+
     TestTheFactoryTeardownBetweenPanels holds every clause of this to
     account without needing a gpiochip.
     """
@@ -503,17 +511,40 @@ def release_gpiozero() -> None:
     gc.collect()
     try:
         if factory is not None:
-            silence(factory)
-            factory.close()
+            try:
+                silence(factory)
+            finally:
+                # close() runs whatever silence() did, and the try/finally
+                # is the whole of the reason. `silence(factory)` then
+                # `factory.close()` in sequence meant a RuntimeError out
+                # of silence skipped every pin.close() and the
+                # gpiochip_close behind them, while the clear() below
+                # still emptied the shared cache -- so the lines stayed
+                # claimed by a handle no object in the process could
+                # reach any more, and the next Button(5) died "GPIO
+                # busy". Measured, with one pin refusing to be silenced:
+                # pins closed [], chip handle closed False.
+                #
+                # Worse, silence() can raise on a failure that is not
+                # dangerous at all: LGPIOPin._disable_event_detect
+                # cancels the lgpio callback FIRST and only then
+                # re-claims the line as an input, so a throw from the
+                # re-claim means the callback is already gone. Losing
+                # the handle over that would manufacture exactly the
+                # leak the RuntimeError is raised to prevent.
+                factory.close()
     finally:
         # Belt and braces: close() clears these itself on the happy path.
         # Leaving a stale pin behind costs the next panel its edges, so
         # they do not get to depend on close() having reached the end.
         LocalPiFactory.pins.clear()
         LocalPiFactory._reservations.clear()
-    # Note what is deliberately NOT caught: if factory.close() raises, it
-    # comes out of here and pytest reports the teardown as an error. That
-    # is the point. The collect above is what should stop it happening,
+    # Note what is deliberately NOT caught: if silence() or
+    # factory.close() raises, it comes out of here and pytest reports the
+    # teardown as an error -- and where both raise, close()'s exception
+    # is the one that propagates with silence()'s attached to it as
+    # __context__, so the traceback carries both.
+    # That is the point. The collect above is what should stop it happening,
     # and if it happens anyway the run must say so in the open rather
     # than in a warning nobody reads. The cache is emptied either way, so
     # a raise here cannot spread to the next test -- it only ends this

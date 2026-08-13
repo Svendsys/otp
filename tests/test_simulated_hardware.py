@@ -690,6 +690,45 @@ class TestTheFactoryTeardownBetweenPanels:
             f"every pin of the factory must be silenced first; got {order}")
         assert len(listening) == 3                # kept alive to here
 
+    def test_the_chip_handle_closes_even_when_a_pin_cannot_be_silenced(
+            self, gz):
+        """
+        The other order that matters: cancel first, close ANYWAY.
+
+        Every other broken case in this class breaks close(). This one
+        breaks the step before it, which the sequential version of
+        release_gpiozero handled by never reaching close() at all: no
+        pin.close(), no gpiochip_close, `_handle` still set -- and the
+        cache cleared regardless by the finally, so the lines stayed
+        claimed by a factory nothing in the process could reach. The
+        next Button(5) then dies "GPIO busy", and the callbacks that
+        could not be cancelled are still in lgpio's notification thread
+        waiting to kill it, which is the outcome the RuntimeError exists
+        to prevent rather than to cause.
+
+        Note where the fake raises: _disable_event_detect drops the
+        callback BEFORE it re-claims the line, exactly as LGPIOPin does,
+        so this failure is one where the cancel already succeeded.
+        """
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+
+        Factory, Pin = gz
+        Device.pin_factory = factory = Factory()
+        listening = self.listening(factory, 5, 6)
+        assert factory._handle is not None
+        Pin.deaf = True
+
+        # Loud: a pin that would not be silenced is worth a red teardown.
+        with pytest.raises(RuntimeError, match="could not cancel edge"):
+            pirig.release_gpiozero()
+
+        assert factory._handle is None, (
+            "the gpiochip handle never closed, so this process is "
+            "holding lines nothing can release for the rest of its life")
+        assert LocalPiFactory.pins == {}
+        assert len(listening) == 2                # kept alive to here
+
     def test_an_unreachable_device_is_finalised_before_the_factory_closes(
             self, gz):
         """
