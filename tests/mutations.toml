@@ -595,7 +595,7 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
-find = '''        grep -qE "OTP-CHECK[[:space:]]+$phase[[:space:]]+$name[[:space:]]+PASS" \
+find = '''        grep -qE "OTP-CHECK[[:space:]]+${phase}[[:space:]]+${name}[[:space:]]+PASS" \
              "$CONSOLE_TXT" 2>/dev/null || missing="$missing $name"'''
 replace = '''        :'''
 

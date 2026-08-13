@@ -373,7 +373,7 @@ boot_phase() {
     # and telling them apart cost a 55-minute build and still ended in a
     # guess. The growth column answers it directly: still climbing means
     # slow, flat for minutes means stuck.
-    local sample=30 elapsed=0 last=0 early_stop= now now2 cpu seen
+    local sample=30 elapsed=0 last=0 early_stop='' now now2 cpu seen
     while kill -0 "$qemu_pid" 2>/dev/null; do
         sleep "$sample"
         elapsed=$((elapsed + sample))
@@ -589,7 +589,7 @@ guest_gate() {
     # that rebooted underneath the harness, and "it reported" stays true of
     # a machine doing nothing else -- the same trap tier 2's gate is built
     # around.
-    count=$(grep -cE "OTP-RESULT[[:space:]]+$phase[[:space:]]" "$CONSOLE_TXT" 2>/dev/null || true)
+    count=$(grep -cE "OTP-RESULT[[:space:]]+${phase}[[:space:]]" "$CONSOLE_TXT" 2>/dev/null || true)
     if [ "${count:-0}" = "1" ]; then
         printf 'IMG-CHECK %s guest-reported-once PASS\n' "$phase"
     else
@@ -610,7 +610,7 @@ guest_gate() {
                "$phase" "${count:-0}"
     fi
 
-    counts=$(grep -oE "OTP-RESULT[[:space:]]+$phase[[:space:]]+[0-9]+/[0-9]+" \
+    counts=$(grep -oE "OTP-RESULT[[:space:]]+${phase}[[:space:]]+[0-9]+/[0-9]+" \
              "$CONSOLE_TXT" 2>/dev/null | tail -1 || true)
     passed=${counts##* }
     total=${passed##*/}
@@ -625,13 +625,13 @@ guest_gate() {
     # Belt and braces over the counts, which come from the guest -- the
     # thing under test. A guest that miscounts must not be able to talk its
     # way to a green run, so one FAIL line fails the phase on its own.
-    count=$(grep -cE "OTP-CHECK[[:space:]]+$phase[[:space:]].*[[:space:]]FAIL([[:space:]]|\$)" \
+    count=$(grep -cE "OTP-CHECK[[:space:]]+${phase}[[:space:]].*[[:space:]]FAIL([[:space:]]|\$)" \
             "$CONSOLE_TXT" 2>/dev/null || true)
     if [ "${count:-1}" = "0" ]; then
         printf 'IMG-CHECK %s guest-no-fail-lines PASS\n' "$phase"
     else
         printf 'IMG-CHECK %s guest-no-fail-lines FAIL %s\n' "$phase" "${count:-?}"
-        grep -E "OTP-CHECK[[:space:]]+$phase[[:space:]].*[[:space:]]FAIL([[:space:]]|\$)" \
+        grep -E "OTP-CHECK[[:space:]]+${phase}[[:space:]].*[[:space:]]FAIL([[:space:]]|\$)" \
              "$CONSOLE_TXT" 2>/dev/null | sed 's/^/  /' || true
     fi
 
@@ -641,7 +641,7 @@ guest_gate() {
         want="$want $GUEST_CHECKS_BOOT2"
     fi
     for name in $want; do
-        grep -qE "OTP-CHECK[[:space:]]+$phase[[:space:]]+$name[[:space:]]+PASS" \
+        grep -qE "OTP-CHECK[[:space:]]+${phase}[[:space:]]+${name}[[:space:]]+PASS" \
              "$CONSOLE_TXT" 2>/dev/null || missing="$missing $name"
     done
     if [ -z "$missing" ]; then
