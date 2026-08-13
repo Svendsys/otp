@@ -640,12 +640,51 @@ class TestTheRealButtonPath:
     def line(self, pin):
         return Path(sim("gpio-control")) / f"sim_gpio{pin}" / "pull"
 
+    def value(self, pin):
+        """What the kernel says the line reads, right now."""
+        node = Path(sim("gpio-control")) / f"sim_gpio{pin}" / "value"
+        try:
+            return node.read_text().strip()
+        except OSError as exc:
+            return f"unreadable({errno.errorcode.get(exc.errno, exc.errno)})"
+
     def press(self, pin, seconds=0.05):
         pull = self.line(pin)
+        # Sampled either side of each write. "No press arrived" has two
+        # very different causes -- the line never moved, or it moved and
+        # the edge did not reach a callback -- and they need opposite
+        # fixes. Without this the failure cannot tell them apart, which
+        # is what made run 31699840801 cost three rounds of guessing.
+        self.trace = [f"gpio{pin} at rest={self.value(pin)}"]
         pull.write_text("pull-down")             # button to ground
+        self.trace.append(f"grounded={self.value(pin)}")
         time.sleep(seconds)
         pull.write_text("pull-up")               # released
+        self.trace.append(f"released={self.value(pin)}")
         time.sleep(0.1)
+        self.trace.append(f"settled={self.value(pin)}")
+
+    def why(self, pin):
+        """
+        The state a missing press needs explaining by.
+
+        Whether the line moved, whether lgpio's notification thread is
+        still running (it is a module-level singleton started at import,
+        and if its FIFO ever reaches EOF it spins forever delivering
+        nothing), and how many callbacks are registered on it.
+        """
+        trace = " -> ".join(getattr(self, "trace", ["no trace recorded"]))
+        try:
+            import lgpio
+            notify = lgpio._notify_thread
+            alert = (f"notify thread alive={notify.is_alive()} "
+                     f"go={notify.go} "
+                     f"callbacks={len(notify.callbacks)} "
+                     f"chips={sorted({c.chip for c in notify.callbacks})}")
+        except Exception as exc:                 # pragma: no cover
+            alert = f"could not read lgpio's notify thread: {exc!r}"
+        return (f"no press arrived.\n  line: {trace}\n  lgpio: {alert}\n"
+                f"  stale pins: {pirig.stale_pins()}")
 
     def glitch(self, pin):
         """
@@ -754,7 +793,7 @@ class TestTheRealButtonPath:
         from otpunit.hw.buttons import PIN_UP, Press
 
         self.press(PIN_UP)
-        assert buttons.wait(timeout=2) is Press.UP
+        assert buttons.wait(timeout=2) is Press.UP, self.why(PIN_UP)
 
     def test_a_tap_on_down_arrives_as_down(self, buttons):
         """
@@ -767,13 +806,13 @@ class TestTheRealButtonPath:
         from otpunit.hw.buttons import PIN_DOWN, Press
 
         self.press(PIN_DOWN)
-        assert buttons.wait(timeout=2) is Press.DOWN
+        assert buttons.wait(timeout=2) is Press.DOWN, self.why(PIN_DOWN)
 
     def test_a_tap_on_ok_arrives_as_ok_not_back(self, buttons):
         from otpunit.hw.buttons import PIN_OK, Press
 
         self.press(PIN_OK, seconds=0.05)
-        assert buttons.wait(timeout=2) is Press.OK
+        assert buttons.wait(timeout=2) is Press.OK, self.why(PIN_OK)
 
     def test_a_hold_on_ok_arrives_as_back_exactly_once(self, buttons):
         """
@@ -784,7 +823,7 @@ class TestTheRealButtonPath:
         from otpunit.hw.buttons import HOLD_SECONDS, PIN_OK, Press
 
         self.press(PIN_OK, seconds=HOLD_SECONDS + 0.3)
-        assert buttons.wait(timeout=3) is Press.BACK
+        assert buttons.wait(timeout=3) is Press.BACK, self.why(PIN_OK)
         assert buttons.wait(timeout=0.5) is None, "one press, two events"
 
     def test_a_bounce_too_short_to_be_a_press_is_not_one(self, buttons):
