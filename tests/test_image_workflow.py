@@ -57,8 +57,17 @@ def workflow() -> dict:
     return yaml.safe_load(WORKFLOW.read_text())
 
 
-def image_steps() -> list:
-    return workflow()["jobs"]["image"]["steps"]
+def build_steps() -> list:
+    """
+    The steps of the job that builds and boots the image.
+
+    Named `build`, not `image`. `image` is the job branch protection
+    requires: it always runs, reports on every pull request, and does
+    nothing but read the other two's results. Everything these tests are
+    about -- the boot, the artifact, the release attachment -- lives in
+    `build`, which is conditional. See test_the_required_check_always_runs.
+    """
+    return workflow()["jobs"]["build"]["steps"]
 
 
 def index_of(steps, name) -> int:
@@ -117,7 +126,7 @@ def release_publishers(paths=None) -> list:
 
 def test_the_release_asset_is_attached_after_the_boot():
     """The point of the file."""
-    steps = image_steps()
+    steps = build_steps()
     assert index_of(steps, ATTACH) > index_of(steps, BOOT), (
         "the release attachment runs before the boot gate, so a tag whose "
         "image cannot boot would ship it anyway")
@@ -129,11 +138,13 @@ def test_there_is_exactly_one_thing_that_can_publish_a_release():
         "more than one step can create a release; every one of them is a "
         f"way past the boot gate: {[(j, s.get('name')) for j, _, s in publishers]}")
     job, _, step = publishers[0]
-    assert job == "image.yml:image", (
+    assert job == "image.yml:build", (
         f"the publisher moved to {job!r}. That may be fine, but the ordering "
-        f"assertions here only see image.yml's `image` job -- update them "
+        f"assertions here only see image.yml's `build` job -- update them "
         f"deliberately rather than letting this pass. A publisher in ci.yml "
-        f"in particular meets no boot gate at all.")
+        f"in particular meets no boot gate at all, and one in image.yml's "
+        f"`image` job would meet none either: that job is the always-runs "
+        f"reporter and does not build anything.")
     assert step.get("name") == ATTACH, step.get("name")
 
 
@@ -143,7 +154,7 @@ def test_the_plain_artifact_is_still_uploaded_before_the_boot():
     image that failed, so the artifact is uploaded unconditionally and
     early. Only the release asset is gated.
     """
-    steps = image_steps()
+    steps = build_steps()
     assert index_of(steps, UPLOAD) < index_of(steps, BOOT)
     upload = step_named(steps, UPLOAD)
     assert "if" not in upload, \
@@ -162,7 +173,7 @@ def test_the_gate_is_exactly_the_expression_it_should_be():
     the gate entirely, and publishes a release named after whatever branch
     was pushed. `!startsWith(...)` inverts it and keeps them too.
     """
-    condition = " ".join(str(step_named(image_steps(), ATTACH)["if"]).split())
+    condition = " ".join(str(step_named(build_steps(), ATTACH)["if"]).split())
     assert condition == GATE, (
         f"the release gate now reads {condition!r}, not {GATE!r}. If the "
         f"change is deliberate, work out what it does on a green push to "
@@ -176,7 +187,7 @@ def test_the_boot_step_can_still_fail_the_job():
     `|| true` to the script invocation is one token and leaves every
     structural property of the step intact.
     """
-    boot = step_named(image_steps(), BOOT)
+    boot = step_named(build_steps(), BOOT)
     assert not boot.get("continue-on-error"), boot
     assert "if" not in boot, \
         "the boot step became conditional; it may no longer gate anything"
@@ -198,7 +209,7 @@ def test_the_asset_is_the_image():
     `files:` at all publishes a release carrying the caveat note and no
     image, entirely green.
     """
-    attach = step_named(image_steps(), ATTACH)
+    attach = step_named(build_steps(), ATTACH)
     assert "softprops/action-gh-release@" in attach["uses"], attach["uses"]
     assert attach["with"]["files"] == "image/deploy/*.img.xz", attach["with"]
 
@@ -216,7 +227,7 @@ def test_the_note_is_appended_so_it_cannot_eat_the_release_notes():
     append_body out, on the reasoning that only the create path mattered,
     and so held the defect in place.
     """
-    attach = step_named(image_steps(), ATTACH)["with"]
+    attach = step_named(build_steps(), ATTACH)["with"]
     assert attach.get("append_body") is True, \
         ("without append_body the note REPLACES the maintainer's release "
          "notes on the UI-publish path; see the comment in image.yml")
@@ -235,7 +246,63 @@ def test_the_gate_never_fires_on_a_branch_or_a_pull_request():
     `tag_name` defaults to `github.ref_name`, so a gate that let a branch
     through would create a release literally called `master`.
     """
-    condition = str(step_named(image_steps(), ATTACH)["if"])
+    condition = str(step_named(build_steps(), ATTACH)["if"])
     assert re.search(r"startsWith\(\s*github\.ref\s*,\s*'refs/tags/'\s*\)",
                      condition), condition
     assert "!" not in condition, f"the tag test is negated: {condition!r}"
+
+
+# --- the required check, which exists to always report -------------------
+#
+# Branch protection requires a check called `image`. It used to be the
+# build job itself, path-filtered at the trigger, so a pull request that
+# touched none of those paths never ran it -- and a required check that
+# never reports does not pass by default, it blocks forever. Five PRs sat
+# behind that. These hold the replacement to the shape that fixes it.
+
+
+def test_the_required_check_is_not_filtered_out_of_existing():
+    on = workflow()[True]
+    assert "paths" not in (on["pull_request"] or {}), (
+        "image.yml filters its pull_request trigger again. Whatever the "
+        "filter says, the effect is that PRs outside it never run this "
+        "workflow, the required `image` check never reports, and they "
+        "cannot be merged at all. Filter the WORK (see the changes job), "
+        "never the report.")
+
+
+def test_the_required_check_always_runs():
+    gate = workflow()["jobs"]["image"]
+    assert gate["if"] == "always()", (
+        f"the `image` job's condition is {gate.get('if')!r}. Without "
+        f"always() a skipped `build` skips this too, and a skipped "
+        f"required check never reports -- which is the original bug.")
+    assert set(gate["needs"]) == {"changes", "build"}, gate["needs"]
+    assert "steps" in gate and len(gate["steps"]) == 1
+
+
+def test_the_expensive_job_is_the_conditional_one():
+    build = workflow()["jobs"]["build"]
+    assert build["needs"] == "changes"
+    assert build["if"] == "needs.changes.outputs.image == 'true'"
+    # The cost is why any of this exists: a docs-only PR must not pay
+    # for a pi-gen build. If this job stops being conditional the gate
+    # still works, but every PR in the repository gets slower.
+    assert build["runs-on"] == "ubuntu-24.04-arm"
+
+
+def test_the_gate_cannot_pass_by_falling_off_the_end():
+    """
+    Every branch of the verdict either exits non-zero or says why not.
+
+    A gate whose default is success is not a gate. `set -e` plus an
+    explicit exit on each path is what keeps an unforeseen combination
+    -- a new job result string, say -- from reading as approval.
+    """
+    run = workflow()["jobs"]["image"]["steps"][0]["run"]
+    assert "set -euo pipefail" in run
+    assert run.count("exit 1") >= 3, (
+        "the verdict has fewer failure exits than it has ways to fail")
+    for swallow in SWALLOWS_FAILURE:
+        assert swallow not in run, (
+            f"the verdict swallows failure with {swallow!r}")
