@@ -454,6 +454,179 @@ class TestTheFakePiIdentity:
         assert cpuinfo_revision() == before_revision
 
 
+class TestTheFactoryTeardownBetweenPanels:
+    """
+    What happens to gpiozero's pin cache when one panel closes.
+
+    No gpiochip needed, which is the point: this ran nowhere until run
+    31699840801 failed, and it is the half of the button path that a
+    machine without gpio-sim can still hold to account. There the first
+    panel worked and every panel after it received nothing -- three
+    timeouts, plus a debounce test that "passed" because all it asserts
+    is that no press arrives.
+
+    gpiozero shares ONE pin dict across every LocalPiFactory instance (a
+    deliberate guard against two back-ends driving one pin), keyed by a
+    PinInfo that compares equal across factories. PiFactory.close()
+    empties it only after every pin.close() has returned. So one raising
+    close() -- and a Device finalizer reaching a closed handle raises
+    exactly that -- hands the next factory a pin belonging to the last
+    one, which claims its alert on a dead handle and never fires.
+    """
+
+    @pytest.fixture
+    def gz(self):
+        """A LocalPiFactory subclass with no kernel behind it."""
+        pytest.importorskip("gpiozero")
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+        from gpiozero.pins.pi import PiPin
+
+        class Pin(PiPin):
+            broken = False
+
+            def close(self):
+                if type(self).broken:
+                    # The shape of the real one, from that run:
+                    # LGPIOPin.close -> when_changed = None ->
+                    # _disable_event_detect -> gpio_get_mode(_handle).
+                    raise TypeError("unsupported operand type(s) for &: "
+                                    "'NoneType' and 'int'")
+
+            def _get_function(self):
+                return "input"
+
+            def _set_function(self, value):
+                pass
+
+            def _get_state(self):
+                return 0
+
+        class Factory(LocalPiFactory):
+            def __init__(self):
+                super().__init__()
+                self.pin_class = Pin
+
+            def _get_revision(self):
+                return pirig.REVISION
+
+        was = Device.pin_factory
+        try:
+            yield Factory, Pin
+        finally:
+            Pin.broken = False
+            LocalPiFactory.pins.clear()
+            LocalPiFactory._reservations.clear()
+            Device.pin_factory = was
+
+    def test_the_pin_cache_really_is_shared_between_factories(self, gz):
+        # The premise. If gpiozero ever gives each factory its own dict,
+        # everything below stops meaning anything and should be deleted
+        # rather than left passing.
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+
+        Factory, _ = gz
+        Device.pin_factory = first = Factory()
+        assert first.pins is LocalPiFactory.pins
+
+    def test_a_raising_close_hands_the_next_factory_a_dead_pin(self, gz):
+        """The defect itself, reproduced without a gpiochip."""
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+
+        Factory, Pin = gz
+        Device.pin_factory = first = Factory()
+        pin = first.pin(5)
+
+        Pin.broken = True
+        with pytest.raises(TypeError):
+            first.close()
+        assert LocalPiFactory.pins, (
+            "close() cleared the cache despite raising, so the rest of "
+            "this test is describing something that cannot happen")
+
+        Device.pin_factory = Factory()
+        assert Device.pin_factory.pin(5) is pin, (
+            "the second factory built a fresh pin, so a stale one could "
+            "not be inherited and release_gpiozero need not clear it")
+        assert pirig.stale_pins() == ["GPIO5"]
+
+    def test_release_gpiozero_empties_the_cache_even_when_close_raises(
+            self, gz):
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+
+        Factory, Pin = gz
+        Device.pin_factory = Factory()
+        Device.pin_factory.pin(5)
+        Pin.broken = True
+
+        # Loud, not swallowed -- and cleaned up regardless, so the next
+        # panel starts from nothing whatever this one did.
+        with pytest.raises(TypeError):
+            pirig.release_gpiozero()
+        assert LocalPiFactory.pins == {}
+        assert Device.pin_factory is None
+        assert pirig.stale_pins() == []
+
+    def test_an_unreachable_device_is_finalised_before_the_factory_closes(
+            self, gz):
+        """
+        The collect, and its ORDER -- the half a cache assertion misses.
+
+        A gpiozero Device that is unreachable but not yet collected runs
+        `Device.__del__` -> `close()` -> the pin -> `factory._handle` at
+        whatever later moment the collector picks. Landing after the
+        factory closed is what raised the TypeError, from a finalizer,
+        in the middle of the next test. Collecting first is what makes
+        it harmless. A reference cycle stands in for the real Device
+        here because refcounting would free a plain object too early to
+        prove anything about gc.collect() at all.
+        """
+        from gpiozero import Device
+
+        Factory, _ = gz
+        Device.pin_factory = factory = Factory()
+        factory.pin(5)
+        when = []
+
+        class Ghost:
+            def __del__(self):
+                when.append("after close" if factory.gone else "while open")
+
+        factory.gone = False
+        closing = factory.close
+        factory.close = lambda: (setattr(factory, "gone", True), closing())
+
+        ghost = Ghost()
+        ghost.cycle = ghost                      # only gc can free this
+        del ghost
+
+        pirig.release_gpiozero()
+        assert when == ["while open"], (
+            f"the finalizer ran {when or ['not at all']}; it must run "
+            f"while the chip handle is still valid, or a real "
+            f"Device.__del__ dereferences a None handle and leaves the "
+            f"shared pin cache dirty for the next panel")
+
+    def test_a_clean_teardown_leaves_no_stale_pin_and_does_not_raise(
+            self, gz):
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+
+        Factory, _ = gz
+        Device.pin_factory = Factory()
+        Device.pin_factory.pin(5)
+        # A live factory's own pins are not stale; only the assertion
+        # about OTHER factories may fire.
+        assert pirig.stale_pins() == []
+
+        pirig.release_gpiozero()
+        assert LocalPiFactory.pins == {}
+        assert Device.pin_factory is None
+
+
 @needs_sim("gpio-chip", "gpio-sim")
 class TestTheRealButtonPath:
     """
@@ -526,6 +699,19 @@ class TestTheRealButtonPath:
                 f"the panel is talking to {opened or 'no gpiochip at all'} "
                 f"rather than {wanted}, the chip gpio-sim just made; every "
                 f"assertion below would be about the wrong hardware")
+            # Which factory the pins belong to, not just which chip is
+            # open. A pin cached from an earlier, closed factory claims
+            # its alert on a dead handle: the panel looks healthy, the
+            # chip is right, and no press ever arrives. That is how run
+            # 31699840801 read -- three timeouts and a debounce test
+            # passing because it asserts nothing arrives.
+            stale = pirig.stale_pins()
+            assert not stale, (
+                f"the panel is holding pins from an earlier factory: "
+                f"{stale}. Their alerts are claimed on a handle that is "
+                f"now closed, so every press below would time out and "
+                f"this class would report a panel that never fires. See "
+                f"pirig.release_gpiozero for why the cache can survive.")
             yield panel
         finally:
             panel.close()

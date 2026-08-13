@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import gc
 import os
 import shutil
 import struct
@@ -356,10 +357,80 @@ def bind_gpiozero_to(chip: int):
     return Device.pin_factory
 
 
-def release_gpiozero() -> None:
-    """Put gpiozero back the way an untouched process would find it."""
+def stale_pins() -> list:
+    """
+    Cached pins that belong to a factory other than the current one.
+
+    Names only, so an assertion message stays readable. Empty is the
+    healthy answer and the only one a panel should ever be built on: a
+    stale pin is indistinguishable from a working one right up until a
+    press fails to arrive, and "no press arrived" is what a broken panel
+    and an untested panel both look like.
+    """
     from gpiozero import Device
+    from gpiozero.pins.local import LocalPiFactory
+
+    live = Device.pin_factory
+    return sorted(
+        info.name for info, pin in LocalPiFactory.pins.items()
+        if pin.factory is not live
+    )
+
+
+def release_gpiozero() -> None:
+    """
+    Put gpiozero back the way an untouched process would find it.
+
+    Two steps beyond dropping the factory, both of them learned from run
+    31699840801, where the first panel worked and every panel after it
+    received no edges at all: UP passed, DOWN/OK/BACK each sat out their
+    timeout with an empty queue, and the debounce test "passed" only
+    because all it asserts is that nothing arrives.
+
+    **Collect before closing, while the chip handle is still open.**
+    `gpiozero.Device.__del__` calls `close()`, which reaches
+    `LGPIOPin._disable_event_detect` and dereferences `factory._handle`.
+    A Device that is already unreachable but not yet collected runs that
+    finalizer whenever the collector next gets to it -- in that run, in
+    the middle of the FOLLOWING test, by which point the handle is None:
+
+        TypeError: unsupported operand type(s) for &: 'NoneType' and 'int'
+
+    and it surfaced as a PytestUnhandledThreadExceptionWarning, which is
+    to say nowhere the failing test would show it.
+
+    **Then empty the pin cache by hand.** `LocalPiFactory.pins` is a
+    CLASS attribute -- gpiozero deliberately shares one dict across every
+    instance so that mixing back-ends cannot drive one pin two ways --
+    and it is keyed by `PinInfo`, which compares equal across factories
+    for the same pin of the same board. `PiFactory.close()` empties it
+    only after every `pin.close()` has returned, so a single raising
+    finalizer leaves it populated. The next factory's `Button(6)` is then
+    handed back a pin belonging to the previous, closed factory; it
+    claims its alert on a dead handle, and no edge ever arrives.
+    Silently -- which is the one outcome this harness exists to refuse.
+
+    TestTheFactoryTeardownBetweenPanels holds every clause of this to
+    account without needing a gpiochip.
+    """
+    from gpiozero import Device
+    from gpiozero.pins.local import LocalPiFactory
 
     factory, Device.pin_factory = Device.pin_factory, None
-    if factory is not None:
-        factory.close()
+    gc.collect()
+    try:
+        if factory is not None:
+            factory.close()
+    finally:
+        # Belt and braces: close() clears these itself on the happy path.
+        # Leaving a stale pin behind costs the next panel its edges, so
+        # they do not get to depend on close() having reached the end.
+        LocalPiFactory.pins.clear()
+        LocalPiFactory._reservations.clear()
+    # Note what is deliberately NOT caught: if factory.close() raises, it
+    # comes out of here and pytest reports the teardown as an error. That
+    # is the point. The collect above is what should stop it happening,
+    # and if it happens anyway the run must say so in the open rather
+    # than in a warning nobody reads. The cache is emptied either way, so
+    # a raise here cannot spread to the next test -- it only ends this
+    # one loudly, which is the trade this repository always takes.
