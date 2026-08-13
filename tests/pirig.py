@@ -377,6 +377,89 @@ def stale_pins() -> list:
     )
 
 
+def notify_thread():
+    """lgpio's notification thread, or None if lgpio is not imported."""
+    try:
+        import lgpio
+    except ImportError:                          # pragma: no cover
+        return None
+    return lgpio._notify_thread
+
+
+def edge_callbacks() -> int:
+    """
+    How many edge callbacks lgpio is currently holding, process-wide.
+
+    Zero between panels. It is a module-level singleton's list, appended
+    to by every `Button` and pruned by nothing except an explicit cancel,
+    so a panel that does not clean up leaves its three behind for the
+    life of the process -- see silence().
+    """
+    thread = notify_thread()
+    return 0 if thread is None else len(thread.callbacks)
+
+
+def silence(factory) -> None:
+    """
+    Cancel every edge callback belonging to `factory`, before it closes.
+
+    This is the fix for the defect that made the panel work exactly
+    once. lgpio's `_callback_thread.run()` dispatches with no guard:
+
+        for cb in self.callbacks:
+            if cb.chip == chip and cb.gpio == gpio:
+                cb.func(chip, gpio, level, tick)
+
+    An exception out of `cb.func` therefore kills the thread -- and it
+    is a module-level singleton created at import, so once it dies no
+    edge reaches any callback anywhere in the process, for the rest of
+    the process. Measured, run 31703316190, on the tests after the
+    first:
+
+        lgpio: notify thread alive=False go=True callbacks=5
+
+    with the line itself moving perfectly (rest=1, grounded=0,
+    released=1, settled=1). Nothing was wrong with the press.
+
+    What raises is gpiozero doing the right thing at the wrong moment.
+    `PiPin._call_when_changed` holds its device by weak reference; once
+    an earlier test's `Button` is collected that reference is dead, so
+    on the next edge the pin tries to stop listening -- `when_changed =
+    None` -> `_disable_event_detect()` -> `gpio_get_mode(_handle)` --
+    and that pin's factory is closed, so `_handle` is None:
+
+        TypeError: unsupported operand type(s) for &: 'NoneType' and 'int'
+
+    raised inside the thread, reported only as a warning, and fatal to
+    every button in the process.
+
+    So the cancel happens HERE: on our terms, while the handle is still
+    open, rather than on an edge that arrives after it is not.
+    """
+    from gpiozero.pins.local import LocalPiFactory
+
+    trouble = []
+    for info, pin in list(LocalPiFactory.pins.items()):
+        if pin.factory is not factory:
+            continue
+        try:
+            # Cancels the lgpio callback and drops it from the notify
+            # thread's list -- the whole point. Through the property
+            # rather than the private method because that is the way in
+            # gpiozero itself uses.
+            pin.when_changed = None
+        except Exception as exc:                 # noqa: BLE001
+            trouble.append(f"{info.name}: {exc!r}")
+    if trouble:
+        # Not swallowed. A pin that could not be silenced is a callback
+        # still armed on a handle about to close, which is exactly what
+        # kills the notification thread later on.
+        raise RuntimeError(
+            "could not cancel edge callbacks before closing the factory, "
+            "so the next edge may kill lgpio's notification thread and "
+            "take every button with it: " + "; ".join(trouble))
+
+
 def release_gpiozero() -> None:
     """
     Put gpiozero back the way an untouched process would find it.
@@ -420,6 +503,7 @@ def release_gpiozero() -> None:
     gc.collect()
     try:
         if factory is not None:
+            silence(factory)
             factory.close()
     finally:
         # Belt and braces: close() clears these itself on the happy path.

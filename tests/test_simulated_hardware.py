@@ -484,6 +484,13 @@ class TestTheFactoryTeardownBetweenPanels:
 
         class Pin(PiPin):
             broken = False
+            silenced = None
+
+            def _set_when_changed(self, value):
+                # What pirig.silence drives, and the only observable
+                # proof that it reached this pin before close().
+                if value is None and type(self).silenced is not None:
+                    type(self).silenced.append(self.info.name)
 
             def close(self):
                 if type(self).broken:
@@ -515,6 +522,7 @@ class TestTheFactoryTeardownBetweenPanels:
             yield Factory, Pin
         finally:
             Pin.broken = False
+            Pin.silenced = None
             LocalPiFactory.pins.clear()
             LocalPiFactory._reservations.clear()
             Device.pin_factory = was
@@ -569,6 +577,40 @@ class TestTheFactoryTeardownBetweenPanels:
         assert LocalPiFactory.pins == {}
         assert Device.pin_factory is None
         assert pirig.stale_pins() == []
+
+    def test_every_edge_callback_is_cancelled_before_the_handle_closes(
+            self, gz):
+        """
+        The defect that actually made the panel work exactly once.
+
+        lgpio dispatches edges from one process-wide thread with no
+        try/except around the call. A callback left armed on a closed
+        factory raises there on the next matching edge, the thread dies,
+        and every button in the process goes with it -- reported as a
+        warning in the summary and as three timeouts that say nothing.
+
+        So each pin must be told to stop listening while its handle is
+        still open. `when_changed = None` is what cancels the lgpio
+        callback; this asserts it reaches every pin of the factory being
+        closed, and that it happens BEFORE close().
+        """
+        from gpiozero import Device
+
+        Factory, Pin = gz
+        Device.pin_factory = factory = Factory()
+        for number in (5, 6, 13):
+            factory.pin(number)
+        order = []
+        Pin.silenced = order
+        closing = factory.close
+        factory.close = lambda: (order.append("close"), closing())
+
+        pirig.release_gpiozero()
+
+        assert order[-1] == "close", (
+            f"close() must come last; got {order}")
+        assert sorted(order[:-1]) == ["GPIO13", "GPIO5", "GPIO6"], (
+            f"every pin of the factory must be silenced first; got {order}")
 
     def test_an_unreachable_device_is_finalised_before_the_factory_closes(
             self, gz):
@@ -723,6 +765,20 @@ class TestTheRealButtonPath:
         # writable and disposable, rather than the repository.
         monkeypatch.chdir(tmp_path)
 
+        # Nothing may be armed before this panel arms anything. lgpio's
+        # notification thread is a process-wide singleton whose callback
+        # list only grows -- measured at 5, then 8, then 11 across three
+        # panels that registered three each. A leftover callback belongs
+        # to a closed factory, and the next edge matching it kills the
+        # thread, and with it every button in the process.
+        armed = pirig.edge_callbacks()
+        assert armed == 0, (
+            f"{armed} edge callbacks are still armed from an earlier "
+            f"panel. See pirig.silence: the next edge to match one of "
+            f"them raises inside lgpio's notification thread, which has "
+            f"no guard around its dispatch, and every press after that "
+            f"is lost with nothing in the log but a warning.")
+
         chip = int(sim("gpio-chip"))
         pirig.bind_gpiozero_to(chip)
         try:
@@ -751,6 +807,16 @@ class TestTheRealButtonPath:
                 f"now closed, so every press below would time out and "
                 f"this class would report a panel that never fires. See "
                 f"pirig.release_gpiozero for why the cache can survive.")
+            # The thread that has to still be running for any of the
+            # tests below to mean anything. It dies silently -- a
+            # warning in the summary, nothing in the failing test -- and
+            # once it has, a press and a broken panel look identical.
+            thread = pirig.notify_thread()
+            assert thread is not None and thread.is_alive(), (
+                "lgpio's notification thread is dead, so no edge can "
+                "reach any callback in this process. Every press test "
+                "below would fail as a timeout, saying nothing about "
+                "why. See pirig.silence.")
             yield panel
         finally:
             panel.close()
