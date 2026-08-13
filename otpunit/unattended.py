@@ -172,14 +172,20 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
     paper = {"media": _media(settings)}
 
     def send(data, title, options=None):
-        # Wait for the queue before adding to it. The unit ships with
-        # MaxJobs 1, so cupsd REJECTS a second job while one is active --
-        # `lp: Too many active jobs.` Measured against a real cupsd with
-        # the shipped config: the manual spooled, then the tabula, copy A,
-        # the separator and the final sheet were all refused in turn, and
-        # the operator got a status sheet promising a pad followed by
-        # nothing at all. Every gap in this sequence needs the wait, not
-        # just the two that had it.
+        # Wait for the queue before adding to it. cupsd does not queue past
+        # MaxJobs, it REJECTS -- `lp: Too many active jobs.` The unit shipped
+        # MaxJobs 1 when that was found: measured against a real cupsd, the
+        # manual spooled, then the tabula, copy A, the separator and the
+        # final sheet were all refused in turn, and the operator got a status
+        # sheet promising a pad followed by nothing at all. Every gap in this
+        # sequence needs the wait, not just the two that had it.
+        #
+        # install.sh ships MaxJobs 4 now, and THIS WAIT is what makes the
+        # sequence independent of that number rather than the number itself
+        # -- measured by the mutation gate (tests/mutations.toml,
+        # sequence-submits-without-waiting-for-the-queue): with the drain
+        # here, MaxJobs back at 1 leaves the whole hardware tier green; with
+        # it gone, the same value loses the pair in under four seconds.
         drain(cups, queue, sleep, log, timeout=_drain_timeout(settings))
         cups.submit(data, name=queue, title=title,
                     options=paper if options is None else options)
