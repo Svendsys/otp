@@ -6,6 +6,7 @@
 reportlab
 pytest
 pypdf
+pyyaml
 
 # The panel's pixels. tests/test_panel_pixels.py drives the real
 # Ssd1306Display drawing code through luma's `dummy` device, which renders

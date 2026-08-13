@@ -217,21 +217,23 @@ jobs:
           path: image/deploy
           key: ${{ steps.imgcache.outputs.cache-primary-key }}
 
-      # The artifact is uploaded and attached BEFORE the image is booted, so
-      # that a failing boot can be reported honestly without costing anyone
-      # the image. See the boot step below for why that ordering matters.
+      # The ARTIFACT is uploaded BEFORE the image is booted, so that a
+      # failing boot can be reported honestly without costing anyone the
+      # image. See the boot step below for why that ordering matters. This
+      # stays exactly where it is: debugging a red boot needs the image
+      # that failed, and needs it whether or not the boot passed.
+      #
+      # The RELEASE attachment is a different question, and it has moved to
+      # AFTER the boot. An artifact is for debugging a red run; a release
+      # asset is a thing someone flashes to a card and hands to another
+      # person. Those want opposite defaults, and for a while they shared
+      # one -- so a tagged image that could not boot shipped anyway.
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: otp-print-unit-image
           path: image/deploy/*.img.xz
           if-no-files-found: error
-
-      - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: image/deploy/*.img.xz
 
       # Tier 3 of the harness: boot the artifact that was just built. Once
       # per image, not per commit -- it is emulated, so it is slow, and its
@@ -301,6 +303,65 @@ jobs:
               || echo "(the image never reported)"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # THE RELEASE ASSET, and it is downstream of the boot on purpose.
+      #
+      # This used to sit above the boot step, next to the artifact upload,
+      # and that was right when it was written: the boot gate was unproven,
+      # and an unvalidated check must not cost anyone the image. It is not
+      # right any more. Tier 3 boots the actual flashable artifact to a
+      # running otp-unit.service in ~4.5 minutes cached, judges on
+      # ANSI-stripped console evidence, and has its verdict logic under
+      # sliced-test and mutation coverage. A tag whose image cannot boot
+      # must produce a red run and NO asset, rather than a release someone
+      # writes to a card and hands to another person.
+      #
+      # No `always()`, no `continue-on-error`, and that is the whole
+      # mechanism: a step whose `if` names no status function carries an
+      # implicit success(), so a red boot skips this and the tag ships
+      # nothing. `success() &&` is written out anyway -- this is the line
+      # that decides whether a broken image reaches a human, and it should
+      # not depend on the reader remembering that rule.
+      #
+      # The `Boot verdict` step above runs under always() and therefore
+      # cannot rescue this one: always() changes whether THAT step runs, not
+      # the job's failure state.
+      - name: Attach to the release
+        if: success() && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: image/deploy/*.img.xz
+          # APPENDED. An earlier version set `body` plainly, reasoning that
+          # append_body is consulted only on the action's UPDATE path and
+          # that the first tag run -- a create -- was the only one that
+          # mattered here. That weighed the wrong case. Publishing a release
+          # through the GitHub UI creates the release AND the tag, and the
+          # tag push is what starts this workflow, so by the time this step
+          # runs the release already exists and the action takes the update
+          # path (verified against src/github.ts):
+          #
+          #   if (input_append_body && workflowBody && existingReleaseBody)
+          #     body = existingReleaseBody + "\n" + workflowBody;
+          #   else
+          #     body = workflowBody || existingReleaseBody;
+          #
+          # With append_body unset and a non-empty body, that else branch
+          # REPLACES the maintainer's changelog with the paragraph below.
+          # Silently destroying someone's release notes is worse than what
+          # appending costs: this paragraph appearing twice if the same
+          # tag's workflow is re-run, which is visible and editable.
+          append_body: true
+          #
+          # A folded scalar, so the note reaches GitHub as one paragraph:
+          # release bodies render hard line breaks, and a block scalar
+          # would ship this at whatever width it happens to be wrapped to
+          # in this file.
+          body: >
+            This image passed the tier-3 boot gate: it was booted under
+            QEMU and `otp-unit.service` reached `Started`. That gate does
+            not exercise the OLED, the buttons or a printer -- see the
+            header of `harness/img-boot.sh` for exactly what it does and
+            does not prove.
 
       # The bar, stated where it can be seen. Ten minutes is the budget for
       # a run that did not have to rebuild the image; a run that did is
