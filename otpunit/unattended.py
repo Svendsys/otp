@@ -223,8 +223,29 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
     #    mode the printer IS the panel, so that page is the only place the
     #    unit can say anything at all.
     announced = [None]
+    missing = [0]
 
     def waiting(seconds):
+        # THE PLUG STAYS LIVE. This wait has no upper bound, and the sheet
+        # already in the tray tells the operator that unplugging the
+        # printer aborts -- that is the whole control surface this mode
+        # has. A wait that ignores it leaves the unit exactly as dead as
+        # the silent hang this gate exists to replace, one step further
+        # on: the page says "pull the cable to stop", and pulling it does
+        # nothing until entropy arrives. Found by review on this PR.
+        #
+        # Same rule as countdown() and drain(): one empty answer is a
+        # hiccup, GONE_AFTER in a row is a cable. devices() swallows every
+        # error and returns [], so a busy cupsd looks identical to an
+        # unplugged one and a single miss must not abort a pad.
+        try:
+            present = bool(cups.devices())
+        except Exception:                        # noqa: BLE001
+            present = False
+        missing[0] = 0 if present else missing[0] + 1
+        if missing[0] >= GONE_AFTER:
+            raise Aborted("printer disconnected while waiting for entropy")
+
         # First, then every 30s. The unit's journal is volatile and lives
         # in RAM, so a line every half second for a wait with no upper
         # bound is a slow leak into the one resource it cannot spare.
@@ -234,7 +255,11 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         log(f"waiting for the kernel CSPRNG to be seeded ({seconds:.0f}s so "
             f"far); no key material can be drawn until it is")
 
-    waited = gen_module().wait_for_crng(on_wait=waiting, sleep=sleep)
+    try:
+        waited = gen_module().wait_for_crng(on_wait=waiting, sleep=sleep)
+    except Aborted as exc:
+        log(f"aborted: {exc}")
+        return 1
     if waited:
         log(f"kernel CSPRNG seeded after {waited:.0f}s")
     codeword = settings.auto_codeword or vocabulary.random()

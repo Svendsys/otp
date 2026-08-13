@@ -1315,11 +1315,29 @@ def main():
                     "material can be drawn until it is; using the machine "
                     "-- keys, disks, interrupts -- helps.")
 
-        waited = wait_for_crng(on_wait=announce)
-        if waited:
-            log(f"Kernel CSPRNG seeded after {waited:.0f}s.")
+        waited_already = [False]
+
+        def ensure_entropy():
+            """Block until the CRNG is seeded, at most once, saying so.
+
+            Called at each point that is genuinely the FIRST draw of its
+            path, rather than once up front. Up front was wrong for
+            --codewords: the wait ran before the file had even been read,
+            so a missing file, a duplicate word or an over-long one parked
+            the CLI in an unbounded wait and then reported an error that
+            needed no randomness to find. Deterministic checks first; the
+            wait immediately before the draw that needs it.
+            """
+            if waited_already[0]:
+                return
+            waited_already[0] = True
+            waited = wait_for_crng(on_wait=announce)
+            if waited:
+                log(f"Kernel CSPRNG seeded after {waited:.0f}s.")
 
         if args.random_codewords:
+            # This IS the first draw on this path, so the wait belongs here.
+            ensure_entropy()
             codewords = random_codewords(args.random_codewords)
             log(f"Random codewords: {' '.join(codewords)}")
         else:
@@ -1418,6 +1436,10 @@ def main():
                 return generate_set_pdf_a4(out, *rest, page_size=sheet, **kwargs)
         else:
             generate = generate_set_pdf_a6
+
+        # And here for the --codewords path, whose first draw is the pad
+        # itself. A no-op when --random-codewords already waited above.
+        ensure_entropy()
 
         for i in range(args.sets):
             codeword = codewords[i]

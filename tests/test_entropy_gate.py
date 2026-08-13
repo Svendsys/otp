@@ -75,6 +75,19 @@ class QuietButtons:
         self.polls = 0
 
     def wait(self, timeout=None):
+        # timeout=0 asks "is anything pending?", not "give me the next
+        # press", and this double models NOBODY PRESSING ANYTHING -- so
+        # the honest answer is None, every time, consuming nothing.
+        #
+        # It matters because a non-blocking drain loop runs until it sees
+        # None. Falling through to the scripted answers would let a drain
+        # eat the run's whole script; falling through to the trailing QUIT
+        # would hand it an endless supply and hang forever, which is
+        # exactly what happened when wait_for_entropy started draining.
+        # The real GpioButtons honours this and FakeButtons carries the
+        # same guard with the same reasoning written above it.
+        if timeout == 0:
+            return None
         self.polls += 1
         return self.answers.pop(0) if self.answers else Press.QUIT
 
@@ -109,9 +122,15 @@ class Cups(printer.Cups):
 def make_app(buttons, cups=None):
     from otpunit import codewords as cw
 
+    # poll_seconds must NOT be 0. The doubles return immediately whatever
+    # it is, so this costs nothing -- but timeout=0 is the wire signal for
+    # "is anything pending?", which is what a non-blocking drain sends. At
+    # poll_seconds=0 the wait loop's own poll is indistinguishable from a
+    # drain probe, so a double that answers one correctly answers the
+    # other wrongly, and wait_for_entropy either starves or hangs.
     return ui.App(display=FakeDisplay(), buttons=buttons, cups=cups or Cups(),
                   settings=config.Settings(pages=2), vocabulary=cw.Vocabulary(),
-                  config_path="/nonexistent", poll_seconds=0)
+                  config_path="/nonexistent", poll_seconds=0.01)
 
 
 def panel(app) -> str:
@@ -432,3 +451,155 @@ class TestTheSheetReportsTheCrngNotABitCount:
         monkeypatch.setattr(gen, "entropy_bits", lambda: None)
         row = posture(diagnostics.collect())["Kernel CSPRNG"]
         assert "unknown" in row
+
+
+# --- what review found: the wait must not eat, park, or pre-empt --------
+
+
+class BankedButtons:
+    """A queue, like the real GpioButtons -- presses persist until taken.
+
+    QuietButtons models nobody pressing anything, which is the wrong
+    double for the banked-press question: the entropy screen is the one
+    screen that ASKS to be pressed.
+    """
+
+    def __init__(self, script=()):
+        self.queue = list(script)
+
+    def push(self, *presses):
+        self.queue.extend(presses)
+
+    def wait(self, timeout=None):
+        # None when empty, for BOTH forms. A queue that answers QUIT to a
+        # blocking poll ends the wait loop on its very first iteration, so
+        # the loop under test never runs. Termination comes from the
+        # crng_seeded probe instead -- which is what the real loop waits
+        # on -- and each probe below caps its own poll count, so a broken
+        # loop fails rather than hangs.
+        return self.queue.pop(0) if self.queue else None
+
+    def close(self):
+        pass
+
+
+class TestTheEntropyWaitDoesNotLeakPressesForward:
+    def test_presses_made_at_the_waiting_screen_do_not_reach_the_menu(
+            self, monkeypatch):
+        """
+        The screen tells the operator that using the buttons helps, so it
+        is the one screen guaranteed to leave a queue behind -- and
+        GpioButtons is a queue, not a level. Handing those presses to
+        whatever is drawn next means a banked OK selecting PRINT PAD PAIR
+        from a press aimed at a waiting screen.
+        """
+        buttons = BankedButtons()
+        polls = [0]
+
+        def seeded():
+            polls[0] += 1
+            if polls[0] > 200:
+                raise AssertionError("wait_for_entropy never returned")
+            if polls[0] <= 2:
+                return False
+            # The presses land during the LAST blocking wait -- after the
+            # loop's own poll has already been served, which is the only
+            # window in which a press can survive to the next screen. A
+            # test that queues them earlier has them eaten by the loop
+            # itself and passes with the drain removed.
+            if not buttons.queue:
+                buttons.push(Press.OK, Press.OK)
+            return True
+
+        monkeypatch.setattr(gen, "crng_seeded", seeded)
+        app = make_app(buttons)
+        assert app.wait_for_entropy() is True
+        assert buttons.queue == [], \
+            f"presses survived the entropy wait and will hit the next " \
+            f"screen: {buttons.queue}"
+
+    def test_the_drain_does_not_swallow_the_shutdown(self, monkeypatch):
+        # BACK on the waiting screen must still power down: the drain runs
+        # on the way OUT, only once the kernel has seeded.
+        monkeypatch.setattr(gen, "crng_seeded", lambda: False)
+        app = make_app(BankedButtons([Press.BACK]))
+        assert app.wait_for_entropy() is False
+        assert app.shutdown_requested is True
+
+
+class TestTheHeadlessWaitKeepsWatchingThePlug:
+    def test_unplugging_during_the_wait_aborts(self, monkeypatch):
+        """
+        The status sheet is already in the tray telling the operator that
+        pulling the cable stops the run -- that is the entire control
+        surface this mode has. A wait that ignores it leaves the unit as
+        dead as the silent hang this gate replaces, one step further on.
+        """
+        events = []
+
+        class Gone(Cups):
+            def devices(self):
+                events.append("devices")
+                return []
+
+        # Bounded, so removing the plug watch FAILS instead of hanging: an
+        # unbounded wait with nothing watching is precisely the defect, and
+        # a test that hangs to report it is unusable in CI.
+        asked = [0]
+
+        def never(*_a, **_k):
+            asked[0] += 1
+            if asked[0] > 200:
+                raise AssertionError(
+                    "the entropy wait ran 200 polls without noticing the "
+                    "printer had gone; nothing is watching the plug")
+            return False
+
+        monkeypatch.setattr(gen, "crng_seeded", never)
+        monkeypatch.setattr(unattended.jobs, "manual_available", lambda: True)
+        monkeypatch.setattr(unattended.jobs, "generate",
+                            lambda spec, *a, **k: bytearray(b"%PDF-fake"))
+        result = unattended.run(
+            Gone(), settings=config.Settings(pages=2, auto_delay=0,
+                                             auto_swap_delay=0),
+            vocabulary=type("V", (), {"random": lambda self: "X-Y"})(),
+            sleep=lambda s: None,
+            log=lambda line: events.append(f"log:{line}"))
+        assert result == 1, events
+        assert any("aborted" in e and "disconnect" in e for e in events), events
+
+    def test_a_single_missed_answer_does_not_abort(self, monkeypatch):
+        """
+        devices() swallows every error and returns [], so a busy cupsd is
+        indistinguishable from an unplugged one. The same GONE_AFTER rule
+        countdown() and drain() use, for the same reason: one empty answer
+        is a hiccup, several in a row is a cable.
+        """
+        waiting = [False]
+        blinked = [False]
+
+        class Blinks(Cups):
+            def devices(self):
+                # One empty answer, and only once the entropy wait is the
+                # thing asking -- an earlier lookup would absorb it and
+                # leave the wait's own tolerance untested.
+                if waiting[0] and not blinked[0]:
+                    blinked[0] = True
+                    return []
+                return super().devices()
+
+        def seeded():
+            waiting[0] = True
+            return blinked[0]
+
+        monkeypatch.setattr(gen, "crng_seeded", seeded)
+        monkeypatch.setattr(unattended.jobs, "manual_available", lambda: True)
+        monkeypatch.setattr(unattended.jobs, "generate",
+                            lambda spec, *a, **k: bytearray(b"%PDF-fake"))
+        result = unattended.run(
+            Blinks(), settings=config.Settings(pages=2, auto_delay=0,
+                                               auto_swap_delay=0),
+            vocabulary=type("V", (), {"random": lambda self: "X-Y"})(),
+            sleep=lambda s: None, log=lambda line: None)
+        assert blinked[0], "the wait never saw the empty answer"
+        assert result == 0, "one empty device list aborted a healthy pair"

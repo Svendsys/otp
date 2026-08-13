@@ -974,6 +974,17 @@ class App:
         screen = WaitForEntropy()
         while self.running:
             if generator().crng_seeded():
+                # Banked presses, discarded. This is the ONLY screen that
+                # asks to be pressed -- it tells the operator that using
+                # the buttons helps -- so it is the one most certain to
+                # leave a queue behind, and GpioButtons is a queue rather
+                # than a level. Returning with presses still in it hands
+                # them to whatever is drawn next: on a unit whose printer
+                # is already attached that is the main menu, where a
+                # banked OK selects PRINT PAD PAIR and a banked DOWN moves
+                # the caret -- from a press aimed at a waiting screen. The
+                # same reason _print_copy and _advance drain.
+                _drain(self)
                 return True
             self.render(screen)
             press = self.buttons.wait(timeout=self.poll_seconds)
