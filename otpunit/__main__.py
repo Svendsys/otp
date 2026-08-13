@@ -73,9 +73,6 @@ class SimulatedCups(Cups):
         # the recovery path for a queue that does not exist.
         return []
 
-    def blocking_reasons(self, name="OTP"):
-        return []
-
     def queue_stopped(self, name="OTP"):
         return False
 

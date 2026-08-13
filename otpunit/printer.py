@@ -332,11 +332,51 @@ class Cups:
     #   tray empty       Alerts: media-empty-error
     #   backend STOP     Alerts: media-empty-error paused
     #
-    # "-error" means the printer cannot print. "-warning" and "-report" are
-    # advisory: a laser reporting toner-low-report all day is working fine,
-    # and treating that as a fault destroys pads that printed perfectly.
-    ADVISORY_SUFFIXES = ("-warning", "-report")
+    # The SUFFIX IS NOT THE SEVERITY, whatever it looks like. That was the
+    # first design here and it was wrong in the dangerous direction:
+    #
+    #   $ strings /usr/lib/cups/backend/{socket,ipp,lpd} | grep media-
+    #   media-empty-warning
+    #   media-jam-warning
+    #   toner-empty-warning
+    #
+    # CUPS' SNMP supplies code emits out-of-paper and paper-jam as
+    # "-warning", so treating "-warning" as advisory discarded exactly the
+    # conditions that mean nothing printed, and the panel said PAIR
+    # COMPLETE over an empty tray.
+    #
+    #   $ strings /usr/lib/cups/backend/usb | grep -c media-
+    #   0
+    #
+    # Worse, the usb backend -- which is what THIS unit runs, on usb://
+    # device URIs -- reports no media state at all, ever. Its only state
+    # keywords are connecting-to-device. So on the unit's own hardware
+    # path, reasons are empty whatever is wrong with the printer, and a
+    # fault decision resting on them cannot see anything.
+    #
+    # Hence: reasons never CREATE a fault, they only EXCUSE one. The prose
+    # in printer-state-message stays the decision channel, because it is
+    # the only one the usb backend populates -- and because reasons are
+    # STICKY, surviving the job that set them and every healthy job after
+    # it, so a single empty tray would otherwise condemn every later pair
+    # for the lifetime of the daemon.
+    #
+    # Matched on the STEM, with the suffix stripped, since the same
+    # condition arrives as -error from one backend and -warning from
+    # another.
+    ADVISORY_STEMS = (
+        "toner-low", "marker-supply-low", "marker-waste-almost-full",
+        "media-low", "cups-waiting-for-job-completed",
+    )
     NOT_A_REASON = ("none",)
+
+    @staticmethod
+    def reason_stem(reason: str) -> str:
+        """An IPP state reason without its severity suffix."""
+        for suffix in ("-error", "-warning", "-report"):
+            if reason.endswith(suffix):
+                return reason[:-len(suffix)]
+        return reason
 
     def state_reasons(self, name: str = QUEUE) -> list[str] | None:
         """
@@ -357,15 +397,6 @@ class Cups:
         # not clean -- claiming clean here is the false success this whole
         # mechanism exists to prevent.
         return None
-
-    def blocking_reasons(self, name: str = QUEUE) -> list[str]:
-        """The state reasons that mean this queue cannot print right now."""
-        reasons = self.state_reasons(name)
-        if reasons is None:
-            return []
-        return [reason for reason in reasons
-                if not reason.endswith(self.ADVISORY_SUFFIXES)
-                and reason != "paused"]
 
     def queue_stopped(self, name: str = QUEUE) -> bool | None:
         """
@@ -538,22 +569,73 @@ def state_reasons(cups, queue: str = QUEUE):
         return None
 
 
-def blocking_of(reasons, cups, queue: str = QUEUE) -> list[str]:
-    """
-    Why this queue cannot print, as IPP keywords; empty if it can.
+# Prose that means the printer is chatting, not failing. cupsd puts filter
+# output in printer-state-message on a perfectly healthy queue -- measured
+# mid-print: "DEBUG: cfFilterChain: universal (PID 21339) exited with no
+# errors." Matched with LC_ALL=C in force, so this is stable English.
+_CHATTER = ("debug:", "info:")
+_ADVISORY_PROSE = ("toner low", "toner is low", "supply low", "media low",
+                   "paper low", "ready to print")
 
-    `reasons` is what state_reasons() returned, None included. On None --
-    a Cups predating state_reasons, a test double, an older install -- this
-    falls back to reported_fault(), deliberately the BROADER check: its
-    failure mode is telling an operator to destroy a pair that was fine,
-    where the narrow one's is telling them a pair printed when the tray was
-    empty. Only the second leaves someone relying on a pad they do not have.
+
+def blocking_in(prose: str, reasons) -> list[str]:
     """
-    if reasons is None:
-        return ["print-error"] if reported_fault(cups, queue) else []
-    return [reason for reason in reasons
-            if not reason.endswith(Cups.ADVISORY_SUFFIXES)
-            and reason != "paused"]
+    Why this queue cannot print; empty if nothing says it cannot.
+
+    The PROSE decides. `reasons` -- whatever state_reasons() returned, None
+    included -- can only excuse it, never create it. Both are passed in
+    rather than fetched, because each is an lpstat subprocess bounded by
+    Cups.TIMEOUT and the caller must be able to ask for each at most once. See Cups.ADVISORY_STEMS
+    for why that asymmetry is not squeamishness: the usb backend this unit
+    runs reports no reasons at all, and the ones other backends do report
+    are sticky and outlive the job that caused them.
+
+    So the failure mode of a printer nobody can classify is "the operator
+    is told to destroy a pair that was probably fine", not "the operator is
+    told a pair printed when the tray was empty". Only the second leaves
+    someone relying on key material they do not have.
+    """
+    prose = (prose or "").strip()
+    if not prose:
+        return []
+    lowered = prose.lower()
+    if lowered.startswith(_CHATTER):
+        return []
+    if any(phrase in lowered for phrase in _ADVISORY_PROSE):
+        return []
+    # An excuse needs reasons that are ALL advisory. Silence excuses
+    # nothing: on the usb backend silence is the normal state.
+    if reasons:
+        stems = {Cups.reason_stem(reason) for reason in reasons}
+        if stems and stems <= set(Cups.ADVISORY_STEMS):
+            return []
+        blocking = [r for r in reasons
+                    if Cups.reason_stem(r) not in Cups.ADVISORY_STEMS]
+        if blocking:
+            return blocking
+    return ["print-error"]
+
+
+def fault_text(cups, queue: str = QUEUE) -> str:
+    """
+    Why this printer did not print, in its own words, or "" if it did.
+
+    THE decision, and the only one either caller should make. The panel and
+    the unattended path had a fault helper each: after they were merged the
+    helper was shared but the DECISION was not, so the panel excused a
+    laser's standing "Toner low." while the headless run aborted a pair on
+    it -- and on an SNMP printer with an empty tray they swapped sides.
+    Two answers to the one question either of them asks.
+
+    Costs up to two lpstat subprocesses, and only reaches the second when
+    the first says something; callers that need the parts separately (the
+    panel, which is also asking whether the queue is stopped) compose
+    reported_fault, state_reasons and blocking_in themselves.
+    """
+    prose = reported_fault(cups, queue)
+    if not prose.strip():
+        return ""
+    return prose if blocking_in(prose, state_reasons(cups, queue)) else ""
 
 
 def stopped_in(reasons, cups, queue: str = QUEUE) -> bool:

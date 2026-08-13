@@ -366,7 +366,11 @@ def _first(cups):
 # so a change to what counts as "cannot tell" had to land in both places or
 # the panel and the headless run would disagree about the only question
 # either of them asks.
-_fault = printer.reported_fault
+# The shared DECISION, not just a shared helper -- see
+# printer.fault_text. Deciding on raw printer-state-message here
+# while the panel weighed the IPP reasons meant the two modes
+# disagreed about the same printer in both directions.
+_fault = printer.fault_text
 
 
 MANUAL_PAGES = 28          # the rendered A5 manual, for the paper estimate
