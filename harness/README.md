@@ -149,9 +149,12 @@ quietly proving nothing.
 Leaving the namespace is done by unmounting, not by `setns` back to where
 we came from: the kernel refuses `setns(CLONE_NEWNS)` once the process has
 threads (`mntns_install` wants `fs->users == 1`, and pthreads share `fs`),
-and lgpio's alert thread is started by the first panel and never stops.
-Measured: `[Errno 22] setns back: Invalid argument`, in the teardown of
-the first button test.
+and lgpio's alert thread starts at `import lgpio` — `_notify_thread =
+_callback_thread()` is module level and its constructor calls `start()` —
+and never stops. Not the first panel: `diagnostics.py` imports lgpio for
+a version string on the status sheet, so the thread is already running by
+the end of the CUPS tests. Measured: `[Errno 22] setns back: Invalid
+argument`, in the teardown of the first button test.
 
 Runs in CI as the `hardware` job.
 

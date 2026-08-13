@@ -67,9 +67,19 @@ came from, which would be the obvious way to do this -- one `setns` and
 the whole borrowed view drops at once, with no way to half-succeed. The
 kernel will not have it: `mntns_install()` requires `fs->users == 1` and
 pthreads share `fs`, so a process with a single thread anywhere in it
-cannot re-enter a mount namespace. lgpio starts an alert thread the first
-time a panel is built and never stops it. Measured, in the teardown of
-the first button test:
+cannot re-enter a mount namespace. lgpio has one from the moment it is
+imported, and never stops it: `_notify_thread = _callback_thread()` is
+module level (lgpio.py:562) and that constructor ends in `self.start()`.
+Measured in a fresh interpreter, with no panel and no gpiochip anywhere:
+
+    threads before import: ['MainThread']
+    threads after  import: ['MainThread', 'Thread-1']
+
+Which is earlier than "the first panel" would suggest. diagnostics.py
+asks `_module_version("lgpio")` for a line on the status sheet, and the
+unattended sequence prints that sheet, so the thread is running by the
+end of the CUPS tests -- before anything here has built a panel at all.
+Measured, in the teardown of the first button test:
 
     OSError: [Errno 22] setns back: Invalid argument
 

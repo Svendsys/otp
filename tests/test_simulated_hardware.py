@@ -861,7 +861,7 @@ class TestTheRealButtonPath:
         return time.monotonic() - started
 
     @pytest.fixture
-    def buttons(self, identity, tmp_path, monkeypatch):
+    def buttons(self, identity):
         """
         The shipped GpioButtons, bound to the chip gpio-sim made.
 
@@ -870,24 +870,35 @@ class TestTheRealButtonPath:
         factory at all. With a board identity it does, so the same
         question is now an assertion: a panel wired to some other
         controller must fail loudly rather than quietly prove nothing.
+
+        There is no chdir here any more, and no way to put one back that
+        would do anything. lgpio opens ONE FIFO, `.lgd-nfy0`, and it does
+        it in `_callback_thread.__init__` (lgpio.py:504) -- which runs at
+        `import lgpio`, in whatever directory the interpreter is in at
+        the time. Not two, not on the first callback: nothing else in
+        lgpio calls notify_open at all. By the time this fixture runs the
+        import has long since happened, from diagnostics.py's version
+        string during the CUPS tests, and the importorskip above would
+        beat any chdir to it regardless. So the FIFO really is left in
+        the repository root after a harness run -- measured, from a clean
+        checkout on a kernel with no gpio-sim, where this fixture never
+        even executes. `git status` does not show it because it is a
+        FIFO rather than a regular file, which is why it went unnoticed.
+        A genuinely read-only checkout therefore breaks at the import,
+        not at the panel, and nothing this fixture does can change that.
         """
         pytest.importorskip("lgpio")
         from otpunit.hw import buttons as buttons_mod
 
-        # lgpio's alert machinery opens FIFOs named .lgd-nfy<n> in the
-        # process's WORKING directory -- measured: two appear on the first
-        # callback and they outlive notify_close. So a panel built from a
-        # read-only checkout dies inside gpiozero's callback setup, for a
-        # reason nothing in the traceback would mention. Somewhere
-        # writable and disposable, rather than the repository.
-        monkeypatch.chdir(tmp_path)
-
         # Nothing may be armed before this panel arms anything. lgpio's
         # notification thread is a process-wide singleton whose callback
-        # list only grows -- measured at 5, then 8, then 11 across three
-        # panels that registered three each. A leftover callback belongs
-        # to a closed factory, and the next edge matching it kills the
-        # thread, and with it every button in the process.
+        # list only grows -- measured at 5, then 8, then 11 as successive
+        # panels were built, three more each time and never fewer. (Three
+        # panels registering three each would be nine, so 5 was not the
+        # first panel's; what was observed is the growth.) A leftover
+        # callback belongs to a closed factory, and the next edge
+        # matching it kills the thread, and with it every button in the
+        # process.
         armed = pirig.edge_callbacks()
         assert armed == 0, (
             f"{armed} edge callbacks are still armed from an earlier "
