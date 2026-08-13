@@ -176,9 +176,11 @@ class PiIdentity:
     A mount namespace in which this process, alone, is a Pi Zero 2 W.
 
     Entering unshares the mount namespace, makes it private so nothing
-    escapes, and binds the forged files over the real ones. Leaving does
-    not unmount anything: it `setns`es back to the namespace we came from,
-    which drops the whole forged view in one step and cannot half-succeed.
+    escapes, and binds the forged files over the real ones. Leaving
+    unmounts each of them by hand and STAYS in the namespace -- see the
+    teardown contract at the top of this file for why setns back is not
+    available once lgpio has a thread running, and
+    test_teardown_leaves_nothing_mounted for the part that is checked.
     """
 
     def __init__(self, revision: int = REVISION):
