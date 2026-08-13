@@ -474,6 +474,13 @@ DROPIN
 # read by nothing, and the unit comes up on a writable root -- which tier 3
 # now fails on. overlayroot's failure mode is a kernel panic on a device with
 # no console.
+#
+# /etc/fstab is deliberately not touched. overlayroot rewrites it, which is
+# most of what its init-bottom script is doing by the time it panics; this
+# mechanism leaves the root entry alone and lets systemd-remount-fs remount
+# whatever is at / with the options fstab gives for /. That is untested here
+# and it is the first thing to look at if a tier-3 console ever shows
+# systemd-remount-fs failing.
 CMDLINE_TXT="$BOOT_DIR/cmdline.txt"
 if [ ! -f "$CMDLINE_TXT" ]; then
     # The overlay is configured through the Raspberry Pi boot firmware, so
