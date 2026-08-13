@@ -517,32 +517,54 @@ def reported_fault(cups, queue: str = QUEUE) -> str:
         return ""
 
 
-def blocking_reasons(cups, queue: str = QUEUE) -> list[str]:
+def state_reasons(cups, queue: str = QUEUE):
     """
-    Why this queue cannot print, as IPP keywords; empty if it can.
+    The queue's IPP state reasons, or None if it could not be asked.
 
-    Falls back to reported_fault() for a Cups that predates state_reasons --
-    a test double, or an older install. That fallback is deliberately the
-    BROADER check: its failure mode is telling an operator to destroy a pair
-    that was fine, where the narrow one's is telling them a pair printed
-    when the tray was empty. Only the second leaves someone relying on a pad
-    they do not have.
+    Split from the two questions asked OF it -- "can this queue print" and
+    "has cupsd stopped it" -- because each is an lpstat subprocess bounded
+    by Cups.TIMEOUT, and the caller usually wants both answers about the
+    same moment. Asking twice put three blocking subprocesses on a single
+    OK press.
+
+    None means "could not tell" and must not be read as "nothing wrong".
     """
-    query = getattr(cups, "blocking_reasons", None)
+    query = getattr(cups, "state_reasons", None)
     if query is None:
-        return ["print-error"] if reported_fault(cups, queue) else []
+        return None
     try:
         return query(queue)
     except Exception:                            # noqa: BLE001
-        return []
+        return None
 
 
-def queue_stopped(cups, queue: str = QUEUE) -> bool:
-    """Whether cupsd has disabled the queue. False when it cannot be asked."""
-    query = getattr(cups, "queue_stopped", None)
-    if query is None:
+def blocking_of(reasons, cups, queue: str = QUEUE) -> list[str]:
+    """
+    Why this queue cannot print, as IPP keywords; empty if it can.
+
+    `reasons` is what state_reasons() returned, None included. On None --
+    a Cups predating state_reasons, a test double, an older install -- this
+    falls back to reported_fault(), deliberately the BROADER check: its
+    failure mode is telling an operator to destroy a pair that was fine,
+    where the narrow one's is telling them a pair printed when the tray was
+    empty. Only the second leaves someone relying on a pad they do not have.
+    """
+    if reasons is None:
+        return ["print-error"] if reported_fault(cups, queue) else []
+    return [reason for reason in reasons
+            if not reason.endswith(Cups.ADVISORY_SUFFIXES)
+            and reason != "paused"]
+
+
+def stopped_in(reasons, cups, queue: str = QUEUE) -> bool:
+    """
+    Whether cupsd has disabled the queue, given its state reasons.
+
+    "paused" is the IPP keyword and is not translated. The UI used to
+    decide this by looking for the substring "disabled" in lpstat's header,
+    which is _cupsLangPrintf output and therefore English only; that
+    fallback survives here for a Cups that cannot report reasons at all.
+    """
+    if reasons is None:
         return "disabled" in reported_fault(cups, queue).lower()
-    try:
-        return bool(query(queue))
-    except Exception:                            # noqa: BLE001
-        return False
+    return "paused" in reasons

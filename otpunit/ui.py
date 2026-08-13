@@ -25,6 +25,11 @@ VERSION = "1.0"
 # and the screens underneath it may not be reachable in any button sequence.
 HOME = object()
 
+# "no reasons supplied", distinct from None -- which state_reasons() uses
+# for "asked, could not tell" and which callers must not conflate with
+# "nothing wrong".
+_UNASKED = object()
+
 
 def wrap(text: str, width: int = 21, lines: int = 4) -> list[str]:
     """
@@ -731,9 +736,26 @@ class RunJob(Screen):
         """What the printer says is wrong, or "" if it says nothing."""
         return printer_mod.reported_fault(app.cups, app.queue)
 
-    def _blocking(self, app) -> list[str]:
+    def _reasons(self, app) -> list[str] | None:
+        """
+        The queue's IPP state reasons, asked for ONCE per _advance.
+
+        Every one of these is an lpstat subprocess bounded by
+        Cups.TIMEOUT = 120s, and _advance already spends one on active_jobs
+        before it gets here. Asking twice -- which the stopped-queue path
+        did, once to decide it was stopped and again to say why -- put the
+        worst case at three subprocesses, so a wedged-but-answering cupsd
+        could freeze the panel for six minutes on a single OK press while
+        the key sits resident. Measured: 3 calls on the stopped path, 2 on
+        every other. One call, two derivations.
+        """
+        return printer_mod.state_reasons(app.cups, app.queue)
+
+    def _blocking(self, app, reasons=_UNASKED) -> list[str]:
         """The IPP reasons this queue cannot print, as keywords."""
-        return printer_mod.blocking_reasons(app.cups, app.queue)
+        if reasons is _UNASKED:
+            reasons = self._reasons(app)
+        return printer_mod.blocking_of(reasons, app.cups, app.queue)
 
     def _resume(self, app) -> None:
         """Ask cupsd to re-enable the queue; never raise into the loop."""
@@ -758,9 +780,10 @@ class RunJob(Screen):
         a printer name and a truncated date. The Alerts line for the same
         queue read "media-empty-error paused".
         """
-        if not printer_mod.queue_stopped(app.cups, app.queue):
+        reasons = self._reasons(app)
+        if not printer_mod.stopped_in(reasons, app.cups, app.queue):
             return ""
-        return _reasons_as_text(self._blocking(app)) or "QUEUE STOPPED"
+        return _reasons_as_text(self._blocking(app, reasons)) or "QUEUE STOPPED"
 
     def _proceed(self, app):
         """Take the transition, having established the queue is clear."""

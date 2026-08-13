@@ -690,6 +690,49 @@ class TestADrainedQueueIsNotProofOfPrinting:
         assert screen.stage == "swap", \
             "the queue recovered and the panel stayed on PRINTER STOPPED"
 
+    def test_one_ok_press_costs_at_most_two_cups_subprocesses(self):
+        """
+        Every CUPS query is a subprocess bounded by Cups.TIMEOUT = 120s, and
+        the panel is frozen with the key resident for the whole of it. The
+        count is therefore a safety property, not a performance one.
+
+        Two is the budget: one active_jobs to decide busy/idle, one
+        state_reasons to decide what the printer says about it. The
+        stopped-queue path briefly cost THREE -- asking for the reasons
+        once to decide it was stopped and again to say why -- which put a
+        wedged-but-answering cupsd at six minutes of dead panel per press.
+        """
+        for label, busy, reasons in [
+            ("busy, healthy", True, []),
+            ("busy, stopped", True, ["media-empty-error", "paused"]),
+            ("idle, healthy", False, []),
+            ("idle, real fault", False, ["media-empty-error"]),
+        ]:
+            calls = []
+
+            class Counting(RecordingCups):
+                def active_jobs(self, name="OTP"):
+                    calls.append("active_jobs")
+                    return 1 if busy else 0
+
+                def printer_fault(self, name="OTP"):
+                    calls.append("printer_fault")
+                    return None
+
+                def state_reasons(self, name="OTP"):
+                    calls.append("state_reasons")
+                    return list(reasons)
+
+            app, screen = self._screen(Counting())
+            screen.press(app, Press.OK)          # confirm -> copy A
+            calls.clear()
+            screen.press(app, Press.OK)          # the press under test
+            assert len(calls) <= 2, (
+                f"{label}: one OK press ran {len(calls)} CUPS subprocesses "
+                f"({calls}); at Cups.TIMEOUT={printer.Cups.TIMEOUT}s each "
+                f"that is up to {len(calls) * printer.Cups.TIMEOUT}s of "
+                f"frozen panel holding key material")
+
     def test_an_advisory_reason_does_not_destroy_a_good_pair(self):
         """
         The severity suffix is the whole point. A laser reporting
