@@ -102,21 +102,56 @@ On a GitHub runner, `gpio-sim`, `i2c-stub` and `vkms` are not in the base
 kernel — they need `linux-modules-extra-$(uname -r)`. Measured before that
 was installed: `1 of 4 up`, with only `uinput` present.
 
-### The gpiozero limitation, stated plainly
+### Making gpiozero talk to gpio-sim
 
-`gpio-sim` gives you a real gpiochip. Getting **gpiozero** to talk to it is
-a separate problem: gpiozero picks its chip from Raspberry Pi board
-detection — `/proc/device-tree/model`, or a `Revision` line in
-`/proc/cpuinfo` — and a machine that is not a Pi has neither. Where it does
-construct, it opens `gpiochip0`, which on an ordinary host is some real
-controller rather than the one `gpio-sim` just made.
+`gpio-sim` gives you a real gpiochip. Getting **gpiozero** to use it was a
+separate problem, and for a long time it was the reason the entire input
+surface of this device — three buttons and a long press — had never
+executed against anything but a fake. gpiozero decides it is on a Pi by
+finding a board revision, and a machine that is not a Pi has none; without
+one it declines to build *any* local pin factory:
 
-So the button tests check which chip the process actually opened, and skip
-with that reason if it is not the simulated one. Asserting against a chip
-the driver never opened would fail for a reason unrelated to the code under
-test; quietly passing would be worse. Closing this properly means faking
-the board identity in a mount namespace, which is a bigger piece of work
-than it looks and is not done yet.
+    PinFactoryFallback: Falling back from lgpio: unable to locate Pi
+    revision in /proc/device-tree or /proc/cpuinfo
+    gpiozero could not open a gpiochip here: Unable to load any default
+    pin factory!
+
+`tests/pirig.py` lends the process a revision — `0x902120`, a Pi Zero 2 W
+rev 1.0, the board this unit ships on — inside a mount namespace of its
+own, and the button tests then assert the binding instead of skipping on
+it. Three measurements shaped how:
+
+- **The order gpiozero reads in.** It takes
+  `/proc/device-tree/system/linux,revision` first and falls back to the
+  `Revision` line in `/proc/cpuinfo` only when that is absent.
+  `/proc/device-tree/model` is never consulted for this, and could not be
+  conjured anyway: procfs refuses to create entries (`mkdir
+  /proc/device-tree` → "No such file or directory"). Bind-mounting over a
+  procfs file that *already* exists works, which is why `/proc/cpuinfo` is
+  the one that can be forged.
+- **The namespace has to be made private first.** A new mount namespace
+  inherits the propagation of the one it was copied from, and on a systemd
+  host — every GitHub runner — `/` is shared, so a bind mount inside
+  propagates straight back out. Measured, without and with
+  `MS_REC|MS_PRIVATE`: the outer namespace saw `Revision: 902120`, then
+  saw nothing.
+- **The revision decides the pin header.** Get it wrong and you get a Pi,
+  but the wrong one: `0x2` decodes to an original model B, whose headers
+  are P1/P2/P3, and `Button(5)` dies with `PinInvalidPin: GPIO5 is not a
+  valid pin name` — a message with no visible connection to the mistake.
+
+`lgpio` addresses chips by *number*, so where `gpio-sim` does not land on
+`gpiochip0` the factory is built against the recorded chip explicitly. The
+fixture then asserts which `/dev/gpiochipN` the process actually has open,
+so a panel talking to some other controller fails loudly rather than
+quietly proving nothing.
+
+Leaving the namespace is done by unmounting, not by `setns` back to where
+we came from: the kernel refuses `setns(CLONE_NEWNS)` once the process has
+threads (`mntns_install` wants `fs->users == 1`, and pthreads share `fs`),
+and lgpio's alert thread is started by the first panel and never stops.
+Measured: `[Errno 22] setns back: Invalid argument`, in the teardown of
+the first button test.
 
 Runs in CI as the `hardware` job.
 

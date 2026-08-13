@@ -19,15 +19,22 @@ So these tests substitute nothing they can avoid:
   * a real DRM connector from `vkms` and a real keyboard from `uinput`,
     so the interface probes read files a kernel wrote.
 
-None of that needs a Raspberry Pi. Anything not available is skipped with
-a reason rather than failed -- a kernel without `vkms` should still get the
-other four.
+None of that needs a Raspberry Pi. One thing does need to look like one:
+gpiozero will not open any gpiochip on a machine with no board revision,
+so the panel is driven inside a mount namespace where /proc/cpuinfo says
+Pi Zero 2 W. That forgery is the only substitution here, it lasts as long
+as the test, and pirig.py documents every part of it -- including how it
+is kept off the host.
+
+Anything not available is skipped with a reason rather than failed -- a
+kernel without `vkms` should still get the other four.
 
     sudo ./harness/kernel-sim.sh up
     sudo pytest tests/test_simulated_hardware.py -v
 """
 from __future__ import annotations
 
+import errno
 import os
 import re
 import subprocess
@@ -42,6 +49,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 
 import cupsrig                                   # noqa: E402
+import pirig                                     # noqa: E402
 from otpunit import config, diagnostics, hmi, printer, unattended  # noqa: E402
 
 SIM_STATE = Path("/run/otp-kernel-sim")
@@ -326,6 +334,126 @@ class TestTheUnattendedSequenceAgainstRealCups:
 # --- the panel, against the kernel rather than a double ------------------
 
 
+@pytest.fixture
+def identity():
+    """
+    This process, and only this process, as a Pi Zero 2 W.
+
+    Both classes below stand on it: with no board revision anywhere,
+    gpiozero declines to build a local pin factory at all, so the real
+    gpiozero -> lgpio -> kernel path could not even be entered. pirig.py
+    documents what is forged, in what order gpiozero reads it, and why it
+    happens inside a mount namespace.
+    """
+    pytest.importorskip("gpiozero")
+    why = pirig.available()
+    if why:
+        pytest.skip(why)
+
+    forged = pirig.PiIdentity()
+    try:
+        forged.__enter__()
+    except OSError as exc:
+        # Only "this host will not let us" is a skip. A container can
+        # hand out root and still refuse CLONE_NEWNS, and that is worth
+        # naming rather than failing over -- but every other errno means
+        # the forgery went wrong, and a skip would bury it. Measured: a
+        # teardown that leaves the previous bind in place makes the next
+        # one fail ENOENT, which arrived here as a confident "no mount
+        # namespaces on this host".
+        if exc.errno not in (errno.EPERM, errno.EACCES, errno.ENOSYS):
+            raise
+        pytest.skip(f"this host would not give us a mount namespace: {exc}")
+    # Entered by hand rather than with a `with`, because only the setup
+    # may turn an OSError into a skip. Wrapping the yield too would catch
+    # one raised by the test body and skip on a genuine failure.
+    try:
+        yield forged
+    finally:
+        forged.__exit__(None, None, None)
+
+
+def cpuinfo_revision():
+    """Whatever Revision /proc/cpuinfo is currently offering, or None."""
+    for line in Path("/proc/cpuinfo").read_text().splitlines():
+        if line.startswith("Revision"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+class TestTheFakePiIdentity:
+    """
+    The forgery itself, which needs root but no gpiochip.
+
+    Two of the ways it can go wrong are silent. A revision that decodes to
+    some other Pi puts the unit's GPIOs on a header that board does not
+    have: measured, 0x2 gets `PinInvalidPin: GPIO5 is not a valid pin
+    name`, which reads like a bug in this repository and is really three
+    digits in a fake file. And a bind mount that escapes the namespace
+    leaves the whole machine answering "Raspberry Pi" to every process
+    that asks, for as long as the box is up.
+    """
+
+    def test_gpiozero_reads_the_revision_we_planted(self, identity):
+        from gpiozero.pins.local import get_pi_revision
+
+        # The one function this whole exercise turns on. Off a Pi and
+        # outside the namespace it raises PinUnknownPi instead.
+        assert get_pi_revision() == pirig.REVISION
+
+    def test_the_forged_board_carries_the_pins_the_unit_uses(self, identity):
+        from gpiozero.pins.pi import PiBoardInfo
+
+        from otpunit.hw.buttons import PIN_DOWN, PIN_OK, PIN_UP
+
+        board = PiBoardInfo.from_revision(pirig.REVISION)
+        assert board.model == pirig.MODEL, board
+        for pin in (PIN_UP, PIN_DOWN, PIN_OK):
+            headers = sorted(header.name
+                             for header, _ in board.find_pin(f"GPIO{pin}"))
+            assert headers == ["J8"], (
+                f"the forged board puts GPIO{pin} on {headers or 'no header'}"
+                f"; the unit's three switches are wired to J8")
+
+    def test_the_forgery_does_not_reach_the_host(self, identity):
+        assert identity.host_sees_a_pi() is False, (
+            "the bind mount propagated out of the namespace: every process "
+            "on this machine now reads a Pi revision from /proc/cpuinfo")
+
+    def test_teardown_leaves_nothing_mounted(self):
+        """
+        The half of the teardown contract that has to hold every time.
+
+        Leaving does not return to the namespace we came from: the kernel
+        refuses that once the process has threads, and lgpio gives it one
+        permanently. pirig.py states the whole contract and the
+        measurement behind it. What that leaves behind is a private copy
+        of the host's mount table, so "the forgery is gone" has to mean
+        the mount table is exactly what it was -- not merely that
+        /proc/cpuinfo reads plausibly again.
+
+        The rest of the harness runs in this same process. A bind mount
+        surviving teardown would have diagnostics.py reporting a Pi this
+        machine is not, in tests with no idea any of this ever happened.
+        """
+        pytest.importorskip("gpiozero")
+        why = pirig.available()
+        if why:
+            pytest.skip(why)
+
+        before_mounts = pirig.mount_points()
+        before_revision = cpuinfo_revision()
+
+        with pirig.PiIdentity():
+            assert str(pirig.CPUINFO_PATH) in pirig.mount_points(), (
+                "nothing got mounted, so this is about to prove that "
+                "unmounting nothing leaves nothing behind")
+            assert cpuinfo_revision() == f"{pirig.REVISION:06x}"
+
+        assert pirig.mount_points() == before_mounts
+        assert cpuinfo_revision() == before_revision
+
+
 @needs_sim("gpio-chip", "gpio-sim")
 class TestTheRealButtonPath:
     """
@@ -336,60 +464,124 @@ class TestTheRealButtonPath:
     that resolves the wrong way can purge the spool and destroy a pair.
     """
 
+    def line(self, pin):
+        return Path(sim("gpio-control")) / f"sim_gpio{pin}" / "pull"
+
     def press(self, pin, seconds=0.05):
-        control = Path(sim("gpio-control"))
-        pull = control / f"sim_gpio{pin}" / "pull"
+        pull = self.line(pin)
         pull.write_text("pull-down")             # button to ground
         time.sleep(seconds)
         pull.write_text("pull-up")               # released
         time.sleep(0.1)
 
+    def glitch(self, pin):
+        """
+        Bounce the line as briefly as this machine can, and time it.
+
+        The duration is returned rather than assumed: what makes a glitch
+        a glitch is being shorter than BOUNCE_SECONDS, and a loaded box
+        that took longer than that has not tested the debounce -- it has
+        delivered a short press, which is a different thing entirely.
+        """
+        pull = self.line(pin)
+        started = time.monotonic()
+        pull.write_text("pull-down")
+        pull.write_text("pull-up")
+        return time.monotonic() - started
+
     @pytest.fixture
-    def buttons(self):
+    def buttons(self, identity, tmp_path, monkeypatch):
         """
-        GpioButtons, but only if it really bound to the simulated chip.
+        The shipped GpioButtons, bound to the chip gpio-sim made.
 
-        gpiozero picks its gpiochip from Pi board detection -- it reads
-        /proc/device-tree/model or a Revision line in /proc/cpuinfo -- and
-        a machine that is not a Pi has neither. Even where it constructs,
-        it opens gpiochip0, which on a normal host is some real controller
-        rather than the one gpio-sim just created.
-
-        So this checks which chip the process actually opened and skips
-        with that reason if it is not ours. Asserting against a chip the
-        driver never opened would fail for a reason that has nothing to do
-        with the code under test; quietly passing would be worse.
+        This used to ask which chip the process had opened and skip when
+        it was not ours, because off a Pi gpiozero would not construct a
+        factory at all. With a board identity it does, so the same
+        question is now an assertion: a panel wired to some other
+        controller must fail loudly rather than quietly prove nothing.
         """
+        pytest.importorskip("lgpio")
         from otpunit.hw import buttons as buttons_mod
 
+        # lgpio's alert machinery opens FIFOs named .lgd-nfy<n> in the
+        # process's WORKING directory -- measured: two appear on the first
+        # callback and they outlive notify_close. So a panel built from a
+        # read-only checkout dies inside gpiozero's callback setup, for a
+        # reason nothing in the traceback would mention. Somewhere
+        # writable and disposable, rather than the repository.
+        monkeypatch.chdir(tmp_path)
+
+        chip = int(sim("gpio-chip"))
+        pirig.bind_gpiozero_to(chip)
         try:
             panel = buttons_mod.GpioButtons()
-        except Exception as exc:                 # noqa: BLE001
-            pytest.skip(f"gpiozero could not open a gpiochip here: {exc}")
+        except BaseException:
+            pirig.release_gpiozero()
+            raise
 
-        wanted = f"/dev/gpiochip{sim('gpio-chip')}"
-        opened = set()
-        for fd in Path("/proc/self/fd").iterdir():
-            try:
-                target = str(fd.resolve())
-            except OSError:
-                continue
-            if target.startswith("/dev/gpiochip"):
-                opened.add(target)
-        if wanted not in opened:
+        wanted = {f"/dev/gpiochip{chip}"}
+        opened = pirig.open_gpiochips()
+        try:
+            assert opened == wanted, (
+                f"the panel is talking to {opened or 'no gpiochip at all'} "
+                f"rather than {wanted}, the chip gpio-sim just made; every "
+                f"assertion below would be about the wrong hardware")
+            yield panel
+        finally:
             panel.close()
+            pirig.release_gpiozero()
+
+    def test_gpiozero_finds_the_simulated_chip_unaided(self, identity):
+        """
+        The identity alone, with nobody naming a factory or a chip.
+
+        That is how the shipped code runs: `GpioButtons` asks gpiozero for
+        a `Button` and takes whatever pin factory it settled on. Worth
+        knowing that a board revision is the only thing that path was
+        missing, and worth failing if gpiozero's own selection stops
+        reaching lgpio.
+        """
+        pytest.importorskip("lgpio")
+        from gpiozero import Device
+        from gpiozero.pins.lgpio import LGPIOFactory
+
+        chip = int(sim("gpio-chip"))
+        if chip != 0:
+            # Not a defect, and not something to assert around: lgpio
+            # addresses chips by NUMBER and gpio-sim takes whichever the
+            # kernel had free. The fixture below pins the factory for
+            # exactly this case; here there is nothing left to prove.
             pytest.skip(
-                f"gpiozero bound to {opened or 'no gpiochip'} rather than "
-                f"{wanted}; it selects the chip from Pi board detection, "
-                f"which cannot find gpio-sim. See harness/README.md.")
-        yield panel
-        panel.close()
+                f"gpio-sim landed at gpiochip{chip}, and for a Zero 2 W "
+                f"gpiozero's unaided default opens gpiochip0")
+
+        factory = Device._default_pin_factory()
+        try:
+            assert isinstance(factory, LGPIOFactory), (
+                f"gpiozero settled on {type(factory).__name__}; only the "
+                f"lgpio factory talks to a gpiochip")
+            assert factory.chip == chip
+        finally:
+            factory.close()
 
     def test_a_tap_on_up_arrives_as_up(self, buttons):
         from otpunit.hw.buttons import PIN_UP, Press
 
         self.press(PIN_UP)
         assert buttons.wait(timeout=2) is Press.UP
+
+    def test_a_tap_on_down_arrives_as_down(self, buttons):
+        """
+        The third switch, on its own line.
+
+        Cheap, and it is the one that would catch a pin number swapped in
+        the constructor -- UP and OK are distinguishable by their events,
+        DOWN only by which line was grounded.
+        """
+        from otpunit.hw.buttons import PIN_DOWN, Press
+
+        self.press(PIN_DOWN)
+        assert buttons.wait(timeout=2) is Press.DOWN
 
     def test_a_tap_on_ok_arrives_as_ok_not_back(self, buttons):
         from otpunit.hw.buttons import PIN_OK, Press
@@ -408,6 +600,34 @@ class TestTheRealButtonPath:
         self.press(PIN_OK, seconds=HOLD_SECONDS + 0.3)
         assert buttons.wait(timeout=3) is Press.BACK
         assert buttons.wait(timeout=0.5) is None, "one press, two events"
+
+    def test_a_bounce_too_short_to_be_a_press_is_not_one(self, buttons):
+        """
+        BOUNCE_SECONDS exists because a switch closing is not one clean
+        edge. Nothing has ever checked that the number reaches the kernel
+        driver: gpiozero hands it to lgpio, and every other test in this
+        repository drives the panel from above that.
+
+        A stuck contact on OK is the expensive version of this -- a
+        phantom BACK while a job prints purges the spool.
+        """
+        from otpunit.hw.buttons import BOUNCE_SECONDS, PIN_UP
+
+        # Asserted, not skipped over. A window of zero is a defect in the
+        # panel, not a fact about this machine, and without this the test
+        # for it would quietly report "could not produce a short enough
+        # glitch" -- measured, with BOUNCE_SECONDS set to 0.
+        assert BOUNCE_SECONDS > 0, "the panel has no debounce window left"
+
+        measured = self.glitch(PIN_UP)
+        if measured >= BOUNCE_SECONDS:
+            pytest.skip(
+                f"this machine took {measured * 1000:.1f}ms to bounce the "
+                f"line, which is longer than the {BOUNCE_SECONDS * 1000:.0f}"
+                f"ms window -- that is a press, not a glitch")
+        assert buttons.wait(timeout=0.5) is None, (
+            f"a {measured * 1000:.1f}ms glitch arrived as a press through a "
+            f"{BOUNCE_SECONDS * 1000:.0f}ms debounce window")
 
 
 @needs_sim("i2c-bus", "i2c-stub")

@@ -185,12 +185,40 @@ jobs:
           # worse than a red one; that is the premise of this whole PR.
           PASSED=$(grep -oE '[0-9]+ passed' /tmp/harness.log | tail -1 | cut -d' ' -f1)
           echo "harness tests passed: ${PASSED:-0}"
-          if [ "${PASSED:-0}" -lt 12 ]; then
-            echo "expected at least 12 passing harness tests (the CUPS rig" >&2
+          # 24, up from 12. Measured on the last run before the board
+          # identity was forged: 17 passed, the three button tests among
+          # the skips. Ten more can run now, so 27 is the expectation and
+          # 24 leaves room for the ones that may skip for a stated reason
+          # -- a machine too slow to bounce a line inside the debounce
+          # window, a gpio-sim chip that did not land on the number
+          # gpiozero's default opens, luma refusing the i2c stub.
+          if [ "${PASSED:-0}" -lt 24 ]; then
+            echo "expected at least 24 passing harness tests (the CUPS rig" >&2
             echo "alone is 11); got ${PASSED:-0}. Something skipped silently." >&2
             grep -E "^SKIPPED" /tmp/harness.log >&2 || true
             exit 1
           fi
+          # The panel by name, not only by count. Every run this repository
+          # has ever done skipped these -- gpiozero will not build a pin
+          # factory on a machine with no Pi revision -- and the CUPS half is
+          # big enough to carry the total back over any floor while the
+          # entire input surface of the device quietly stops being tested.
+          # If a future runner kernel loses gpio-sim this goes red on
+          # purpose; the reason will be in the lines it prints.
+          for named in test_a_tap_on_up_arrives_as_up \
+                       test_a_tap_on_down_arrives_as_down \
+                       test_a_tap_on_ok_arrives_as_ok_not_back \
+                       test_a_hold_on_ok_arrives_as_back_exactly_once; do
+            if ! grep -q "TestTheRealButtonPath::${named} PASSED" \
+                 /tmp/harness.log; then
+              echo "${named} did not pass. A real press on a simulated" >&2
+              echo "line must reach a GpioButtons callback here, or this" >&2
+              echo "job is not testing the panel at all." >&2
+              grep -E "TestTheRealButtonPath|^SKIPPED" /tmp/harness.log >&2 \
+                || true
+              exit 1
+            fi
+          done
 
   vm:
     # Tier 2: boot a real system, run device/install.sh on it, and check
