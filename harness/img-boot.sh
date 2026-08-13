@@ -473,8 +473,9 @@ per_boot_verdict() {
 # script BEFORE verdict.txt was written: no IMG-CHECK lines, no rc
 # report, no console tail, precisely in the no-evidence case. Found by
 # the review panel; the identical guard was already on the next line.
-LAST_TS=$(grep -oE '\[ *[0-9]+\.[0-9]+\]' "$CONSOLE_TXT" 2>/dev/null | tr -d '[] ' | sort -g | tail -1 || true)
-KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/null || true)
+    local LAST_TS KERNEL_ENTRIES
+    LAST_TS=$(grep -oE '\[ *[0-9]+\.[0-9]+\]' "$CONSOLE_TXT" 2>/dev/null | tr -d '[] ' | sort -g | tail -1 || true)
+    KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/null || true)
     printf 'qemu exit: %s\n' "$QEMU_RC"
     # How far it got and how many times the kernel STARTED. Entries > 1 is
     # a reboot loop stated as a number, instead of an inference from byte
@@ -582,7 +583,7 @@ GUEST_CHECKS_BOOT2="root-writes-discarded-by-the-power-cycle \
 settings-survive-the-power-cycle"
 
 guest_gate() {
-    local phase="$1" count counts passed total missing want
+    local phase="$1" count counts passed total missing want name
 
     # Exactly once, not at least once. A guest that reported twice is one
     # that rebooted underneath the harness, and "it reported" stays true of
