@@ -294,17 +294,35 @@ class PiIdentity:
         # process could not get rid of is not something to log and move
         # on from: everything after it would read a board revision it did
         # not ask for, and the failures would land far from the cause.
-        while self.forged:
-            _checked(_libc.umount(self.forged.pop().encode()), "umount")
-        if self._home is not None:
-            os.close(self._home)
-            self._home = None
-        for path in self._temporary:
-            try:
-                os.unlink(path)                  # gone from /tmp either way
-            except OSError:
-                pass
-        self._temporary.clear()
+        #
+        # It does get a try/FINALLY, which is a different thing. A umount
+        # that raised used to take the rest of this method with it: the
+        # namespace descriptor stayed open for the life of the process
+        # and every /tmp/otp-pirig-* file stayed on disk, on top of
+        # whatever was still mounted. One failure, three leaks.
+        try:
+            while self.forged:
+                # Read, umount, and only then discard. Popping first
+                # threw the path away before the call that needed it, so
+                # a failed umount left nothing to retry and nothing to
+                # name in the error.
+                _checked(_libc.umount(self.forged[-1].encode()), "umount")
+                self.forged.pop()
+        finally:
+            if self._home is not None:
+                os.close(self._home)
+                self._home = None
+            for path in self._temporary:
+                try:
+                    # Safe even where the bind is still up: the mount
+                    # holds the inode, so this removes the /tmp name and
+                    # nothing else, and the mount table -- which is what
+                    # test_teardown_leaves_nothing_mounted compares -- is
+                    # still the place a survivor shows up.
+                    os.unlink(path)
+                except OSError:
+                    pass
+            self._temporary.clear()
 
 
 def mount_points() -> tuple:
@@ -338,25 +356,6 @@ def open_gpiochips() -> set:
         if target.startswith("/dev/gpiochip"):
             found.add(target)
     return found
-
-
-def default_chip() -> int:
-    """
-    The chip number gpiozero's own factory selection would open here.
-
-    Observed rather than predicted from gpiozero's source, and safe to
-    observe: opening a gpiochip claims no lines, so this does not touch a
-    real controller's pins even where /dev/gpiochip0 is real hardware.
-    Requires a faked identity -- with no revision the factory refuses to
-    construct at all.
-    """
-    from gpiozero.pins.lgpio import LGPIOFactory
-
-    factory = LGPIOFactory()
-    try:
-        return factory.chip
-    finally:
-        factory.close()
 
 
 def bind_gpiozero_to(chip: int):

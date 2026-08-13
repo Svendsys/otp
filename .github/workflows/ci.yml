@@ -185,12 +185,12 @@ jobs:
           # worse than a red one; that is the premise of this whole PR.
           PASSED=$(grep -oE '[0-9]+ passed' /tmp/harness.log | tail -1 | cut -d' ' -f1)
           echo "harness tests passed: ${PASSED:-0}"
-          # 29, up from 12. Counted from `pytest -m hardware
+          # 30, up from 12. Counted from `pytest -m hardware
           # --collect-only` rather than from the tail of an old run,
           # because the previous arithmetic here was wrong in both
           # directions -- it said 32 collect when 34 did, and credited
           # TestTheFactoryTeardownBetweenPanels with 5 tests when it had
-          # 6. 35 collect today, and every one of them is expected to
+          # 6. 36 collect today, and every one of them is expected to
           # run on this job:
           #
           #   13  the CUPS half: TestTheRealPrintPath 8,
@@ -200,7 +200,9 @@ jobs:
           #       kernel simulator at all -- only gpiozero, which this
           #       job installs -- so it runs wherever this job runs;
           #    6  TestTheRealButtonPath, the panel itself;
-          #    4  TestTheFakePiIdentity, root and nsenter but no chip;
+          #    5  TestTheFakePiIdentity, root and nsenter but no chip
+          #       (four of them; the fifth is a pure decode of a
+          #       constant and needs neither);
           #    2  TestTheRealI2CPath;
           #    1  each for vkms, uinput, and the bash -n syntax check.
           #
@@ -214,9 +216,9 @@ jobs:
           # stub is not a seventh -- it can only happen on a runner that
           # HAS i2c-stub, so it replaces one of that pair.
           #
-          # 35 - 6 = 29. Anything below that is a skip nobody has named.
-          if [ "${PASSED:-0}" -lt 29 ]; then
-            echo "expected at least 29 passing harness tests (the CUPS rig" >&2
+          # 36 - 6 = 30. Anything below that is a skip nobody has named.
+          if [ "${PASSED:-0}" -lt 30 ]; then
+            echo "expected at least 30 passing harness tests (the CUPS rig" >&2
             echo "alone is 13); got ${PASSED:-0}. Something skipped silently." >&2
             grep -E "^SKIPPED" /tmp/harness.log >&2 || true
             exit 1

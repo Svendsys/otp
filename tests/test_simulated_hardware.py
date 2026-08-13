@@ -394,14 +394,43 @@ class TestTheFakePiIdentity:
     that asks, for as long as the box is up.
     """
 
-    def test_gpiozero_reads_the_revision_we_planted(self, identity):
-        from gpiozero.pins.local import get_pi_revision
+    def test_the_forged_cpuinfo_does_not_contradict_itself(self, identity):
+        """
+        Every field of the forgery, not only the one gpiozero reads.
 
-        # The one function this whole exercise turns on. Off a Pi and
-        # outside the namespace it raises PinUnknownPi instead.
-        assert get_pi_revision() == pirig.REVISION
+        This used to assert `get_pi_revision() == pirig.REVISION`, which
+        `PiIdentity.__enter__` has already asserted by the time the
+        fixture yields -- so the test could only ever ERROR in setup and
+        had no way to fail on its own name.
 
-    def test_the_forged_board_carries_the_pins_the_unit_uses(self, identity):
+        What nothing checked is the rest of the file. diagnostics.py
+        pulls Model and Serial out of /proc/cpuinfo for the status
+        sheet, and the comment above pirig.CPUINFO says those fields are
+        there so the fake cannot answer one question and contradict
+        itself on the next two. Changing REVISION without changing the
+        Model line is exactly how that would happen, and this is what
+        would notice.
+        """
+        from gpiozero.pins.pi import PiBoardInfo
+
+        planted = diagnostics._cpuinfo_field("Revision")
+        assert planted == f"{pirig.REVISION:06x}", (
+            f"the forged file says revision {planted}, not "
+            f"{pirig.REVISION:06x}")
+        assert (PiBoardInfo.from_revision(int(planted, 16)).model
+                == pirig.MODEL)
+        assert "Zero 2 W" in diagnostics._cpuinfo_field("Model"), (
+            f"the Model line says {diagnostics._cpuinfo_field('Model')!r} "
+            f"while the revision decodes to a {pirig.MODEL}; the status "
+            f"sheet and gpiozero would report different boards")
+        assert diagnostics._cpuinfo_field("Serial") == "00000000f1e2d3c4"
+
+    def test_the_forged_board_carries_the_pins_the_unit_uses(self):
+        # No identity fixture: PiBoardInfo.from_revision is a pure
+        # function of a constant, so the mount namespace it used to take
+        # made this test need root for nothing. The importorskip comes
+        # with it, since that was the fixture's too.
+        pytest.importorskip("gpiozero")
         from gpiozero.pins.pi import PiBoardInfo
 
         from otpunit.hw.buttons import PIN_DOWN, PIN_OK, PIN_UP
@@ -452,6 +481,58 @@ class TestTheFakePiIdentity:
 
         assert pirig.mount_points() == before_mounts
         assert cpuinfo_revision() == before_revision
+
+    def test_a_umount_that_fails_still_gives_back_the_fd_and_the_files(self):
+        """
+        One failure used to become three.
+
+        __exit__ deliberately does not swallow a umount error -- a forged
+        /proc/cpuinfo this process cannot get rid of has to be loud. But
+        the raise used to take the rest of the method with it: the
+        /proc/self/ns/mnt descriptor stayed open for the life of the
+        process and every /tmp/otp-pirig-* file stayed on disk, neither
+        of which the failed umount had anything to do with. The pop was
+        wrong the same way -- it discarded the path before the call that
+        needed it, so nothing could name what was still mounted or try
+        again.
+
+        An unmountable path is planted at the FRONT of the list, so the
+        real binds are taken down first and this test cannot leave a
+        forged /proc/cpuinfo behind for the rest of the run.
+        """
+        pytest.importorskip("gpiozero")
+        why = pirig.available()
+        if why:
+            pytest.skip(why)
+
+        before_mounts = pirig.mount_points()
+        forged = pirig.PiIdentity()
+        try:
+            forged.__enter__()
+        except OSError as exc:
+            if exc.errno not in (errno.EPERM, errno.EACCES, errno.ENOSYS):
+                raise
+            pytest.skip(f"this host would not give us a mount namespace: {exc}")
+
+        never_mounted = "/tmp/otp-pirig-was-never-a-mount-point"
+        forged.forged.insert(0, never_mounted)
+        temporary = list(forged._temporary)
+        assert temporary and all(os.path.exists(p) for p in temporary)
+
+        with pytest.raises(OSError):
+            forged.__exit__(None, None, None)
+
+        assert pirig.mount_points() == before_mounts, (
+            "the real binds did not come down, so this test has left the "
+            "process reading a forged /proc/cpuinfo")
+        assert forged._home is None, (
+            "the namespace descriptor is still open; _home is cleared "
+            "only after os.close() returns")
+        assert not any(os.path.exists(p) for p in temporary), (
+            f"{[p for p in temporary if os.path.exists(p)]} left in /tmp")
+        assert forged.forged == [never_mounted], (
+            "the path that would not unmount is not in the list any "
+            "more, so nothing can retry it or say what is still mounted")
 
 
 class TestTheFactoryTeardownBetweenPanels:
@@ -633,8 +714,11 @@ class TestTheFactoryTeardownBetweenPanels:
         with pytest.raises(TypeError):
             pirig.release_gpiozero()
         assert LocalPiFactory.pins == {}
-        assert Device.pin_factory is None
-        assert pirig.stale_pins() == []
+        # Nothing about Device.pin_factory or stale_pins() here. The
+        # first is set to None by release_gpiozero's opening statement
+        # whatever follows, and the second reads the dict the line above
+        # has just been asserted empty -- two assertions that could not
+        # have failed however this function was broken.
 
     def test_every_edge_callback_is_cancelled_before_the_handle_closes(
             self, gz):
@@ -783,7 +867,6 @@ class TestTheFactoryTeardownBetweenPanels:
 
         pirig.release_gpiozero()
         assert LocalPiFactory.pins == {}
-        assert Device.pin_factory is None
 
 
 @needs_sim("gpio-chip", "gpio-sim")
