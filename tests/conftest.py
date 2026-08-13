@@ -14,6 +14,15 @@ and most laptops look like. tests/test_entropy.py points HWRNG_PATH at
 fakes it controls, which is the only place the mixing logic needs to be
 exercised.
 
+**Keep the suite off the machine's real CUPS.** Every Cups double in the
+suite is built as `printer.Cups(run=None)` -- and `run=None` means "use the
+real subprocess runner", so any method the double does not override shells
+out to the host's `lp`/`lpstat`. That was harmless only for as long as
+nothing in the fast path called such a method. The moment RunJob started
+consulting `printer_fault`, a machine with a real `OTP` queue in a fault
+state failed eleven tests, including the control that asserts a healthy
+pair still completes. The doubles were never the problem; the default was.
+
 **Keep the suite off the machine's real filesystem.** Several tests build
 an App with config_path="/nonexistent", meaning "somewhere we will never
 write". Running as root -- which CI and every container do -- that path is
@@ -40,6 +49,39 @@ def no_real_hwrng(monkeypatch):
     if otp_generator.HWRNG_PATH == "/dev/hwrng":
         monkeypatch.setattr(otp_generator, "HWRNG_PATH",
                             "/nonexistent/hwrng-under-test")
+
+
+@pytest.fixture(autouse=True)
+def no_real_cups(monkeypatch, request):
+    """
+    Make Cups' default runner refuse, so a stubbed-out method cannot
+    silently reach the host's daemon.
+
+    Refusing is safe by construction: every query in printer.py already
+    treats an exception as "cannot tell" -- `_text` returns "", `_run_text`
+    returns None -- which is exactly the answer a machine with no CUPS
+    gives. The change is that the answer stops depending on whether the
+    developer's laptop happens to be running cupsd, which is the whole
+    point of a hermetic suite.
+
+    Not applied to the hardware harness, which runs a real cupsd on
+    purpose. Nor to a test marked `real_cups_runner`, of which there is
+    one: the timeout guard in test_mutation_survivors.py has to call
+    _subprocess_run for real to see the kwargs it passes, and stubs
+    subprocess.run itself so nothing leaves the process.
+    """
+    if request.node.get_closest_marker("hardware") \
+            or request.node.get_closest_marker("real_cups_runner"):
+        return
+    from otpunit import printer
+
+    def refuse(argv, stdin=None):
+        raise OSError(
+            f"the fast suite must not run {argv[0]}: this Cups double left "
+            f"a method unstubbed and fell through to the host's CUPS. Stub "
+            f"it, or use the hardware harness.")
+
+    monkeypatch.setattr(printer.Cups, "_subprocess_run", staticmethod(refuse))
 
 
 @pytest.fixture(autouse=True)
