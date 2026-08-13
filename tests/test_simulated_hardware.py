@@ -1018,14 +1018,31 @@ class TestTheRealButtonPath:
 
         A stuck contact on OK is the expensive version of this -- a
         phantom BACK while a job prints purges the spool.
+
+        The one assertion this test is named for is negative, and a
+        negative assertion about a panel is what a dead panel passes.
+        That is not hypothetical here: run 31699840801 had every button
+        silently receiving nothing, and this test went green through all
+        of it while its three neighbours timed out. So the glitch is
+        preceded by a real press on the same line of the same panel, and
+        "no press arrived" only counts once one has.
         """
-        from otpunit.hw.buttons import BOUNCE_SECONDS, PIN_UP
+        from otpunit.hw.buttons import BOUNCE_SECONDS, PIN_UP, Press
 
         # Asserted, not skipped over. A window of zero is a defect in the
         # panel, not a fact about this machine, and without this the test
         # for it would quietly report "could not produce a short enough
         # glitch" -- measured, with BOUNCE_SECONDS set to 0.
         assert BOUNCE_SECONDS > 0, "the panel has no debounce window left"
+
+        # The control. Same panel, same GPIO, same wait() -- so the only
+        # difference between it and the assertion below is how long the
+        # line was held.
+        self.press(PIN_UP)
+        assert buttons.wait(timeout=2) is Press.UP, (
+            "a full-length press did not arrive either, so this panel "
+            "cannot say anything about the debounce window.\n  "
+            + self.why(PIN_UP))
 
         measured = self.glitch(PIN_UP)
         if measured >= BOUNCE_SECONDS:
