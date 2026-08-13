@@ -108,8 +108,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="OTP pad print unit")
     parser.add_argument("--sim", action="store_true",
                         help="run in the terminal with a simulated printer")
-    parser.add_argument("--rotate", type=int, default=0, choices=(0, 1, 2, 3),
-                        help="rotate the OLED by N*90 degrees")
+    # 1 and 3 are absent deliberately: they give a 64x128 portrait panel and
+    # the 21x8 character grid is landscape, so half of every row was being
+    # cut off. See Ssd1306Display.SQUARE_ON.
+    # luma counts rotate in NINETY-degree steps (angle = rotate * -90), so
+    # 2 is half a turn. Saying "N*180" here was arithmetically wrong and
+    # pointed at the value that is no longer accepted: someone wanting an
+    # upside-down panel reads it, computes N=1, and argparse exits 2 --
+    # which under Restart=on-failure with RestartSec=15 is an unbounded
+    # restart loop on an appliance with no console to read the error on.
+    parser.add_argument("--rotate", type=int, default=0, choices=(0, 2),
+                        help="0 for upright, 2 for upside-down (180 degrees). "
+                             "90 and 270 need a portrait layout the 21x8 "
+                             "character grid does not have")
     parser.add_argument("--config", default=config.CONFIG_PATH,
                         help="settings file (default: %(default)s)")
     parser.add_argument("--diagnostic", action="store_true",
