@@ -251,6 +251,123 @@ def _source_note(source: str) -> str:
             "theoretically secure one-time pads.")
 
 
+# --- is the kernel CSPRNG up yet ---------------------------------------
+#
+# NOT a security gate, and deliberately so. os.urandom goes through
+# getrandom(), which since Linux 5.6 BLOCKS until the CRNG is seeded
+# rather than returning predictable bytes, so "a pad generated from an
+# unseeded pool" is not a thing this program can do. The kernel already
+# refuses.
+#
+# What the kernel does not do is say anything while it refuses. On a
+# freshly flashed, network-less, RTC-less Pi at first boot the block lands
+# in the middle of a synchronous UI loop, and the panel stops repainting
+# wherever it happened to be. Measured against this codebase before these
+# helpers existed: the first draw of the interactive flow is
+# Vocabulary.random(), called from inside CodewordRoll.frame(), so the
+# panel froze on the CODEWORD menu with the caret still on ROLL RANDOM --
+# two frames drawn, then nothing. Headless was worse: unattended.run()
+# rolled its codeword before submitting the status sheet, so the unit
+# printed NOTHING AT ALL, not even the sheet whose whole job is to
+# explain a unit that has no panel.
+#
+# On three buttons and 128x64 pixels a freeze is indistinguishable from a
+# crash, and the documented remedy for a crash -- power-cycle -- discards
+# the entropy accumulated so far and restarts the wait. So these probes
+# exist to convert the kernel's silent wait into a report. They never
+# decide whether key material is drawn; getrandom() still does that.
+
+# Where the kernel publishes its entropy estimate. Read for CONTEXT, never
+# as a gate. Since 5.6 the number is not a level anyone can wait for: it
+# is clamped to the pool size and sits pinned at that maximum on any
+# healthy machine (measured: 256 on an idle 6.18 kernel), and getrandom()
+# ignores it entirely once the CRNG is up. Comparing it to a threshold
+# tests a pre-5.6 model of the kernel, which is why the diagnostic sheet's
+# old "ok/LOW" verdict on this number was removed rather than reused.
+ENTROPY_AVAIL = "/proc/sys/kernel/random/entropy_avail"
+
+# How often to re-ask while waiting. A boot that waits at all waits
+# seconds, not minutes -- a Pi's bcm2835-rng is builtin and the kernel
+# credits it at ~2.4s, measured under emulation in issue #17 -- so this is
+# quick enough to clear before an operator looks up and cheap enough to
+# cost nothing on the units that never wait at all.
+CRNG_POLL_SECONDS = 0.5
+
+
+def crng_seeded() -> bool:
+    """
+    Whether the kernel's CSPRNG is initialised -- asked, not estimated.
+
+    getrandom(GRND_NONBLOCK) returns EAGAIN if and only if the CRNG has
+    not been seeded, which is exactly the condition under which the
+    ordinary getrandom() behind os.urandom would block. That makes this
+    the only form of the question that stays true on a modern kernel;
+    see ENTROPY_AVAIL for why the bit count is not.
+
+    Unaskable counts as seeded. On a kernel or platform with no
+    getrandom() this probe has no opinion, and the alternative is parking
+    an operator in front of a WAITING screen that can never clear. The
+    kernel's own blocking is underneath either way -- being wrong here
+    costs the report, never the key material.
+    """
+    getrandom = getattr(os, "getrandom", None)
+    nonblock = getattr(os, "GRND_NONBLOCK", None)
+    if getrandom is None or nonblock is None:
+        return True
+    try:
+        # One byte, discarded. This is a question, not a draw: nothing
+        # generated here ever reaches a pad.
+        getrandom(1, nonblock)
+    except BlockingIOError:
+        return False
+    except OSError:
+        # Any other errno is the probe failing, not the CRNG being down.
+        return True
+    return True
+
+
+def entropy_bits() -> int | None:
+    """
+    The kernel's entropy estimate, or None where it cannot be read.
+
+    Worth showing an operator only while crng_seeded() is False, where it
+    genuinely does climb towards the seeding threshold. Once seeded it is
+    a constant and means nothing.
+    """
+    try:
+        with open(ENTROPY_AVAIL) as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def wait_for_crng(on_wait=None, sleep=None, poll: float = None) -> float:
+    """
+    Block until the CRNG is seeded, giving the caller something to say.
+
+    Returns the seconds waited, which is 0.0 on every machine whose
+    kernel has already seeded -- every laptop, every CI runner, and every
+    Pi past its first few seconds of uptime. `on_wait(waited)` is called
+    once before each sleep, so a caller can write a log line or repaint a
+    panel. A caller with its own event loop to keep alive (the front
+    panel has buttons to poll) should poll crng_seeded() itself instead;
+    this is for callers whose only job while waiting is to say so.
+
+    There is no timeout. Giving up would mean generating anyway, and
+    getrandom() would simply block at the first draw instead -- back to
+    the silent hang, with the report already printed and now a lie.
+    """
+    sleep = sleep or time.sleep
+    poll = CRNG_POLL_SECONDS if poll is None else poll
+    waited = 0.0
+    while not crng_seeded():
+        if on_wait is not None:
+            on_wait(waited)
+        sleep(poll)
+        waited += poll
+    return waited
+
+
 def get_random_bytes(n: int) -> bytes:
     """
     n bytes for key material: the hardware TRNG XORed with the CSPRNG.
@@ -1094,6 +1211,15 @@ def main():
         if source != "hwrng+urandom":
             print(f"No usable {HWRNG_PATH}. Every Raspberry Pi has one; most "
                   f"laptops do not.")
+        # The other half of the question, and the one that decides whether
+        # generation would start at all: an unseeded CRNG makes the first
+        # os.urandom call block, for as long as the kernel needs.
+        if crng_seeded():
+            print("Kernel CSPRNG: seeded -- generation will start at once.")
+        else:
+            print("Kernel CSPRNG: NOT SEEDED. Generation would block inside "
+                  "getrandom() until the kernel has collected enough noise. "
+                  "Use the machine -- keys, disks, interrupts all help.")
         sys.exit(0 if source == "hwrng+urandom" else 2)
 
     with_auth = not args.no_auth
@@ -1176,7 +1302,42 @@ def main():
             log("ERROR: --pages must be at least 1")
             sys.exit(1)
 
+        # Before the first draw, which on --random-codewords is the line
+        # below. An unseeded CRNG makes os.urandom block, and a program
+        # that stops dead with no output is a program that looks broken.
+        # Costs nothing when the kernel is up, which it is everywhere this
+        # CLI normally runs.
+        def announce(seconds):
+            # Once, not once per poll. The point is that the program has
+            # not died, not a running commentary on a terminal.
+            if seconds == 0.0:
+                log("Waiting for the kernel CSPRNG to be seeded. No key "
+                    "material can be drawn until it is; using the machine "
+                    "-- keys, disks, interrupts -- helps.")
+
+        waited_already = [False]
+
+        def ensure_entropy():
+            """Block until the CRNG is seeded, at most once, saying so.
+
+            Called at each point that is genuinely the FIRST draw of its
+            path, rather than once up front. Up front was wrong for
+            --codewords: the wait ran before the file had even been read,
+            so a missing file, a duplicate word or an over-long one parked
+            the CLI in an unbounded wait and then reported an error that
+            needed no randomness to find. Deterministic checks first; the
+            wait immediately before the draw that needs it.
+            """
+            if waited_already[0]:
+                return
+            waited_already[0] = True
+            waited = wait_for_crng(on_wait=announce)
+            if waited:
+                log(f"Kernel CSPRNG seeded after {waited:.0f}s.")
+
         if args.random_codewords:
+            # This IS the first draw on this path, so the wait belongs here.
+            ensure_entropy()
             codewords = random_codewords(args.random_codewords)
             log(f"Random codewords: {' '.join(codewords)}")
         else:
@@ -1275,6 +1436,10 @@ def main():
                 return generate_set_pdf_a4(out, *rest, page_size=sheet, **kwargs)
         else:
             generate = generate_set_pdf_a6
+
+        # And here for the --codewords path, whose first draw is the pad
+        # itself. A no-op when --random-codewords already waited above.
+        ensure_entropy()
 
         for i in range(args.sets):
             codeword = codewords[i]
