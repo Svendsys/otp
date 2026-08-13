@@ -33,6 +33,7 @@ truncation bugs, which are the ones that actually get shipped.
 """
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 
@@ -72,6 +73,25 @@ def _a_proportional_font():
     return None if isinstance(candidate, ImageFont.ImageFont) else candidate
 
 
+@contextlib.contextmanager
+def _pillow_without_the_bitmap_accessor(monkeypatch):
+    """Pillow 10.1-10.3, simulated: Aileron and no way to ask for better.
+
+    Yields False when this build has no FreeType, in which case
+    load_default() can only return the bitmap font and there is no hazard
+    to simulate.
+    """
+    from PIL import ImageFont
+
+    proportional = _a_proportional_font()
+    if proportional is None:
+        yield False
+        return
+    monkeypatch.delattr(ImageFont, "load_default_imagefont", raising=False)
+    monkeypatch.setattr(ImageFont, "load_default", lambda *a, **k: proportional)
+    yield True
+
+
 def panel():
     """A real Ssd1306Display with only the I2C constructor bypassed.
 
@@ -86,10 +106,20 @@ def panel():
 
 
 def framebuffer(frame: Frame) -> Image.Image:
-    """What the panel would be lit with, as a 1-bit image."""
+    """What the panel would be lit with, as a 1-bit image.
+
+    Through show(), NOT by re-running its body here. This file's whole
+    premise is that show() had no coverage -- "the init ran and nothing was
+    ever drawn" -- and an earlier version of this helper opened its own
+    `with canvas(...)` and called draw_frame directly, which left show()
+    exactly as uncovered as before. Gutting it to `with canvas(...): pass`
+    kept the entire suite green. It is two lines, but they are the two that
+    put the frame on the glass: lose the context manager, or draw outside
+    it so nothing is flushed to the device, and the panel goes dark with
+    every test still passing.
+    """
     unit = panel()
-    with canvas(unit._device) as draw:
-        unit.draw_frame(draw, frame)
+    unit.show(frame)
     return unit._device.image.convert("1")
 
 
@@ -114,7 +144,17 @@ class _Shifted:
         self._draw.text((xy[0] + PAD, xy[1] + PAD), *args, **kwargs)
 
     def rectangle(self, xy, *args, **kwargs):
-        (x0, y0), (x1, y1) = xy[:2], xy[2:] if len(xy) == 4 else xy[1]
+        # Both coordinate forms PIL accepts: a flat (x0, y0, x1, y1) and a
+        # pair of points [(x0, y0), (x1, y1)]. The first version of this
+        # unpacked `xy[:2]` as the first point, which for the point-pair
+        # form is the WHOLE list, so x0 bound to a tuple and the idiomatic
+        # call raised "can only concatenate tuple (not int) to tuple" from
+        # inside the harness -- the confusing failure the __getattr__ below
+        # exists to prevent.
+        flat = [value for point in xy
+                for value in (point if isinstance(point, (tuple, list))
+                              else (point,))]
+        x0, y0, x1, y1 = flat
         self._draw.rectangle((x0 + PAD, y0 + PAD, x1 + PAD, y1 + PAD),
                              *args, **kwargs)
 
@@ -143,7 +183,21 @@ def unclipped(frame: Frame) -> Image.Image:
     return image
 
 
-def off_panel(frame: Frame) -> list:
+#: Where the panel sits in the oversized canvas. ONE definition, because
+#: it is what "on the panel" means for every test in this file, and a
+#: one-pixel error in it blinds all of them at once. Half-open --
+#: (left, upper, right, lower) with right and lower exclusive, which is
+#: PIL's paste convention -- so it is exactly the per-pixel
+#: `PAD <= x < PAD + WIDTH` this replaced, with no fencepost to get wrong.
+#: An earlier version erased an ImageDraw rectangle at `PAD + WIDTH - 1`,
+#: an INCLUSIVE corner; widening that by a single pixel on the top or right
+#: left every test in this file green, and widening it by one character
+#: cell let COLS = 22 pass -- 132-pixel rows on a 128-pixel panel, the
+#: exact bug this file exists to catch.
+PANEL_BOX = (PAD, PAD, PAD + WIDTH, PAD + HEIGHT)
+
+
+def off_panel(frame: Frame = None, image: Image.Image = None) -> list:
     """Every ink pixel outside the 128x64 panel, in panel coordinates.
 
     Erase the panel rectangle and ask what ink is left. getbbox() answers
@@ -151,10 +205,14 @@ def off_panel(frame: Frame) -> list:
     offending region, and only when there is one. The previous form did
     801,792 Python-level `pixels[x, y]` lookups on every call -- 55ms each,
     which was essentially the whole runtime of this file.
+
+    `image` feeds a pre-built canvas through this exact path, so the
+    fencepost test can pin PANEL_BOX by the code that uses it rather than
+    by a copy of it. Its first version rebuilt the box inline and therefore
+    pinned nothing: all three one-pixel mutations stayed green.
     """
-    image = unclipped(frame)
-    ImageDraw.Draw(image).rectangle(
-        (PAD, PAD, PAD + WIDTH - 1, PAD + HEIGHT - 1), fill=0)
+    image = image.copy() if image is not None else unclipped(frame)
+    image.paste(0, PANEL_BOX)
     box = image.getbbox()
     if box is None:
         return []
@@ -197,52 +255,71 @@ class TestTheFontIsTheOneTheLayoutAssumes:
                   for ch in "XWMil. "}
         assert len(widths) == 1, f"the panel font is not monospace: {widths}"
 
-    def test_a_pillow_with_no_bitmap_accessor_is_refused_not_accepted(
-            self, monkeypatch):
+    def test_the_wrong_font_is_recognised_as_wrong(self, monkeypatch):
         """
         The 10.1-10.3 window, simulated on whatever Pillow is installed.
 
         There, load_default() is Aileron and load_default_imagefont() does
-        not exist yet -- it landed in 10.4, not 11. A getattr() fallback
-        therefore returns the proportional face on exactly the versions the
-        guard was written for, silently. Ubuntu 24.04 ships 10.2.0.
-
-        So: strip the accessor, make load_default() hand back a proportional
-        font, and require that _panel_font() REFUSES rather than returns it.
+        not exist yet -- it landed in 10.4, not 11 -- so a getattr fallback
+        returns the proportional face on exactly the versions the guard was
+        written for. Ubuntu 24.04 ships 10.2.0.
         """
-        from PIL import ImageFont
+        with _pillow_without_the_bitmap_accessor(monkeypatch) as available:
+            if not available:
+                pytest.skip("no FreeType here, so load_default() could only "
+                            "ever return the bitmap font")
+            assert not display_mod.is_panel_font(display_mod._panel_font())
 
-        proportional = _a_proportional_font()
-        if proportional is None:
-            pytest.skip("no FreeType here, so there is no proportional face "
-                        "for load_default() to have returned")
-
-        monkeypatch.delattr(ImageFont, "load_default_imagefont", raising=False)
-        monkeypatch.setattr(ImageFont, "load_default",
-                            lambda *a, **k: proportional)
-        with pytest.raises(RuntimeError, match="bitmap font"):
-            display_mod._panel_font()
-
-    def test_the_refusal_names_the_version_and_the_remedy(self, monkeypatch):
+    def test_the_wrong_font_still_leaves_a_usable_panel(self, monkeypatch):
         """
-        A unit that will not boot has to say why, or the operator is left
-        with a dead panel and no thread to pull.
+        It must DEGRADE, not disappear. This is the finding that reversed
+        the earlier design.
+
+        _panel_font() used to raise here. hmi.open_display wraps the whole
+        Ssd1306Display construction in a bare `except Exception` and reports
+        "no OLED", so raising deleted a WORKING panel from the interface:
+        Interface.interactive went False and __main__ fell through to the
+        unattended path, which prints a status sheet claiming the unit
+        "booted with no display attached" and then, after auto_delay, a full
+        pad pair with a codeword nobody chose. The guard against a panel
+        that clips text became unprompted emission of key material, on
+        precisely the Pillow versions it was written for.
         """
-        from PIL import ImageFont
+        with _pillow_without_the_bitmap_accessor(monkeypatch) as available:
+            if not available:
+                pytest.skip("no FreeType here")
+            # No exception, and no screen runs off the SIDES -- which is
+            # what a proportional face causes. Vertical loss is judged by
+            # the file's own standing invariant (a descender tail on the
+            # last row) and is not affected by the substitution.
+            app = make_app()
+            for label, frame in every_screen(app):
+                sideways = [p for p in off_panel(frame)
+                            if p[0] < 0 or p[0] >= WIDTH]
+                assert not sideways, (
+                    f"{label}: the fallback font put ink off the side of the "
+                    f"panel at {sideways[:4]}; draw_frame is meant to fit "
+                    f"each row to {WIDTH}px")
 
-        proportional = _a_proportional_font()
-        if proportional is None:
-            pytest.skip("no FreeType here")
+    def test_the_wrong_font_does_not_look_like_a_missing_panel(self, monkeypatch):
+        """
+        The mechanism of the finding above, pinned at the seam where it bit.
 
-        monkeypatch.delattr(ImageFont, "load_default_imagefont", raising=False)
-        monkeypatch.setattr(ImageFont, "load_default",
-                            lambda *a, **k: proportional)
-        with pytest.raises(RuntimeError) as caught:
-            display_mod._panel_font()
-        message = str(caught.value)
-        import PIL
-        assert PIL.__version__ in message
-        assert "10.4" in message and "10.1" in message
+        hmi.open_display must still hand back a display. If constructing
+        Ssd1306Display raises for a reason that is not "there is no panel
+        here", the unit silently becomes a headless auto-printer.
+        """
+        with _pillow_without_the_bitmap_accessor(monkeypatch) as available:
+            if not available:
+                pytest.skip("no FreeType here")
+            unit = Ssd1306Display.__new__(Ssd1306Display)
+            unit._device = dummy(width=WIDTH, height=HEIGHT, mode="1")
+            # The step hmi.open_display would have died on.
+            unit._font = display_mod._panel_font()
+            unit.show(Frame(title="OTP PRINT UNIT", lines=["PRINT PAD PAIR"],
+                            footer="1/7"))
+            assert lit(unit._device.image.convert("1")) > 0, \
+                "the panel drew nothing at all with the fallback font"
 
     def test_a_full_row_of_the_widest_glyph_still_fits(self):
         measure = ImageDraw.Draw(Image.new("1", (1024, 64)))
@@ -588,14 +665,41 @@ class TestTheMeasurementCanSeeClipping:
     Everything above passes trivially if `lost_pixels` always returns 0.
     """
 
-    def test_a_row_too_wide_for_the_panel_is_counted(self):
-        # Straight past Frame's character truncation, to prove the PIXEL
-        # check is what is doing the work.
+    def test_a_row_too_wide_for_the_panel_is_counted(self, monkeypatch):
+        # Straight past BOTH truncations -- Frame's by characters and
+        # draw_frame's by pixels -- to prove off_panel is what is doing the
+        # work. With _fit in place a too-wide row can no longer reach the
+        # edge, which is the point of it, so the measurement has to be
+        # exercised with fitting disabled or this guard tests nothing.
+        monkeypatch.setattr(Ssd1306Display, "_fit", lambda self, text: (text, 0))
+
         class Overflowing(Frame):
             def rendered(self):
                 return ["X" * 60] + [""] * (ROWS - 1)
 
         assert lost_pixels(Overflowing()) > 0
+
+    def test_the_pixel_fit_is_what_keeps_a_wide_font_on_the_panel(
+            self, monkeypatch):
+        """
+        Ties draw_frame's fitting to the outcome, the same way
+        test_frames_own_truncation_... ties Frame's character cut to it.
+
+        With a proportional font a full row is 210px on a 128px panel. The
+        fit is the only thing standing between that and ink off the edge,
+        so it has to be shown failing when the fit is removed.
+        """
+        with _pillow_without_the_bitmap_accessor(monkeypatch) as available:
+            if not available:
+                pytest.skip("no FreeType here")
+            wide = Frame(title="W" * COLS, lines=["M" * COLS] * 3,
+                         footer="W" * COLS)
+            assert off_panel(wide) == [], \
+                "draw_frame did not fit the rows to the panel"
+            monkeypatch.setattr(Ssd1306Display, "_fit", lambda self, t: (t, 0))
+            assert off_panel(wide), \
+                "with the fit removed a proportional row still fit; the " \
+                "font substitution is not being simulated"
 
     def test_ink_above_the_panel_is_counted(self, monkeypatch):
         """
@@ -647,6 +751,41 @@ class TestTheMeasurementCanSeeClipping:
         for rotation in (1, 3):
             with pytest.raises(ValueError, match="portrait"):
                 Ssd1306Display(rotate=rotation)
+
+    def test_the_panel_rect_is_exactly_the_panel(self):
+        """
+        The fencepost, on all four edges, one pixel at a time.
+
+        off_panel's erase box is this file's only definition of "the panel",
+        and every other test in it inherits that definition -- so a box one
+        pixel too generous blinds them all at once, silently. The coarse
+        mutations (erase the whole canvas above the panel, and so on) were
+        caught; a single pixel was not.
+
+        A lit pixel just INSIDE each edge must be ignored and the same pixel
+        just OUTSIDE must be counted. Drawn straight onto the padded canvas,
+        bypassing draw_frame, so this measures off_panel and nothing else.
+        """
+        def counted(x, y):
+            image = Image.new("1", (WIDTH + 2 * PAD, HEIGHT + 2 * PAD), 0)
+            image.putpixel((PAD + x, PAD + y), 1)
+            # Through off_panel itself. Rebuilding the erase box here
+            # instead -- which is what the first version did -- pins a copy
+            # rather than the definition, and all three one-pixel mutations
+            # of the real box stayed green.
+            return off_panel(image=image) != []
+
+        edges = {
+            "left":   ((0, 0),              (-1, 0)),
+            "right":  ((WIDTH - 1, 0),      (WIDTH, 0)),
+            "top":    ((0, 0),              (0, -1)),
+            "bottom": ((0, HEIGHT - 1),     (0, HEIGHT)),
+        }
+        for edge, (inside, outside) in edges.items():
+            assert not counted(*inside), \
+                f"{edge}: a pixel at {inside} is ON the panel but was counted"
+            assert counted(*outside), \
+                f"{edge}: a pixel at {outside} is OFF the panel and was missed"
 
     def test_a_row_below_the_panel_is_counted(self):
         class TooTall(Frame):

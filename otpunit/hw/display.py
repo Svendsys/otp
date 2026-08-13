@@ -72,28 +72,37 @@ def _panel_font():
     getattr() fallback lands on the exact face this function exists to
     refuse. Ubuntu 24.04's python3-pil is 10.2.0, squarely inside the window.
 
-    Hence the type check rather than a version check: whatever we are handed
-    has to BE the bitmap font, and if it is not we refuse to start. A panel
-    that quietly cuts "DESTROY PRINTED PAGES" off at the right edge is worse
-    than a unit that will not boot and says why.
+    A type check rather than a version check, because the version boundary
+    is not the thing that matters -- whatever we are handed has to BE the
+    bitmap face. FreeTypeFont and ImageFont are siblings rather than parent
+    and child, so isinstance is exact and not a subclass accident.
+
+    And it RETURNS the wrong font rather than raising on it. Raising was
+    tried and was worse: hmi.open_display wraps this construction in a bare
+    `except Exception` and reports "no OLED", so a working panel on Pillow
+    10.2 was deleted from the interface, Interface.interactive went False,
+    and __main__ fell through to the unattended path -- which prints a
+    status sheet claiming the unit "booted with no display attached" and
+    then, five minutes later, a whole pad pair with a codeword nobody
+    chose. The guard against a slightly-wrong panel became unprompted
+    emission of key material on exactly the versions it was written for.
+
+    draw_frame fits each row to the panel instead, so a proportional face
+    degrades to visible truncation rather than ink off the right-hand edge,
+    and the unit keeps its menu. On the correct font this changes nothing:
+    21 columns is 126px of a 128px panel.
     """
     from PIL import ImageFont
 
     loader = getattr(ImageFont, "load_default_imagefont", None)
-    font = loader() if loader is not None else ImageFont.load_default()
-    # FreeTypeFont and ImageFont are siblings, not parent and child, so this
-    # is an exact test for "the bitmap face" and not a subclass accident.
-    if not isinstance(font, ImageFont.ImageFont):
-        import PIL
+    return loader() if loader is not None else ImageFont.load_default()
 
-        raise RuntimeError(
-            f"Pillow {PIL.__version__} gave the panel a {type(font).__name__} "
-            f"where the 6x8 bitmap font was required; a proportional face "
-            f"overruns the 128x64 panel by up to 82px per row. Install "
-            f"Pillow >= 10.4 (which has load_default_imagefont) or < 10.1 "
-            f"(whose load_default is still the bitmap font)."
-        )
-    return font
+
+def is_panel_font(font) -> bool:
+    """Whether this is the 6x8 bitmap face the 21x8 grid is built on."""
+    from PIL import ImageFont
+
+    return isinstance(font, ImageFont.ImageFont)
 
 
 @dataclass
@@ -251,10 +260,74 @@ class Ssd1306Display(Display):
         until tests/test_panel_pixels.py it was the only place with no
         coverage at all -- the SSD1306 init sequence ran under i2c-stub and
         nothing was ever drawn.
+
+        Each row is fitted to the panel in PIXELS as well as characters.
+        Frame.rendered() cuts to 21 CHARACTERS, which is the right unit only
+        for a monospace face; with the proportional font some Pillow
+        versions hand out, 21 characters is up to 210px on a 128px panel and
+        the overflow is simply lost off the right-hand edge with nothing to
+        show for it. Fitting here means the worst a wrong font can do is
+        visible truncation. On the correct font it is a no-op -- 21 columns
+        is 126px -- so this costs the shipped configuration nothing.
         """
         for row, text in enumerate(frame.rendered()):
-            draw.text((0, row * ROW_HEIGHT + ROW_TOP), text.rstrip(),
+            fitted, left = self._fit(text.rstrip())
+            draw.text((left, row * ROW_HEIGHT + ROW_TOP), fitted,
                       font=self._font, fill=255)
+
+    def _fit(self, text: str):
+        """The longest prefix of `text` whose INK stays on the panel.
+
+        Free on the shipped configuration: the 6x8 face puts 21 columns at
+        126px of a 128px panel by construction, so there is nothing to
+        measure and this returns immediately. The measuring path exists for
+        the substituted-font case, where being slow is not a concern
+        because the alternative is an unreadable panel.
+
+        RENDERED ink, not font metrics. Both getlength (the advance) and
+        getbbox (the metric ink box) under-report what actually reaches the
+        raster for a proportional face -- measured on Aileron, getbbox said
+        the row "HOLD OK TO SHUT DOWN" ended at x=121 and it rasterised to
+        x=130. Trimming on either left ink at x=129 on a 128px panel, which
+        is the whole defect. The only reliable answer is to draw it and
+        look.
+
+        Returns the text AND the x it must be drawn at. A glyph can have a
+        negative left bearing -- ink to the left of its own origin -- and no
+        amount of trimming from the right fixes ink at x=-1, so the row gets
+        nudged instead.
+        """
+        if is_panel_font(self._font):
+            return text, 0
+
+        from PIL import Image, ImageDraw
+
+        # Drawn at an offset, because PIL discards negative coordinates:
+        # measuring at x=0 would silently hide the very bearing being
+        # measured, which is the same blindness that let ROW_TOP=-3 through.
+        margin = WIDTH
+        def ink(candidate: str):
+            probe = Image.new("1", (WIDTH * 8, ROW_HEIGHT * 4), 0)
+            ImageDraw.Draw(probe).text((margin, 0), candidate,
+                                       font=self._font, fill=1)
+            box = probe.getbbox()
+            return None if box is None else (box[0] - margin, box[2] - margin)
+
+        try:
+            while text:
+                extent = ink(text)
+                if extent is None:
+                    return text, 0
+                left, right = extent
+                nudge = max(0, -left)
+                if right + nudge <= WIDTH:
+                    return text, nudge
+                text = text[:-1]
+        except Exception:                        # noqa: BLE001
+            # A font that cannot be rendered to a scratch image is not one
+            # to second-guess; let the panel show whatever it shows.
+            return text, 0
+        return text, 0
 
     def close(self) -> None:
         try:
