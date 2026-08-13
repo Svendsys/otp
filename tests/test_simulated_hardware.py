@@ -484,13 +484,41 @@ class TestTheFactoryTeardownBetweenPanels:
 
         class Pin(PiPin):
             broken = False
-            silenced = None
+            deaf = False
+            # lgpio's callback list, in miniature. The real one is a
+            # module-level singleton's `callbacks`, appended to when a
+            # pin claims its alert and pruned by nothing but an explicit
+            # cancel; pirig.edge_callbacks() reads it and the buttons
+            # fixture asserts it is empty before each panel. Here the
+            # same list, driven by the same two gpiozero hooks.
+            armed = []
+            order = None
 
-            def _set_when_changed(self, value):
-                # What pirig.silence drives, and the only observable
-                # proof that it reached this pin before close().
-                if value is None and type(self).silenced is not None:
-                    type(self).silenced.append(self.info.name)
+            # _enable/_disable_event_detect, NOT _set_when_changed.
+            # PiPin._set_when_changed is where gpiozero's own guard
+            # lives -- `if value is None: if self._when_changed is not
+            # None: self._disable_event_detect()` -- and a fake that
+            # replaces it wholesale takes that guard out of the test
+            # while leaving the test's name unchanged. Overriding one
+            # level down keeps the shipped code path in play: silence()
+            # sets the property, gpiozero decides whether that means a
+            # cancel, and this list records what it decided.
+            def _enable_event_detect(self):
+                type(self).armed.append(self.info.name)
+
+            def _disable_event_detect(self):
+                if type(self).deaf:
+                    # LGPIOPin's does the dangerous half FIRST -- cancel
+                    # the lgpio callback -- and only then re-claims the
+                    # line as an input, which is where it can throw. So
+                    # a raise here does not mean the callback survived,
+                    # and it must not cost the handle its close().
+                    type(self).armed.remove(self.info.name)
+                    raise RuntimeError(
+                        "gpio_claim_input: could not re-claim the line")
+                type(self).armed.remove(self.info.name)
+                if type(self).order is not None:
+                    type(self).order.append(self.info.name)
 
             def close(self):
                 if type(self).broken:
@@ -513,6 +541,15 @@ class TestTheFactoryTeardownBetweenPanels:
             def __init__(self):
                 super().__init__()
                 self.pin_class = Pin
+                # Stands in for LGPIOFactory._handle, the gpiochip
+                # descriptor. None means gpiochip_close has run; while
+                # it is not None the lines this factory claimed are
+                # still claimed and no other factory can have them.
+                self._handle = object()
+
+            def close(self):
+                super().close()
+                self._handle = None
 
             def _get_revision(self):
                 return pirig.REVISION
@@ -522,10 +559,31 @@ class TestTheFactoryTeardownBetweenPanels:
             yield Factory, Pin
         finally:
             Pin.broken = False
-            Pin.silenced = None
+            Pin.deaf = False
+            Pin.order = None
             LocalPiFactory.pins.clear()
             LocalPiFactory._reservations.clear()
             Device.pin_factory = was
+
+    @staticmethod
+    def listening(factory, *numbers):
+        """
+        Pins of `factory` with an edge listener attached, and the strong
+        references that keep them attached.
+
+        gpiozero holds `when_changed` by weak reference on purpose -- a
+        pin must not keep the Button alive -- so a listener nothing else
+        refers to can be collected before the assertion that needs it.
+        release_gpiozero calls gc.collect(); the returned list is what
+        stops that emptying the fixture out from under the test.
+        """
+        listeners = []
+        for number in numbers:
+            def listener(ticks, state):          # noqa: ARG001
+                raise AssertionError("no edge should reach this fake")
+            factory.pin(number).when_changed = listener
+            listeners.append(listener)
+        return listeners
 
     def test_the_pin_cache_really_is_shared_between_factories(self, gz):
         # The premise. If gpiozero ever gives each factory its own dict,
@@ -591,26 +649,46 @@ class TestTheFactoryTeardownBetweenPanels:
 
         So each pin must be told to stop listening while its handle is
         still open. `when_changed = None` is what cancels the lgpio
-        callback; this asserts it reaches every pin of the factory being
-        closed, and that it happens BEFORE close().
+        callback; this asserts the callback list is empty afterwards,
+        and that it emptied BEFORE close().
+
+        The list is what makes this test able to fail. Asking the pins
+        whether they were told is not the same question: gpiozero
+        decides, inside `PiPin._set_when_changed`, whether a `None`
+        means anything at all -- it cancels only `if self._when_changed
+        is not None` -- and a fake that answers for that method proves
+        the harness called a setter, not that a callback went away.
+        Measured: with `pin._when_changed = None` inserted immediately
+        before `pin.when_changed = None` in silence(), which cancels
+        nothing whatever on a real LGPIOPin, the earlier version of this
+        test passed.
         """
         from gpiozero import Device
 
         Factory, Pin = gz
         Device.pin_factory = factory = Factory()
-        for number in (5, 6, 13):
-            factory.pin(number)
+        listening = self.listening(factory, 5, 6, 13)
+        assert sorted(Pin.armed) == ["GPIO13", "GPIO5", "GPIO6"], (
+            f"the panel never armed anything, so an empty list at the "
+            f"end would prove nothing; got {Pin.armed}")
+
         order = []
-        Pin.silenced = order
+        Pin.order = order
         closing = factory.close
         factory.close = lambda: (order.append("close"), closing())
 
         pirig.release_gpiozero()
 
+        assert Pin.armed == [], (
+            f"{Pin.armed} still armed on a factory that has closed. The "
+            f"next edge matching one of them raises inside lgpio's "
+            f"notification thread, which has no guard around its "
+            f"dispatch, and takes every button in the process with it")
         assert order[-1] == "close", (
             f"close() must come last; got {order}")
         assert sorted(order[:-1]) == ["GPIO13", "GPIO5", "GPIO6"], (
             f"every pin of the factory must be silenced first; got {order}")
+        assert len(listening) == 3                # kept alive to here
 
     def test_an_unreachable_device_is_finalised_before_the_factory_closes(
             self, gz):
