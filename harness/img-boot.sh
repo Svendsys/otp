@@ -405,7 +405,27 @@ KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/n
     else
         printf 'IMG-CHECK single-kernel-entry FAIL\n'
     fi
-    for want in "Linux version" "systemd[1]:" "Reached target"; do
+    # THE ENTROPY EVIDENCE -- the only place it is observed on the real
+    # artifact rather than injected into a unit test. See issue #16.
+    #
+    # "hwrng registered" is bcm2835-rng's probe line. The driver is BUILTIN
+    # (CONFIG_HW_RANDOM_BCM2835=y), so this line appearing is what proves
+    # the SoC's TRNG is the pool's source on the image that gets flashed,
+    # as opposed to timing jitter alone -- which is what a dead board or a
+    # device-tree regression would silently leave behind. Nothing else in
+    # this harness tells those two apart.
+    #
+    # "crng init done" is the kernel saying the CSPRNG is seeded. Every
+    # byte this unit generates goes through getrandom(), which BLOCKS until
+    # that line is printed, so its absence is not a warning: it is a unit
+    # that cannot make key material and, before issue #16, would have hung
+    # silently trying. Measured at ~2.4s guest in the local rig -- see the
+    # header -- and present in every green run's console.
+    #
+    # loglevel=7 keeps both: bcm2835-rng's line is KERN_INFO and the crng
+    # line is KERN_NOTICE, and neither is DEBUG.
+    for want in "Linux version" "systemd[1]:" "Reached target" \
+                "hwrng registered" "crng init done"; do
         if grep -qF -- "$want" "$CONSOLE_TXT" 2>/dev/null; then
             printf 'IMG-CHECK %s PASS\n' "$(printf '%s' "$want" | tr ' ' '-')"
         else

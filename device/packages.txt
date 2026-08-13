@@ -69,6 +69,17 @@ foomatic-db-engine
 # apt-get at the exact moment the unit has no network by design.
 overlayroot
 
-# Entropy. The Pi has a hardware RNG; rng-tools feeds it to the kernel pool
-# so the CSPRNG is seeded early rather than at some point after boot.
+# Entropy -- and NOT what seeds the CRNG at boot. That claim was here, and
+# it was wrong. The Pi's TRNG is driven by bcm2835-rng, which is BUILT IN
+# to the Raspberry Pi kernel (CONFIG_HW_RANDOM_BCM2835=y, read out of the
+# linux-image-*-rpi-v8 package), so the kernel's own hwrng core credits
+# the pool before userspace exists at all: measured under emulation in
+# issue #17, the driver registers at ~2.4s and "random: crng init done"
+# follows immediately, with no configuration and no daemon. Tier 3 now
+# asserts both lines appear on the console; see harness/img-boot.sh.
+#
+# rngd's contribution is everything AFTER that: it goes on feeding
+# /dev/hwrng into the pool for the life of the unit. Worth keeping for
+# that, but a unit without it still seeds on time, so nothing in the boot
+# path may be written as though it depended on this package.
 rng-tools5
