@@ -19,15 +19,22 @@ So these tests substitute nothing they can avoid:
   * a real DRM connector from `vkms` and a real keyboard from `uinput`,
     so the interface probes read files a kernel wrote.
 
-None of that needs a Raspberry Pi. Anything not available is skipped with
-a reason rather than failed -- a kernel without `vkms` should still get the
-other four.
+None of that needs a Raspberry Pi. One thing does need to look like one:
+gpiozero will not open any gpiochip on a machine with no board revision,
+so the panel is driven inside a mount namespace where /proc/cpuinfo says
+Pi Zero 2 W. That forgery is the only substitution here, it lasts as long
+as the test, and pirig.py documents every part of it -- including how it
+is kept off the host.
+
+Anything not available is skipped with a reason rather than failed -- a
+kernel without `vkms` should still get the other four.
 
     sudo ./harness/kernel-sim.sh up
     sudo pytest tests/test_simulated_hardware.py -v
 """
 from __future__ import annotations
 
+import errno
 import os
 import re
 import subprocess
@@ -42,6 +49,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 
 import cupsrig                                   # noqa: E402
+import pirig                                     # noqa: E402
 from otpunit import config, diagnostics, hmi, printer, unattended  # noqa: E402
 
 SIM_STATE = Path("/run/otp-kernel-sim")
@@ -804,6 +812,541 @@ class TestThePanelAgainstAFailingPrinter:
 # --- the panel, against the kernel rather than a double ------------------
 
 
+@pytest.fixture
+def identity():
+    """
+    This process, and only this process, as a Pi Zero 2 W.
+
+    Both classes below stand on it: with no board revision anywhere,
+    gpiozero declines to build a local pin factory at all, so the real
+    gpiozero -> lgpio -> kernel path could not even be entered. pirig.py
+    documents what is forged, in what order gpiozero reads it, and why it
+    happens inside a mount namespace.
+    """
+    pytest.importorskip("gpiozero")
+    why = pirig.available()
+    if why:
+        pytest.skip(why)
+
+    forged = pirig.PiIdentity()
+    try:
+        forged.__enter__()
+    except OSError as exc:
+        # Only "this host will not let us" is a skip. A container can
+        # hand out root and still refuse CLONE_NEWNS, and that is worth
+        # naming rather than failing over -- but every other errno means
+        # the forgery went wrong, and a skip would bury it. Measured: a
+        # teardown that leaves the previous bind in place makes the next
+        # one fail ENOENT, which arrived here as a confident "no mount
+        # namespaces on this host".
+        if exc.errno not in (errno.EPERM, errno.EACCES, errno.ENOSYS):
+            raise
+        pytest.skip(f"this host would not give us a mount namespace: {exc}")
+    # Entered by hand rather than with a `with`, because only the setup
+    # may turn an OSError into a skip. Wrapping the yield too would catch
+    # one raised by the test body and skip on a genuine failure.
+    try:
+        yield forged
+    finally:
+        forged.__exit__(None, None, None)
+
+
+def cpuinfo_revision():
+    """Whatever Revision /proc/cpuinfo is currently offering, or None."""
+    for line in Path("/proc/cpuinfo").read_text().splitlines():
+        if line.startswith("Revision"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+class TestTheFakePiIdentity:
+    """
+    The forgery itself, which needs root but no gpiochip.
+
+    Two of the ways it can go wrong are silent. A revision that decodes to
+    some other Pi puts the unit's GPIOs on a header that board does not
+    have: measured, 0x2 gets `PinInvalidPin: GPIO5 is not a valid pin
+    name`, which reads like a bug in this repository and is really three
+    digits in a fake file. And a bind mount that escapes the namespace
+    leaves the whole machine answering "Raspberry Pi" to every process
+    that asks, for as long as the box is up.
+    """
+
+    def test_the_forged_cpuinfo_does_not_contradict_itself(self, identity):
+        """
+        Every field of the forgery, not only the one gpiozero reads.
+
+        This used to assert `get_pi_revision() == pirig.REVISION`, which
+        `PiIdentity.__enter__` has already asserted by the time the
+        fixture yields -- so the test could only ever ERROR in setup and
+        had no way to fail on its own name.
+
+        What nothing checked is the rest of the file. diagnostics.py
+        pulls Model and Serial out of /proc/cpuinfo for the status
+        sheet, and the comment above pirig.CPUINFO says those fields are
+        there so the fake cannot answer one question and contradict
+        itself on the next two. Changing REVISION without changing the
+        Model line is exactly how that would happen, and this is what
+        would notice.
+        """
+        from gpiozero.pins.pi import PiBoardInfo
+
+        planted = diagnostics._cpuinfo_field("Revision")
+        assert planted == f"{pirig.REVISION:06x}", (
+            f"the forged file says revision {planted}, not "
+            f"{pirig.REVISION:06x}")
+        assert (PiBoardInfo.from_revision(int(planted, 16)).model
+                == pirig.MODEL)
+        assert "Zero 2 W" in diagnostics._cpuinfo_field("Model"), (
+            f"the Model line says {diagnostics._cpuinfo_field('Model')!r} "
+            f"while the revision decodes to a {pirig.MODEL}; the status "
+            f"sheet and gpiozero would report different boards")
+        assert diagnostics._cpuinfo_field("Serial") == "00000000f1e2d3c4"
+
+    def test_the_forged_board_carries_the_pins_the_unit_uses(self):
+        # No identity fixture: PiBoardInfo.from_revision is a pure
+        # function of a constant, so the mount namespace it used to take
+        # made this test need root for nothing. The importorskip comes
+        # with it, since that was the fixture's too.
+        pytest.importorskip("gpiozero")
+        from gpiozero.pins.pi import PiBoardInfo
+
+        from otpunit.hw.buttons import PIN_DOWN, PIN_OK, PIN_UP
+
+        board = PiBoardInfo.from_revision(pirig.REVISION)
+        assert board.model == pirig.MODEL, board
+        for pin in (PIN_UP, PIN_DOWN, PIN_OK):
+            headers = sorted(header.name
+                             for header, _ in board.find_pin(f"GPIO{pin}"))
+            assert headers == ["J8"], (
+                f"the forged board puts GPIO{pin} on {headers or 'no header'}"
+                f"; the unit's three switches are wired to J8")
+
+    def test_the_forgery_does_not_reach_the_host(self, identity):
+        assert identity.host_sees_a_pi() is False, (
+            "the bind mount propagated out of the namespace: every process "
+            "on this machine now reads a Pi revision from /proc/cpuinfo")
+
+    def test_teardown_leaves_nothing_mounted(self):
+        """
+        The half of the teardown contract that has to hold every time.
+
+        Leaving does not return to the namespace we came from: the kernel
+        refuses that once the process has threads, and lgpio gives it one
+        permanently. pirig.py states the whole contract and the
+        measurement behind it. What that leaves behind is a private copy
+        of the host's mount table, so "the forgery is gone" has to mean
+        the mount table is exactly what it was -- not merely that
+        /proc/cpuinfo reads plausibly again.
+
+        The rest of the harness runs in this same process. A bind mount
+        surviving teardown would have diagnostics.py reporting a Pi this
+        machine is not, in tests with no idea any of this ever happened.
+        """
+        pytest.importorskip("gpiozero")
+        why = pirig.available()
+        if why:
+            pytest.skip(why)
+
+        before_mounts = pirig.mount_points()
+        before_revision = cpuinfo_revision()
+
+        with pirig.PiIdentity():
+            assert str(pirig.CPUINFO_PATH) in pirig.mount_points(), (
+                "nothing got mounted, so this is about to prove that "
+                "unmounting nothing leaves nothing behind")
+            assert cpuinfo_revision() == f"{pirig.REVISION:06x}"
+
+        assert pirig.mount_points() == before_mounts
+        assert cpuinfo_revision() == before_revision
+
+    def test_a_umount_that_fails_still_gives_back_the_fd_and_the_files(self):
+        """
+        One failure used to become three.
+
+        __exit__ deliberately does not swallow a umount error -- a forged
+        /proc/cpuinfo this process cannot get rid of has to be loud. But
+        the raise used to take the rest of the method with it: the
+        /proc/self/ns/mnt descriptor stayed open for the life of the
+        process and every /tmp/otp-pirig-* file stayed on disk, neither
+        of which the failed umount had anything to do with. The pop was
+        wrong the same way -- it discarded the path before the call that
+        needed it, so nothing could name what was still mounted or try
+        again.
+
+        An unmountable path is planted at the FRONT of the list, so the
+        real binds are taken down first and this test cannot leave a
+        forged /proc/cpuinfo behind for the rest of the run.
+        """
+        pytest.importorskip("gpiozero")
+        why = pirig.available()
+        if why:
+            pytest.skip(why)
+
+        before_mounts = pirig.mount_points()
+        forged = pirig.PiIdentity()
+        try:
+            forged.__enter__()
+        except OSError as exc:
+            if exc.errno not in (errno.EPERM, errno.EACCES, errno.ENOSYS):
+                raise
+            pytest.skip(f"this host would not give us a mount namespace: {exc}")
+
+        never_mounted = "/tmp/otp-pirig-was-never-a-mount-point"
+        forged.forged.insert(0, never_mounted)
+        temporary = list(forged._temporary)
+        assert temporary and all(os.path.exists(p) for p in temporary)
+
+        with pytest.raises(OSError):
+            forged.__exit__(None, None, None)
+
+        assert pirig.mount_points() == before_mounts, (
+            "the real binds did not come down, so this test has left the "
+            "process reading a forged /proc/cpuinfo")
+        assert forged._home is None, (
+            "the namespace descriptor is still open; _home is cleared "
+            "only after os.close() returns")
+        assert not any(os.path.exists(p) for p in temporary), (
+            f"{[p for p in temporary if os.path.exists(p)]} left in /tmp")
+        assert forged.forged == [never_mounted], (
+            "the path that would not unmount is not in the list any "
+            "more, so nothing can retry it or say what is still mounted")
+
+
+class TestTheFactoryTeardownBetweenPanels:
+    """
+    What happens to gpiozero's pin cache when one panel closes.
+
+    No gpiochip needed, which is the point: this ran nowhere until run
+    31699840801 failed, and it is the half of the button path that a
+    machine without gpio-sim can still hold to account. There the first
+    panel worked and every panel after it received nothing -- three
+    timeouts, plus a debounce test that "passed" because all it asserts
+    is that no press arrives.
+
+    gpiozero shares ONE pin dict across every LocalPiFactory instance (a
+    deliberate guard against two back-ends driving one pin), keyed by a
+    PinInfo that compares equal across factories. PiFactory.close()
+    empties it only after every pin.close() has returned. So one raising
+    close() -- and a Device finalizer reaching a closed handle raises
+    exactly that -- hands the next factory a pin belonging to the last
+    one, which claims its alert on a dead handle and never fires.
+    """
+
+    @pytest.fixture
+    def gz(self):
+        """A LocalPiFactory subclass with no kernel behind it."""
+        pytest.importorskip("gpiozero")
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+        from gpiozero.pins.pi import PiPin
+
+        class Pin(PiPin):
+            broken = False
+            deaf = False
+            # lgpio's callback list, in miniature. The real one is a
+            # module-level singleton's `callbacks`, appended to when a
+            # pin claims its alert and pruned by nothing but an explicit
+            # cancel; pirig.edge_callbacks() reads it and the buttons
+            # fixture asserts it is empty before each panel. Here the
+            # same list, driven by the same two gpiozero hooks.
+            armed = []
+            order = None
+
+            # _enable/_disable_event_detect, NOT _set_when_changed.
+            # PiPin._set_when_changed is where gpiozero's own guard
+            # lives -- `if value is None: if self._when_changed is not
+            # None: self._disable_event_detect()` -- and a fake that
+            # replaces it wholesale takes that guard out of the test
+            # while leaving the test's name unchanged. Overriding one
+            # level down keeps the shipped code path in play: silence()
+            # sets the property, gpiozero decides whether that means a
+            # cancel, and this list records what it decided.
+            def _enable_event_detect(self):
+                type(self).armed.append(self.info.name)
+
+            def _disable_event_detect(self):
+                if type(self).deaf:
+                    # LGPIOPin's does the dangerous half FIRST -- cancel
+                    # the lgpio callback -- and only then re-claims the
+                    # line as an input, which is where it can throw. So
+                    # a raise here does not mean the callback survived,
+                    # and it must not cost the handle its close().
+                    type(self).armed.remove(self.info.name)
+                    raise RuntimeError(
+                        "gpio_claim_input: could not re-claim the line")
+                type(self).armed.remove(self.info.name)
+                if type(self).order is not None:
+                    type(self).order.append(self.info.name)
+
+            def close(self):
+                if type(self).broken:
+                    # The shape of the real one, from that run:
+                    # LGPIOPin.close -> when_changed = None ->
+                    # _disable_event_detect -> gpio_get_mode(_handle).
+                    raise TypeError("unsupported operand type(s) for &: "
+                                    "'NoneType' and 'int'")
+
+            def _get_function(self):
+                return "input"
+
+            def _set_function(self, value):
+                pass
+
+            def _get_state(self):
+                return 0
+
+        class Factory(LocalPiFactory):
+            def __init__(self):
+                super().__init__()
+                self.pin_class = Pin
+                # Stands in for LGPIOFactory._handle, the gpiochip
+                # descriptor. None means gpiochip_close has run; while
+                # it is not None the lines this factory claimed are
+                # still claimed and no other factory can have them.
+                self._handle = object()
+
+            def close(self):
+                super().close()
+                self._handle = None
+
+            def _get_revision(self):
+                return pirig.REVISION
+
+        was = Device.pin_factory
+        try:
+            yield Factory, Pin
+        finally:
+            Pin.broken = False
+            Pin.deaf = False
+            Pin.order = None
+            LocalPiFactory.pins.clear()
+            LocalPiFactory._reservations.clear()
+            Device.pin_factory = was
+
+    @staticmethod
+    def listening(factory, *numbers):
+        """
+        Pins of `factory` with an edge listener attached, and the strong
+        references that keep them attached.
+
+        gpiozero holds `when_changed` by weak reference on purpose -- a
+        pin must not keep the Button alive -- so a listener nothing else
+        refers to can be collected before the assertion that needs it.
+        release_gpiozero calls gc.collect(); the returned list is what
+        stops that emptying the fixture out from under the test.
+        """
+        listeners = []
+        for number in numbers:
+            def listener(ticks, state):          # noqa: ARG001
+                raise AssertionError("no edge should reach this fake")
+            factory.pin(number).when_changed = listener
+            listeners.append(listener)
+        return listeners
+
+    def test_the_pin_cache_really_is_shared_between_factories(self, gz):
+        # The premise. If gpiozero ever gives each factory its own dict,
+        # everything below stops meaning anything and should be deleted
+        # rather than left passing.
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+
+        Factory, _ = gz
+        Device.pin_factory = first = Factory()
+        assert first.pins is LocalPiFactory.pins
+
+    def test_a_raising_close_hands_the_next_factory_a_dead_pin(self, gz):
+        """The defect itself, reproduced without a gpiochip."""
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+
+        Factory, Pin = gz
+        Device.pin_factory = first = Factory()
+        pin = first.pin(5)
+
+        Pin.broken = True
+        with pytest.raises(TypeError):
+            first.close()
+        assert LocalPiFactory.pins, (
+            "close() cleared the cache despite raising, so the rest of "
+            "this test is describing something that cannot happen")
+
+        Device.pin_factory = Factory()
+        assert Device.pin_factory.pin(5) is pin, (
+            "the second factory built a fresh pin, so a stale one could "
+            "not be inherited and release_gpiozero need not clear it")
+        assert pirig.stale_pins() == ["GPIO5"]
+
+    def test_release_gpiozero_empties_the_cache_even_when_close_raises(
+            self, gz):
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+
+        Factory, Pin = gz
+        Device.pin_factory = Factory()
+        Device.pin_factory.pin(5)
+        Pin.broken = True
+
+        # Loud, not swallowed -- and cleaned up regardless, so the next
+        # panel starts from nothing whatever this one did.
+        with pytest.raises(TypeError):
+            pirig.release_gpiozero()
+        assert LocalPiFactory.pins == {}
+        # Nothing about Device.pin_factory or stale_pins() here. The
+        # first is set to None by release_gpiozero's opening statement
+        # whatever follows, and the second reads the dict the line above
+        # has just been asserted empty -- two assertions that could not
+        # have failed however this function was broken.
+
+    def test_every_edge_callback_is_cancelled_before_the_handle_closes(
+            self, gz):
+        """
+        The defect that actually made the panel work exactly once.
+
+        lgpio dispatches edges from one process-wide thread with no
+        try/except around the call. A callback left armed on a closed
+        factory raises there on the next matching edge, the thread dies,
+        and every button in the process goes with it -- reported as a
+        warning in the summary and as three timeouts that say nothing.
+
+        So each pin must be told to stop listening while its handle is
+        still open. `when_changed = None` is what cancels the lgpio
+        callback; this asserts the callback list is empty afterwards,
+        and that it emptied BEFORE close().
+
+        The list is what makes this test able to fail. Asking the pins
+        whether they were told is not the same question: gpiozero
+        decides, inside `PiPin._set_when_changed`, whether a `None`
+        means anything at all -- it cancels only `if self._when_changed
+        is not None` -- and a fake that answers for that method proves
+        the harness called a setter, not that a callback went away.
+        Measured: with `pin._when_changed = None` inserted immediately
+        before `pin.when_changed = None` in silence(), which cancels
+        nothing whatever on a real LGPIOPin, the earlier version of this
+        test passed.
+        """
+        from gpiozero import Device
+
+        Factory, Pin = gz
+        Device.pin_factory = factory = Factory()
+        listening = self.listening(factory, 5, 6, 13)
+        assert sorted(Pin.armed) == ["GPIO13", "GPIO5", "GPIO6"], (
+            f"the panel never armed anything, so an empty list at the "
+            f"end would prove nothing; got {Pin.armed}")
+
+        order = []
+        Pin.order = order
+        closing = factory.close
+        factory.close = lambda: (order.append("close"), closing())
+
+        pirig.release_gpiozero()
+
+        assert Pin.armed == [], (
+            f"{Pin.armed} still armed on a factory that has closed. The "
+            f"next edge matching one of them raises inside lgpio's "
+            f"notification thread, which has no guard around its "
+            f"dispatch, and takes every button in the process with it")
+        assert order[-1] == "close", (
+            f"close() must come last; got {order}")
+        assert sorted(order[:-1]) == ["GPIO13", "GPIO5", "GPIO6"], (
+            f"every pin of the factory must be silenced first; got {order}")
+        assert len(listening) == 3                # kept alive to here
+
+    def test_the_chip_handle_closes_even_when_a_pin_cannot_be_silenced(
+            self, gz):
+        """
+        The other order that matters: cancel first, close ANYWAY.
+
+        Every other broken case in this class breaks close(). This one
+        breaks the step before it, which the sequential version of
+        release_gpiozero handled by never reaching close() at all: no
+        pin.close(), no gpiochip_close, `_handle` still set -- and the
+        cache cleared regardless by the finally, so the lines stayed
+        claimed by a factory nothing in the process could reach. The
+        next Button(5) then dies "GPIO busy", and the callbacks that
+        could not be cancelled are still in lgpio's notification thread
+        waiting to kill it, which is the outcome the RuntimeError exists
+        to prevent rather than to cause.
+
+        Note where the fake raises: _disable_event_detect drops the
+        callback BEFORE it re-claims the line, exactly as LGPIOPin does,
+        so this failure is one where the cancel already succeeded.
+        """
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+
+        Factory, Pin = gz
+        Device.pin_factory = factory = Factory()
+        listening = self.listening(factory, 5, 6)
+        assert factory._handle is not None
+        Pin.deaf = True
+
+        # Loud: a pin that would not be silenced is worth a red teardown.
+        with pytest.raises(RuntimeError, match="could not cancel edge"):
+            pirig.release_gpiozero()
+
+        assert factory._handle is None, (
+            "the gpiochip handle never closed, so this process is "
+            "holding lines nothing can release for the rest of its life")
+        assert LocalPiFactory.pins == {}
+        assert len(listening) == 2                # kept alive to here
+
+    def test_an_unreachable_device_is_finalised_before_the_factory_closes(
+            self, gz):
+        """
+        The collect, and its ORDER -- the half a cache assertion misses.
+
+        A gpiozero Device that is unreachable but not yet collected runs
+        `Device.__del__` -> `close()` -> the pin -> `factory._handle` at
+        whatever later moment the collector picks. Landing after the
+        factory closed is what raised the TypeError, from a finalizer,
+        in the middle of the next test. Collecting first is what makes
+        it harmless. A reference cycle stands in for the real Device
+        here because refcounting would free a plain object too early to
+        prove anything about gc.collect() at all.
+        """
+        from gpiozero import Device
+
+        Factory, _ = gz
+        Device.pin_factory = factory = Factory()
+        factory.pin(5)
+        when = []
+
+        class Ghost:
+            def __del__(self):
+                when.append("after close" if factory.gone else "while open")
+
+        factory.gone = False
+        closing = factory.close
+        factory.close = lambda: (setattr(factory, "gone", True), closing())
+
+        ghost = Ghost()
+        ghost.cycle = ghost                      # only gc can free this
+        del ghost
+
+        pirig.release_gpiozero()
+        assert when == ["while open"], (
+            f"the finalizer ran {when or ['not at all']}; it must run "
+            f"while the chip handle is still valid, or a real "
+            f"Device.__del__ dereferences a None handle and leaves the "
+            f"shared pin cache dirty for the next panel")
+
+    def test_a_clean_teardown_leaves_no_stale_pin_and_does_not_raise(
+            self, gz):
+        from gpiozero import Device
+        from gpiozero.pins.local import LocalPiFactory
+
+        Factory, _ = gz
+        Device.pin_factory = Factory()
+        Device.pin_factory.pin(5)
+        # A live factory's own pins are not stale; only the assertion
+        # about OTHER factories may fire.
+        assert pirig.stale_pins() == []
+
+        pirig.release_gpiozero()
+        assert LocalPiFactory.pins == {}
+
+
 @needs_sim("gpio-chip", "gpio-sim")
 class TestTheRealButtonPath:
     """
@@ -814,66 +1357,217 @@ class TestTheRealButtonPath:
     that resolves the wrong way can purge the spool and destroy a pair.
     """
 
+    def line(self, pin):
+        return Path(sim("gpio-control")) / f"sim_gpio{pin}" / "pull"
+
+    def value(self, pin):
+        """What the kernel says the line reads, right now."""
+        node = Path(sim("gpio-control")) / f"sim_gpio{pin}" / "value"
+        try:
+            return node.read_text().strip()
+        except OSError as exc:
+            return f"unreadable({errno.errorcode.get(exc.errno, exc.errno)})"
+
     def press(self, pin, seconds=0.05):
-        control = Path(sim("gpio-control"))
-        pull = control / f"sim_gpio{pin}" / "pull"
+        pull = self.line(pin)
+        # Sampled either side of each write. "No press arrived" has two
+        # very different causes -- the line never moved, or it moved and
+        # the edge did not reach a callback -- and they need opposite
+        # fixes. Without this the failure cannot tell them apart, which
+        # is what made run 31699840801 cost three rounds of guessing.
+        self.trace = [f"gpio{pin} at rest={self.value(pin)}"]
         pull.write_text("pull-down")             # button to ground
+        self.trace.append(f"grounded={self.value(pin)}")
         time.sleep(seconds)
         pull.write_text("pull-up")               # released
+        self.trace.append(f"released={self.value(pin)}")
         time.sleep(0.1)
+        self.trace.append(f"settled={self.value(pin)}")
+
+    def why(self, pin):
+        """
+        The state a missing press needs explaining by.
+
+        Whether the line moved, whether lgpio's notification thread is
+        still running (it is a module-level singleton started at import,
+        and if its FIFO ever reaches EOF it spins forever delivering
+        nothing), and how many callbacks are registered on it.
+        """
+        trace = " -> ".join(getattr(self, "trace", ["no trace recorded"]))
+        try:
+            import lgpio
+            notify = lgpio._notify_thread
+            alert = (f"notify thread alive={notify.is_alive()} "
+                     f"go={notify.go} "
+                     f"callbacks={len(notify.callbacks)} "
+                     f"chips={sorted({c.chip for c in notify.callbacks})}")
+        except Exception as exc:                 # pragma: no cover
+            alert = f"could not read lgpio's notify thread: {exc!r}"
+        return (f"no press arrived.\n  line: {trace}\n  lgpio: {alert}\n"
+                f"  stale pins: {pirig.stale_pins()}")
+
+    def glitch(self, pin):
+        """
+        Bounce the line as briefly as this machine can, and time it.
+
+        The duration is returned rather than assumed: what makes a glitch
+        a glitch is being shorter than BOUNCE_SECONDS, and a loaded box
+        that took longer than that has not tested the debounce -- it has
+        delivered a short press, which is a different thing entirely.
+        """
+        pull = self.line(pin)
+        started = time.monotonic()
+        pull.write_text("pull-down")
+        pull.write_text("pull-up")
+        return time.monotonic() - started
 
     @pytest.fixture
-    def buttons(self):
+    def buttons(self, identity):
         """
-        GpioButtons, but only if it really bound to the simulated chip.
+        The shipped GpioButtons, bound to the chip gpio-sim made.
 
-        gpiozero picks its gpiochip from Pi board detection -- it reads
-        /proc/device-tree/model or a Revision line in /proc/cpuinfo -- and
-        a machine that is not a Pi has neither. Even where it constructs,
-        it opens gpiochip0, which on a normal host is some real controller
-        rather than the one gpio-sim just created.
+        This used to ask which chip the process had opened and skip when
+        it was not ours, because off a Pi gpiozero would not construct a
+        factory at all. With a board identity it does, so the same
+        question is now an assertion: a panel wired to some other
+        controller must fail loudly rather than quietly prove nothing.
 
-        So this checks which chip the process actually opened and skips
-        with that reason if it is not ours. Asserting against a chip the
-        driver never opened would fail for a reason that has nothing to do
-        with the code under test; quietly passing would be worse.
+        There is no chdir here any more, and no way to put one back that
+        would do anything. lgpio opens ONE FIFO, `.lgd-nfy0`, and it does
+        it in `_callback_thread.__init__` (lgpio.py:504) -- which runs at
+        `import lgpio`, in whatever directory the interpreter is in at
+        the time. Not two, not on the first callback: nothing else in
+        lgpio calls notify_open at all. By the time this fixture runs the
+        import has long since happened, from diagnostics.py's version
+        string during the CUPS tests, and the importorskip above would
+        beat any chdir to it regardless. So the FIFO really is left in
+        the repository root after a harness run -- measured, from a clean
+        checkout on a kernel with no gpio-sim, where this fixture never
+        even executes. `git status` does not show it because it is a
+        FIFO rather than a regular file, which is why it went unnoticed.
+        A genuinely read-only checkout therefore breaks at the import,
+        not at the panel, and nothing this fixture does can change that.
         """
+        pytest.importorskip("lgpio")
         from otpunit.hw import buttons as buttons_mod
 
+        # Nothing may be armed before this panel arms anything. lgpio's
+        # notification thread is a process-wide singleton whose callback
+        # list only grows -- measured at 5, then 8, then 11 as successive
+        # panels were built, three more each time and never fewer. (Three
+        # panels registering three each would be nine, so 5 was not the
+        # first panel's; what was observed is the growth.) A leftover
+        # callback belongs to a closed factory, and the next edge
+        # matching it kills the thread, and with it every button in the
+        # process.
+        armed = pirig.edge_callbacks()
+        assert armed == 0, (
+            f"{armed} edge callbacks are still armed from an earlier "
+            f"panel. See pirig.silence: the next edge to match one of "
+            f"them raises inside lgpio's notification thread, which has "
+            f"no guard around its dispatch, and every press after that "
+            f"is lost with nothing in the log but a warning.")
+
+        chip = int(sim("gpio-chip"))
+        pirig.bind_gpiozero_to(chip)
         try:
             panel = buttons_mod.GpioButtons()
-        except Exception as exc:                 # noqa: BLE001
-            pytest.skip(f"gpiozero could not open a gpiochip here: {exc}")
+        except BaseException:
+            pirig.release_gpiozero()
+            raise
 
-        wanted = f"/dev/gpiochip{sim('gpio-chip')}"
-        opened = set()
-        for fd in Path("/proc/self/fd").iterdir():
-            try:
-                target = str(fd.resolve())
-            except OSError:
-                continue
-            if target.startswith("/dev/gpiochip"):
-                opened.add(target)
-        if wanted not in opened:
+        wanted = {f"/dev/gpiochip{chip}"}
+        opened = pirig.open_gpiochips()
+        try:
+            assert opened == wanted, (
+                f"the panel is talking to {opened or 'no gpiochip at all'} "
+                f"rather than {wanted}, the chip gpio-sim just made; every "
+                f"assertion below would be about the wrong hardware")
+            # Which factory the pins belong to, not just which chip is
+            # open. A pin cached from an earlier, closed factory claims
+            # its alert on a dead handle: the panel looks healthy, the
+            # chip is right, and no press ever arrives. That is how run
+            # 31699840801 read -- three timeouts and a debounce test
+            # passing because it asserts nothing arrives.
+            stale = pirig.stale_pins()
+            assert not stale, (
+                f"the panel is holding pins from an earlier factory: "
+                f"{stale}. Their alerts are claimed on a handle that is "
+                f"now closed, so every press below would time out and "
+                f"this class would report a panel that never fires. See "
+                f"pirig.release_gpiozero for why the cache can survive.")
+            # The thread that has to still be running for any of the
+            # tests below to mean anything. It dies silently -- a
+            # warning in the summary, nothing in the failing test -- and
+            # once it has, a press and a broken panel look identical.
+            thread = pirig.notify_thread()
+            assert thread is not None and thread.is_alive(), (
+                "lgpio's notification thread is dead, so no edge can "
+                "reach any callback in this process. Every press test "
+                "below would fail as a timeout, saying nothing about "
+                "why. See pirig.silence.")
+            yield panel
+        finally:
             panel.close()
+            pirig.release_gpiozero()
+
+    def test_gpiozero_finds_the_simulated_chip_unaided(self, identity):
+        """
+        The identity alone, with nobody naming a factory or a chip.
+
+        That is how the shipped code runs: `GpioButtons` asks gpiozero for
+        a `Button` and takes whatever pin factory it settled on. Worth
+        knowing that a board revision is the only thing that path was
+        missing, and worth failing if gpiozero's own selection stops
+        reaching lgpio.
+        """
+        pytest.importorskip("lgpio")
+        from gpiozero import Device
+        from gpiozero.pins.lgpio import LGPIOFactory
+
+        chip = int(sim("gpio-chip"))
+        if chip != 0:
+            # Not a defect, and not something to assert around: lgpio
+            # addresses chips by NUMBER and gpio-sim takes whichever the
+            # kernel had free. The fixture below pins the factory for
+            # exactly this case; here there is nothing left to prove.
             pytest.skip(
-                f"gpiozero bound to {opened or 'no gpiochip'} rather than "
-                f"{wanted}; it selects the chip from Pi board detection, "
-                f"which cannot find gpio-sim. See harness/README.md.")
-        yield panel
-        panel.close()
+                f"gpio-sim landed at gpiochip{chip}, and for a Zero 2 W "
+                f"gpiozero's unaided default opens gpiochip0")
+
+        factory = Device._default_pin_factory()
+        try:
+            assert isinstance(factory, LGPIOFactory), (
+                f"gpiozero settled on {type(factory).__name__}; only the "
+                f"lgpio factory talks to a gpiochip")
+            assert factory.chip == chip
+        finally:
+            factory.close()
 
     def test_a_tap_on_up_arrives_as_up(self, buttons):
         from otpunit.hw.buttons import PIN_UP, Press
 
         self.press(PIN_UP)
-        assert buttons.wait(timeout=2) is Press.UP
+        assert buttons.wait(timeout=2) is Press.UP, self.why(PIN_UP)
+
+    def test_a_tap_on_down_arrives_as_down(self, buttons):
+        """
+        The third switch, on its own line.
+
+        Cheap, and it is the one that would catch a pin number swapped in
+        the constructor -- UP and OK are distinguishable by their events,
+        DOWN only by which line was grounded.
+        """
+        from otpunit.hw.buttons import PIN_DOWN, Press
+
+        self.press(PIN_DOWN)
+        assert buttons.wait(timeout=2) is Press.DOWN, self.why(PIN_DOWN)
 
     def test_a_tap_on_ok_arrives_as_ok_not_back(self, buttons):
         from otpunit.hw.buttons import PIN_OK, Press
 
         self.press(PIN_OK, seconds=0.05)
-        assert buttons.wait(timeout=2) is Press.OK
+        assert buttons.wait(timeout=2) is Press.OK, self.why(PIN_OK)
 
     def test_a_hold_on_ok_arrives_as_back_exactly_once(self, buttons):
         """
@@ -884,8 +1578,53 @@ class TestTheRealButtonPath:
         from otpunit.hw.buttons import HOLD_SECONDS, PIN_OK, Press
 
         self.press(PIN_OK, seconds=HOLD_SECONDS + 0.3)
-        assert buttons.wait(timeout=3) is Press.BACK
+        assert buttons.wait(timeout=3) is Press.BACK, self.why(PIN_OK)
         assert buttons.wait(timeout=0.5) is None, "one press, two events"
+
+    def test_a_bounce_too_short_to_be_a_press_is_not_one(self, buttons):
+        """
+        BOUNCE_SECONDS exists because a switch closing is not one clean
+        edge. Nothing has ever checked that the number reaches the kernel
+        driver: gpiozero hands it to lgpio, and every other test in this
+        repository drives the panel from above that.
+
+        A stuck contact on OK is the expensive version of this -- a
+        phantom BACK while a job prints purges the spool.
+
+        The one assertion this test is named for is negative, and a
+        negative assertion about a panel is what a dead panel passes.
+        That is not hypothetical here: run 31699840801 had every button
+        silently receiving nothing, and this test went green through all
+        of it while its three neighbours timed out. So the glitch is
+        preceded by a real press on the same line of the same panel, and
+        "no press arrived" only counts once one has.
+        """
+        from otpunit.hw.buttons import BOUNCE_SECONDS, PIN_UP, Press
+
+        # Asserted, not skipped over. A window of zero is a defect in the
+        # panel, not a fact about this machine, and without this the test
+        # for it would quietly report "could not produce a short enough
+        # glitch" -- measured, with BOUNCE_SECONDS set to 0.
+        assert BOUNCE_SECONDS > 0, "the panel has no debounce window left"
+
+        # The control. Same panel, same GPIO, same wait() -- so the only
+        # difference between it and the assertion below is how long the
+        # line was held.
+        self.press(PIN_UP)
+        assert buttons.wait(timeout=2) is Press.UP, (
+            "a full-length press did not arrive either, so this panel "
+            "cannot say anything about the debounce window.\n  "
+            + self.why(PIN_UP))
+
+        measured = self.glitch(PIN_UP)
+        if measured >= BOUNCE_SECONDS:
+            pytest.skip(
+                f"this machine took {measured * 1000:.1f}ms to bounce the "
+                f"line, which is longer than the {BOUNCE_SECONDS * 1000:.0f}"
+                f"ms window -- that is a press, not a glitch")
+        assert buttons.wait(timeout=0.5) is None, (
+            f"a {measured * 1000:.1f}ms glitch arrived as a press through a "
+            f"{BOUNCE_SECONDS * 1000:.0f}ms debounce window")
 
 
 @needs_sim("i2c-bus", "i2c-stub")

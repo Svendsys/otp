@@ -485,15 +485,27 @@ name = "cups-rig-tray-failure-is-not-injected"
 tier = "hardware"
 guard = """
 The empty-tray test rests entirely on the rig being able to make the backend
-fail. If the flag stops arriving, the job succeeds, the unit reports a
+fail. If the mode stops arriving, the job succeeds, the unit reports a
 printed pair, and the test asserting that it must NOT reports a pass -- a
 fixture that lies, which this rig has produced once already: a stale
 .unplugged file made a test believing it exercised a CUPS_BACKEND_STOP
-exercise a disconnect instead."""
+exercise a disconnect instead.
+
+THE INJECTION POINT MOVED, and this row did not follow it. It was written
+against `fail_jobs()` touching a boolean `{outdir}/.fail`, which the rig
+stopped having when the failure modes became a table: set_failure() now
+writes the mode NAME into `{outdir}/.mode` and the backend re-reads that file
+on every invocation. The rename is the same break in the new shape -- the
+writer puts the mode somewhere the backend does not look, `cat` falls through
+to its `|| echo ""`, MODE is empty, and the case statement takes the healthy
+branch for every mode the table offers. It is the whole injection mechanism
+rather than the empty tray alone, which is the correct blast radius: nothing
+else in the rig can make a job fail, and fail_jobs() is a two-line wrapper
+over this same call."""
 tests = [
   "tests/test_simulated_hardware.py::TestTheUnattendedSequenceAgainstRealCups::test_an_empty_tray_does_not_produce_a_sheet_claiming_a_pair",
 ]
 [[mutation.edit]]
 file = "tests/cupsrig.py"
-find = '''        flag = self.jobs / ".fail"'''
-replace = '''        flag = self.jobs / ".fail-disabled"'''
+find = '''        (self.jobs / ".mode").write_text(mode)'''
+replace = '''        (self.jobs / ".mode-disabled").write_text(mode)'''
