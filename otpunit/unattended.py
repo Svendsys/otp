@@ -166,8 +166,6 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
     sleep = sleep or time.sleep
     vocabulary = vocabulary or Vocabulary()
 
-    codeword = settings.auto_codeword or vocabulary.random()
-
     # Every sheet carries the media size. Dropping it left the status,
     # swap and done sheets submitted with no media at all, so a LETTER or
     # A6 unit rendered one size and asked the queue for another.
@@ -209,7 +207,64 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         log("auto_print is off; stopping after the status sheet")
         return 1
 
-    # 2. Wait, so there is time to read the sheet and pull the plug.
+    # 2. The codeword, and not one line earlier.
+    #
+    #    Rolling one draws from the CSPRNG, and os.urandom blocks inside
+    #    getrandom() until the kernel has seeded it. This used to be the
+    #    first statement in run(), which meant a unit at first boot with
+    #    no network and no RTC printed NOTHING AT ALL -- not the status
+    #    sheet, not the plan, not the row that would have explained it.
+    #    Measured against this function before the move: an empty
+    #    submission list and an empty log, indefinitely.
+    #
+    #    The status sheet needs no codeword -- it must never carry one --
+    #    so it goes out first and reports the CRNG state itself, and the
+    #    wait below happens with that page already in the tray. In this
+    #    mode the printer IS the panel, so that page is the only place the
+    #    unit can say anything at all.
+    announced = [None]
+    missing = [0]
+
+    def waiting(seconds):
+        # THE PLUG STAYS LIVE. This wait has no upper bound, and the sheet
+        # already in the tray tells the operator that unplugging the
+        # printer aborts -- that is the whole control surface this mode
+        # has. A wait that ignores it leaves the unit exactly as dead as
+        # the silent hang this gate exists to replace, one step further
+        # on: the page says "pull the cable to stop", and pulling it does
+        # nothing until entropy arrives. Found by review on this PR.
+        #
+        # Same rule as countdown() and drain(): one empty answer is a
+        # hiccup, GONE_AFTER in a row is a cable. devices() swallows every
+        # error and returns [], so a busy cupsd looks identical to an
+        # unplugged one and a single miss must not abort a pad.
+        try:
+            present = bool(cups.devices())
+        except Exception:                        # noqa: BLE001
+            present = False
+        missing[0] = 0 if present else missing[0] + 1
+        if missing[0] >= GONE_AFTER:
+            raise Aborted("printer disconnected while waiting for entropy")
+
+        # First, then every 30s. The unit's journal is volatile and lives
+        # in RAM, so a line every half second for a wait with no upper
+        # bound is a slow leak into the one resource it cannot spare.
+        if announced[0] is not None and seconds - announced[0] < 30.0:
+            return
+        announced[0] = seconds
+        log(f"waiting for the kernel CSPRNG to be seeded ({seconds:.0f}s so "
+            f"far); no key material can be drawn until it is")
+
+    try:
+        waited = gen_module().wait_for_crng(on_wait=waiting, sleep=sleep)
+    except Aborted as exc:
+        log(f"aborted: {exc}")
+        return 1
+    if waited:
+        log(f"kernel CSPRNG seeded after {waited:.0f}s")
+    codeword = settings.auto_codeword or vocabulary.random()
+
+    # 3. Wait, so there is time to read the sheet and pull the plug.
     try:
         countdown(cups, settings.auto_delay, buttons=buttons, sleep=sleep,
                   log=log)
@@ -217,7 +272,7 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         log(f"aborted: {exc}")
         return 1
 
-    # 3. The manual, BEFORE the pads. A pad is useless to someone who
+    # 4. The manual, BEFORE the pads. A pad is useless to someone who
     #    does not know the rules -- one reused page undoes the whole
     #    thing -- and the person this mode exists for has no other way to
     #    find out. It goes first so that if the paper runs out, what
@@ -230,7 +285,7 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         except Exception as exc:                 # noqa: BLE001
             log(f"manual failed, continuing: {exc}")
 
-    # 4. The tabula recta, which is what makes a pad usable by hand
+    # 5. The tabula recta, which is what makes a pad usable by hand
     #    without doing arithmetic. No key material.
     try:
         card = jobs.generate(jobs.JobSpec(jobs.JobKind.TABULA, "", settings))
@@ -240,7 +295,7 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         # Useful, not essential. Losing it must not lose the pads.
         log(f"tabula recta failed, continuing: {exc}")
 
-    # 4. The pair itself, generated once and submitted twice so the two
+    # 6. The pair itself, generated once and submitted twice so the two
     #    copies are byte-identical -- which is what makes them a pair.
     spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, codeword, settings)
     job = jobs.PadPairJob(spec, cups, queue)
@@ -268,7 +323,7 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         job.print_next_copy()
         log(f"copy A submitted ({settings.pages} pages)")
 
-        # 5. The separator IS the prompt. With no buttons nothing can wait
+        # 7. The separator IS the prompt. With no buttons nothing can wait
         #    for a keypress, so the sheet names the deadline instead.
         send(sheet(SWAP, codeword=codeword, settings=settings,
                    seconds=settings.auto_swap_delay), "REMOVE COPY A")
@@ -339,7 +394,7 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
             # Never let a wipe failure mask what happened to the pair.
             log(f"wipe failed: {exc}")
 
-    # 6. What they are now holding -- which is NOT always a pair. Saying
+    # 8. What they are now holding -- which is NOT always a pair. Saying
     #    "two identical copies" over half a pair is worse than saying
     #    nothing, because the operator files it and finds out later.
     try:

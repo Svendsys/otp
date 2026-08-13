@@ -405,13 +405,55 @@ KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/n
     else
         printf 'IMG-CHECK single-kernel-entry FAIL\n'
     fi
-    for want in "Linux version" "systemd[1]:" "Reached target"; do
+    # THE ENTROPY EVIDENCE -- the only place it is observed on the real
+    # artifact rather than injected into a unit test. See issue #16.
+    #
+    # "crng init done" is the kernel saying the CSPRNG is seeded. Every
+    # byte this unit generates goes through getrandom(), which BLOCKS until
+    # that line is printed, so its absence is not a warning: it is a unit
+    # that cannot make key material and, before issue #16, would have hung
+    # silently trying. Measured at ~2.4s guest in the local rig (see the
+    # header), and the wording is confirmed verbatim against a running
+    # kernel: "[    0.193894] random: crng init done". A hard gate.
+    #
+    # "hwrng registered" is the hw_random core accepting bcm2835-rng, which
+    # is builtin (CONFIG_HW_RANDOM_BCM2835=y). It is what separates "the
+    # SoC's ring oscillator seeded the pool" from "interrupt timing did" --
+    # the difference between a one-time pad and a very good stream cipher,
+    # and a distinction nothing else in this harness can draw.
+    #
+    # A GATE, but only since it was read. It shipped for one commit as a
+    # report instead, because the wording was a guess and no console in
+    # this repository carried it: hard-failing a release on an unread
+    # string is the defect issue #14 catalogues -- its list already has
+    # "tier 3 verdict grepped for otp-unit, which is the image's HOSTNAME"
+    # -- with the sign flipped, blocking a boot that was fine. Run
+    # 31693881773 then booted the built image and printed it verbatim:
+    #
+    #   IMG-NOTE hwrng-line-present: g 3f104000.rng: hwrng registered
+    #
+    # ("g " is the tail of "bcm2835-rng", clipped by the note's own quote
+    # window.) Now it is evidence, so now it gates.
+    #
+    # loglevel=7 keeps both: the crng line is KERN_NOTICE and the hwrng
+    # line is KERN_INFO, and neither is DEBUG.
+    for want in "Linux version" "systemd[1]:" "Reached target" \
+                "crng init done" "hwrng registered"; do
         if grep -qF -- "$want" "$CONSOLE_TXT" 2>/dev/null; then
             printf 'IMG-CHECK %s PASS\n' "$(printf '%s' "$want" | tr ' ' '-')"
         else
             printf 'IMG-CHECK %s FAIL\n' "$(printf '%s' "$want" | tr ' ' '-')"
         fi
     done
+    # Quoted back as well as gated, so the next kernel bump shows WHICH
+    # driver registered rather than only that something did. Widened from
+    # 16 characters of leading context to 40: at 16 the run above clipped
+    # "bcm2835-rng" down to "g ", losing the one detail worth reading.
+    if grep -qiE "hwrng|hw_random|rng_core" "$CONSOLE_TXT" 2>/dev/null; then
+        printf 'IMG-NOTE hwrng-line: %s\n' \
+            "$(grep -ioE '.{0,40}(hwrng|hw_random|rng_core).{0,44}' \
+                 "$CONSOLE_TXT" 2>/dev/null | head -1)"
+    fi
 } > "$VERDICT"
 cat "$VERDICT"
 

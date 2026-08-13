@@ -849,10 +849,15 @@ class RunJob(Screen):
         return self.queue_state(app) != "idle"
 
 
-def gen_cancelled():
+def generator():
+    """otp_generator, imported late so this module stays cheap to import."""
     import otp_generator
 
-    return otp_generator.GenerationCancelled
+    return otp_generator
+
+
+def gen_cancelled():
+    return generator().GenerationCancelled
 
 
 
@@ -1063,6 +1068,49 @@ class WaitForPrinter(Screen):
         return self
 
 
+class WaitForEntropy(Screen):
+    """
+    Shown while the kernel CSPRNG is still being seeded.
+
+    The bit count sits on the footer next to a spinner because between
+    them they are the two things that move, and something moving is what
+    tells an operator the unit is alive rather than wedged. The count is
+    only ever shown in the state where it means anything: while the CRNG
+    is unseeded the kernel's estimate genuinely climbs towards the
+    threshold, and once seeded it pins at the pool size and this screen is
+    gone.
+
+    The button hint is literal advice, not reassurance. Each GPIO edge is
+    an interrupt and interrupt timings are one of the things the kernel
+    folds into the pool, so pressing them does help -- a little, which is
+    how it is worded. It also gives someone standing at a quiet box
+    something to do other than pull the power, which is the failure this
+    screen exists to prevent: a power cycle discards every bit collected
+    so far and starts the wait again from zero.
+    """
+
+    def __init__(self):
+        self.spinner = 0
+
+    def frame(self, app):
+        self.spinner = (self.spinner + 1) % 4
+        bits = generator().entropy_bits()
+        return Frame(
+            title="WAITING FOR ENTROPY",
+            lines=["THE KERNEL RANDOM",
+                   "POOL IS NOT SEEDED.",
+                   "NO KEY CAN BE MADE",
+                   "UNTIL IT IS.",
+                   "PRESS THE BUTTONS:",
+                   "IT HELPS A LITTLE."],
+            footer=f"{'?' if bits is None else bits} BITS   "
+                   + "|/-\\"[self.spinner],
+        )
+
+    def press(self, app, press):
+        return self
+
+
 class App:
     """Owns the screen stack and the hardware handles."""
 
@@ -1107,6 +1155,55 @@ class App:
         self.running = False
         return None
 
+    def wait_for_entropy(self) -> bool:
+        """
+        Hold the panel here until the kernel CSPRNG is seeded.
+
+        NOT a security gate -- see otp_generator.crng_seeded. os.urandom
+        goes through getrandom(), which blocks rather than handing back
+        unseeded bytes, so a pad drawn from an unseeded pool is already
+        impossible and nothing here makes it more so. What this replaces
+        is the SYMPTOM. The first draw of the interactive flow is
+        Vocabulary.random(), called from inside CodewordRoll.frame(), so
+        the block lands BEFORE the frame is computed and the panel never
+        repaints. Measured on this code without this loop: two frames
+        drawn, then the CODEWORD menu with the caret still on ROLL RANDOM,
+        for as long as the kernel took. On three buttons and 128x64 pixels
+        that is a crash, and the remedy for a crash -- power-cycle --
+        discards the entropy collected so far.
+
+        It has its own loop rather than reusing wait_for_crng() for the
+        same reason wait_for_printer does: the buttons have to keep being
+        polled, or the wait that was meant to fix a frozen panel simply
+        freezes it somewhere else. Every poll repaints, so the spinner and
+        the bit count move.
+        """
+        screen = WaitForEntropy()
+        while self.running:
+            if generator().crng_seeded():
+                # Banked presses, discarded. This is the ONLY screen that
+                # asks to be pressed -- it tells the operator that using
+                # the buttons helps -- so it is the one most certain to
+                # leave a queue behind, and GpioButtons is a queue rather
+                # than a level. Returning with presses still in it hands
+                # them to whatever is drawn next: on a unit whose printer
+                # is already attached that is the main menu, where a
+                # banked OK selects PRINT PAD PAIR and a banked DOWN moves
+                # the caret -- from a press aimed at a waiting screen. The
+                # same reason _print_copy and _advance drain.
+                _drain(self)
+                return True
+            self.render(screen)
+            press = self.buttons.wait(timeout=self.poll_seconds)
+            if press is Press.QUIT:
+                self.running = False
+            elif press is Press.BACK:
+                # The same exit wait_for_printer offers, for the same
+                # reason: a unit that can never seed must still be able to
+                # power down cleanly rather than have its plug pulled.
+                self.request_shutdown()
+        return False
+
     def wait_for_printer(self) -> bool:
         """Block on the waiting screen until a printer appears."""
         screen = WaitForPrinter()
@@ -1125,6 +1222,12 @@ class App:
         return False
 
     def run(self) -> None:
+        # Entropy first. Waiting for a printer is a wait an operator
+        # understands and can act on; waiting for the CRNG is not, and it
+        # is the one that has to clear before the menu can roll a codeword
+        # -- which is the very first thing PRINT PAD PAIR does.
+        if not self.wait_for_entropy():
+            return
         if not self.wait_for_printer():
             return
         # The main menu is always the bottom of the stack, even when setup
