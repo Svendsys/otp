@@ -115,20 +115,53 @@ def test_healthy_boot_passes_on_console_evidence_despite_rc_124(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
 
-def test_a_boot_with_no_hardware_rng_fails(tmp_path):
+def test_a_boot_with_no_hardware_rng_is_reported_but_not_failed(tmp_path):
     """
-    bcm2835-rng not probing means the pool has no TRNG behind it.
+    bcm2835-rng not probing means the pool has no TRNG behind it, which is
+    the difference between a one-time pad and a very good stream cipher --
+    and nothing downstream would complain, because getrandom() is happy
+    once seeded by anything.
 
-    The unit would still make pads -- getrandom() is happy once seeded by
-    anything -- so nothing downstream would ever complain. This is the
-    only check that separates "seeded by the SoC's ring oscillator" from
-    "seeded by interrupt jitter", which is the difference between a
-    one-time pad and a very good stream cipher.
+    Worth surfacing, therefore. NOT worth failing a release on, because
+    the wording of that line has never been read off a real Pi console:
+    there is no arm64 image to boot from this repository, no recorded
+    console in the tree carries it, and the kernel available here for
+    checking registers an RNG while printing no matching line at all.
+
+    That is the shape of the defect issue #14 catalogues -- the tier-3
+    verdict once grepped for "otp-unit", which is the image's HOSTNAME,
+    and passed a boot that restart-looped. A hard gate on an unread string
+    is the same guess with the sign flipped: it blocks a boot that was
+    fine. Promote it once someone has read a real console.
     """
     lines = [ln for ln in kernel_lines() if "hwrng registered" not in ln]
     proc, verdict = run_verdict(tmp_path, lines + [SUCCESS])
-    assert "IMG-CHECK hwrng-registered FAIL" in verdict
-    assert proc.returncode == 1
+    assert "IMG-NOTE hwrng-line-absent" in verdict, verdict
+    assert "FAIL" not in verdict, \
+        "an unverified console string is failing the boot: " + verdict
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_a_hardware_rng_line_is_quoted_back_when_present(tmp_path):
+    """
+    The other half, and the point of reporting rather than dropping it:
+    when the console DOES carry an hwrng line, the verdict must print it
+    verbatim. That is how the wording gets learned -- the first real
+    tier-3 run is what turns this note into the gate above.
+    """
+    # The fixture's own hwrng line is stripped first, because it is
+    # INVENTED -- "3f104000.rng: hwrng registered" was written to match the
+    # grep, not read off a Pi. That is exactly why this is a note and not a
+    # gate; a fixture agreeing with a guess proves only that both were
+    # written by the same person.
+    plain = [ln for ln in kernel_lines() if "hwrng" not in ln.lower()]
+    real = "[    2.401337] hwrng: registered bcm2835 (quality: 1000)"
+    proc, verdict = run_verdict(tmp_path, plain + [real, SUCCESS])
+    assert "IMG-NOTE hwrng-line-present" in verdict, verdict
+    assert "bcm2835" in verdict, \
+        "the note did not quote the line back, so a real run would teach " \
+        "nothing: " + verdict
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_a_boot_whose_crng_never_seeds_fails(tmp_path):

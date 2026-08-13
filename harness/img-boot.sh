@@ -408,30 +408,49 @@ KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/n
     # THE ENTROPY EVIDENCE -- the only place it is observed on the real
     # artifact rather than injected into a unit test. See issue #16.
     #
-    # "hwrng registered" is bcm2835-rng's probe line. The driver is BUILTIN
-    # (CONFIG_HW_RANDOM_BCM2835=y), so this line appearing is what proves
-    # the SoC's TRNG is the pool's source on the image that gets flashed,
-    # as opposed to timing jitter alone -- which is what a dead board or a
-    # device-tree regression would silently leave behind. Nothing else in
-    # this harness tells those two apart.
-    #
     # "crng init done" is the kernel saying the CSPRNG is seeded. Every
     # byte this unit generates goes through getrandom(), which BLOCKS until
     # that line is printed, so its absence is not a warning: it is a unit
     # that cannot make key material and, before issue #16, would have hung
-    # silently trying. Measured at ~2.4s guest in the local rig -- see the
-    # header -- and present in every green run's console.
+    # silently trying. Measured at ~2.4s guest in the local rig (see the
+    # header), and the wording is confirmed verbatim against a running
+    # kernel: "[    0.193894] random: crng init done". A hard gate.
     #
-    # loglevel=7 keeps both: bcm2835-rng's line is KERN_INFO and the crng
-    # line is KERN_NOTICE, and neither is DEBUG.
+    # loglevel=7 keeps it: the crng line is KERN_NOTICE, not DEBUG.
     for want in "Linux version" "systemd[1]:" "Reached target" \
-                "hwrng registered" "crng init done"; do
+                "crng init done"; do
         if grep -qF -- "$want" "$CONSOLE_TXT" 2>/dev/null; then
             printf 'IMG-CHECK %s PASS\n' "$(printf '%s' "$want" | tr ' ' '-')"
         else
             printf 'IMG-CHECK %s FAIL\n' "$(printf '%s' "$want" | tr ' ' '-')"
         fi
     done
+    # REPORTED, not gated, and deliberately so until it has been SEEN.
+    #
+    # bcm2835-rng is builtin (CONFIG_HW_RANDOM_BCM2835=y), so its probe
+    # line is what would distinguish "the SoC TRNG seeded the pool" from
+    # "timing jitter did" -- a distinction nothing else here can draw, and
+    # one worth having. But the exact wording the hw_random core prints
+    # has NOT been observed on a Pi console from this repository: there is
+    # no arm64 image to boot here, no recorded console in the tree carries
+    # it, and the kernel available for checking registers an RNG while
+    # emitting no matching line at all.
+    #
+    # Hard-failing on a string nobody has read is the defect issue #14
+    # catalogues, with the sign flipped. That list already contains "tier
+    # 3 verdict grepped for otp-unit, which is the image's HOSTNAME" -- a
+    # guess that passed a restart-looping boot. The same guess here would
+    # block a release on a boot that was fine.
+    #
+    # So it reports. Promote it into the loop above once a real console
+    # has been read and the wording is known.
+    if grep -qiE "hwrng|hw_random|rng_core" "$CONSOLE_TXT" 2>/dev/null; then
+        printf 'IMG-NOTE hwrng-line-present: %s\n' \
+            "$(grep -ioE '.{0,16}(hwrng|hw_random|rng_core).{0,44}' \
+                 "$CONSOLE_TXT" 2>/dev/null | head -1)"
+    else
+        printf 'IMG-NOTE hwrng-line-absent (reported, not gated)\n'
+    fi
 } > "$VERDICT"
 cat "$VERDICT"
 
