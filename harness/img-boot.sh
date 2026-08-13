@@ -126,6 +126,15 @@
 # in boot1 are there in boot2, and writes that only reached the overlay's
 # tmpfs are not. That difference is the entire claim.
 #
+# Run 16 (31752321387) is the first one that did it, and it went green on
+# the first attempt: 9/9 guest checks in boot1 and 11/11 in boot2, both
+# boots reaching ~150s guest time with one kernel entry each, 7m59s of wall
+# clock for the pair on top of a 6m58s pi-gen build. Both boots ended
+# `qemu exit: 0` -- qemu exits cleanly on the SIGTERM the early stop sends
+# -- which is why the "guest reset itself" diagnosis below is conditioned on
+# EARLY_STOP being empty as well. Without that it would have fired on two
+# perfectly healthy boots.
+#
 # PARTLY cmdline.txt and config.txt now, where it used to be neither. QEMU
 # still reads no firmware configuration -- -append below REPLACES the kernel
 # command line wholesale, and dtparam=i2c_arm=on and the disable-wifi/bt
@@ -139,9 +148,10 @@
 # WHAT IT DOES NOT CATCH, and this is the important caveat: QEMU's raspi3b
 # is a Pi with nothing plugged into it. No OLED on the I2C bus, no buttons
 # on the header, no printer. Peripheral coverage is WORSE here than tier
-# 1, which simulates all three. This tier answers exactly one question --
-# does the image come up and does the unit start -- and should be run once
-# per image rather than per commit.
+# 1, which simulates all three. This tier answers whether the image comes
+# up, whether the unit starts, and whether the root it starts on is the
+# read-only overlay that discards -- nothing about hardware -- and should
+# be run once per image rather than per commit.
 set -euo pipefail
 
 IMAGE_XZ="${1:?usage: img-boot.sh <image.img.xz>}"

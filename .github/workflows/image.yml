@@ -127,12 +127,16 @@ jobs:
     #
     # TWO boots now, for the read-only overlay (issue #9): the second is a
     # power-cycle of the same card, and the backstop is per boot. The
-    # arithmetic that sizes this: ~10 minutes of non-boot work on a
-    # cache-miss rebuild (checkout, apt, pi-gen at 7m24s, cache save,
-    # upload, decompress) + 2 x (600s backstop + timeout's 30s kill grace)
-    # + verdict overhead = ~31.5, so 40 keeps the same kind of margin 25
-    # gave one boot. Healthy runs never go near it: the harness stops each
-    # boot the moment the guest check reports done.
+    # arithmetic that sizes this is the WORST case, where neither boot ever
+    # reports: ~10 minutes of non-boot work on a cache-miss rebuild
+    # (checkout, apt, pi-gen, cache save, upload, decompress) + 2 x (600s
+    # backstop + timeout's 30s kill grace) + verdict overhead = ~31.5, so 40
+    # keeps the same kind of margin 25 gave one boot.
+    #
+    # Healthy runs are nowhere near it, and that is measured rather than
+    # hoped: run 31752321387, a cache MISS with both boots, took 16m16s end
+    # to end -- 6m58s of pi-gen and 7m59s for the pair of boots, because the
+    # harness stops each one the moment its guest check reports done.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4

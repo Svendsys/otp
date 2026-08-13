@@ -319,6 +319,13 @@ reached the card is there in boot 2 and a write that only reached the
 overlay's tmpfs is not. A fresh copy would answer both questions with the
 image build's own contents.
 
+**Run 16 (31752321387) is the first one that did this, and it went green on
+its first attempt** — 9/9 guest checks in boot 1, 11/11 in boot 2, each boot
+reaching ~150s guest time with one kernel entry, and both ANSI-stripped
+consoles carrying `random: crng init done` and `bcm2835-rng 3f104000.rng:
+hwrng registered`. Measured cost on a cache miss: 6m58s of pi-gen, then
+7m59s for the pair of boots, 16m16s for the whole job.
+
 The reporting comes from inside the guest, because `findmnt /` and
 `cupsd -t` need a running machine. `otp-unit-imgcheck.service` **ships in
 the image** and is gated on `otp.imgcheck` in the kernel command line, which
