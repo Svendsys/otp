@@ -24,7 +24,6 @@ import re
 import subprocess
 from pathlib import Path
 
-import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 IMG_BOOT = REPO / "harness" / "img-boot.sh"

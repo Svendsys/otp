@@ -516,3 +516,123 @@ tests = [
 file = "tests/cupsrig.py"
 find = '''        (self.jobs / ".mode").write_text(mode)'''
 replace = '''        (self.jobs / ".mode-disabled").write_text(mode)'''
+
+
+# --- tier 3: the overlay, and the guest that reports on it ----------------
+#
+# Issue #9. The read-only root was the largest completely unobserved surface
+# in the project, and what observes it now is a guest reporting over a serial
+# console into a gate. Every row here is a way for that gate to accept a boot
+# that proved nothing -- which is the shape of four of the five defects in
+# issue #14.
+
+[[mutation]]
+name = "tier3-guest-phase-never-reported-accepted"
+tier = "fast"
+guard = """
+Exactly one OTP-RESULT per phase. Boot 2 is the entire power-cycle half of
+issue #9, and a boot 2 that never happened produces an empty console -- which
+is indistinguishable from a boot 2 with nothing to say. Accepting silence
+greens a run in which the overlay was never asked to discard anything."""
+tests = [
+  "tests/test_img_verdict.py::test_the_second_boot_must_report_too",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ "${count:-0}" = "1" ]; then
+        printf 'IMG-CHECK %s guest-reported-once PASS\n' "$phase"'''
+replace = '''    if true; then
+        printf 'IMG-CHECK %s guest-reported-once PASS\n' "$phase"'''
+
+
+[[mutation]]
+name = "tier3-guest-unfinished-phase-accepted"
+tier = "fast"
+guard = """
+OTP-GUEST-DONE is the only evidence a phase ran out rather than being killed
+part way through -- and this tier kills the emulator by hand the moment that
+line appears, so the difference between "finished" and "cut off" is a single
+line of output. Counts printed without it agree with themselves right up to
+the axe."""
+tests = [
+  "tests/test_img_verdict.py::test_a_phase_that_started_but_never_finished_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ "${count:-0}" = "1" ]; then
+        printf 'IMG-CHECK %s guest-finished PASS\n' "$phase"'''
+replace = '''    if true; then
+        printf 'IMG-CHECK %s guest-finished PASS\n' "$phase"'''
+
+
+[[mutation]]
+name = "tier3-guest-fail-lines-ignored"
+tier = "fast"
+guard = """
+Belt and braces over the counts, which come from the guest -- the thing under
+test. A guest that miscounts must not be able to talk its way to a green run,
+so one OTP-CHECK FAIL fails the phase on its own."""
+tests = [
+  "tests/test_img_verdict.py::test_a_guest_fail_line_fails_the_phase",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ "${count:-1}" = "0" ]; then'''
+replace = '''    if true; then'''
+
+
+[[mutation]]
+name = "tier3-guest-named-checks-not-required"
+tier = "fast"
+guard = """
+Zero FAIL lines is trivially true of a guest that checked nothing -- row 4 of
+issue #14 arriving somewhere new. The gate names the checks it expects, so a
+check deleted from img-guest-check.sh fails the run instead of quietly
+shrinking what tier 3 proves. The overlay checks are the ones worth losing by
+accident: everything else in the phase would still pass without them."""
+tests = [
+  "tests/test_img_verdict.py::test_a_dropped_guest_check_fails_even_with_no_fail_lines",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        grep -qE "OTP-CHECK[[:space:]]+$phase[[:space:]]+$name[[:space:]]+PASS" \
+             "$CONSOLE_TXT" 2>/dev/null || missing="$missing $name"'''
+replace = '''        :'''
+
+
+# --- what provisioning is allowed to leave behind -------------------------
+
+[[mutation]]
+name = "install-overlay-initramfs-not-verified"
+tier = "fast"
+guard = """
+The initramfs has to CONTAIN scripts/overlay, not merely exist. One built
+before the overlay script was written has the right name and the right size,
+the firmware loads it, and boot=overlay is then read by nothing -- so the
+unit comes up on a writable root and nothing anywhere says so. install.sh
+reads the archive rather than stat()ing the file for exactly that case."""
+tests = [
+  "tests/test_overlay_root.py::test_an_initramfs_without_the_overlay_script_fails_the_install",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''        if lsinitramfs "$candidate" 2>/dev/null | grep -q "scripts/overlay"; then'''
+replace = '''        if true; then'''
+
+
+[[mutation]]
+name = "install-overlay-token-not-added"
+tier = "fast"
+guard = """
+boot=overlay on the kernel command line is what makes the initrd source
+/scripts/overlay at all. Without it the initramfs is built, loaded, and takes
+the default local mount path -- a read-write root, with every other trace of
+the overlay in place."""
+tests = [
+  "tests/test_overlay_root.py::test_the_overlay_token_is_added_to_the_command_line",
+  "tests/test_overlay_root.py::test_adding_the_token_twice_does_not_add_it_twice",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''        sed -i -e "s|^|boot=overlay |" "$CMDLINE_TXT"'''
+replace = '''        :'''
