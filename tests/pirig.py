@@ -194,8 +194,17 @@ class PiIdentity:
     test_teardown_leaves_nothing_mounted for the part that is checked.
     """
 
-    def __init__(self, revision: int = REVISION):
-        self.revision = revision
+    # No `revision` parameter, deliberately. There used to be one, and it
+    # forged a board that contradicted itself: it reached the device-tree
+    # bind, but /proc/cpuinfo is CPUINFO, formatted from the module-level
+    # REVISION at import and the same for every instance. On a machine
+    # with no device tree, any non-default revision therefore made
+    # __enter__ fail its own consistency check; on one with a device
+    # tree, the two sources disagreed -- exactly the trap the comment
+    # above CPUINFO says the extra fields are there to avoid. Nothing
+    # ever passed it. A test wanting a different board should change
+    # REVISION and MODEL together, which is one place.
+    def __init__(self):
         self.forged: list[str] = []
         self._home = None
         self._temporary: list[str] = []
@@ -225,19 +234,19 @@ class PiIdentity:
             self._bind(CPUINFO_PATH, CPUINFO.encode())
             if DEVICE_TREE_REVISION.exists():
                 self._bind(DEVICE_TREE_REVISION,
-                           struct.pack(">L", self.revision))
+                           struct.pack(">L", REVISION))
 
             from gpiozero.pins.local import get_pi_revision
 
             found = get_pi_revision()
-            if found != self.revision:
+            if found != REVISION:
                 # Something is answering ahead of what we forged. Refuse,
                 # rather than let the tests run against whatever board
                 # that turns out to be: the pin header would be wrong and
                 # the failure would land somewhere unrelated to the cause.
                 raise AssertionError(
                     f"gpiozero read revision {found:#x} with {self.forged} "
-                    f"forged; expected {self.revision:#x}. Some source "
+                    f"forged; expected {REVISION:#x}. Some source "
                     f"ahead of these is answering first.")
         except BaseException:
             self.__exit__(None, None, None)
