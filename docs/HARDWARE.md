@@ -170,10 +170,10 @@ unit found:
 - which of `luma.oled`, `gpiozero` and `lgpio` actually imported
 - the printer it detected, the queue it created and the driver it matched
 - whether swap is off, whether the root filesystem is a read-only overlay,
-  whether any network link is up, and whether the key came from the
-  hardware RNG — the claims this device makes
+  whether any network link is up, whether the kernel CSPRNG is seeded, and
+  whether the key came from the hardware RNG — the claims this device makes
   about itself, checked rather than asserted
-- Pi model, serial, memory, temperature, kernel, entropy, disk
+- Pi model, serial, memory, temperature, kernel, disk
 
 It reprints when the printer is unplugged and reconnected, not on a timer,
 so a unit left plugged in overnight runs the sequence once, not repeatedly. To

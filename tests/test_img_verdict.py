@@ -39,12 +39,23 @@ def verdict_block() -> str:
     return text[text.index(MARKER):]
 
 
+# The two entropy lines, spelled as the kernel spells them. bcm2835-rng is
+# builtin, so its probe and the CRNG seeding it causes both land within the
+# first three seconds -- long before the unit could ask for a pad byte.
+HWRNG = "[    2.383417] bcm2835-rng 3f104000.rng: hwrng registered"
+CRNG = "[    2.421905] random: crng init done"
+
+
 def kernel_lines(*, entries=1, last_ts="20.000000"):
     lines = []
     for _ in range(entries):
         lines.append("[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x410fd034]")
     lines += [
         "[    0.100000] Linux version 6.12.96+rpt-rpi-v8 (build@host)",
+        # Filtered back out by the two tests that need them missing, so
+        # what they prove is the ABSENCE of the line rather than a flag.
+        HWRNG,
+        CRNG,
         "[    9.180895] systemd[1]: Hostname set to <otp-unit>.",
         f"[   {last_ts}] systemd[1]: Reached target sysinit.target - System Initialization.",
     ]
@@ -102,6 +113,57 @@ def test_healthy_boot_passes_on_console_evidence_despite_rc_124(tmp_path):
     # rc 124 is the NORMAL ending of a healthy appliance boot (the guest
     # idles; only the stopwatch ends it). It must not fail the run.
     assert proc.returncode == 0, proc.stderr
+
+
+def test_a_boot_with_no_hardware_rng_fails(tmp_path):
+    """
+    bcm2835-rng not probing means the pool has no TRNG behind it, which is
+    the difference between a one-time pad and a very good stream cipher --
+    and nothing downstream would complain, because getrandom() is happy
+    once seeded by anything.
+
+    A gate, and only since the wording was READ rather than guessed. It
+    shipped for one commit as a report instead: no console in this
+    repository carried the line, and hard-failing a release on an unread
+    string is issue #14's catalogued defect with the sign flipped. Run
+    31693881773 booted the built image and printed it:
+
+        IMG-NOTE hwrng-line-present: g 3f104000.rng: hwrng registered
+    """
+    lines = [ln for ln in kernel_lines() if "hwrng registered" not in ln]
+    proc, verdict = run_verdict(tmp_path, lines + [SUCCESS])
+    assert "IMG-CHECK hwrng-registered FAIL" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_the_hardware_rng_line_is_quoted_back_with_its_driver(tmp_path):
+    """
+    Gated AND quoted. The gate answers "did something register"; the note
+    says WHICH, so a kernel bump that swapped the driver is readable
+    rather than merely green.
+
+    The quote window was 16 characters of leading context and clipped
+    "bcm2835-rng" to "g " on the very first real run -- losing the one
+    detail the note exists to carry.
+    """
+    plain = [ln for ln in kernel_lines() if "hwrng" not in ln.lower()]
+    real = "[    2.401337] bcm2835-rng 3f104000.rng: hwrng registered"
+    proc, verdict = run_verdict(tmp_path, plain + [real, SUCCESS])
+    assert "IMG-CHECK hwrng-registered PASS" in verdict, verdict
+    assert "bcm2835-rng" in verdict, \
+        "the note clipped the driver name off, which is the only thing " \
+        "it adds over the gate: " + verdict
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_a_boot_whose_crng_never_seeds_fails(tmp_path):
+    # Without this line the unit has started and cannot generate: the
+    # first draw blocks inside getrandom() for as long as it takes. A
+    # green tier 3 over that console would be reporting a working image.
+    lines = [ln for ln in kernel_lines() if "crng init done" not in ln]
+    proc, verdict = run_verdict(tmp_path, lines + [SUCCESS])
+    assert "IMG-CHECK crng-init-done FAIL" in verdict
+    assert proc.returncode == 1
 
 
 def test_guest_reached_is_the_max_not_the_concats_last_line(tmp_path):
