@@ -1681,6 +1681,63 @@ replace = '''          "$(if [ "$UC_TROUBLE" = no ] \'''
 
 
 [[mutation]]
+name = "guest-userconf-journal-not-scoped-to-this-boot"
+tier = "fast"
+guard = """
+`journalctl -u` with no boot filter answers out of every boot the journal
+still holds, so a PREVIOUS boot's `Finished userconfig.service` satisfies a
+boot on which the unit never ran -- the exact reading this block exists to
+make impossible. It is harmless today only because device/install.sh sets
+Storage=volatile three hundred lines away in another file, and a probe must
+not be correct by accident at that distance."""
+tests = [
+  "tests/test_overlay_root.py::test_a_previous_boots_success_line_does_not_answer_for_this_boot",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''journalctl -b -u userconfig.service --no-pager'''
+replace = '''journalctl -u userconfig.service --no-pager'''
+
+
+[[mutation]]
+name = "guest-userconf-success-line-not-from-pid-1"
+tier = "fast"
+guard = """
+`journalctl -u` returns the unit's own STDOUT as well as PID 1's status lines
+about it -- that is what StandardOutput=journal means -- so a userconf-service
+that merely PRINTED "Finished userconfig.service" passed the check.
+Demonstrated with a synthetic journal. Nothing upstream prints it today, which
+is the only reason this was not already a false green, and a phrase whose
+truth depends on nobody happening to say it is not a measurement. `Finished`
+is systemd's own success line; carrying the speaker costs nothing."""
+tests = [
+  "tests/test_overlay_root.py::test_the_wizards_own_stdout_cannot_report_its_success",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = "UC_DONE='systemd[1]: Finished userconfig.service'"
+replace = "UC_DONE='Finished userconfig.service'"
+
+
+[[mutation]]
+name = "guest-userconf-success-line-matched-as-a-glob"
+tier = "fast"
+guard = """
+`systemd[1]:` is a glob pattern as well as a string, and `[1]` is a character
+class matching the single character 1. Unquoted inside the ${var#pattern}
+that does the matching, `systemd1: Finished userconfig.service` passes -- not
+a line systemd writes, but one the unit's own stdout could, which is the hole
+the speaker match was added to close."""
+tests = [
+  "tests/test_overlay_root.py::test_the_success_line_is_matched_literally_not_as_a_glob",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''    if [ "${UC_LOG#*"$UC_DONE"}" != "$UC_LOG" ]; then'''
+replace = '''    if [ "${UC_LOG#*$UC_DONE}" != "$UC_LOG" ]; then'''
+
+
+[[mutation]]
 name = "guest-userconf-restart-loop-called-clean"
 tier = "fast"
 guard = """

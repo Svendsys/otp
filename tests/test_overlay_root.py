@@ -947,13 +947,25 @@ esac
 # apply: cancel-rename disables the unit, systemd collects it, and every
 # `systemctl show` after that describes a freshly loaded default. The
 # default text is what run 31972140190's console recorded, verbatim.
+#
+# A JOURNAL THAT REMEMBERS, because the real one is one config line away from
+# doing so. `-b` scopes the read to this boot; without it journalctl answers
+# out of every boot it still holds, and device/install.sh's Storage=volatile
+# is the only reason that is harmless today. UC_JOURNAL_LAST_BOOT is what a
+# persistent journal would add, and the shipped `-b` is what keeps it out --
+# so a test can set it and watch the check stay red.
 JOURNALCTL_STUB = """#!/bin/sh
 case "$*" in
-    *userconfig.service*) printf '%s\\n' "${UC_JOURNAL-\
-Aug 16 22:05:01 otp-unit systemd[1]: Starting userconfig.service - User configuration dialog...
-Aug 16 22:06:11 otp-unit systemd[1]: Finished userconfig.service - User configuration dialog.}" ;;
+    *userconfig.service*) ;;
     *) echo "stub: unexpected journalctl $*" >&2; exit 64 ;;
 esac
+case "$*" in
+    *-b*) ;;
+    *) [ -z "${UC_JOURNAL_LAST_BOOT-}" ] || printf '%s\\n' "$UC_JOURNAL_LAST_BOOT" ;;
+esac
+printf '%s\\n' "${UC_JOURNAL-\
+Aug 16 22:05:01 otp-unit systemd[1]: Starting userconfig.service - User configuration dialog...
+Aug 16 22:06:11 otp-unit systemd[1]: Finished userconfig.service - User configuration dialog.}"
 """
 
 # What upstream does to a seed it will not accept: append the reason, rename
@@ -1175,6 +1187,72 @@ def test_a_seeded_boot_whose_wizard_never_ran_at_all_fails(tmp_path):
     """
     proc, _ = run_userconf(tmp_path, phase="boot1",
                            env={**HEALTHY_BOOT1, "UC_JOURNAL": ""})
+    assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
+
+
+def test_a_previous_boots_success_line_does_not_answer_for_this_boot(tmp_path):
+    """
+    `journalctl -u` with no boot filter answers out of every boot the journal
+    still holds. This machine's journal is volatile -- device/install.sh
+    writes Storage=volatile into journald.conf.d -- so today there is only
+    ever one boot in it, and the read was correct by accident three hundred
+    lines away in another file. Delete that one setting, or ship on a machine
+    someone has made persistent, and the FIRST boot's `Finished
+    userconfig.service` satisfies a later boot on which the unit never ran at
+    all: exactly the reading this block exists to make impossible.
+
+    `-b` on the read is what stops it, and this is the fixture that can tell.
+    The stub keeps a previous boot's entries and hands them over only to a
+    caller that did not ask for this one.
+    """
+    persistent = {**HEALTHY_BOOT1, "UC_JOURNAL": "", "UC_JOURNAL_LAST_BOOT":
+                  "Aug 15 09:00:00 otp-unit systemd[1]: Finished "
+                  "userconfig.service - User configuration dialog."}
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=persistent)
+    assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
+    # The positive control on the fixture itself: the same journal, offered
+    # as THIS boot's, is the healthy case. Without this the test above would
+    # also pass against a stub that simply printed nothing.
+    proc, _ = run_userconf(
+        tmp_path / "this-boot", phase="boot1",
+        env={**HEALTHY_BOOT1, "UC_JOURNAL": persistent["UC_JOURNAL_LAST_BOOT"]})
+    assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "PASS", proc.stdout
+
+
+def test_the_wizards_own_stdout_cannot_report_its_success(tmp_path):
+    """
+    `journalctl -u` returns the unit's STDOUT as well as PID 1's status lines
+    about it -- that is what StandardOutput=journal means -- so a
+    userconf-service that merely PRINTED the phrase satisfied the check.
+    Nothing upstream prints it today, which is the only reason this was not
+    already a false green; a phrase whose truth depends on nobody happening
+    to say it is not a measurement.
+
+    `Finished` is systemd's own success line. Matching the speaker with it
+    costs nothing and means only PID 1 can make the claim.
+    """
+    impostor = ("Aug 16 22:05:01 otp-unit systemd[1]: Starting "
+                "userconfig.service - User configuration dialog...\n"
+                "Aug 16 22:06:10 otp-unit userconf-service[512]: Finished "
+                "userconfig.service - User configuration dialog.")
+    proc, _ = run_userconf(tmp_path, phase="boot1",
+                           env={**HEALTHY_BOOT1, "UC_JOURNAL": impostor})
+    assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
+    assert "journal-finished=no" in proc.stdout, proc.stdout
+
+
+def test_the_success_line_is_matched_literally_not_as_a_glob(tmp_path):
+    """
+    `systemd[1]:` is a glob pattern as well as a string, and `[1]` is a
+    character class matching the single character 1. Unquoted inside the
+    ${var#pattern} that does the matching, `systemd1: Finished` would
+    therefore pass -- which is not a line systemd writes, but it is a line
+    the unit's own stdout could.
+    """
+    globbed = ("Aug 16 22:06:10 otp-unit userconf-service[512]: systemd1: "
+               "Finished userconfig.service - User configuration dialog.")
+    proc, _ = run_userconf(tmp_path, phase="boot1",
+                           env={**HEALTHY_BOOT1, "UC_JOURNAL": globbed})
     assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
 
 

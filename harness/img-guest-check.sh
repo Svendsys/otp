@@ -324,15 +324,38 @@ USERCONF_SERVICE=/usr/lib/userconf-pi/userconf-service
 # the card --
 # and the poll spent its whole 120 seconds waiting for a timestamp that had
 # been collected along with the unit. Log entries outlive unit objects.
+#
+# TWO NARROWINGS ON THE READ, both of them one config line away from
+# mattering:
+#
+#   -b, THIS BOOT. `journalctl -u` with no boot filter answers out of every
+#   boot the journal still holds. That is harmless only because
+#   device/install.sh sets Storage=volatile in journald.conf.d -- delete that
+#   one line and a PREVIOUS boot's `Finished userconfig.service` satisfies a
+#   boot on which the unit never ran at all, which is precisely the reading
+#   this whole block exists to make impossible. A probe must not depend for
+#   its correctness on a setting three hundred lines away in another file.
+#
+#   systemd[1], NOT just the phrase. `journalctl -u` returns the unit's own
+#   STDOUT as well as PID 1's status lines about it -- that is what
+#   StandardOutput=journal means -- so a userconf-service that merely PRINTED
+#   "Finished userconfig.service" passed this check. Demonstrated with a
+#   synthetic journal. `Finished` is systemd's own success line and only
+#   systemd may say it, so the match carries the speaker: no other process on
+#   the machine writes with the identifier systemd and PID 1.
+#
+# The needle is quoted inside the ${#} patterns below. Unquoted, `[1]` is a
+# glob character class and the match would also accept `systemd1: Finished`.
+UC_DONE='systemd[1]: Finished userconfig.service'
 UC_COND_TS=""
 UC_JOBS=1
 UC_LOG=""
 for _ in $(seq 1 60); do
     UC_COND_TS=$(systemctl show userconfig.service -p ConditionTimestamp --value 2>/dev/null)
     UC_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -c "userconfig\.service" || true)
-    UC_LOG=$(journalctl -u userconfig.service --no-pager 2>/dev/null | tr '\n' ' ')
+    UC_LOG=$(journalctl -b -u userconfig.service --no-pager 2>/dev/null | tr '\n' ' ')
     if [ "${UC_JOBS:-1}" = 0 ] \
-       && { [ -n "$UC_COND_TS" ] || [ "${UC_LOG#*Finished userconfig.service}" != "$UC_LOG" ]; }
+       && { [ -n "$UC_COND_TS" ] || [ "${UC_LOG#*"$UC_DONE"}" != "$UC_LOG" ]; }
     then break; fi
     sleep 2
 done
@@ -386,20 +409,27 @@ if [ "$PHASE" = "boot1" ]; then
     #
     # READ OFF THE LOG, not off the unit, and that is a strengthening rather
     # than a softening. `ConditionResult=yes` said only that systemd let the
-    # unit start; "Finished userconfig.service" is systemd's own success line
-    # and a unit that was skipped, that is still running, or that failed
-    # never prints it. It is also the only one of the two that still exists
-    # after the apply: see the poll above for what cancel-rename's `systemctl
-    # disable` plus a daemon-reload do to the unit object, measured in run
-    # 31972140190. ConditionResult is still REPORTED, so a future reader can
-    # see the collected-unit default for what it is.
+    # unit start; `systemd[1]: Finished userconfig.service` is systemd's own
+    # success line and a unit that was skipped, that is still running, or
+    # that failed never prints it. It is also the only one of the two that
+    # still exists after the apply: see the poll above for what
+    # cancel-rename's `systemctl disable` plus a daemon-reload do to the unit
+    # object, measured in run 31972140190. ConditionResult is still REPORTED,
+    # so a future reader can see the collected-unit default for what it is.
+    #
+    # WITH THE SPEAKER, and out of THIS boot: $UC_DONE and the `-b` on the
+    # read carry both narrowings, and the poll above says why each is there.
     UC_TROUBLE=no
     case "$UC_LOG" in
         *"Failed with result"*|*"Failed to start"*|*"Scheduled restart job"*|\
         *"was skipped"*|*"skipped, unmet condition"*) UC_TROUBLE=yes ;;
     esac
+    # The trouble strings above are deliberately NOT speaker-scoped: a
+    # userconf-service that printed one of them on its own stdout is a boot
+    # worth failing either way, and that is the safe direction. "Finished" is
+    # the clause that has to be earned.
     UC_FINISHED=no
-    if [ "${UC_LOG#*Finished userconfig.service}" != "$UC_LOG" ]; then
+    if [ "${UC_LOG#*"$UC_DONE"}" != "$UC_LOG" ]; then
         UC_FINISHED=yes
     fi
     check userconf-seeded-boot-ran-no-wizard \
