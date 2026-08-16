@@ -730,6 +730,33 @@ def test_cloud_init_is_switched_off_on_an_air_gapped_printer(tmp_path):
         p.name for p in cloud.iterdir()) if cloud.exists() else "no /etc/cloud"
 
 
+def test_the_closing_summary_names_what_was_done_to_the_whole_machine():
+    """
+    The documented path is "run this on a Pi you already have", and two of
+    the steps above are not confined to the unit: a shared systemd unit is
+    MASKED, and cloud-init is switched off permanently. Both outlive this
+    script, both change how software installed later behaves, and neither
+    was in the summary the operator reads at the end -- which listed the
+    overlay and stopped, reading as though nothing else had been touched.
+
+    The summary is what someone gets instead of a diff. Undo instructions
+    are required with them: a machine-wide change nobody can find again is
+    the part that hurts, six months later, when networkd's wait-online is
+    the thing that mysteriously never blocks.
+    """
+    install = INSTALL.read_text()
+    summary = install[install.index('log "Done. Reboot to start the unit."'):]
+    for claim in ("systemd-networkd-wait-online.service", "cloud-init"):
+        assert claim in summary, (
+            f"install.sh changes {claim} on any machine it touches and the "
+            f"closing summary does not mention it")
+    for undo in ("unmask systemd-networkd-wait-online.service",
+                 "/etc/cloud/cloud-init.disabled"):
+        assert undo in summary, (
+            f"the summary names a permanent change without telling the "
+            f"operator how to reverse it: {undo}")
+
+
 GETTY_BLOCK = ("install -d /etc/systemd/system/getty@tty1.service.d",
                "systemctl stop getty@tty1.service 2>/dev/null || true")
 GETTY_DIR = "/etc/systemd/system/getty@tty1.service.d"

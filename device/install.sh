@@ -871,6 +871,11 @@ OVERLAY
     log "  overlay initramfs: $OVERLAY_INITRAMFS"
 fi
 
+# WHAT THIS SCRIPT DID TO SOMEONE ELSE'S MACHINE, said out loud. The
+# documented path is "run this on a Pi you already have", and two of the
+# steps above are not confined to the unit: they change how the whole box
+# behaves and they do not come back on their own. A summary that lists only
+# the overlay reads as though nothing else was touched.
 if [ "$IMAGE_BUILD" -eq 0 ]; then
     log "Done. Reboot to start the unit."
     cat <<'EOF'
@@ -880,6 +885,21 @@ read-only and everything written to / goes to a tmpfs on top of it, so a
 power-cycle is a full reset and nothing a session touched survives it.
 Settings still persist -- they live on the boot partition, which is outside
 the overlay.
+
+Two machine-wide changes were made as well, because an unbounded network
+wait held this image's boot open for its whole length (see the comments in
+this script):
+
+  * systemd-networkd-wait-online.service is MASKED. Nothing on this machine
+    can wait for network-online.target through networkd any more, including
+    software installed later. Undo with
+    `sudo systemctl unmask systemd-networkd-wait-online.service`.
+  * cloud-init is switched off permanently, via /etc/cloud/cloud-init.disabled.
+    This machine will not run any cloud-init datasource again -- including
+    user-data written to the boot partition. Undo by deleting that file.
+
+Both are deliberate on an air-gapped key printer and both outlive this
+script. tty1 is the front panel; the login prompt is on tty2 (Alt+F2).
 
 To change the software afterwards, take `boot=overlay` back out of
 /boot/firmware/cmdline.txt, reboot, edit, and rerun this script.

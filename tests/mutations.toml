@@ -1465,6 +1465,31 @@ replace = ''': > /etc/cloud/cloud-init.enabled'''
 
 
 [[mutation]]
+name = "install-summary-hides-a-machine-wide-change"
+tier = "fast"
+guard = """
+The summary is what an operator gets instead of a diff, on the documented
+"run this on a Pi you already have" path. Two of this script's steps are not
+confined to the unit -- a shared systemd unit is masked, and cloud-init is
+switched off permanently -- and both outlive the script and change how
+software installed later behaves. A summary that lists the overlay and stops
+reads as though nothing else was touched."""
+tests = [
+  "tests/test_overlay_root.py::test_the_closing_summary_names_what_was_done_to_the_whole_machine",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''  * systemd-networkd-wait-online.service is MASKED. Nothing on this machine
+    can wait for network-online.target through networkd any more, including
+    software installed later. Undo with
+    `sudo systemctl unmask systemd-networkd-wait-online.service`.
+  * cloud-init is switched off permanently, via /etc/cloud/cloud-init.disabled.
+    This machine will not run any cloud-init datasource again -- including
+    user-data written to the boot partition. Undo by deleting that file.'''
+replace = '''  * Some system services were adjusted.'''
+
+
+[[mutation]]
 name = "install-getty-tty1-condition-dropped"
 tier = "fast"
 guard = """
