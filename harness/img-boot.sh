@@ -797,5 +797,5 @@ done
 if [ -z "$CLAIM_MISSING" ]; then
     log "the image boots twice on a read-only overlay, and the unit starts on both"
 else
-    log "the image boots on a read-only overlay and the unit starts; phases run:$PHASES -- NOT the two-boot claim, which needs:$CLAIM_MISSING"
+    log "the image boots on a read-only overlay and the unit starts; phases run: $PHASES -- NOT the two-boot claim, which needs:$CLAIM_MISSING"
 fi
