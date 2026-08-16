@@ -127,6 +127,36 @@ class TestTheUnitCanActuallyStart:
             f"LimitCORE is {directive('LimitCORE')!r}, so the process can "
             f"dump the pad it is holding")
 
+    def test_nothing_can_stop_the_panel_by_starting_a_getty_on_tty1(self):
+        """
+        Conflicts= is symmetric, and that is what made it wrong here.
+
+        The unit holds /dev/tty1 as the front panel, and the line that used
+        to keep a login prompt off it was Conflicts=getty@tty1.service --
+        which also means "anything that starts that getty stops this unit".
+        Something does: userconf-pi's cancel-rename is the last thing a
+        successful credential apply runs, and it ends with `systemctl
+        --no-block start getty@tty1`. An operator who set their password
+        through the documented /boot/firmware/userconf.txt lost the print
+        unit until the next power-cycle.
+
+        install.sh keeps the prompt off tty1 with a condition on the getty
+        instead, so it never starts rather than being stopped, and
+        harness/img-guest-check.sh gates both halves on the booted image.
+        """
+        # Parsed, not searched: the comment above the directive names the
+        # line it removed, and a substring test would match that instead --
+        # passing or failing on prose either way.
+        assert directive("Conflicts") is None, (
+            f"Conflicts={directive('Conflicts')} is back: a getty started "
+            f"by cancel-rename after a credential apply stops the panel")
+        # The replacement has to be in the file that provisions the machine,
+        # or removing the conflict just hands tty1 to the login prompt.
+        install = INSTALL.read_text()
+        assert "/etc/systemd/system/getty@tty1.service.d" in install, install[:0]
+        assert ("ConditionPathExists=!/etc/systemd/system/otp-unit.service"
+                in install)
+
     def test_restart_on_failure_is_paired_with_a_backoff(self):
         # Without RestartSec above systemd's burst limit, a unit that
         # cannot start goes permanently `failed` after five tries in ten

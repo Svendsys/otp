@@ -657,6 +657,134 @@ def test_the_condition_follows_the_boot_directory_that_exists(tmp_path):
     assert "/boot/firmware" not in text, text
 
 
+# --- the two things that kept the wizard from ever running ----------------
+
+# Run 31968966879 is the first run that seeded a real userconf.txt, and it
+# found that the drop-in above had never been the deciding factor: the unit's
+# start job never came up for execution at all. It was ordered behind
+# cloud-init's config stage, which waits on network-online.target, which waits
+# on systemd-networkd-wait-online.service -- TimeoutStartSec=infinity on a box
+# whose links NetworkManager owns. Both boots ended with that job still
+# running and multi-user.target never reached.
+
+BOOT_FINISHES_BLOCK = ("systemctl mask systemd-networkd-wait-online.service",
+                       ": > /etc/cloud/cloud-init.disabled")
+
+
+def run_boot_finishes(tmp_path):
+    """Run the shipped block that clears the two blockers, into a fake /etc.
+
+    /etc/cloud is rewritten to a temporary directory; nothing else is, so
+    the unit name masked and the kill switch's own filename stay the bytes
+    that ship.
+    """
+    cloud = tmp_path / "cloud"
+    block = slice_between(INSTALL.read_text(), *BOOT_FINISHES_BLOCK)
+    assert block.count("/etc/cloud") == 2, block
+    block = block.replace("/etc/cloud", str(cloud))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "systemctl").write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> {tmp_path}/systemctl.log\n')
+    (bin_dir / "systemctl").chmod(0o755)
+    proc = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{block}"],
+        capture_output=True, text=True, timeout=30,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    assert proc.returncode == 0, proc.stderr
+    return (tmp_path / "systemctl.log").read_text(), cloud
+
+
+def test_the_unbounded_network_wait_is_masked(tmp_path):
+    """
+    The job both boots of run 31968966879 ended on, in the console's own
+    words: `systemd-networkd-wait-online.service/start running (2min 37s /
+    no limit)`. "No limit" is the unit's TimeoutStartSec=infinity, and this
+    appliance has no networkd configuration for it to ever be satisfied by.
+    Everything ordered after network-online.target -- cloud-init's config
+    stage, and through it the credential wizard -- waits for the life of
+    the boot.
+    """
+    log, _ = run_boot_finishes(tmp_path)
+    assert "mask systemd-networkd-wait-online.service" in log, log
+
+
+def test_cloud_init_is_switched_off_on_an_air_gapped_printer(tmp_path):
+    """
+    The other end of the same chain, and worth doing on its own account.
+
+    cloud-init is what pulls network-online.target into the transaction
+    here; it spent 57 seconds of every boot finding no datasource; and it
+    is a provisioning agent that takes user-data off the boot partition --
+    the one partition an operator is told to write files on -- on a device
+    that prints one-time pads and has no network by design. Its generator
+    reads this file before it links cloud-init.target into
+    multi-user.target, so cloud-config.service is not in the transaction at
+    all and userconfig.service's `After=` on it becomes void.
+    """
+    _, cloud = run_boot_finishes(tmp_path)
+    assert (cloud / "cloud-init.disabled").exists(), sorted(
+        p.name for p in cloud.iterdir()) if cloud.exists() else "no /etc/cloud"
+
+
+GETTY_BLOCK = ("install -d /etc/systemd/system/getty@tty1.service.d",
+               "ConditionPathExists=!/etc/systemd/system/otp-unit.service\nGETTY")
+GETTY_DIR = "/etc/systemd/system/getty@tty1.service.d"
+
+
+def run_getty_dropin(tmp_path):
+    """Write the shipped getty drop-in into a substituted unit directory."""
+    etc = tmp_path / "etc"
+    block = slice_between(INSTALL.read_text(), *GETTY_BLOCK)
+    assert block.count(GETTY_DIR) == 2, block
+    block = block.replace(GETTY_DIR, f"{etc}/getty@tty1.service.d")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "systemctl").write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> {tmp_path}/systemctl.log\n')
+    (bin_dir / "systemctl").chmod(0o755)
+    proc = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{block}"],
+        capture_output=True, text=True, timeout=30,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    assert proc.returncode == 0, proc.stderr
+    written = etc / "getty@tty1.service.d" / "otp-appliance.conf"
+    log = tmp_path / "systemctl.log"
+    return written.read_text(), (log.read_text() if log.exists() else "")
+
+
+def test_no_login_prompt_can_start_on_the_front_panels_tty(tmp_path):
+    """
+    tty1 is the front panel, and the thing that starts a getty on it is the
+    credential path itself: /usr/lib/userconf-pi/userconf ends in
+    cancel-rename, which ends in `systemctl --no-block start getty@tty1` on
+    every console-boot machine. A condition, evaluated at start time, is
+    what keeps that from ever producing a prompt.
+
+    Negated and pointed at the unit file install.sh writes, so the prompt
+    comes back on a machine where the front panel is not installed -- a
+    half-provisioned unit is exactly when a login is wanted.
+    """
+    text, _ = run_getty_dropin(tmp_path)
+    assert ("ConditionPathExists=!/etc/systemd/system/otp-unit.service"
+            in text), text
+    assert text.lstrip().startswith("[Unit]"), text
+
+
+def test_the_getty_is_conditioned_rather_than_masked(tmp_path):
+    """
+    Masking looks equivalent and is not. `systemctl start` on a masked unit
+    FAILS, cancel-rename's exit status is that command's, `userconf` hands
+    it up, and userconf-service runs under `sh -e` -- so it dies before
+    `rm`-ing the applied seed. Stock userconfig.service's Restart=on-failure
+    then loops, printing "Failed with result" and "Scheduled restart job",
+    two of the strings img-boot.sh fails a release on. A condition-skipped
+    start returns success and does nothing.
+    """
+    _, log = run_getty_dropin(tmp_path)
+    assert "mask getty@tty1" not in log, log
+
+
 # --- the seeded userconf.txt path, as the guest sees it -------------------
 
 # The stock unit is `StandardInput=tty`, `TTYPath=/dev/tty8` and
@@ -796,6 +924,74 @@ def test_a_seeded_first_boot_reports_applied_credentials_and_no_wizard(tmp_path)
         "userconf-seed-applied": "PASS",
         "userconf-seeded-boot-ran-no-wizard": "PASS",
         "front-panel-survives-the-credential-apply": "PASS"}, proc.stdout
+
+
+def test_a_boot_still_waiting_on_the_network_fails(tmp_path):
+    """
+    Run 31968966879's shape, stated as a check.
+
+    The wizard's job was queued behind network-online.target, which was
+    queued behind a wait with no timeout, and from the unit's own fields
+    that is indistinguishable from a skip. The queue is asked directly, in
+    both boots, because the boot that suffers it is any boot.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env={
+        **HEALTHY_BOOT1,
+        "JOBS": "1 systemd-networkd-wait-online.service start running\n"})
+    assert results(proc)["network-wait-cannot-hold-the-boot-open"] == "FAIL", \
+        proc.stdout
+
+
+def test_an_unmasked_network_wait_fails_even_with_an_empty_queue(tmp_path):
+    """
+    Both halves, because either alone is satisfied by the broken image.
+
+    An empty queue at the moment the probe looks says nothing about the next
+    boot: whatever pulls network-online.target in decides that, and on the
+    image run 31968966879 booted it was cloud-init. The mask is what makes
+    the answer the same every time, so it is read back off the machine.
+    """
+    for state in ("enabled", "disabled", "static"):
+        proc, _ = run_userconf(tmp_path / state, phase="boot2",
+                               env={**HEALTHY_BOOT2, "NETWAIT_ENABLED": state})
+        assert results(proc)["network-wait-cannot-hold-the-boot-open"] == "FAIL", \
+            proc.stdout
+
+
+def test_a_credential_apply_that_took_the_front_panel_down_fails(tmp_path):
+    """
+    The defect this check exists for, with the credentials applied perfectly.
+
+    cancel-rename starts a getty on tty1 at the end of every successful
+    apply. While otp-unit.service carried Conflicts=getty@tty1.service that
+    start stopped the panel, so a unit whose operator used the documented
+    credential file printed nothing until it was power-cycled -- with every
+    other check in this phase green, because the seed WAS applied.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1",
+                           env={**HEALTHY_BOOT1, "PANEL_ACTIVE": "inactive"})
+    assert results(proc)["userconf-seed-applied"] == "PASS", proc.stdout
+    assert results(proc)["front-panel-survives-the-credential-apply"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_login_prompt_sharing_the_panels_tty_fails(tmp_path):
+    """
+    The other outcome of the same start, and the reason the check does not
+    stop at "otp-unit is active". Without the Conflicts= that used to stop
+    it, a getty that DOES start shares /dev/tty1 with a unit holding it
+    through StandardInput=tty-force: output interleaves and keystrokes go to
+    whichever grabbed them. A getty merely queued is the same thing a moment
+    later, so the queue counts too.
+    """
+    proc, _ = run_userconf(tmp_path / "running", phase="boot1",
+                           env={**HEALTHY_BOOT1, "TTY1_ACTIVE": "active"})
+    assert results(proc)["front-panel-survives-the-credential-apply"] == "FAIL", \
+        proc.stdout
+    proc, _ = run_userconf(tmp_path / "queued", phase="boot1", env={
+        **HEALTHY_BOOT1, "JOBS": "7 getty@tty1.service start waiting\n"})
+    assert results(proc)["front-panel-survives-the-credential-apply"] == "FAIL", \
+        proc.stdout
 
 
 def test_a_wizard_still_holding_a_job_fails_the_first_boot(tmp_path):
