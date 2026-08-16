@@ -281,6 +281,121 @@ def test_the_guest_probe_cannot_run_on_a_flashed_unit():
     assert "otp.imgcheck=$phase" in IMG_BOOT.read_text()
 
 
+# --- the build refuses to ship an image it cannot probe ------------------
+
+PROBE_INSTALL_BLOCK = ('if [ -f "$REPO_DIR/harness/img-guest-check.sh" ]; then',
+                       'would have nothing to report with."\nfi')
+
+STAGE_RUN = REPO / "image" / "stage-otpunit" / "01-otpunit" / "00-run.sh"
+STAGE_COPY_BLOCK = ("for item in otpunit codewords device harness",
+                    'Run image/render-manual.sh before building." >&2\nfi')
+
+
+def run_probe_install(tmp_path, *, repo_dir, image_build):
+    """Run install.sh's probe-install block against a substitute REPO_DIR.
+
+    `install` is shadowed by a shell function rather than stubbed on PATH:
+    the block installs into /etc/systemd/system and /opt/otp-unit, and a
+    test has no business writing to either.
+    """
+    block = slice_between(INSTALL.read_text(), *PROBE_INSTALL_BLOCK)
+    return run_block(block, tmp_path,
+                     preamble=("install() { printf 'INSTALL %s\\n' \"$*\"; }\n"
+                               f'REPO_DIR="{repo_dir}"\n'
+                               f'PREFIX="{tmp_path}/opt"\n'
+                               f"IMAGE_BUILD={image_build}"))
+
+
+def test_an_image_build_without_the_probe_fails(tmp_path):
+    """
+    Every other overlay precondition exits 1 under --image-build; this one
+    printed a NOTE and carried on, so a build could ship an image whose
+    overlay nothing can observe. Deleting the install line survived the
+    whole fast suite, and the miss only appeared after a pi-gen build and
+    two emulated boots -- as a guest that never reported, which reads as a
+    boot failure rather than a packaging one.
+    """
+    empty = tmp_path / "repo"
+    (empty / "harness").mkdir(parents=True)
+    proc = run_probe_install(tmp_path, repo_dir=empty, image_build=1)
+    assert proc.returncode != 0, proc.stdout
+    assert "nothing to report on the" in proc.stderr, proc.stderr
+
+
+def test_a_hand_provisioned_machine_without_the_probe_only_says_so(tmp_path):
+    # Not an image build: someone running install.sh from a partial copy on
+    # a Pi gets a working unit and a note, which is what they had before.
+    empty = tmp_path / "repo"
+    (empty / "harness").mkdir(parents=True)
+    proc = run_probe_install(tmp_path, repo_dir=empty, image_build=0)
+    assert proc.returncode == 0, proc.stderr
+    assert "NOTE" in proc.stdout, proc.stdout
+
+
+def test_the_probe_is_installed_when_it_is_there(tmp_path):
+    # The positive control, against the real repository.
+    proc = run_probe_install(tmp_path, repo_dir=REPO, image_build=1)
+    assert proc.returncode == 0, proc.stderr
+    assert "img-guest-check.sh" in proc.stdout, proc.stdout
+    assert "otp-unit-imgcheck.service" in proc.stdout, proc.stdout
+
+
+def run_stage_copy(tmp_path, *, present):
+    """Run the pi-gen stage's copy loop over a synthetic repository."""
+    src = tmp_path / "src"
+    src.mkdir(parents=True, exist_ok=True)
+    for item in present:
+        if item.endswith(".py") or item.endswith(".md"):
+            (src / item).write_text("x")
+        else:
+            (src / item).mkdir(exist_ok=True)
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "tmp" / "otp-src").mkdir(parents=True, exist_ok=True)
+    block = slice_between(STAGE_RUN.read_text(), *STAGE_COPY_BLOCK)
+    runner = tmp_path / "stage.sh"
+    runner.write_text(
+        f'set -e\nREPO_SRC="{src}"\nROOTFS_DIR="{rootfs}"\n'
+        'STAGING=/tmp/otp-src\n' + block)
+    return subprocess.run(["bash", str(runner)], capture_output=True,
+                          text=True, timeout=60)
+
+
+ALL_ITEMS = ("otpunit", "codewords", "device", "harness",
+             "otp_generator.py", "otp.md", "assets")
+
+
+def test_the_stage_copies_everything_install_sh_reads(tmp_path):
+    proc = run_stage_copy(tmp_path, present=ALL_ITEMS)
+    assert proc.returncode == 0, proc.stderr
+    for item in ALL_ITEMS:
+        assert (tmp_path / "rootfs" / "tmp" / "otp-src" / item).exists(), item
+
+
+def test_a_missing_item_stops_the_stage_instead_of_being_skipped(tmp_path):
+    """
+    The copy was `if [ -e ]`, so dropping a name from the list -- or from
+    the repository -- was a silent no-op. `harness` is the one that did not
+    even fail in the chroot: install.sh printed a NOTE and built an image
+    whose overlay nothing could probe.
+    """
+    for missing in ALL_ITEMS:
+        if missing == "assets":
+            continue
+        present = [i for i in ALL_ITEMS if i != missing]
+        proc = run_stage_copy(tmp_path / missing, present=present)
+        assert proc.returncode != 0, f"{missing} missing was accepted"
+        assert missing in proc.stderr, proc.stderr
+
+
+def test_the_assets_directory_stays_optional(tmp_path):
+    # install.sh guards its own use of the manual PDFs, and an image
+    # without them boots and prints pads. The warning is the whole penalty.
+    present = [i for i in ALL_ITEMS if i != "assets"]
+    proc = run_stage_copy(tmp_path, present=present)
+    assert proc.returncode == 0, proc.stderr
+    assert "manual PDFs missing" in proc.stderr, proc.stderr
+
+
 # --- the probe refuses to run on anything but a harness boot -------------
 
 PHASE_GUARD_BLOCK = ('PHASE=""', "\nesac")

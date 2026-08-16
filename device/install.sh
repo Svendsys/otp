@@ -344,6 +344,19 @@ if [ -f "$REPO_DIR/harness/img-guest-check.sh" ]; then
         "$PREFIX/img-guest-check.sh"
     install -m 0644 "$REPO_DIR/device/systemd/otp-unit-imgcheck.service" \
         /etc/systemd/system/otp-unit-imgcheck.service
+elif [ "$IMAGE_BUILD" -eq 1 ]; then
+    # EXIT, like every other overlay precondition in this file. This one
+    # printed a NOTE and carried on, which is how a build ships an image
+    # whose overlay nothing can probe -- and the miss does not surface for
+    # about seven minutes of pi-gen plus two emulated boots, arriving then
+    # as "the guest never reported", which reads as a boot failure rather
+    # than as the packaging error it is. The only way the file goes missing
+    # in a chroot is the copy list in image/stage-otpunit/01-otpunit, which
+    # now fails on the same absence at the other end.
+    echo "ERROR: harness/img-guest-check.sh is not in $REPO_DIR, so the" >&2
+    echo "       image being built would have nothing to report on the" >&2
+    echo "       read-only overlay and tier 3 could not observe it." >&2
+    exit 1
 else
     echo "NOTE: harness/img-guest-check.sh is absent, so a tier-3 boot of"
     echo "      this system would have nothing to report with."
