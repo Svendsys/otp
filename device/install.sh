@@ -409,6 +409,50 @@ systemctl enable cups.service 2>/dev/null || true
 # SD card, and the SD card is the whole device.
 systemctl enable getty@tty2.service 2>/dev/null || true
 
+# --- the boot has to be able to FINISH ------------------------------------
+#
+# MEASURED, on the built image, in run 31968966879. Both emulated boots ran
+# for three minutes and NEITHER reached multi-user.target. Both consoles end
+# on the same line:
+#
+#   Job systemd-networkd-wait-online.service/start running (2min 37s / no limit)
+#
+# "no limit" is that unit's own TimeoutStartSec=infinity. This appliance has
+# no networkd configuration -- NetworkManager owns the link, and its own
+# wait-online finished in seconds -- so networkd's wait never returns,
+# network-online.target is never reached, and every job ordered after it
+# stays queued for the life of the boot.
+#
+# WHAT THAT COSTS is not just a slow boot. cloud-init's cloud-config.service
+# is ordered after network-online.target, and stock userconfig.service is
+# `After=cloud-config.service`, so the wizard's start job sat in the queue
+# for the whole of both boots -- the guest read `jobs=1` with the condition
+# never evaluated -- and the valid /boot/firmware/userconf.txt seeded onto
+# the card came back off it untouched. An operator's credentials IGNORED IN
+# SILENCE is the exact outcome the drop-in below replaced a mask to avoid,
+# arriving from a direction nobody had looked at. See issue #20.
+#
+# TWO LOCKS, because either alone leaves half the trap armed:
+#
+#   - The wait is masked. An unbounded wait for a network this appliance
+#     does not have must not be able to hold a boot open, whatever pulls
+#     network-online.target in next.
+#   - cloud-init is switched off with its own documented kill switch. It is
+#     what pulls network-online.target in here, it cost 57 seconds of every
+#     boot doing nothing, and a provisioning agent that takes user-data off
+#     the boot partition -- the partition an operator is told to write files
+#     on -- has no business on an air-gapped key printer. Its generator
+#     reads this file before it links cloud-init.target into
+#     multi-user.target, so cloud-config.service is not in the transaction
+#     at all and the wizard's `After=` on it is void rather than waiting.
+#
+# harness/img-guest-check.sh reads the mask back off the booted machine and
+# checks the queue for its job; the kill switch is measured by what it
+# unblocks, which is the wizard's job count in the same probe.
+systemctl mask systemd-networkd-wait-online.service
+install -d /etc/cloud
+: > /etc/cloud/cloud-init.disabled
+
 # Raspberry Pi OS's first-boot user wizard (userconf-pi) decides whether
 # to prompt from get_boot_cli alone: on a console-boot image it goes
 # INTERACTIVE on every boot until someone answers a whiptail on tty8,
@@ -461,6 +505,40 @@ ConditionPathExists=|$BOOT_DIR/userconf.txt
 [Service]
 StandardInput=null
 DROPIN
+
+# AND THE LAST THING THAT APPLY PATH DOES, which is where it bites. Applying
+# a seed ends in /usr/lib/userconf-pi/userconf, whose final act is
+# `cancel-rename`, and cancel-rename ends -- on every machine that boots to a
+# console, which is this one -- with
+#
+#   systemctl --quiet enable getty@tty1
+#   systemctl --quiet --no-block start getty@tty1
+#
+# So the documented credential file, used as documented, puts a login prompt
+# on the front panel's tty. otp-unit.service used to answer that with
+# Conflicts=getty@tty1.service, and Conflicts is symmetric: starting the
+# getty STOPS the unit. An operator who set their password the supported way
+# lost the panel until the next power-cycle.
+#
+# A CONDITION, and not either of the two obvious alternatives:
+#
+#   - Masked, and that start FAILS. cancel-rename's exit status is that
+#     command's, `userconf` passes it up, and userconf-service runs under
+#     `sh -e` -- so it dies BEFORE deleting the applied seed, and stock
+#     userconfig.service's Restart=on-failure turns that into a restart
+#     loop printing two of the strings tier 3 fails a release on.
+#   - Left to Conflicts=, and the panel dies as described.
+#
+# A condition-skipped start does neither: systemd reports the job done, no
+# getty ever runs on tty1, the seed is deleted and the unit succeeds. The
+# condition names the unit file THIS script installs, so a machine without
+# the front panel still gets its login prompt -- including one where
+# provisioning failed half way, which is when it is wanted most.
+install -d /etc/systemd/system/getty@tty1.service.d
+cat > /etc/systemd/system/getty@tty1.service.d/otp-appliance.conf <<'GETTY'
+[Unit]
+ConditionPathExists=!/etc/systemd/system/otp-unit.service
+GETTY
 
 # --- the read-only root overlay ------------------------------------------
 

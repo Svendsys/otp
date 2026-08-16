@@ -293,17 +293,30 @@ USERCONF_USER=otp
 USERCONF_SALT='$6$otpimgcheck$'
 USERCONF_SERVICE=/usr/lib/userconf-pi/userconf-service
 
-# POLLED, and briefly. This probe is ordered after otp-unit.service and
-# cups.service and the poll above has already spent up to 90 seconds, so
-# userconfig.service -- a oneshot wanted by multi-user.target -- has had every
-# chance to be dealt with. It is polled anyway because "systemd has not looked
-# at it yet" and "systemd looked and skipped it" are the same two empty fields
-# from here, and reading the first as the second passes on exactly the boot run
-# 12 died on.
+# POLLED UNTIL SYSTEMD HAS DEALT WITH THE UNIT, not for a fixed few seconds.
+# Nothing orders this probe after userconfig.service -- the two run in the
+# same stretch of a boot -- and "systemd has not looked at it yet" and
+# "systemd looked and skipped it" are the same two empty fields from here.
+# Reading the first as the second passes on exactly the boot run 12 died on.
+#
+# SETTLED means both halves: a condition timestamp says systemd evaluated the
+# unit, and an empty job queue says it is not still waiting to. A JOB is what
+# held run 12's boot open (a whiptail nobody could see, with
+# multi-user.target waiting on the job) and it is what run 31968966879 found
+# again for a different reason -- a unit whose ExecStart has not been reached
+# reads `inactive` in every other field systemd offers.
+#
+# 120 seconds, against a 30-second wait that was not enough: in run
+# 31968966879 the wait expired, the probe reported `condition=no jobs=1`, and
+# the job was queued behind a network wait that was never going to return.
+# That diagnosis came out of the fields printed below, so the timeout still
+# reports rather than aborting -- it is longer now, not softer.
 UC_COND_TS=""
-for _ in $(seq 1 15); do
+UC_JOBS=1
+for _ in $(seq 1 60); do
     UC_COND_TS=$(systemctl show userconfig.service -p ConditionTimestamp --value 2>/dev/null)
-    [ -n "$UC_COND_TS" ] && break
+    UC_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -c "userconfig\.service" || true)
+    if [ -n "$UC_COND_TS" ] && [ "${UC_JOBS:-1}" = 0 ]; then break; fi
     sleep 2
 done
 UC_COND=$(systemctl show userconfig.service -p ConditionResult --value 2>/dev/null)
@@ -311,11 +324,27 @@ UC_RESULT=$(systemctl show userconfig.service -p Result --value 2>/dev/null)
 UC_STDIN=$(systemctl show userconfig.service -p StandardInput --value 2>/dev/null)
 UC_ACTIVE=$(systemctl is-active userconfig.service 2>&1 || true)
 UC_ENABLED=$(systemctl is-enabled userconfig.service 2>&1 || true)
-# A JOB, because a job is what actually held run 12's boot open: the wizard sat
-# on a whiptail nobody could see and multi-user.target waited on the job. That
-# state is not `is-active`'s business -- a unit whose ExecStart is blocked is
-# "activating", and so is a healthy unit that started two seconds ago.
-UC_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -c "userconfig\.service" || true)
+
+# --- what the wizard's job was waiting for --------------------------------
+
+# THE JOB THAT WAS NEVER GOING TO FINISH, asked about directly. Stock
+# systemd-networkd-wait-online.service carries TimeoutStartSec=infinity, and
+# on this appliance -- NetworkManager owns the link, networkd configures
+# nothing -- it never returns. In run 31968966879 both boots ended with that
+# job still running ("no limit"), network-online.target never reached,
+# cloud-init's config stage never run, and userconfig.service queued behind
+# it: the seeded credential file came off the card untouched. device/install.sh
+# masks it and switches cloud-init off; this reads the first back off the
+# running machine and looks for its job in the queue, because a mask that
+# reached the image and a boot that is not waiting on it are different
+# claims.
+NETWAIT=systemd-networkd-wait-online.service
+NETWAIT_ENABLED=$(systemctl is-enabled "$NETWAIT" 2>&1 || true)
+NETWAIT_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -cF "$NETWAIT" || true)
+check network-wait-cannot-hold-the-boot-open \
+      "$(if [ "$NETWAIT_ENABLED" = masked ] && [ "${NETWAIT_JOBS:-1}" = 0 ]; \
+         then echo yes; else echo no; fi)" \
+      "$NETWAIT is-enabled=$NETWAIT_ENABLED jobs=${NETWAIT_JOBS:-?}"
 
 if [ "$PHASE" = "boot1" ]; then
     # APPLIED, not merely deleted. From outside, the harness can watch the
@@ -342,6 +371,25 @@ if [ "$PHASE" = "boot1" ]; then
                 && [ "$UC_ACTIVE" = inactive ] && [ "${UC_JOBS:-1}" = 0 ]; \
              then echo yes; else echo no; fi)" \
           "condition=${UC_COND:-?} result=${UC_RESULT:-?} is-active=$UC_ACTIVE jobs=${UC_JOBS:-?}"
+
+    # AND THE PANEL IS STILL THERE AFTERWARDS, which is the half nobody was
+    # looking at. Applying a seed ends in userconf-pi's cancel-rename, and
+    # cancel-rename starts a getty on tty1 -- the tty otp-unit.service holds
+    # as its front panel. While that unit carried Conflicts=getty@tty1.service
+    # the start stopped it, so setting a password the documented way took the
+    # print unit down until the next power-cycle. device/install.sh answers
+    # that with a condition on the getty; both halves are read here, after
+    # the apply and in the only boot that performs one.
+    #
+    # `unit-active` above cannot stand in for this: it runs before the seed
+    # is applied and passes on a machine the apply is about to take down.
+    PANEL=$(systemctl is-active otp-unit.service 2>&1 || true)
+    TTY1=$(systemctl is-active getty@tty1.service 2>&1 || true)
+    TTY1_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -cF "getty@tty1.service" || true)
+    check front-panel-survives-the-credential-apply \
+          "$(if [ "$PANEL" = active ] && [ "$TTY1" != active ] \
+                && [ "${TTY1_JOBS:-1}" = 0 ]; then echo yes; else echo no; fi)" \
+          "otp-unit=$PANEL getty@tty1=$TTY1 getty-jobs=${TTY1_JOBS:-?}"
 fi
 
 if [ "$PHASE" = "boot2" ]; then

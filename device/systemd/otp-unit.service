@@ -8,11 +8,20 @@ Requires=otp-unit-etc-cups.service
 # The unit owns tty1, because that is the front panel when a monitor is
 # attached. Raspberry Pi OS Lite runs a login prompt there, and
 # StandardInput=tty-force below TAKES the console rather than failing --
-# so without this both processes hold /dev/tty1, output interleaves and
-# keystrokes go to whichever grabbed them. Conflicts= makes systemd stop
-# the getty first. A login prompt is still available on tty2 (Alt+F2).
-Conflicts=getty@tty1.service
-After=getty@tty1.service
+# so with both running, output interleaves and keystrokes go to whichever
+# grabbed them. A login prompt is still available on tty2 (Alt+F2).
+#
+# NOT Conflicts=getty@tty1.service, which is what used to be here, and the
+# reason is what Conflicts= also means: ANYTHING THAT STARTS THAT GETTY
+# STOPS THIS UNIT. Something does. userconf-pi's cancel-rename is the last
+# thing the seeded-credential path runs and it ends with `systemctl
+# --no-block start getty@tty1`, so an operator who used the documented
+# /boot/firmware/userconf.txt lost the front panel for that boot -- a
+# print appliance going dark as a side effect of setting a password.
+# device/install.sh puts the answer on the getty instead, as a condition
+# that keeps it from ever starting on tty1; a unit that never starts
+# cannot take this one down with it. harness/img-guest-check.sh checks
+# both halves on the booted image, in the boot that applies a seed.
 
 [Service]
 Type=simple

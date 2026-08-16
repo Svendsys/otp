@@ -688,7 +688,15 @@ case "$1 $2" in
         echo ;;
     "is-active userconfig.service")  echo "${UC_ACTIVE-inactive}" ;;
     "is-enabled userconfig.service") echo "${UC_ENABLED-enabled}" ;;
-    "list-jobs --no-legend")         printf '%s' "${UC_JOBLINE-}" ;;
+    "is-active otp-unit.service")    echo "${PANEL_ACTIVE-active}" ;;
+    "is-active getty@tty1.service")  echo "${TTY1_ACTIVE-inactive}" ;;
+    "is-enabled systemd-networkd-wait-online.service")
+        echo "${NETWAIT_ENABLED-masked}" ;;
+    # ONE queue for every question asked of it, because that is what the
+    # machine has. A stub that answered the wizard's job count out of one
+    # variable and the getty's out of another would let a test describe a
+    # boot systemd cannot produce.
+    "list-jobs --no-legend")         printf '%s' "${JOBS-}" ;;
     *) echo "stub: unexpected systemctl $*" >&2; exit 64 ;;
 esac
 """
@@ -765,7 +773,9 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
 
 HEALTHY_BOOT1 = {"UC_TS": "Sat 2026-08-15 10:00:00 UTC", "UC_COND": "yes",
                  "UC_RESULT": "success", "UC_ACTIVE": "inactive",
-                 "UC_ENABLED": "enabled", "UC_STDIN": "null", "UC_JOBLINE": ""}
+                 "UC_ENABLED": "enabled", "UC_STDIN": "null", "JOBS": "",
+                 "NETWAIT_ENABLED": "masked", "PANEL_ACTIVE": "active",
+                 "TTY1_ACTIVE": "inactive"}
 HEALTHY_BOOT2 = {**HEALTHY_BOOT1, "UC_COND": "no", "UC_RESULT": ""}
 
 
@@ -781,8 +791,11 @@ def test_a_seeded_first_boot_reports_applied_credentials_and_no_wizard(tmp_path)
     # all of them.
     proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1)
     assert proc.returncode == 0, proc.stderr
-    assert results(proc) == {"userconf-seed-applied": "PASS",
-                             "userconf-seeded-boot-ran-no-wizard": "PASS"}, proc.stdout
+    assert results(proc) == {
+        "network-wait-cannot-hold-the-boot-open": "PASS",
+        "userconf-seed-applied": "PASS",
+        "userconf-seeded-boot-ran-no-wizard": "PASS",
+        "front-panel-survives-the-credential-apply": "PASS"}, proc.stdout
 
 
 def test_a_wizard_still_holding_a_job_fails_the_first_boot(tmp_path):
@@ -796,7 +809,7 @@ def test_a_wizard_still_holding_a_job_fails_the_first_boot(tmp_path):
     """
     proc, _ = run_userconf(tmp_path, phase="boot1", env={
         **HEALTHY_BOOT1,
-        "UC_JOBLINE": "42 userconfig.service start waiting\n"})
+        "JOBS": "42 userconfig.service start waiting\n"})
     assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
 
 
@@ -805,7 +818,7 @@ def test_a_wizard_parked_mid_start_fails_the_first_boot(tmp_path):
     # "activating" for as long as the boot has been waiting.
     proc, _ = run_userconf(tmp_path, phase="boot1", env={
         **HEALTHY_BOOT1, "UC_ACTIVE": "activating", "UC_RESULT": "",
-        "UC_JOBLINE": "42 userconfig.service start running\n"})
+        "JOBS": "42 userconfig.service start running\n"})
     assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
 
 
@@ -851,9 +864,11 @@ def test_an_unseeded_second_boot_is_quiet_and_leaves_evidence(tmp_path):
     # but enabled, no prompt possible, and the malformed seed quarantined.
     proc, bootdir = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2)
     assert proc.returncode == 0, proc.stderr
-    assert results(proc) == {"userconf-unseeded-boot-skips-the-wizard": "PASS",
-                             "userconf-wizard-cannot-prompt": "PASS",
-                             "userconf-malformed-seed-fails-fast": "PASS"}, proc.stdout
+    assert results(proc) == {
+        "network-wait-cannot-hold-the-boot-open": "PASS",
+        "userconf-unseeded-boot-skips-the-wizard": "PASS",
+        "userconf-wizard-cannot-prompt": "PASS",
+        "userconf-malformed-seed-fails-fast": "PASS"}, proc.stdout
     assert (bootdir / "failed_userconf.txt").exists()
     assert not (bootdir / "userconf.txt").exists()
 

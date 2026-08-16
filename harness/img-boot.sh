@@ -183,6 +183,38 @@
 # wrong trade. What the drop-in contributes to that path, StandardInput=null,
 # is read back off the running machine instead of assumed.
 #
+# RUN 17 (31968966879) is what the first real execution of all that found,
+# and it found the image rather than the harness. Every credential check
+# failed the same way in both boots:
+#
+#   OTP-CHECK boot1 userconf-seeded-boot-ran-no-wizard FAIL
+#     condition=no result=success is-active=inactive jobs=1
+#   OTP-CHECK boot2 userconf-unseeded-boot-skips-the-wizard FAIL
+#     condition=no checked-at='never' is-active=inactive is-enabled=enabled
+#   IMG-CHECK boot1 userconf-seed-consumed FAIL still there: userconf.txt
+#
+# with userconf-seed-planted PASS beside them: the seed reached the card and
+# nothing on the machine ever looked at it. `jobs=1` with the condition never
+# evaluated is a unit whose START JOB IS STILL QUEUED, and the consoles say
+# what it was queued behind -- both of them end on
+#
+#   Job systemd-networkd-wait-online.service/start running (2min 37s / no limit)
+#
+# neither boot having reached multi-user.target at all. That wait is
+# TimeoutStartSec=infinity on an appliance whose links NetworkManager owns;
+# it blocks network-online.target, which blocks cloud-init's
+# cloud-config.service, which stock userconfig.service is ordered after. So
+# the documented headless credential file was ignored in silence on every
+# unit this image would have produced. device/install.sh masks the wait and
+# switches cloud-init off, and the probe now reads the mask back and asks
+# the queue for its job.
+#
+# The same run's boot2 answered the one question the malformed-seed
+# experiment was uncertain about: whiptail with no TERM FAILS rather than
+# blocking. "rc=1 ... said: Entered username is invalid: ... TERM
+# environment variable needs set." -- so the fail-fast is real, not a
+# stopwatch artifact, and the 60s bound was never reached.
+#
 # PARTLY cmdline.txt and config.txt now, where it used to be neither. QEMU
 # still reads no firmware configuration -- -append below REPLACES the kernel
 # command line wholesale, and dtparam=i2c_arm=on and the disable-wifi/bt
@@ -722,8 +754,10 @@ per_boot_verdict() {
 # against each other so they cannot drift apart in the other direction.
 GUEST_CHECKS_COMMON="root-is-overlay root-write-lands-and-is-readable \
 unit-active unit-not-restart-looping etc-cups-is-its-own-tmpfs cups-running \
-cupsd-config-valid boot-partition-separate setting-saved-to-the-boot-partition"
-GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard"
+cupsd-config-valid boot-partition-separate setting-saved-to-the-boot-partition \
+network-wait-cannot-hold-the-boot-open"
+GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
+front-panel-survives-the-credential-apply"
 GUEST_CHECKS_BOOT2="root-writes-discarded-by-the-power-cycle \
 settings-survive-the-power-cycle userconf-unseeded-boot-skips-the-wizard \
 userconf-wizard-cannot-prompt userconf-malformed-seed-fails-fast"
