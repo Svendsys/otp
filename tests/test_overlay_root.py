@@ -1546,10 +1546,16 @@ def test_the_probe_is_given_longer_than_its_own_bounded_wait(tmp_path):
 
     EVERY bounded wait, summed, not the first one. The probe grew a second
     poll and a `timeout` when the credential checks landed, and a test that
-    kept reading only the unit poll would have gone on approving a 300s
-    budget against 90s of a 180s worst case. Measured as this stands: 90s
-    polling for otp-unit, 30s polling for systemd's verdict on the wizard,
-    60s bounding the malformed-seed experiment.
+    kept reading only the unit poll would have gone on approving a budget
+    against 90s of a worst case several times that. Measured as this stands:
+    90s polling for otp-unit, 120s polling for systemd's verdict on the
+    wizard, 60s bounding the malformed-seed experiment -- 270s against a
+    TimeoutStartSec of 420 inside a 600s per-boot backstop.
+
+    Those three numbers are prose and the assertions below are not: the sums
+    are re-derived from the shipped files on every run, so a wait that
+    changes size fails the arithmetic rather than the sentence. The wizard
+    poll was 30s when this paragraph was first written and is 120s now.
 
     Both halves are read out of the shipped files: the bounds out of the
     probe, the backstop out of the workflow.
