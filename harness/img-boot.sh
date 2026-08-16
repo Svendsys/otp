@@ -168,7 +168,7 @@
 #          has to be GONE afterwards with no failed_userconf.txt beside it,
 #          and the guest has to find the seeded hash in /etc/shadow and
 #          userconfig.service finished, successful and holding no job.
-#   boot2  the delete boot1 made is still there -- the FAT partition is
+#   boot2  the delete boot1's wizard made has stuck -- the FAT partition is
 #          outside the overlay -- so the wizard's condition is false, and it
 #          has to be SKIPPED while staying enabled rather than masked. The
 #          guest then hands the shipped userconf-service a MALFORMED seed by

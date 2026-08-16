@@ -335,8 +335,8 @@ if [ "$PHASE" = "boot1" ]; then
 
     # NO WIZARD, which is the clause issue #20 is written around. A seeded
     # boot must take the non-interactive path: the condition passed (the
-    # drop-in let it run), the oneshot finished successfully, and there is no
-    # job of its left in the queue holding multi-user.target open.
+    # drop-in let it run), the oneshot finished successfully, and it has left
+    # no job of its own in the queue holding multi-user.target open.
     check userconf-seeded-boot-ran-no-wizard \
           "$(if [ "$UC_COND" = yes ] && [ "$UC_RESULT" = success ] \
                 && [ "$UC_ACTIVE" = inactive ] && [ "${UC_JOBS:-1}" = 0 ]; \
