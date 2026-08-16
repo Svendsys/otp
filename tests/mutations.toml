@@ -644,6 +644,45 @@ replace = '''if true; then'''
 
 
 [[mutation]]
+name = "tier3-backstop-message-contradicts-the-console"
+tier = "fast"
+guard = """
+rc=124 with an empty early-stop is not the same as a guest that said
+nothing: the sampler looks every 30 seconds, so a done line printed inside
+the last window reaches the console and never reaches early-stop. The old
+wording announced "ran to the backstop without a guest report" over a
+console holding a complete report -- a diagnosis contradicted by the file
+next to it, which is how a healthy-but-slow boot gets read as a dead one."""
+tests = [
+  "tests/test_img_verdict.py::test_a_backstopped_boot_that_did_report_is_not_called_silent",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        if grep -qF "OTP-GUEST-DONE $phase" "$CONSOLE_TXT" 2>/dev/null; then'''
+replace = '''        if false; then'''
+
+
+[[mutation]]
+name = "imgcheck-unit-start-timeout-too-short"
+tier = "fast"
+guard = """
+The probe's own poll for otp-unit.service is 45 iterations of `sleep 2` --
+90 seconds, exactly systemd's default TimeoutStartSec -- before cupsd -t
+and two Python interpreters under TCG. A timeout that does not clear that
+bound kills the probe mid-poll on a slow but healthy boot, and the phase
+then has no OTP-GUEST-DONE line, which the harness fails it for. Red rather
+than green, so a flake risk rather than a false pass, but the number has to
+be stated rather than inherited."""
+tests = [
+  "tests/test_overlay_root.py::test_the_probe_is_given_longer_than_its_own_bounded_wait",
+]
+[[mutation.edit]]
+file = "device/systemd/otp-unit-imgcheck.service"
+find = "TimeoutStartSec=300"
+replace = "TimeoutStartSec=60"
+
+
+[[mutation]]
 name = "guest-probe-runs-without-a-phase-token"
 tier = "fast"
 guard = """
