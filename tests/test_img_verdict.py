@@ -65,6 +65,8 @@ def required_checks(phase: str) -> list:
         return match.group(1).replace("\\\n", " ").split()
 
     found = names("GUEST_CHECKS_COMMON")
+    if phase == "boot1":
+        found += names("GUEST_CHECKS_BOOT1")
     if phase == "boot2":
         found += names("GUEST_CHECKS_BOOT2")
     return found
@@ -118,14 +120,37 @@ def healthy(phase):
     return kernel_lines() + [SUCCESS] + guest_report(phase)
 
 
+# What `mdir -b` prints for the FAT partition of an image this harness can
+# boot: absolute paths, one per line. kernel8.img is the load-bearing entry --
+# the verdict uses it as the positive control that the listing is a listing at
+# all, because every "the file is gone" below is equally true of a partition
+# nothing could read.
+FAT_ROOT = ["::/kernel8.img", "::/bcm2710-rpi-3-b.dtb", "::/config.txt",
+            "::/cmdline.txt", "::/initramfs8", "::/otp-unit.conf"]
+
+
+def healthy_listings(phase):
+    """The boot partition either side of a healthy phase.
+
+    boot1 goes in with the harness's seed and comes out without it; boot2
+    goes in clean and comes out holding the quarantined malformed seed the
+    guest fed to userconf-service by hand.
+    """
+    if phase == "boot1":
+        return FAT_ROOT + ["::/userconf.txt"], list(FAT_ROOT)
+    if phase == "boot2":
+        return list(FAT_ROOT), FAT_ROOT + ["::/failed_userconf.txt"]
+    return list(FAT_ROOT), list(FAT_ROOT)
+
+
 def run_verdict(tmp_path, consoles, *, phases=("boot1",), uart1_lines=None,
-                qemu_rc="124", early_stop=""):
+                qemu_rc="124", early_stop="", boot_files=None):
     """Run the sliced block over synthetic per-phase evidence directories.
 
     `consoles` maps a phase name to its uart0 lines. The verdict block reads
-    a phase as a directory on disk -- both consoles, qemu's exit code and
-    whether the harness stopped it -- so the fixture writes exactly what a
-    real boot leaves behind.
+    a phase as a directory on disk -- both consoles, qemu's exit code, whether
+    the harness stopped it, and the FAT root either side of the boot -- so the
+    fixture writes exactly what a real boot leaves behind.
     """
     if uart1_lines is None:
         # What the real second UART holds: early bootconsole lines that stop
@@ -142,6 +167,11 @@ def run_verdict(tmp_path, consoles, *, phases=("boot1",), uart1_lines=None,
             "\n".join(uart1_lines) + ("\n" if uart1_lines else ""))
         (pdir / "qemu-rc").write_text(qemu_rc + "\n")
         (pdir / "early-stop").write_text(early_stop)
+        before, after = (boot_files or {}).get(phase, healthy_listings(phase))
+        (pdir / "boot-files-before.txt").write_text(
+            "".join(f"{line}\n" for line in before))
+        (pdir / "boot-files-after.txt").write_text(
+            "".join(f"{line}\n" for line in after))
     script = "\n".join(
         [
             "set -euo pipefail",
@@ -272,9 +302,20 @@ def test_the_harness_and_the_guest_agree_on_which_checks_exist():
     emitted = set(re.findall(r"^\s*check\s+([a-z0-9-]+)[\s\\]",
                              GUEST_CHECK.read_text(), re.M))
     assert emitted, "no check calls found in img-guest-check.sh"
-    assert emitted == set(required_checks("boot2")), (
+    # The UNION over the phases, because the two boots no longer ask the same
+    # questions: only boot1 has a seed to consume, only boot2 can speak about
+    # what a power-cycle kept.
+    demanded = set(required_checks("boot1")) | set(required_checks("boot2"))
+    assert emitted == demanded, (
         f"img-guest-check.sh emits {sorted(emitted)}, img-boot.sh requires "
-        f"{sorted(required_checks('boot2'))}")
+        f"{sorted(demanded)}")
+    # And no name is demanded of a phase that cannot emit it. A phase-specific
+    # check listed as COMMON fails every run of the other phase -- red rather
+    # than green, but red for a bookkeeping mistake rather than for the image.
+    common = set(required_checks("boot1")) & set(required_checks("boot2"))
+    for phase in ("boot1", "boot2"):
+        only = set(required_checks(phase)) - common
+        assert only, f"{phase} demands nothing of its own"
 
 
 def test_a_healthy_two_boot_run_passes(tmp_path):

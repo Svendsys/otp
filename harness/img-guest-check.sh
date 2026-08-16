@@ -274,6 +274,133 @@ check setting-saved-to-the-boot-partition \
       "$(if [ "${SAVED#*save=True}" != "$SAVED" ]; then echo yes; else echo no; fi)" \
       "$SAVED"
 
+# --- the seeded userconf.txt path -----------------------------------------
+
+# WHY THIS IS HERE. Issue #18 replaced a mask on userconfig.service with a
+# ConditionPathExists drop-in so that the documented headless credential file
+# keeps working, and until issue #20 only the branch where nobody ever wrote
+# one had been exercised: no seed, no wizard, boot green. The harness plants a
+# real seed in the boot partition before boot1; what follows is the machine's
+# side of it.
+#
+# The account the seed names and the salt its hash carries. The hash itself
+# stays in harness/img-boot.sh, which is not installed on a unit; only this
+# marker travels here, and a salt is a comparison string rather than a
+# credential. tests/test_img_verdict.py holds the two files against each other
+# and against image/build.sh's FIRST_USER_NAME.
+USERCONF_USER=otp
+USERCONF_SALT='$6$otpimgcheck$'
+USERCONF_SERVICE=/usr/lib/userconf-pi/userconf-service
+
+# POLLED, and briefly. This probe is ordered after otp-unit.service and
+# cups.service and the poll above has already spent up to 90 seconds, so
+# userconfig.service -- a oneshot wanted by multi-user.target -- has had every
+# chance to be dealt with. It is polled anyway because "systemd has not looked
+# at it yet" and "systemd looked and skipped it" are the same two empty fields
+# from here, and reading the first as the second passes on exactly the boot run
+# 12 died on.
+UC_COND_TS=""
+for _ in $(seq 1 15); do
+    UC_COND_TS=$(systemctl show userconfig.service -p ConditionTimestamp --value 2>/dev/null)
+    [ -n "$UC_COND_TS" ] && break
+    sleep 2
+done
+UC_COND=$(systemctl show userconfig.service -p ConditionResult --value 2>/dev/null)
+UC_RESULT=$(systemctl show userconfig.service -p Result --value 2>/dev/null)
+UC_STDIN=$(systemctl show userconfig.service -p StandardInput --value 2>/dev/null)
+UC_ACTIVE=$(systemctl is-active userconfig.service 2>&1 || true)
+UC_ENABLED=$(systemctl is-enabled userconfig.service 2>&1 || true)
+# A JOB, because a job is what actually held run 12's boot open: the wizard sat
+# on a whiptail nobody could see and multi-user.target waited on the job. That
+# state is not `is-active`'s business -- a unit whose ExecStart is blocked is
+# "activating", and so is a healthy unit that started two seconds ago.
+UC_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -c "userconfig\.service" || true)
+
+if [ "$PHASE" = "boot1" ]; then
+    # APPLIED, not merely deleted. From outside, the harness can watch the
+    # file vanish from the FAT partition; only the machine can say the
+    # credentials in it were put anywhere, and a userconf-service that
+    # deleted the seed without applying it would look identical from there.
+    # pi-gen hashes FIRST_USER_PASS with a random salt, so this marker in the
+    # shadow entry can only have come from the seed. The entry itself is
+    # never printed: this console is uploaded as a CI artifact.
+    UC_SHADOW=$(awk -F: -v u="$USERCONF_USER" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
+    check userconf-seed-applied \
+          "$(if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; \
+             then echo yes; else echo no; fi)" \
+          "$USERCONF_USER's shadow entry (${#UC_SHADOW} chars) begins $USERCONF_SALT: $(
+             if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; \
+             then echo yes; else echo no; fi)"
+
+    # NO WIZARD, which is the clause issue #20 is written around. A seeded
+    # boot must take the non-interactive path: the condition passed (the
+    # drop-in let it run), the oneshot finished successfully, and there is no
+    # job of its left in the queue holding multi-user.target open.
+    check userconf-seeded-boot-ran-no-wizard \
+          "$(if [ "$UC_COND" = yes ] && [ "$UC_RESULT" = success ] \
+                && [ "$UC_ACTIVE" = inactive ] && [ "${UC_JOBS:-1}" = 0 ]; \
+             then echo yes; else echo no; fi)" \
+          "condition=${UC_COND:-?} result=${UC_RESULT:-?} is-active=$UC_ACTIVE jobs=${UC_JOBS:-?}"
+fi
+
+if [ "$PHASE" = "boot2" ]; then
+    # THE UNSEEDED BRANCH, which is every boot a unit does after its first.
+    # The delete boot1's wizard made stuck, because the FAT partition is
+    # outside the overlay, so the condition is false here and the unit is
+    # skipped -- instantly, with no prompt.
+    #
+    # `enabled` is asserted in the same breath, and it is the half that is
+    # easy to lose. Masking or disabling the unit would also make it quiet,
+    # and it is the ONLY consumer of userconf.txt: a quiet-by-masking image
+    # ignores an operator's credentials in silence and leaves the tty2
+    # recovery getty with no knowable login. That is the trade
+    # device/install.sh's comment refuses, stated as a check.
+    check userconf-unseeded-boot-skips-the-wizard \
+          "$(if [ "$UC_COND" = no ] && [ -n "$UC_COND_TS" ] \
+                && [ "$UC_ACTIVE" = inactive ] && [ "$UC_ENABLED" = enabled ]; \
+             then echo yes; else echo no; fi)" \
+          "condition=${UC_COND:-?} checked-at='${UC_COND_TS:-never}' is-active=$UC_ACTIVE is-enabled=$UC_ENABLED"
+
+    # StandardInput=null, read back off the running machine rather than out
+    # of the file install.sh wrote. It is the whole of the fail-fast: with a
+    # tty a malformed seed becomes a whiptail nobody can answer, which is how
+    # run 12's boot was held open. This says the drop-in reached the image,
+    # parsed, and is in effect on the unit.
+    check userconf-wizard-cannot-prompt \
+          "$(if [ "$UC_STDIN" = null ]; then echo yes; else echo no; fi)" \
+          "StandardInput=${UC_STDIN:-unset}"
+
+    # THE MALFORMED SEED, run by hand and not left on the card for the unit
+    # to find at boot. Stock userconfig.service carries Restart=on-failure,
+    # so a boot that met one prints "Failed with result" and "Scheduled
+    # restart job" -- two of the strings harness/img-boot.sh fails a release
+    # on -- and relaxing a release gate to accommodate a fault the harness
+    # injected itself is the wrong way round. The conditions the unit would
+    # supply are supplied here instead: stdin closed, and no TERM, which is
+    # what a unit with no tty is given. The drop-in's own half is the check
+    # directly above.
+    #
+    # WHAT IS GATED is what matters on a device: the thing TERMINATED, and it
+    # left the operator the evidence under the failed_ name. The exit status
+    # is reported and NOT gated -- the failure mode that hurts is a script
+    # that never returns, and whether the return is 0 or 1 is upstream's
+    # business.
+    UC_BAD='NOT A VALID NAME:'
+    UC_SAID="the probe never ran it: $USERCONF_SERVICE is not executable here"
+    UC_RC=none
+    if [ -x "$USERCONF_SERVICE" ]; then
+        printf '%s\n' "$UC_BAD" > "$BOOTDIR/userconf.txt"
+        UC_SAID=$(timeout -k 5 60 env -u TERM "$USERCONF_SERVICE" < /dev/null 2>&1)
+        UC_RC=$?
+        UC_SAID=${UC_SAID//[$'\n\r']/ }
+    fi
+    check userconf-malformed-seed-fails-fast \
+          "$(if [ "$UC_RC" != none ] && [ "$UC_RC" != 124 ] \
+                && [ -e "$BOOTDIR/failed_userconf.txt" ] \
+                && [ ! -e "$BOOTDIR/userconf.txt" ]; then echo yes; else echo no; fi)" \
+          "rc=$UC_RC (124 = still running at the 60s bound) quarantined=$(yesno test -e "$BOOTDIR/failed_userconf.txt") leftover-seed=$(yesno test -e "$BOOTDIR/userconf.txt") said: ${UC_SAID:0:160}"
+fi
+
 sync 2>/dev/null || true
 
 echo "--- otp-unit journal ($PHASE) ---"
