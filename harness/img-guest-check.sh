@@ -325,12 +325,12 @@ if [ "$PHASE" = "boot1" ]; then
     # shadow entry can only have come from the seed. The entry itself is
     # never printed: this console is uploaded as a CI artifact.
     UC_SHADOW=$(awk -F: -v u="$USERCONF_USER" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
-    check userconf-seed-applied \
-          "$(if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; \
-             then echo yes; else echo no; fi)" \
-          "$USERCONF_USER's shadow entry (${#UC_SHADOW} chars) begins $USERCONF_SALT: $(
-             if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; \
-             then echo yes; else echo no; fi)"
+    UC_APPLIED=no
+    if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; then
+        UC_APPLIED=yes
+    fi
+    check userconf-seed-applied "$UC_APPLIED" \
+          "${USERCONF_USER}'s shadow entry (${#UC_SHADOW} chars) begins $USERCONF_SALT: $UC_APPLIED"
 
     # NO WIZARD, which is the clause issue #20 is written around. A seeded
     # boot must take the non-interactive path: the condition passed (the

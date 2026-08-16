@@ -95,8 +95,14 @@ jobs:
             "$(git merge-base "origin/$base" HEAD)" HEAD)
           echo "$changed"
           # The same four paths the trigger used to carry.
+          # harness/img-guest-check.sh is in this list because it is IN the
+          # image: the pi-gen stage copies harness/ into the rootfs and
+          # install.sh installs the probe to /opt/otp-unit, where a unit runs
+          # it every tier-3 boot. It arrived with the overlay work and this
+          # filter was not updated, so a pull request that changed only the
+          # probe skipped the image job entirely -- the one job that runs it.
           if printf '%s\n' "$changed" | grep -qE \
-              '^(image/|device/|harness/img-boot\.sh$|\.github/workflows/image\.yml$)'
+              '^(image/|device/|harness/img-boot\.sh$|harness/img-guest-check\.sh$|\.github/workflows/image\.yml$)'
           then
             echo "image=true" >> "$GITHUB_OUTPUT"
           else
@@ -148,6 +154,15 @@ jobs:
       # so the boot runs against the same image the previous run built --
       # which is exactly right, and skips the build entirely.
       #
+      # harness/img-guest-check.sh is the exception in that directory, and it
+      # is named separately below rather than by widening the pattern to
+      # harness/**. The probe RUNS INSIDE the image: the pi-gen stage copies
+      # harness/ into the rootfs and install.sh installs it to /opt/otp-unit.
+      # Without it in the key, editing a check restored yesterday's image and
+      # booted yesterday's probe -- and the harness then fails the run for
+      # named checks the guest never emitted, which reads as a broken image
+      # rather than a stale cache.
+      #
       # human_bias.png is in the key because otp.md embeds it and
       # render-manual.sh bakes it into the manual PDFs inside the image --
       # a chart-only change must not green-certify (or tag-release) a
@@ -163,7 +178,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: image/deploy
-          key: otp-image-${{ runner.arch }}-${{ hashFiles('image/**', 'device/**', 'otpunit/**', 'codewords/**', 'otp_generator.py', 'otp.md', 'human_bias.png') }}
+          key: otp-image-${{ runner.arch }}-${{ hashFiles('image/**', 'device/**', 'otpunit/**', 'codewords/**', 'harness/img-guest-check.sh', 'otp_generator.py', 'otp.md', 'human_bias.png') }}
 
       - name: Free up disk space
         if: steps.imgcache.outputs.cache-hit != 'true'

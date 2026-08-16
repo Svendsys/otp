@@ -926,3 +926,322 @@ tests = [
 file = "device/install.sh"
 find = '''        sed -i -e "s|^|boot=overlay |" "$CMDLINE_TXT"'''
 replace = '''        :'''
+
+
+# --- the seeded userconf.txt path (issue #20) -----------------------------
+
+[[mutation]]
+name = "tier3-boot-partition-listing-not-controlled"
+tier = "fast"
+guard = """
+Every credential check below reads an ABSENCE off a listing -- the seed is
+gone, the bad seed is not lying around -- and an empty listing satisfies all
+of them. mdir against a wrong offset, an image that moved, mtools missing:
+each produces no lines, and no lines reads as consumed. kernel8.img is the
+control that the listing is a listing at all, and it is not a guess: it is
+the file this harness pulled off that partition to boot the guest with."""
+tests = [
+  "tests/test_img_verdict.py::test_a_boot_partition_nothing_could_read_fails_rather_than_passing",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if fat_lists "$after" kernel8.img; then'''
+replace = '''    if true; then'''
+
+
+[[mutation]]
+name = "tier3-userconf-seed-never-planted-accepted"
+tier = "fast"
+guard = """
+The before-listing, which is the only thing separating "the machine consumed
+the operator's file" from "no file was ever written". mcopy against a wrong
+partition offset writes nothing and says nothing -- run 1 read exactly that
+as a bad image -- and the whole credential gate then passes over an image the
+harness never touched."""
+tests = [
+  "tests/test_img_verdict.py::test_a_seed_that_never_reached_the_card_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            if fat_lists "$before" userconf.txt; then'''
+replace = '''            if true; then'''
+
+
+[[mutation]]
+name = "tier3-userconf-rejected-seed-counts-as-consumed"
+tier = "fast"
+guard = """
+Consumed has two halves. A first boot that renamed the operator's file to
+failed_userconf.txt took the seed and gave them NO credentials, and from
+outside the machine that is indistinguishable from success: userconf.txt is
+gone either way. A unit that lands there has an unknowable login on the tty2
+recovery getty, which is the only way into a device with no network and no
+SSH."""
+tests = [
+  "tests/test_img_verdict.py::test_a_seed_the_image_rejected_fails_the_first_boot",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            if ! fat_lists "$after" userconf.txt && ! fat_lists "$after" failed_userconf.txt; then'''
+replace = '''            if ! fat_lists "$after" userconf.txt; then'''
+
+
+[[mutation]]
+name = "tier3-userconf-malformed-seed-not-quarantined"
+tier = "fast"
+guard = """
+The host's half of the malformed-seed experiment. failed_userconf.txt is the
+only thing that tells an operator why they have no login, and a bad seed left
+under its own name prompts the wizard on every boot from then on. Both are
+asserted together because either alone is satisfied by a guest that ran no
+experiment at all."""
+tests = [
+  "tests/test_img_verdict.py::test_a_malformed_seed_that_left_no_evidence_fails_boot2",
+  "tests/test_img_verdict.py::test_a_bad_seed_left_where_the_next_wizard_finds_it_fails_boot2",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            if fat_lists "$after" failed_userconf.txt && ! fat_lists "$after" userconf.txt; then'''
+replace = '''            if true; then'''
+
+
+[[mutation]]
+name = "tier3-boot1-named-checks-not-required"
+tier = "fast"
+guard = """
+The named-check gate, for the phase that grew a list of its own. boot1's two
+checks ARE the seeded credential path: drop them from what the run demands
+and every other check in boot1 still passes, so the run goes green having
+observed nothing about the file the operator wrote. The same defect as
+tier3-guest-named-checks-not-required, one phase over."""
+tests = [
+  "tests/test_img_verdict.py::test_a_dropped_boot1_check_fails_too",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        boot1) want="$want $GUEST_CHECKS_BOOT1" ;;'''
+replace = '''        boot1) ;;'''
+
+
+[[mutation]]
+name = "tier3-before-listing-taken-after-the-boot"
+tier = "fast"
+guard = """
+Ordering. The before-listing is what says the seed reached the card; taken
+after qemu has run it says only that the partition ended the boot in some
+state, and "the seed was planted" becomes a sentence about nothing."""
+tests = [
+  "tests/test_img_verdict.py::test_the_before_listing_is_taken_before_the_boot",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    fat_listing "$dir/boot-files-before.txt"
+'''
+replace = ''''''
+
+
+[[mutation]]
+name = "guest-userconf-seed-not-really-applied"
+tier = "fast"
+guard = """
+The gap between "the file is gone" and "the credentials work". A
+userconf-service that unlinked the seed without running chpasswd leaves the
+operator an account whose password is pi-gen's random FIRST_USER_PASS -- a
+value nobody has -- and the host, which can only watch the file disappear,
+would call that success. pi-gen salts its hash randomly, so the marker salt
+in the shadow entry can only have come from the seed."""
+tests = [
+  "tests/test_overlay_root.py::test_a_seed_deleted_without_being_applied_fails",
+  "tests/test_overlay_root.py::test_no_shadow_entry_at_all_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''    if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; then'''
+replace = '''    if [ -n "$UC_SHADOW" ]; then'''
+
+
+[[mutation]]
+name = "guest-userconf-wizard-job-ignored"
+tier = "fast"
+guard = """
+A JOB is what held run 12's boot open: multi-user.target waited on a whiptail
+nobody could see. A queued job for a unit that has not started yet reads as
+`inactive` in every other field systemd offers, so the queue is asked
+directly rather than inferred from the unit's state."""
+tests = [
+  "tests/test_overlay_root.py::test_a_wizard_still_holding_a_job_fails_the_first_boot",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''                && [ "$UC_ACTIVE" = inactive ] && [ "${UC_JOBS:-1}" = 0 ]; \'''
+replace = '''                && [ "$UC_ACTIVE" = inactive ]; \'''
+
+
+[[mutation]]
+name = "guest-userconf-masked-wizard-accepted"
+tier = "fast"
+guard = """
+Quiet is not the property. Masking userconfig.service also stops the prompt
+-- an earlier fix did exactly that and the review round reverted it --
+because that unit is the ONLY consumer of the documented credential file: a
+masked image discards an operator's credentials in silence and leaves the
+tty2 recovery getty with a login nobody can pass. Skipped AND enabled, or the
+check says nothing."""
+tests = [
+  "tests/test_overlay_root.py::test_a_masked_wizard_is_quiet_for_the_wrong_reason",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''                && [ "$UC_ACTIVE" = inactive ] && [ "$UC_ENABLED" = enabled ]; \'''
+replace = '''                && [ "$UC_ACTIVE" = inactive ]; \'''
+
+
+[[mutation]]
+name = "guest-userconf-unevaluated-condition-accepted"
+tier = "fast"
+guard = """
+An empty ConditionTimestamp is "systemd has not looked at this unit yet",
+which is what a probe running too early sees -- and it is identical to a real
+skip in every other field. Reading the first as the second passes on exactly
+the boot whose wizard is still ahead of it."""
+tests = [
+  "tests/test_overlay_root.py::test_a_condition_systemd_never_evaluated_is_not_a_skip",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''          "$(if [ "$UC_COND" = no ] && [ -n "$UC_COND_TS" ] \'''
+replace = '''          "$(if [ "$UC_COND" = no ] \'''
+
+
+[[mutation]]
+name = "guest-userconf-standardinput-not-checked"
+tier = "fast"
+guard = """
+StandardInput=null is the whole of the fail-fast, and it exists only because
+device/install.sh writes a drop-in into the image. Read back off the running
+machine it says the drop-in arrived, parsed, and applies to the unit; without
+it the stock StandardInput=tty is back and a malformed seed is a prompt
+holding the boot open again."""
+tests = [
+  "tests/test_overlay_root.py::test_a_wizard_that_can_still_reach_a_tty_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''          "$(if [ "$UC_STDIN" = null ]; then echo yes; else echo no; fi)" \'''
+replace = '''          "$(if true; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "guest-userconf-hang-accepted"
+tier = "fast"
+guard = """
+The failure that hurts is a userconf-service that never returns: on a device
+that is multi-user.target held open forever, which is issue #17. rc 124 is
+the probe's own stopwatch having had to kill it, and accepting that as a pass
+turns the one experiment that can observe a hang into a report that something
+ran."""
+tests = [
+  "tests/test_overlay_root.py::test_a_malformed_seed_that_hangs_fails_instead_of_timing_the_boot_out",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''          "$(if [ "$UC_RC" != none ] && [ "$UC_RC" != 124 ] \'''
+replace = '''          "$(if [ "$UC_RC" != none ] \'''
+
+
+[[mutation]]
+name = "guest-userconf-evidence-not-required"
+tier = "fast"
+guard = """
+failed_userconf.txt is the only thing an operator gets to read after a seed
+the machine would not take, and quarantine means MOVED -- a card still
+holding the bad line prompts on every boot from then on. Both halves go
+together: a service that ended having deleted their file satisfies every
+other clause of this check, and so does an image with no userconf-pi on it at
+all."""
+tests = [
+  "tests/test_overlay_root.py::test_a_malformed_seed_that_leaves_no_evidence_fails",
+  "tests/test_overlay_root.py::test_a_seed_left_in_place_by_the_service_fails",
+  "tests/test_overlay_root.py::test_an_image_without_userconf_pi_fails_rather_than_passing_silently",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''                && [ -e "$BOOTDIR/failed_userconf.txt" ] \
+                && [ ! -e "$BOOTDIR/userconf.txt" ]; then echo yes; else echo no; fi)" \'''
+replace = '''                ; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "guest-userconf-experiment-keeps-its-own-stdin"
+tier = "fast"
+guard = """
+The experiment has to supply what the unit would: stdin closed, and no TERM.
+Run with the probe's own stdin, whiptail may find a terminal after all, and
+the malformed seed then measures a machine nobody ships. Asserted on the text
+of the line rather than behaviourally -- a stub cannot be made to care -- so
+it gets a row of its own rather than riding on another check's."""
+tests = [
+  "tests/test_overlay_root.py::test_the_experiment_supplies_the_conditions_the_unit_would",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = ''' env -u TERM "$USERCONF_SERVICE" < /dev/null 2>&1)'''
+replace = ''' "$USERCONF_SERVICE" 2>&1)'''
+
+
+[[mutation]]
+name = "install-userconf-dropin-hardcodes-the-boot-dir"
+tier = "fast"
+guard = """
+BOOT_DIR falls back to /boot when /boot/firmware is not a directory, and
+userconf-service's own get_fw_loc makes the same choice -- so on that layout
+a flat /boot/firmware in the condition names a path that cannot exist. The
+condition is then false on every boot, the unit never runs, and the
+operator's credentials are ignored in the same silence masking produced."""
+tests = [
+  "tests/test_overlay_root.py::test_the_condition_follows_the_boot_directory_that_exists",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''ConditionPathExists=|$BOOT_DIR/userconf
+ConditionPathExists=|$BOOT_DIR/userconf.txt'''
+replace = '''ConditionPathExists=|/boot/firmware/userconf
+ConditionPathExists=|/boot/firmware/userconf.txt'''
+
+
+[[mutation]]
+name = "install-userconf-dropin-allows-a-prompt"
+tier = "fast"
+guard = """
+Without StandardInput=null a malformed seed falls back to the interactive
+branch of userconf-service, and on a console-boot image that is a whiptail on
+a tty nobody is looking at, holding multi-user.target open. That is the boot
+run 12 found, and this drop-in is the whole of what stops it."""
+tests = [
+  "tests/test_overlay_root.py::test_the_wizard_cannot_reach_a_terminal",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''[Service]
+StandardInput=null
+DROPIN'''
+replace = '''DROPIN'''
+
+
+[[mutation]]
+name = "install-userconf-dropin-loses-a-spelling"
+tier = "fast"
+guard = """
+userconf-pi reads `userconf` first and `userconf.txt` second, and Raspberry
+Pi Imager writes the second. Drop either line and the condition is false for
+the file an operator actually wrote -- and a single remaining
+ConditionPathExists is no longer an OR group at all, so it would then have to
+match on its own."""
+tests = [
+  "tests/test_overlay_root.py::test_the_wizard_runs_only_when_an_operator_seeded_it",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''ConditionPathExists=|$BOOT_DIR/userconf.txt
+'''
+replace = ''''''

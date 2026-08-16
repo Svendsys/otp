@@ -896,10 +896,17 @@ def test_a_malformed_seed_that_hangs_fails_instead_of_timing_the_boot_out(tmp_pa
     a whiptail that found a terminal after all, a read on a stdin that is not
     really closed -- holds multi-user.target open on a device forever. Here it
     is bounded and reported: the probe kills it and says rc=124.
+
+    The stub quarantines the file FIRST and blocks after, which is the real
+    order: upstream renames the bad seed and only then reaches the whiptail.
+    Every other clause of the check therefore passes, so what this measures is
+    the stopwatch and nothing else.
     """
     proc, bootdir = run_userconf(
         tmp_path, phase="boot2", env=HEALTHY_BOOT2,
-        service="#!/bin/sh\nsleep 30\n")
+        service=('#!/bin/sh\ncat "$BOOTDIR/userconf.txt" >> '
+                 '"$BOOTDIR/failed_userconf.txt"\n'
+                 'rm -f "$BOOTDIR/userconf.txt"\nsleep 30\n'))
     assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
     assert "rc=124" in proc.stdout, proc.stdout
     # And the probe carried on to report, rather than being the hang itself.
