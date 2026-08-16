@@ -295,6 +295,28 @@ def test_the_release_notes_credential_claim_is_backed_by_the_harness():
         "nothing seeds a userconf.txt, so the note's first clause is empty"
 
 
+def test_the_release_notes_boot_completion_claim_is_backed_by_the_harness():
+    """
+    Two sentences that only exist because run 31968966879 disproved them.
+
+    Neither boot in that run finished: an unbounded
+    systemd-networkd-wait-online held network-online.target, which held
+    cloud-init's config stage, which held the credential wizard -- and the
+    apply the wizard performs ends by starting a getty on the front panel's
+    tty. Both are checks on the booted image now, and a note that says so
+    has to be backed by a harness that still demands them by name.
+    """
+    body = step_named(build_steps(), ATTACH)["with"]["body"]
+    assert "front panel" in body, body
+    assert "network" in body, body
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    for name in ("front-panel-survives-the-credential-apply",
+                 "network-wait-cannot-hold-the-boot-open"):
+        assert name in harness, (
+            f"the release note claims the boot finished with its panel "
+            f"intact, but img-boot.sh no longer requires {name}")
+
+
 # --- what counts as a change to the image --------------------------------
 #
 # The probe runs INSIDE the image. install.sh installs

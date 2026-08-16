@@ -1459,3 +1459,22 @@ replace = '''Conflicts=getty@tty1.service
 
 [Service]
 Type=simple'''
+
+
+[[mutation]]
+name = "tier3-front-panel-check-not-required"
+tier = "fast"
+guard = """
+The named-check gate over the check run 31968966879's aftermath added. Drop
+the name and boot1 still passes everything else -- the seed is applied, the
+wizard is quiet -- while the panel the apply took down goes unmentioned, and
+the release note image.yml attaches to a tag says it was still there."""
+tests = [
+  "tests/test_img_verdict.py::test_the_harness_and_the_guest_agree_on_which_checks_exist",
+  "tests/test_image_workflow.py::test_the_release_notes_boot_completion_claim_is_backed_by_the_harness",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
+front-panel-survives-the-credential-apply"'''
+replace = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard"'''

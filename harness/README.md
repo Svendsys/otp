@@ -295,8 +295,12 @@ naming a device this DTB doesn't have (`ttyAMA1`, not `ttyAMA0` — six
 runs diagnosed a "freeze" that was a dead console), and Raspberry Pi
 OS's first-boot wizard holding `multi-user.target` open forever — a
 real bug that would have shipped to hardware, now handled by a
-systemd drop-in in `install.sh`. The harness stops the emulator the
-moment the guest reports done and judges the boot on ANSI-stripped
+systemd drop-in in `install.sh`. Run 17 found two more of that kind:
+an unbounded wait for a network the appliance does not have holding
+`multi-user.target` open on every boot, and the credential path
+stopping the front panel as its last act. Both are `install.sh` fixes
+with checks on the booted image, below. The harness stops the emulator
+the moment the guest reports done and judges the boot on ANSI-stripped
 console evidence, not qemu's exit code. The full fifteen-run narrative
 lives in `img-boot.sh`'s header and issue #17.
 
@@ -327,10 +331,13 @@ hwrng registered`. Measured cost on a cache miss: 6m58s of pi-gen, then
 7m59s for the pair of boots, 16m16s for the whole job.
 
 Those two totals are run 16's and stay run 16's. The credential checks
-below added two names to what boot 1 must report and three to boot 2, so a
-green run now counts differently — and the first run of *those* is whichever
-CI run this paragraph was written for. The cost is unchanged: no extra boot,
-and the one bounded experiment inside boot 2 is capped at 60 seconds.
+below added three names to what boot 1 must report and three to boot 2, and
+one more — the network wait — to both, so a green run now counts
+differently: 13 in boot 1 and 15 in boot 2. Run 17 measured 9/11 and 13/14
+against the counts as they stood then, which is a different arithmetic
+again; the numbers move with the list and only the list is authoritative.
+The cost is unchanged: no extra boot, and the one bounded experiment inside
+boot 2 is capped at 60 seconds.
 
 **`OTP_IMG_PHASES` picks the boots, and it may not drop `boot2`.** It
 defaults to `boot1 boot2`; a run debugging the boot itself can shorten it,
@@ -360,9 +367,47 @@ operator actually meets rode along with the two boots that already existed:
 
 | Branch | Where | What has to be true |
 |---|---|---|
-| seeded | `boot1` | The seed reaches the card (checked *before* the boot), is gone afterwards with no `failed_userconf.txt` beside it, its hash is in `/etc/shadow`, and `userconfig.service` finished successfully holding no job. |
+| seeded | `boot1` | The seed reaches the card (checked *before* the boot), is gone afterwards with no `failed_userconf.txt` beside it, its hash is in `/etc/shadow`, `userconfig.service` finished successfully holding no job, and the front panel still owns tty1 afterwards. |
 | unseeded | `boot2` | The delete stuck — the FAT partition is outside the overlay — so the condition is false and the unit is skipped **while staying enabled**. |
 | malformed | `boot2` | The shipped `userconf-service`, handed a bad seed with stdin closed and no `TERM`, terminates inside a 60s bound and leaves `failed_userconf.txt` with no `userconf.txt` behind it. |
+
+### Run 17 (31968966879): the first seeded boot, and what it found
+
+Every credential check failed, in both boots, and the image was what was
+wrong. The guest reported `condition=no result=success is-active=inactive
+jobs=1` in boot 1 and `condition=no checked-at='never'` in boot 2, with
+`userconf-seed-planted PASS` beside them: the seed reached the card and
+nothing on the machine ever looked at it. A **queued start job** with the
+condition never evaluated is not a skip, and the consoles say what it was
+queued behind — both of them end on
+
+```
+Job systemd-networkd-wait-online.service/start running (2min 37s / no limit)
+```
+
+with `multi-user.target` never reached in either boot. That unit is
+`TimeoutStartSec=infinity` on an appliance whose links NetworkManager owns,
+so it blocks `network-online.target`, which blocks cloud-init's
+`cloud-config.service`, which stock `userconfig.service` is ordered after.
+**Every unit this image would have produced ignored the operator's
+`userconf.txt` in silence** — the outcome `install.sh` replaced a mask to
+avoid, arriving through the ordering instead of the condition.
+`install.sh` masks the wait and switches cloud-init off, and the probe reads
+the mask back with its job queue rather than trusting the line that wrote it.
+
+The apply's own tail came out of the same reading. It ends in
+`/usr/lib/userconf-pi/userconf` → `cancel-rename` → `systemctl --no-block
+start getty@tty1`, and `otp-unit.service` carried
+`Conflicts=getty@tty1.service`: setting a password the documented way would
+have **stopped the print unit** until the next power-cycle. A condition on
+the getty replaces the conflict — masking it would fail that start, and
+`userconf-service` runs under `sh -e`, so it would die before deleting the
+applied seed and `Restart=on-failure` would loop it.
+
+The same run settled the one question the malformed-seed experiment was
+uncertain about: whiptail with no `TERM` **fails** rather than blocking —
+`rc=1 ... TERM environment variable needs set.` — so the fail-fast is real
+and the 60s bound was never reached.
 
 Three details worth knowing about that last row. It is run **by hand from
 the probe** rather than left on the card for the unit to find at boot,
