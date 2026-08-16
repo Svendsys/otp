@@ -692,13 +692,6 @@ set -f
 '''
 replace = '''PHASE=""
 '''
-[[mutation.edit]]
-file = "harness/img-guest-check.sh"
-find = '''done
-set +f
-'''
-replace = '''done
-'''
 
 
 # --- what provisioning is allowed to leave behind -------------------------
@@ -754,6 +747,66 @@ replace = '''        if lsinitramfs "$candidate" 2>/dev/null | grep -q "scripts/
             OVERLAY_INITRAMFS="$candidate"
             break
         fi'''
+
+
+[[mutation]]
+name = "overlay-lower-layer-mounted-writable"
+tier = "fast"
+guard = """
+`-r` on the lower mount is the line that makes the card read-only for the
+whole life of the boot: without it the running system has a writable handle
+on the filesystem it booted from, and the appliance is a slower way of
+writing to an SD card rather than a machine a power-cycle resets. It is the
+most safety-critical line in the overlay script and it had no row."""
+tests = [
+  "tests/test_overlay_root.py::test_the_lower_layer_is_mounted_read_only",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''	if ! mount -r ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${ROOT}" /lower; then'''
+replace = '''	if ! mount ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${ROOT}" /lower; then'''
+
+
+[[mutation]]
+name = "initramfs-updated-instead-of-created"
+tier = "fast"
+guard = """
+`-c`, not `-u`, and the comment above the line has always named this exact
+defect: pi-gen sets update_initramfs=no in update-initramfs.conf, and
+update-initramfs honours that setting on its UPDATE path only. `-u` prints
+"Not updating initramfs." and exits 0, leaving the overlay script out of an
+initramfs that already exists, has the right name and is the right size --
+the firmware loads it, boot=overlay is read by nothing, and the unit comes
+up on a writable root. The edit survived the whole fast suite until the
+build loop was run against a recording stub."""
+tests = [
+  "tests/test_overlay_root.py::test_the_initramfs_is_created_and_not_merely_updated",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''        update-initramfs -c -k "$kern"'''
+replace = '''        update-initramfs -u -k "$kern"'''
+
+
+[[mutation]]
+name = "empty-kernel-list-not-refused"
+tier = "fast"
+guard = """
+The kernel list is read out of /lib/modules because in pi-gen's chroot
+`uname -r` is the build host's kernel -- which is what stops raspi-config's
+enable_overlayfs working at image-build time at all. An empty list means no
+initramfs can be built and the overlay cannot be enabled, so provisioning
+stops there rather than building nothing and leaving the later verification
+as the only thing between that and a released image."""
+tests = [
+  "tests/test_overlay_root.py::test_no_kernel_under_lib_modules_stops_provisioning",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''        echo "       can be built and the overlay cannot be enabled." >&2
+        exit 1'''
+replace = '''        echo "       can be built and the overlay cannot be enabled." >&2
+        :'''
 
 
 [[mutation]]

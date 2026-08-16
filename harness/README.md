@@ -444,12 +444,12 @@ stayed green.
 
 ```sh
 python3 tests/mutation_gate.py --list
-python3 tests/mutation_gate.py --tier fast       # 26 rows, 17s
+python3 tests/mutation_gate.py --tier fast       # 36 rows, 28s
 sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
 ```
 
 **Runtime decided the trigger.** The issue expected nightly or
-label-triggered; measured, the fast tier is seventeen seconds at 26 rows —
+label-triggered; measured, the fast tier is twenty-eight seconds at 36 rows —
 still cheaper than the suite it audits — so it runs per pull request as its
 own `mutation` job, and the ordinary suite's wall clock does not move. The three CUPS-rig rows run in
 the existing `hardware` job, the only place with a real `cupsd`, for 36
@@ -479,7 +479,7 @@ Both were single-edit rows that survived:
 **What is not covered.** No row needs a booted guest, and the checks that
 only exist *inside* one — tier 2's spool redirect above, tty1 ownership, the
 persistence phases, and now tier 3's overlay probe — cannot be mutated from
-here. What the six overlay rows attack is the *host-side gate* over what the
+here. What the seventeen overlay rows attack is the *host-side gate* over what the
 guest says and the *provisioning* that sets the overlay up; that the guest
 reports the truth about a machine with a read-only root is a claim only a
 booted image can settle, and only the image build makes one. Proving the

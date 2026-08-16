@@ -118,8 +118,16 @@ def test_the_first_boot_resize_token_is_removed(tmp_path):
 
 # --- building the initramfs the overlay lives in --------------------------
 
-KERNELS_GUARD_BLOCK = ('    if [ -z "$KERNELS" ]; then',
-                       'the overlay cannot be enabled." >&2\n        exit 1\n    fi')
+def kernels_guard_block() -> str:
+    """The empty-kernel-list guard, ending at its own `fi`.
+
+    The end is computed rather than quoted for the same reason the build
+    loop's is: an edit inside the block has to surface as a behavioural
+    failure, not as a slice that stopped matching.
+    """
+    text = INSTALL.read_text()
+    start = text.index('    if [ -z "$KERNELS" ]; then')
+    return text[start:text.index("\n    fi", start) + len("\n    fi")]
 
 
 def initramfs_build_block() -> str:
@@ -180,8 +188,7 @@ def test_no_kernel_under_lib_modules_stops_provisioning(tmp_path):
     /lib/modules on the machine running the test, and what it finds there
     is not this repository's business.
     """
-    block = slice_between(INSTALL.read_text(), *KERNELS_GUARD_BLOCK)
-    proc = run_block(block, tmp_path, preamble='KERNELS=""')
+    proc = run_block(kernels_guard_block(), tmp_path, preamble='KERNELS=""')
     assert proc.returncode != 0, proc.stdout
     assert "no kernel found" in proc.stderr, proc.stderr
 
@@ -189,8 +196,8 @@ def test_no_kernel_under_lib_modules_stops_provisioning(tmp_path):
 def test_a_kernel_list_passes_the_guard(tmp_path):
     # The positive control: a guard that stopped everything would satisfy
     # the test above.
-    block = slice_between(INSTALL.read_text(), *KERNELS_GUARD_BLOCK)
-    proc = run_block(block, tmp_path, preamble='KERNELS=" 6.12.96+rpt-rpi-v8"')
+    proc = run_block(kernels_guard_block(), tmp_path,
+                     preamble='KERNELS=" 6.12.96+rpt-rpi-v8"')
     assert proc.returncode == 0, proc.stderr
 
 
