@@ -580,6 +580,83 @@ def test_the_refusal_comes_before_anything_the_probe_writes():
         assert guard < text.index(later), what
 
 
+# --- the drop-in that keeps the first-boot wizard usable ------------------
+
+# The end anchor is the heredoc's LAST line, not the delimiter's first
+# appearance: `slice_between` takes the first match, and "DROPIN\n" first
+# appears on the `cat <<DROPIN` line itself -- which cut the body off and
+# wrote an empty drop-in that these tests then passed judgement on.
+DROPIN_BLOCK = ("systemctl unmask userconfig.service", "StandardInput=null\nDROPIN")
+DROPIN_DIR = "/etc/systemd/system/userconfig.service.d"
+
+
+def run_dropin(tmp_path, *, boot_dir):
+    """Write the shipped drop-in into a substituted /etc/systemd/system.
+
+    The unit directory is rewritten rather than stubbed: a test has no
+    business writing into the machine's real /etc/systemd/system, and
+    everything that decides what the file SAYS -- the two conditions, the
+    directory they name, StandardInput -- stays the shipped bytes.
+    """
+    etc = tmp_path / "etc"
+    block = slice_between(INSTALL.read_text(), *DROPIN_BLOCK)
+    assert block.count(DROPIN_DIR) == 2, block
+    block = block.replace(DROPIN_DIR, f"{etc}/userconfig.service.d")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "systemctl").write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> {tmp_path}/systemctl.log\n')
+    (bin_dir / "systemctl").chmod(0o755)
+    proc = subprocess.run(
+        ["bash", "-c", f'set -euo pipefail\nBOOT_DIR="{boot_dir}"\n{block}'],
+        capture_output=True, text=True, timeout=30,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    assert proc.returncode == 0, proc.stderr
+    written = etc / "userconfig.service.d" / "otp-appliance.conf"
+    return written.read_text(), (tmp_path / "systemctl.log").read_text()
+
+
+def test_the_wizard_runs_only_when_an_operator_seeded_it(tmp_path):
+    """
+    Both spellings, both as `|=`, or the unit is worse than before.
+
+    A single ConditionPathExists is an AND with itself and would demand BOTH
+    files; the pair with `|` is an OR group, which is what makes "either
+    spelling of the seed" work. And the file has to be one an operator
+    actually writes -- userconf-pi reads `userconf` first and `userconf.txt`
+    second, and Raspberry Pi Imager writes the latter.
+    """
+    text, log = run_dropin(tmp_path, boot_dir="/boot/firmware")
+    assert "ConditionPathExists=|/boot/firmware/userconf\n" in text, text
+    assert "ConditionPathExists=|/boot/firmware/userconf.txt\n" in text, text
+    # Not masked. Masking is the fix that was tried and reverted: it stops the
+    # prompt and silently discards every credential file too.
+    assert "unmask userconfig.service" in log, log
+    assert "mask userconfig.service" not in log.replace("unmask", ""), log
+
+
+def test_the_wizard_cannot_reach_a_terminal(tmp_path):
+    # Without this a malformed seed falls back to the interactive prompt and
+    # holds multi-user.target open on a machine with no visible tty.
+    text, _ = run_dropin(tmp_path, boot_dir="/boot/firmware")
+    assert "StandardInput=null" in text, text
+
+
+def test_the_condition_follows_the_boot_directory_that_exists(tmp_path):
+    """
+    install.sh falls back to BOOT_DIR=/boot when /boot/firmware is not a
+    directory, and userconf-service's own get_fw_loc makes the same choice.
+    Hardcoded, the pair named a path that cannot exist on that layout: the
+    condition is false on every boot, the unit never runs, and the operator's
+    credentials are ignored in silence -- the exact outcome masking the unit
+    produced, arriving by a different route.
+    """
+    text, _ = run_dropin(tmp_path, boot_dir="/boot")
+    assert "ConditionPathExists=|/boot/userconf\n" in text, text
+    assert "ConditionPathExists=|/boot/userconf.txt\n" in text, text
+    assert "/boot/firmware" not in text, text
+
+
 # --- the seeded userconf.txt path, as the guest sees it -------------------
 
 # The stock unit is `StandardInput=tty`, `TTYPath=/dev/tty8` and
@@ -869,13 +946,28 @@ def test_the_probe_is_given_longer_than_its_own_bounded_wait(tmp_path):
     rather than green, so this is a flake risk and not a false pass, but the
     number is worth stating rather than inheriting.
 
-    Both halves are read out of the shipped files: the bound out of the
+    EVERY bounded wait, summed, not the first one. The probe grew a second
+    poll and a `timeout` when the credential checks landed, and a test that
+    kept reading only the unit poll would have gone on approving a 300s
+    budget against 90s of a 180s worst case. Measured as this stands: 90s
+    polling for otp-unit, 30s polling for systemd's verdict on the wizard,
+    60s bounding the malformed-seed experiment.
+
+    Both halves are read out of the shipped files: the bounds out of the
     probe, the backstop out of the workflow.
     """
     probe = GUEST_CHECK.read_text()
-    iterations = int(re.search(r"for _ in \$\(seq 1 (\d+)\); do", probe).group(1))
-    interval = int(re.search(r"^\s*sleep (\d+)$", probe, re.M).group(1))
-    poll_bound = iterations * interval
+    # Each `for _ in $(seq 1 N) ... done` with the `sleep S` inside it.
+    poll_bound = 0
+    for loop in re.finditer(r"for _ in \$\(seq 1 (\d+)\); do(.*?)\n *done",
+                            probe, re.S):
+        interval = re.search(r"^\s*sleep (\d+)\s*$", loop.group(2), re.M)
+        assert interval, f"a poll with no sleep in it: {loop.group(0)[:80]}"
+        poll_bound += int(loop.group(1)) * int(interval.group(1))
+    # Plus anything the probe runs under a stopwatch of its own.
+    for bound in re.finditer(r"timeout -k \d+ (\d+)", probe):
+        poll_bound += int(bound.group(1))
+    assert poll_bound >= 90, "the probe's bounded waits went missing"
 
     unit = IMGCHECK_UNIT.read_text()
     match = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.M)

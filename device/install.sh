@@ -433,12 +433,23 @@ systemctl enable getty@tty2.service 2>/dev/null || true
 #     interactive prompt; with no tty it fails fast instead, the boot
 #     completes (wanted-by, not required-by), and the file is left
 #     renamed failed_userconf.txt on the boot partition as evidence.
+#
+# $BOOT_DIR, not a hardcoded /boot/firmware, and the heredoc is UNQUOTED so
+# that it expands. The condition has to name the directory the firmware
+# partition is actually mounted on, because that is where the operator's file
+# lands: userconf-service reads
+# `/usr/lib/raspberrypi-sys-mods/get_fw_loc`, which answers /boot on the
+# pre-bookworm layout, and BOOT_DIR above falls back to /boot for the same
+# reason. Written flat, the pair named a path that does not exist on such a
+# machine -- the condition is then false forever, the unit never runs, and a
+# seeded userconf.txt is ignored in exactly the silence this drop-in replaced
+# a mask to avoid. Nothing else in the block contains a `$`.
 systemctl unmask userconfig.service 2>/dev/null || true
 install -d /etc/systemd/system/userconfig.service.d
-cat > /etc/systemd/system/userconfig.service.d/otp-appliance.conf <<'DROPIN'
+cat > /etc/systemd/system/userconfig.service.d/otp-appliance.conf <<DROPIN
 [Unit]
-ConditionPathExists=|/boot/firmware/userconf
-ConditionPathExists=|/boot/firmware/userconf.txt
+ConditionPathExists=|$BOOT_DIR/userconf
+ConditionPathExists=|$BOOT_DIR/userconf.txt
 
 [Service]
 StandardInput=null
