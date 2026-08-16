@@ -470,6 +470,21 @@ if [ "$PHASE" = "boot2" ]; then
     # is reported and NOT gated -- the failure mode that hurts is a script
     # that never returns, and whether the return is 0 or 1 is upstream's
     # business.
+    #
+    # "TERMINATED" IS rc < 124, NOT rc != 124, and the difference is the exact
+    # failure this experiment exists to catch. The `timeout` below answers 124
+    # only when the child took the SIGTERM and died of it; a child that IGNORES
+    # SIGTERM -- which is the interesting hang, a whiptail with a handler or a
+    # shell with `trap "" TERM` -- has to be SIGKILLed by the -k escalation,
+    # and then timeout answers 128+9 = 137. Measured: a fixture that
+    # quarantines the seed and then ignores TERM scored `rc=137` and PASSED
+    # this check while it read `!= 124`. Everything at or above 124 is
+    # `timeout` reporting that it could not get a clean status out of the
+    # child -- 124 timed out, 125 timeout itself failed, 126/127 could not
+    # execute, 128+n died on a signal -- and none of those is "the script
+    # returned". A clean return is a small number, so that is what is
+    # required. The `2>/dev/null` covers rc=none: the clause left of it
+    # short-circuits, but `[ none -lt 124 ]` would otherwise be free to print.
     UC_BAD='NOT A VALID NAME:'
     UC_SAID="the probe never ran it: $USERCONF_SERVICE is not executable here"
     UC_RC=none
@@ -480,10 +495,10 @@ if [ "$PHASE" = "boot2" ]; then
         UC_SAID=${UC_SAID//[$'\n\r']/ }
     fi
     check userconf-malformed-seed-fails-fast \
-          "$(if [ "$UC_RC" != none ] && [ "$UC_RC" != 124 ] \
+          "$(if [ "$UC_RC" != none ] && [ "$UC_RC" -lt 124 ] 2>/dev/null \
                 && [ -e "$BOOTDIR/failed_userconf.txt" ] \
                 && [ ! -e "$BOOTDIR/userconf.txt" ]; then echo yes; else echo no; fi)" \
-          "rc=$UC_RC (124 = still running at the 60s bound) quarantined=$(yesno test -e "$BOOTDIR/failed_userconf.txt") leftover-seed=$(yesno test -e "$BOOTDIR/userconf.txt") said: ${UC_SAID:0:160}"
+          "rc=$UC_RC (>=124 = no clean status at the 60s bound: 124 killed by TERM, 137 ignored it and needed KILL) quarantined=$(yesno test -e "$BOOTDIR/failed_userconf.txt") leftover-seed=$(yesno test -e "$BOOTDIR/userconf.txt") said: ${UC_SAID:0:160}"
 fi
 
 sync 2>/dev/null || true

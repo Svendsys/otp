@@ -1137,17 +1137,40 @@ name = "guest-userconf-hang-accepted"
 tier = "fast"
 guard = """
 The failure that hurts is a userconf-service that never returns: on a device
-that is multi-user.target held open forever, which is issue #17. rc 124 is
-the probe's own stopwatch having had to kill it, and accepting that as a pass
-turns the one experiment that can observe a hang into a report that something
-ran."""
+that is multi-user.target held open forever, which is issue #17. An exit
+status of 124 or more is the probe's own stopwatch having had to kill it, and
+accepting that as a pass turns the one experiment that can observe a hang into
+a report that something ran."""
 tests = [
   "tests/test_overlay_root.py::test_a_malformed_seed_that_hangs_fails_instead_of_timing_the_boot_out",
+  "tests/test_overlay_root.py::test_a_hang_that_ignores_the_term_signal_also_fails",
 ]
 [[mutation.edit]]
 file = "harness/img-guest-check.sh"
-find = '''          "$(if [ "$UC_RC" != none ] && [ "$UC_RC" != 124 ] \'''
+find = '''          "$(if [ "$UC_RC" != none ] && [ "$UC_RC" -lt 124 ] 2>/dev/null \'''
 replace = '''          "$(if [ "$UC_RC" != none ] \'''
+
+
+[[mutation]]
+name = "guest-userconf-hang-that-ignores-term-accepted"
+tier = "fast"
+guard = """
+124 is only HALF of "it did not return", and it is the polite half. `timeout
+-k` answers 124 when the child took its SIGTERM and died of it; a child that
+IGNORES SIGTERM -- a whiptail with a handler, a shell carrying `trap "" TERM`
+-- survives that and has to be SIGKILLed by the escalation, and then timeout
+answers 137. So the `!= 124` form of this gate PASSED the exact hang the
+experiment exists to catch: `userconf-malformed-seed-fails-fast PASS rc=137`
+against a service that never returned, with the detail line printing the
+"124 = still running" gloss beside it. A clean return is a small number;
+everything from 124 up is timeout saying it could not get a status."""
+tests = [
+  "tests/test_overlay_root.py::test_a_hang_that_ignores_the_term_signal_also_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''&& [ "$UC_RC" -lt 124 ] 2>/dev/null \'''
+replace = '''&& [ "$UC_RC" != 124 ] \'''
 
 
 [[mutation]]

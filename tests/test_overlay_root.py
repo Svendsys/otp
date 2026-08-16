@@ -1204,27 +1204,85 @@ def test_a_wizard_that_can_still_reach_a_tty_fails(tmp_path):
     assert results(proc)["userconf-wizard-cannot-prompt"] == "FAIL", proc.stdout
 
 
+def hang_stub(*, ignore_term: bool) -> str:
+    """A userconf-service that quarantines the seed and then never returns.
+
+    The quarantine comes FIRST, which is the real order: upstream renames the
+    bad seed and only then reaches the whiptail. Every other clause of the
+    check therefore passes, so what these fixtures measure is the stopwatch
+    and nothing else.
+
+    `exec >/dev/null` before the block, so that the `sleep` this process
+    leaves behind when it is killed is not still holding the pipe the probe's
+    command substitution is reading -- without it the ORPHAN sets the test's
+    runtime, not the timeout, and the experiment measures the harness.
+    """
+    return ('#!/bin/sh\n'
+            + ('trap "" TERM\n' if ignore_term else '')
+            + 'cat "$BOOTDIR/userconf.txt" >> "$BOOTDIR/failed_userconf.txt"\n'
+              'rm -f "$BOOTDIR/userconf.txt"\n'
+              'exec >/dev/null 2>&1\n'
+              'sleep 30\n')
+
+
 def test_a_malformed_seed_that_hangs_fails_instead_of_timing_the_boot_out(tmp_path):
     """
     The failure this experiment exists for. A userconf-service that blocks --
     a whiptail that found a terminal after all, a read on a stdin that is not
     really closed -- holds multi-user.target open on a device forever. Here it
     is bounded and reported: the probe kills it and says rc=124.
-
-    The stub quarantines the file FIRST and blocks after, which is the real
-    order: upstream renames the bad seed and only then reaches the whiptail.
-    Every other clause of the check therefore passes, so what this measures is
-    the stopwatch and nothing else.
     """
-    proc, bootdir = run_userconf(
-        tmp_path, phase="boot2", env=HEALTHY_BOOT2,
-        service=('#!/bin/sh\ncat "$BOOTDIR/userconf.txt" >> '
-                 '"$BOOTDIR/failed_userconf.txt"\n'
-                 'rm -f "$BOOTDIR/userconf.txt"\nsleep 30\n'))
+    proc, bootdir = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+                                 service=hang_stub(ignore_term=False))
     assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
     assert "rc=124" in proc.stdout, proc.stdout
     # And the probe carried on to report, rather than being the hang itself.
     assert "TOTALS" in proc.stdout, proc.stdout
+
+
+def test_a_hang_that_ignores_the_term_signal_also_fails(tmp_path):
+    """
+    The hang the check was written for, and the one it used to PASS.
+
+    124 is what `timeout` answers when the child took its SIGTERM and died.
+    A child that IGNORES SIGTERM -- a whiptail with a handler, a shell with
+    `trap "" TERM`, anything wedged in uninterruptible state -- survives it
+    and has to be SIGKILLed by the `-k` escalation, and then timeout answers
+    128+9 = 137 instead. Against the `!= 124` form of the gate that scored
+
+        userconf-malformed-seed-fails-fast PASS rc=137
+
+    on a service that never returned, with the detail line printing the
+    "124 = still running" gloss beside a 137. The test above passed only
+    because a bare `sleep` is reaped by the first signal.
+
+    So the gate reads `-lt 124` now, and this is the fixture that tells the
+    two apart. Both fixtures are kept: this one alone would be satisfied by a
+    gate that only knew about 137.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+                           service=hang_stub(ignore_term=True))
+    assert "rc=137" in proc.stdout, (
+        "the fixture did not reach the -k escalation, so this test is not "
+        "measuring what it says: " + proc.stdout)
+    assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
+    assert "TOTALS" in proc.stdout, proc.stdout
+
+
+def test_the_detail_line_does_not_gloss_a_kill_as_a_timeout(tmp_path):
+    """
+    What the operator reads has to survive the same correction the gate did.
+    The old line said "(124 = still running at the 60s bound)" unconditionally
+    -- printed next to rc=137 it names the wrong number and the wrong signal,
+    and the next person debugging a red run is told the child was politely
+    asked when it was actually killed.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+                           service=hang_stub(ignore_term=True))
+    detail = next(ln for ln in proc.stdout.splitlines()
+                  if "userconf-malformed-seed-fails-fast" in ln)
+    assert "137" in detail, detail
+    assert "124 = still running" not in detail, detail
 
 
 def test_the_experiment_supplies_the_conditions_the_unit_would(tmp_path):
