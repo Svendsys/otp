@@ -1597,15 +1597,37 @@ replace = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-
 
 
 [[mutation]]
+name = "tier3-unfinished-boot-accepted"
+tier = "fast"
+guard = """
+"Reached target" on its own is satisfied by remote-fs.target at 30 seconds.
+Run 31968966879 reached fourteen targets, passed that clause in BOTH boots,
+and finished neither -- the consoles end on
+`systemd-networkd-wait-online.service/start running (2min 37s / no limit)`,
+with the credential wizard queued behind it and the seeded userconf.txt
+coming back off the card untouched, and every string the verdict could see
+was green. multi-user.target by name is the only line that says the boot
+FINISHED. It rode as a note for one run because nothing here had printed it;
+run 31972140190 printed it in both boots, which is what promoted it."""
+tests = [
+  "tests/test_img_verdict.py::test_a_boot_that_never_finished_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''                "Reached target multi-user.target" \'''
+replace = '''                "Reached target" \'''
+
+
+[[mutation]]
 name = "tier3-targets-not-named"
 tier = "fast"
 guard = """
-The note that turns "a target was reached" into "which ones". The gate above
-it is satisfied by remote-fs.target at 30 seconds, and run 31968966879 passed
-it in both boots while never reaching multi-user.target -- the boot never
-finished, and the verdict had no way to say so. This is the evidence a gate
-on that line needs before it can exist, so losing it costs the next run's
-ability to read what this one could not."""
+The note that turns "the boot finished" into "how far did it get". The gate
+beside it says only whether multi-user.target was reached; run 31968966879
+reached fourteen OTHER targets and the list of them is the only thing that
+made that run legible. Losing it costs the next reader the ability to see
+where a red boot stopped, and costs the next promotion the evidence it will
+be argued from."""
 tests = [
   "tests/test_img_verdict.py::test_every_target_reached_is_named_not_just_counted",
 ]

@@ -79,6 +79,20 @@ HWRNG = "[    2.383417] bcm2835-rng 3f104000.rng: hwrng registered"
 CRNG = "[    2.421905] random: crng init done"
 
 
+# The line that says the boot FINISHED, as systemd 252 spells it: unit name
+# first, description after. "Reached target" alone is satisfied by
+# remote-fs.target at 30 seconds, which is how run 31968966879 passed that
+# clause in both boots while neither one ever finished.
+#
+# Stamped with `last_ts` rather than a time of its own, so that the fixture
+# keeps exactly one latest timestamp -- "guest reached" is a max over the
+# concatenated consoles, and a second clock in here would be testing this
+# file's arithmetic instead of the harness's.
+def multi_user_line(ts):
+    return (f"[   {ts}] systemd[1]: Reached target multi-user.target "
+            f"- Multi-User System.")
+
+
 def kernel_lines(*, entries=1, last_ts="20.000000"):
     lines = []
     for _ in range(entries):
@@ -91,6 +105,7 @@ def kernel_lines(*, entries=1, last_ts="20.000000"):
         CRNG,
         "[    9.180895] systemd[1]: Hostname set to <otp-unit>.",
         f"[   {last_ts}] systemd[1]: Reached target sysinit.target - System Initialization.",
+        multi_user_line(last_ts),
     ]
     return lines
 
@@ -715,17 +730,57 @@ def test_the_hardware_rng_line_is_quoted_back_with_its_driver(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
 
+def test_a_boot_that_never_finished_fails(tmp_path):
+    """
+    The gate the note below was collecting evidence for.
+
+    `Reached target` on its own is satisfied by remote-fs.target at 30
+    seconds. Run 31968966879 reached fourteen targets, passed that clause in
+    BOTH boots, and finished neither: the consoles end on
+    `systemd-networkd-wait-online.service/start running (2min 37s / no
+    limit)`, with the credential wizard's job queued behind it and the seeded
+    userconf.txt coming back off the card untouched. Everything the verdict
+    could see was green.
+
+    multi-user.target is the line that says the boot FINISHED. It was carried
+    as a note for exactly one run, because hard-failing a release on a string
+    no console here had ever printed is issue #14's defect with the sign
+    flipped -- then run 31972140190 printed it in both boots, which is the
+    evidence this repository's report-then-gate rule asks for.
+    """
+    lines = [ln for ln in kernel_lines() if "multi-user.target" not in ln]
+    still_assembling = [
+        "[   30.5] systemd[1]: Reached target remote-fs.target - Remote File Systems.",
+        "[  157.0] systemd[1]: Job systemd-networkd-wait-online.service/start "
+        "running (2min 37s / no limit)"]
+    proc, verdict = run_verdict(
+        tmp_path,
+        {"boot1": lines + still_assembling + [SUCCESS] + guest_report("boot1")})
+    # The weaker clause is still satisfied, which is the whole point.
+    assert "IMG-CHECK boot1 Reached-target PASS" in verdict, verdict
+    assert "IMG-CHECK boot1 Reached-target-multi-user.target FAIL" in verdict, \
+        verdict
+    assert proc.returncode == 1
+
+
+def test_a_boot_that_did_finish_passes(tmp_path):
+    # The positive control: a gate keyed to a string nothing prints would
+    # satisfy the test above and fail every release.
+    proc, verdict = run_verdict(tmp_path, {"boot1": healthy("boot1")})
+    assert "IMG-CHECK boot1 Reached-target-multi-user.target PASS" in verdict, \
+        verdict
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_every_target_reached_is_named_not_just_counted(tmp_path):
     """
-    The note that is here to become a gate.
+    The note the gate above was promoted out of, which stays.
 
-    `Reached-target` is satisfied by remote-fs.target at 30 seconds, and
-    run 31968966879 passed it in both boots while never reaching
-    multi-user.target at all -- the boots were still assembling, with the
-    credential wizard's start job queued behind a network wait, when the
-    harness stopped them. Naming the targets puts the one that means
-    "finished" into the evidence, which is what a future gate on it needs
-    and what that run did not have.
+    The gate answers "did the boot finish". The note answers "how far did it
+    get", and that is the only thing that made run 31968966879 legible: a red
+    gate says a boot did not finish and nothing about where it stopped. It is
+    also what the next promotion, whatever target that turns out to be, will
+    be argued from.
     """
     reached = ["[   30.5] systemd[1]: Reached target remote-fs.target - Remote File Systems.",
                "[  180.2] systemd[1]: Reached target multi-user.target - Multi-User System.",

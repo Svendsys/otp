@@ -753,7 +753,27 @@ per_boot_verdict() {
     #
     # loglevel=7 keeps both: the crng line is KERN_NOTICE and the hwrng
     # line is KERN_INFO, and neither is DEBUG.
+    #
+    # AND multi-user.target BY NAME, which is the second string in this list
+    # to arrive by the report-then-gate route. "Reached target" on its own is
+    # satisfied by remote-fs.target at 30 seconds: run 31968966879 reached
+    # fourteen targets, passed that clause in both boots, and never finished
+    # either -- both consoles ended on
+    # `systemd-networkd-wait-online.service/start running (2min 37s / no
+    # limit)`, with the credential wizard's job still queued behind it. The
+    # only thing that says the boot FINISHED is multi-user.target, and it was
+    # carried as a note (below) for exactly one run because nothing in this
+    # repository had printed it yet. Run 31972140190 then printed it in BOTH
+    # boots -- see the RUN 18 paragraph in this file's header. It is evidence
+    # now, so it gates now, which is the same rule the hwrng line above was
+    # promoted under.
+    #
+    # The margin is real rather than assumed: the sampler stops the emulator
+    # ten seconds after OTP-GUEST-DONE, and the probe that prints that line
+    # is a Type=oneshot WantedBy=multi-user.target -- so the target is
+    # reached in the instant after the probe exits, well inside the drain.
     for want in "Linux version" "systemd[1]:" "Reached target" \
+                "Reached target multi-user.target" \
                 "crng init done" "hwrng registered"; do
         if grep -qF -- "$want" "$CONSOLE_TXT" 2>/dev/null; then
             printf 'IMG-CHECK %s %s PASS\n' "$phase" "$(printf '%s' "$want" | tr ' ' '-')"
@@ -770,19 +790,17 @@ per_boot_verdict() {
             "$(grep -ioE '.{0,40}(hwrng|hw_random|rng_core).{0,44}' \
                  "$CONSOLE_TXT" 2>/dev/null | head -1)"
     fi
-    # WHICH targets, and not merely that one was reached. "Reached target"
-    # above is satisfied by remote-fs.target at 30 seconds; run 31968966879
-    # reached fourteen of them and never got to multi-user.target, which is
-    # the one that says the boot FINISHED -- both boots were still assembling
-    # when the harness stopped them, with the credential wizard's job in the
-    # queue. The blockers are fixed in device/install.sh.
+    # WHICH targets, and not merely that one was reached. This began as the
+    # evidence multi-user.target needed before it could gate, and it printed
+    # that evidence in run 31972140190; the gate is in the list above now.
     #
-    # A NOTE, not a gate, and deliberately so for one run: no console in this
-    # repository has ever carried "Reached target multi-user.target", and
-    # hard-failing a release on an unread string is the defect issue #14
-    # catalogues with the sign flipped -- the hwrng gate above shipped as a
-    # note for exactly one commit for the same reason. Once a run prints it,
-    # it is evidence, and then it can gate.
+    # IT STAYS, as a note, because the gate and the note answer different
+    # questions. The gate says whether the ONE target that means "the boot
+    # finished" was reached. The note says which fourteen were and which one
+    # was not, which is the only thing that made run 31968966879 legible at
+    # all -- a red gate on its own says a boot did not finish and nothing
+    # about where it stopped. It is also what the NEXT promotion will be
+    # argued from, whatever target that turns out to be.
     printf 'IMG-NOTE %s targets-reached: %s\n' "$phase" \
         "$(grep -ohE 'Reached target [a-zA-Z0-9@:._-]+' "$CONSOLE_TXT" 2>/dev/null \
              | sort -u | tr '\n' ' ')"
