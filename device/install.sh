@@ -485,6 +485,37 @@ install -d /etc/cloud
 # userconf-service a malformed seed with stdin closed to see it end and
 # quarantine the file rather than hang. See harness/img-guest-check.sh.
 #
+# KNOWN, MEASURED, AND NOT YET DECIDED: THE SEED LASTS ONE BOOT. The apply
+# path is `chpasswd -e` into /etc/shadow. /etc is inside the read-only root
+# overlay this script installs below, so the new hash lives in the tmpfs and
+# dies with the power. The seed itself is on the FAT partition, which is
+# OUTSIDE the overlay, and userconf-service deletes it as the last step of a
+# successful apply -- so the one file that could reapply the credential is
+# destroyed by the boot that consumed it, and the account goes back to the
+# random FIRST_USER_PASS pi-gen generated at build time, which nobody has.
+# The operator gets a working password for exactly one boot.
+#
+# Tier 3 measures both halves of that already and neither reads as a
+# contradiction: boot1 finds the seeded hash in /etc/shadow, and boot2 finds
+# the seed gone from the card. What is missing is a DECISION, and it is not
+# one to make silently in a comment. The three candidates:
+#
+#   - refuse the seed loudly, so an operator is told the credential path
+#     does not work on an overlay root rather than discovering it at the
+#     second power-on;
+#   - persist the credential, which means writing outside the overlay (the
+#     boot partition, or a bind-mounted /etc/shadow) and deciding what a
+#     password hash sitting on a FAT partition costs on a key printer;
+#   - keep the seed file, so the wizard reapplies it every boot -- which
+#     leaves the operator's credential line readable in any card reader for
+#     the life of the device.
+#
+# Every one of those is a security trade on a machine that prints one-time
+# pads, so it belongs to the repository and not to this script. Until it is
+# made, the behaviour above is the behaviour, and it is stated here and in
+# the release note image.yml attaches to a tag rather than implied away. Do
+# NOT "fix" this by adding a persistence mechanism without the decision.
+#
 # $BOOT_DIR, not a hardcoded /boot/firmware, and the heredoc is UNQUOTED so
 # that it expands. The condition has to name the directory the firmware
 # partition is actually mounted on, because that is where the operator's file

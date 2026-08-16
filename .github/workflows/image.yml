@@ -438,6 +438,21 @@ jobs:
           # release bodies render hard line breaks, and a block scalar
           # would ship this at whatever width it happens to be wrapped to
           # in this file.
+          #
+          # THE CREDENTIAL SENTENCE SAYS "FOR THAT BOOT", and the clause is
+          # load-bearing rather than cautious. "Applied and consumed by the
+          # first boot" is exactly what the gate measures and a reader takes
+          # it to mean their password now works -- but userconf applies with
+          # `chpasswd -e` to /etc/shadow, /etc is inside the RAM overlay this
+          # same paragraph describes two sentences earlier, and the seed is
+          # deleted from the FAT partition, which is OUTSIDE it. So the
+          # credential lasts exactly one boot and the file that would reapply
+          # it is destroyed in the act of applying it; the account reverts to
+          # pi-gen's random FIRST_USER_PASS, which nobody has. Nothing here
+          # implies otherwise until the repository decides what to do about
+          # it -- see device/install.sh, above the drop-in, for the open
+          # question. A release note is the one place this project's claims
+          # reach someone who cannot check them.
           body: >
             This image passed the tier-3 boot gate: it was booted under
             QEMU twice, `otp-unit.service` reached `Started` on both, the
@@ -445,15 +460,18 @@ jobs:
             written to `/` in the first boot was gone in the second, and a
             setting written to `/boot/firmware` was still there. A
             `userconf.txt` seeded into the boot partition was applied and
-            consumed by the first boot with no wizard, the second boot
-            skipped the wizard without disabling it, and a malformed seed
-            failed fast and left `failed_userconf.txt` rather than holding
-            the boot open. The first boot still had its front panel on tty1
-            afterwards, and neither boot was left waiting on a network this
-            appliance does not have. That gate does not exercise the OLED,
-            the buttons or a printer -- see the header of
-            `harness/img-boot.sh` for exactly what it does and does not
-            prove.
+            consumed by the first boot with no wizard -- **for that boot
+            only**: the password is written to `/etc/shadow`, which is inside
+            the RAM overlay, and the seed file is deleted from the card, so
+            neither survives the power-cycle and this image does not give you
+            a persistent login. The second boot skipped the wizard without
+            disabling it, and a malformed seed failed fast and left
+            `failed_userconf.txt` rather than holding the boot open. The
+            first boot still had its front panel on tty1 afterwards, and
+            neither boot was left waiting on a network this appliance does
+            not have. That gate does not exercise the OLED, the buttons or a
+            printer -- see the header of `harness/img-boot.sh` for exactly
+            what it does and does not prove.
 
       # The bar, stated where it can be seen. Ten minutes is the budget for
       # a run that did not have to rebuild the image; a run that did is
