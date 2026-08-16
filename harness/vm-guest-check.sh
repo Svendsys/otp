@@ -102,9 +102,20 @@ check no-restart-loop \
 
 # --- tty1, the riskiest untested change in the repository ---------------
 
-# Conflicts=getty@tty1.service should have stopped the login prompt. Both
-# processes holding /dev/tty1 means interleaved output and keystrokes going
-# to whichever grabbed them.
+# No login prompt on tty1. Both processes holding /dev/tty1 means
+# interleaved output and keystrokes going to whichever grabbed them.
+#
+# WHAT KEEPS IT OFF changed with issue #20 and this check did not need to.
+# It used to be otp-unit.service's Conflicts=getty@tty1.service, which
+# stopped a getty that started; it is now a condition install.sh puts on the
+# getty so none starts, plus one explicit `systemctl stop` for the getty a
+# live machine already has running. The conflict had to go because it is
+# symmetric -- userconf-pi's cancel-rename starts that getty at the end of
+# every credential apply, and the unit went down with it -- and THIS CHECK
+# IS WHY THE STOP EXISTS: with only the condition, the provision phase read
+# `getty@tty1=active` with the unit deactivating a second after it started.
+# It asks about the outcome rather than the mechanism, so it reads the same
+# on both.
 GETTY1=$(systemctl is-active getty@tty1.service 2>&1 || true)
 check getty1-stopped \
       "$(if [ "$GETTY1" != "active" ]; then echo yes; else echo no; fi)" \

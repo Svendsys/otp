@@ -540,6 +540,32 @@ cat > /etc/systemd/system/getty@tty1.service.d/otp-appliance.conf <<'GETTY'
 ConditionPathExists=!/etc/systemd/system/otp-unit.service
 GETTY
 
+# AND THE ONE ALREADY RUNNING, because a condition only stops a getty
+# STARTING. On the documented "run this on a Pi you already have" path there
+# is one running: Raspberry Pi OS Lite started it at boot, before this file
+# existed. Conflicts= used to stop it as a side effect of starting the unit,
+# and tier 2 measured what dropping that costs on a live machine, in the run
+# that arrived without this line:
+#
+#   OTP-CHECK provision getty1-stopped FAIL getty@tty1=active
+#   OTP-CHECK provision service-active FAIL is-active=inactive
+#   systemd[1]: Started otp-unit.service - OTP pad print unit.
+#   systemd[1]: otp-unit.service: Deactivated successfully.      (1s later)
+#
+# -- the panel takes /dev/tty1 with tty-force, the getty is hung up, its
+# Restart=always brings it straight back, and its TTYVHangup takes the tty
+# off the panel, whose Python then exits. The two boots after that reboot
+# were 14/14 and 13/13, because by then the condition was in force and no
+# getty ran at all.
+#
+# Stopped ONCE, explicitly, after the reload that puts the condition in
+# force -- not a standing rule that anything starting a getty takes the unit
+# down with it, which is the trade Conflicts= made. In pi-gen's chroot
+# systemctl ignores start/stop requests, which is exactly right there: no
+# getty is running, and the condition ships for the first boot.
+systemctl daemon-reload
+systemctl stop getty@tty1.service 2>/dev/null || true
+
 # --- the read-only root overlay ------------------------------------------
 
 # This section used to be a paragraph of advice printed at the end telling

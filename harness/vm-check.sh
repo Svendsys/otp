@@ -7,8 +7,10 @@
 #
 # WHY A VM AND NOT A CONTAINER. The riskiest untested change in this
 # repository is otp-unit.service binding tty1 -- StandardInput=tty-force,
-# TTYPath=/dev/tty1, Conflicts=getty@tty1.service. If that is wrong the
-# unit restart-loops instead of starting, and nothing else will say so:
+# TTYPath=/dev/tty1, and a getty install.sh conditions off that tty rather
+# than conflicting with (issue #20: the conflict was symmetric, and the
+# credential apply starts that getty). If that is wrong the unit
+# restart-loops instead of starting, and nothing else will say so:
 # pi-gen never boots the image it builds, containers have no virtual
 # terminals at all, and the unit tests substitute systemd entirely. A VM
 # is the cheapest thing with real VTs.

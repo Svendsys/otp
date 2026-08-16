@@ -1497,3 +1497,22 @@ tests = [
 file = "harness/img-boot.sh"
 find = '''        "$(grep -ohE 'Reached target [a-zA-Z0-9@:._-]+' "$CONSOLE_TXT" 2>/dev/null \'''
 replace = '''        "$(grep -ohE 'Reached target remote-fs[a-zA-Z0-9@:._-]*' "$CONSOLE_TXT" 2>/dev/null \'''
+
+
+[[mutation]]
+name = "install-getty-already-running-not-stopped"
+tier = "fast"
+guard = """
+The half the condition cannot do. `sudo ./device/install.sh` on a Pi that is
+already up meets a getty started at boot, and a condition only stops one
+STARTING. Tier 2 measured the gap in the run that arrived without this line:
+`getty1-stopped FAIL getty@tty1=active`, and otp-unit `Started` then
+`Deactivated successfully` a second later, because the getty's
+Restart=always and TTYVHangup take /dev/tty1 back off the panel."""
+tests = [
+  "tests/test_overlay_root.py::test_a_getty_already_running_on_tty1_is_stopped",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''systemctl stop getty@tty1.service 2>/dev/null || true'''
+replace = '''systemctl status getty@tty1.service 2>/dev/null || true'''

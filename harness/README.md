@@ -163,8 +163,10 @@ Runs in CI as the `hardware` job.
 `./harness/vm-check.sh`, or the `vm` job in CI.
 
 The riskiest untested change in the repository is `otp-unit.service`
-binding `tty1` — `StandardInput=tty-force`, `TTYPath=/dev/tty1`,
-`Conflicts=getty@tty1.service`. If that is wrong the unit restart-loops
+binding `tty1` — `StandardInput=tty-force`, `TTYPath=/dev/tty1`, and a
+getty that `install.sh` conditions off that tty instead of conflicting
+with it (issue #20 — see tier 3 below for why the conflict had to go).
+If that is wrong the unit restart-loops
 instead of starting, and **nothing else will say so**: pi-gen never boots
 the image it builds, a container has no virtual terminals at all, and the
 unit tests substitute systemd entirely.
@@ -173,7 +175,8 @@ So this boots a Debian 13 cloud image, runs `device/install.sh` on it, and
 asks the questions only a booted system can answer:
 
 - is `otp-unit.service` active, and has it restarted more than once?
-- did `Conflicts=` actually stop `getty@tty1`?
+- is `getty@tty1` off the panel's tty — conditioned off for every boot,
+  and stopped on the live machine `install.sh` just provisioned?
 - is the unit's main process really holding `/dev/tty1`?
 - is a login prompt still reachable on tty2?
 - is swap off, is the journal volatile, are core dumps disabled?

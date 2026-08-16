@@ -728,7 +728,7 @@ def test_cloud_init_is_switched_off_on_an_air_gapped_printer(tmp_path):
 
 
 GETTY_BLOCK = ("install -d /etc/systemd/system/getty@tty1.service.d",
-               "ConditionPathExists=!/etc/systemd/system/otp-unit.service\nGETTY")
+               "systemctl stop getty@tty1.service 2>/dev/null || true")
 GETTY_DIR = "/etc/systemd/system/getty@tty1.service.d"
 
 
@@ -769,6 +769,27 @@ def test_no_login_prompt_can_start_on_the_front_panels_tty(tmp_path):
     assert ("ConditionPathExists=!/etc/systemd/system/otp-unit.service"
             in text), text
     assert text.lstrip().startswith("[Unit]"), text
+
+
+def test_a_getty_already_running_on_tty1_is_stopped(tmp_path):
+    """
+    The half a condition cannot do, and tier 2 is where it was measured.
+
+    `sudo ./device/install.sh` on a Pi that is already up meets a getty that
+    started at boot, before any of this existed. otp-unit.service's
+    Conflicts= used to stop it as a side effect of the unit starting; with
+    the conflict gone and nothing in its place, the run went 11/15 with
+    `getty1-stopped FAIL getty@tty1=active` and the unit `Started` then
+    `Deactivated successfully` a second later -- the getty's Restart=always
+    and TTYVHangup take /dev/tty1 back off the panel, whose Python exits.
+
+    After the reload, not before it: the condition has to be in force before
+    the getty is stopped, or anything that pokes it in between starts a new
+    one.
+    """
+    _, log = run_getty_dropin(tmp_path)
+    assert "stop getty@tty1.service" in log, log
+    assert log.index("daemon-reload") < log.index("stop getty@tty1.service"), log
 
 
 def test_the_getty_is_conditioned_rather_than_masked(tmp_path):
