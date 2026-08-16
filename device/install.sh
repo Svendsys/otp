@@ -434,6 +434,13 @@ systemctl enable getty@tty2.service 2>/dev/null || true
 #     completes (wanted-by, not required-by), and the file is left
 #     renamed failed_userconf.txt on the boot partition as evidence.
 #
+# All three branches are asserted on the real image now rather than argued
+# here (issue #20): tier 3 plants a valid seed before boot1 and requires it
+# consumed with the hash in /etc/shadow and no wizard job, requires boot2 to
+# skip the unit while leaving it enabled, and hands the shipped
+# userconf-service a malformed seed with stdin closed to see it end and
+# quarantine the file rather than hang. See harness/img-guest-check.sh.
+#
 # $BOOT_DIR, not a hardcoded /boot/firmware, and the heredoc is UNQUOTED so
 # that it expands. The condition has to name the directory the firmware
 # partition is actually mounted on, because that is where the operator's file
