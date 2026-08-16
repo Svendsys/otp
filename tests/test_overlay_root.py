@@ -116,6 +116,84 @@ def test_the_first_boot_resize_token_is_removed(tmp_path):
     assert "rootwait" in after
 
 
+# --- building the initramfs the overlay lives in --------------------------
+
+KERNELS_GUARD_BLOCK = ('    if [ -z "$KERNELS" ]; then',
+                       'the overlay cannot be enabled." >&2\n        exit 1\n    fi')
+
+
+def initramfs_build_block() -> str:
+    """The per-kernel build loop, sliced without its trailing flag.
+
+    The end anchor deliberately stops at `done` rather than quoting the
+    `update-initramfs` line, so a change to that line shows up as a failed
+    assertion about what was RUN rather than as a slice that no longer
+    matches.
+    """
+    text = INSTALL.read_text()
+    start = text.index("    for kern in $KERNELS; do")
+    return text[start:text.index("\n    done", start) + len("\n    done")]
+
+
+def run_initramfs_build(tmp_path, kernels):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    record = tmp_path / "argv.txt"
+    (bin_dir / "update-initramfs").write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> {record}\n')
+    (bin_dir / "update-initramfs").chmod(0o755)
+    proc = run_block(initramfs_build_block(), tmp_path,
+                     preamble=f'KERNELS="{kernels}"')
+    return proc, (record.read_text() if record.exists() else "")
+
+
+def test_the_initramfs_is_created_and_not_merely_updated(tmp_path):
+    """
+    `-c`, and the shipped comment names the exact defect: pi-gen sets
+    update_initramfs=no in update-initramfs.conf so kernel installs build
+    nothing, and update-initramfs honours that setting on its UPDATE path
+    only. `-u` therefore prints "Not updating initramfs." and exits 0,
+    leaving the overlay script out of an initramfs that already exists, has
+    the right name and is the right size -- the firmware loads it,
+    boot=overlay is read by nothing, and the unit comes up on a writable
+    root. Nothing was red for that edit until this test.
+    """
+    kernels = "6.12.96+rpt-rpi-v8 6.12.96+rpt-rpi-2712"
+    proc, argv = run_initramfs_build(tmp_path, kernels)
+    assert proc.returncode == 0, proc.stderr
+    # Every installed kernel, not just one: the image carries a second one
+    # for the Pi 5, and an initramfs missing for the kernel that boots is
+    # the same read-write root by another route.
+    assert argv.split() and argv.splitlines() == [
+        f"-c -k {kern}" for kern in kernels.split()], argv
+
+
+def test_no_kernel_under_lib_modules_stops_provisioning(tmp_path):
+    """
+    In pi-gen's chroot `uname -r` is the BUILD HOST's kernel, for which
+    there are no modules and no initramfs can be built -- so the kernel list
+    is read out of /lib/modules, and an empty list means the overlay cannot
+    be enabled at all. Building nothing and carrying on leaves the later
+    verification to catch it, which is one guard rather than two.
+
+    KERNELS is set here rather than discovered: the discovery loop reads
+    /lib/modules on the machine running the test, and what it finds there
+    is not this repository's business.
+    """
+    block = slice_between(INSTALL.read_text(), *KERNELS_GUARD_BLOCK)
+    proc = run_block(block, tmp_path, preamble='KERNELS=""')
+    assert proc.returncode != 0, proc.stdout
+    assert "no kernel found" in proc.stderr, proc.stderr
+
+
+def test_a_kernel_list_passes_the_guard(tmp_path):
+    # The positive control: a guard that stopped everything would satisfy
+    # the test above.
+    block = slice_between(INSTALL.read_text(), *KERNELS_GUARD_BLOCK)
+    proc = run_block(block, tmp_path, preamble='KERNELS=" 6.12.96+rpt-rpi-v8"')
+    assert proc.returncode == 0, proc.stderr
+
+
 # --- the verification that decides whether provisioning fails -------------
 
 VERIFY_BLOCK = ('    OVERLAY_INITRAMFS=""',
