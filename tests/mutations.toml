@@ -600,6 +600,64 @@ find = '''        grep -qE "OTP-CHECK[[:space:]]+${phase}[[:space:]]+${name}[[:s
 replace = '''        :'''
 
 
+[[mutation]]
+name = "guest-probe-runs-without-a-phase-token"
+tier = "fast"
+guard = """
+The probe refuses to run unless the kernel command line names boot1 or
+boot2, and that guard protects a REAL UNIT rather than a test. The script
+ships 0755 in /opt/otp-unit and its service is enabled on every appliance;
+what it does is write a sentinel to / and pages=137 through config.save()
+into /boot/firmware/otp-unit.conf, which is outside the overlay and so
+permanent. Before the guard, an absent token meant PHASE=unknown and every
+check ran regardless -- measured against a realistic device command line,
+the operator's page count went 500 -> 137. The unit's
+ConditionKernelCommandLine= is the other lock; this row is the one that
+holds when a drop-in, a hand-run `systemctl start` or anything resolving
+the ExecStart path steps past it."""
+tests = [
+  "tests/test_overlay_root.py::test_the_probe_is_inert_on_a_command_line_without_the_token",
+  "tests/test_overlay_root.py::test_a_phase_that_is_not_one_of_the_two_is_refused",
+  "tests/test_overlay_root.py::test_the_command_line_is_split_but_not_glob_expanded",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''case "$PHASE" in
+    boot1|boot2) ;;'''
+replace = '''case "$PHASE" in
+    *) ;;'''
+
+
+[[mutation]]
+name = "guest-probe-cmdline-glob-expanded"
+tier = "fast"
+guard = """
+The token loop word-splits an unquoted command substitution, which is
+wanted, and `set -f` is what stops it being PATHNAME EXPANDED as well. The
+unit runs as root with a working directory of /, so with globbing on a bare
+`*` in the command line becomes the listing of the root directory before
+the case sees it. Measured with the guard removed and a directory holding a
+file named `otp.imgcheck=boot2`: the probe selected phase boot2 from that
+filename and ran."""
+tests = [
+  "tests/test_overlay_root.py::test_the_command_line_is_split_but_not_glob_expanded",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''PHASE=""
+set -f
+'''
+replace = '''PHASE=""
+'''
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''done
+set +f
+'''
+replace = '''done
+'''
+
+
 # --- what provisioning is allowed to leave behind -------------------------
 
 [[mutation]]
