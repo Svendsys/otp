@@ -1478,3 +1478,22 @@ file = "harness/img-boot.sh"
 find = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
 front-panel-survives-the-credential-apply"'''
 replace = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard"'''
+
+
+[[mutation]]
+name = "tier3-targets-not-named"
+tier = "fast"
+guard = """
+The note that turns "a target was reached" into "which ones". The gate above
+it is satisfied by remote-fs.target at 30 seconds, and run 31968966879 passed
+it in both boots while never reaching multi-user.target -- the boot never
+finished, and the verdict had no way to say so. This is the evidence a gate
+on that line needs before it can exist, so losing it costs the next run's
+ability to read what this one could not."""
+tests = [
+  "tests/test_img_verdict.py::test_every_target_reached_is_named_not_just_counted",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        "$(grep -ohE 'Reached target [a-zA-Z0-9@:._-]+' "$CONSOLE_TXT" 2>/dev/null \'''
+replace = '''        "$(grep -ohE 'Reached target remote-fs[a-zA-Z0-9@:._-]*' "$CONSOLE_TXT" 2>/dev/null \'''

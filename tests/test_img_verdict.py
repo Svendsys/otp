@@ -682,6 +682,32 @@ def test_the_hardware_rng_line_is_quoted_back_with_its_driver(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
 
+def test_every_target_reached_is_named_not_just_counted(tmp_path):
+    """
+    The note that is here to become a gate.
+
+    `Reached-target` is satisfied by remote-fs.target at 30 seconds, and
+    run 31968966879 passed it in both boots while never reaching
+    multi-user.target at all -- the boots were still assembling, with the
+    credential wizard's start job queued behind a network wait, when the
+    harness stopped them. Naming the targets puts the one that means
+    "finished" into the evidence, which is what a future gate on it needs
+    and what that run did not have.
+    """
+    reached = ["[   30.5] systemd[1]: Reached target remote-fs.target - Remote File Systems.",
+               "[  180.2] systemd[1]: Reached target multi-user.target - Multi-User System.",
+               "[  180.3] systemd[1]: Reached target multi-user.target - Multi-User System."]
+    proc, verdict = run_verdict(
+        tmp_path,
+        {"boot1": kernel_lines() + reached + [SUCCESS] + guest_report("boot1")})
+    note = next(ln for ln in verdict.splitlines() if "targets-reached" in ln)
+    assert "multi-user.target" in note, note
+    assert "remote-fs.target" in note, note
+    # One line, and each target once: this is a note somebody reads.
+    assert note.count("multi-user.target") == 1, note
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_a_boot_whose_crng_never_seeds_fails(tmp_path):
     # Without this line the unit has started and cannot generate: the
     # first draw blocks inside getrandom() for as long as it takes. A
