@@ -302,9 +302,12 @@ jobs:
       # Tier 3 of the harness: boot the artifact that was just built. Once
       # per image, not per commit -- it is emulated, so it is slow, and its
       # peripheral coverage is WORSE than tier 1's simulators. It answers
-      # exactly one question nothing else can: does the thing that gets
-      # flashed to a card actually come up? pi-gen assembles a filesystem
-      # and never starts it. See harness/README.md.
+      # three questions nothing else can -- it used to be one, and the
+      # overlay work added two: does the thing that gets flashed to a card
+      # actually come up, does the unit start on the read-only overlay it
+      # comes up on, and does a power-cycle discard what the session wrote
+      # while keeping the settings? pi-gen assembles a filesystem and never
+      # starts it. See harness/README.md.
       #
       # LAST, AND ALLOWED TO FAIL LOUDLY. This step used to run before the
       # upload with `continue-on-error: true`, so that an unvalidated check

@@ -20,9 +20,28 @@
 #
 # Run 2 then stopped at 11.4 seconds with `qemu exit: 0`, right after
 # "Detected first boot", and -no-reboot was removed on the theory that a
-# Pi OS first-boot resize was rebooting. WRONG: -append carries no
-# `init=`, so init=/usr/lib/raspberrypi-sys-mods/firstboot never runs and
-# no resize happens. The flag is back; see the qemu invocation.
+# Pi OS first-boot resize was rebooting. It was not -- the reset was the
+# bcm2835-pm watchdog, bisected in run 7 and described below -- and the
+# reason given here for ruling the resize out was wrong as well, so it is
+# restated. It said `-append` carries no `init=`, so
+# init=/usr/lib/raspberrypi-sys-mods/firstboot never runs. That token is
+# not in this picture at all: pi-gen's arm64 branch ships one cmdline.txt,
+# stage1/00-boot-files/files/cmdline.txt, and it reads
+#
+#   console=serial0,115200 console=tty1 root=ROOTDEV rootfstype=ext4 \
+#   fsck.repair=yes rootwait resize
+#
+# with no init= of any kind; the only `init=` anywhere in the tree is in
+# export-noobs/00-release/files/partition_setup.sh, which STRIPS
+# init=/usr/lib/raspi-config/init_resize.sh on the NOOBS path this build
+# does not take. What actually grows the filesystem is the bare `resize`
+# token above plus rpi-resize.service, enabled in
+# stage2/01-sys-tweaks/01-run.sh -- and device/install.sh removes the token
+# from cmdline.txt and disables the service, because an online resize of a
+# read-only overlay lower layer cannot work. On top of that, `-append`
+# replaces the command line wholesale here, so the token would not reach
+# the kernel even on an unprovisioned image. The conclusion held; the
+# reason did not. The flag is back; see the qemu invocation.
 #
 # Runs 4 and 5 (31283220918, 31283879022) added 30-second console
 # sampling and put -no-reboot back, and between them -- re-reading runs
@@ -266,7 +285,21 @@ else
 fi
 
 KERNEL="$WORK/boot/kernel8.img"
-DTB=$(find "$WORK/boot" -name '*.dtb' | head -n 1)
+# A GLOB, not `find ... | head -n 1`. This script runs under pipefail and
+# set -e: head closes the pipe the moment it has its line, find dies of
+# SIGPIPE, the pipeline returns 141, and a bare assignment at top level then
+# ends the script with no verdict and no explanation. It is the shape
+# install.sh already carries a comment about, where lsinitramfs | grep -q
+# returned 141 for exactly the input that should pass. Unreachable at this
+# scale -- mcopy puts one dtb in one flat directory, so find can never
+# outrun head -- and fixed rather than reasoned about, because the next
+# person to add a file to that directory is not reading this line.
+DTB=""
+for candidate in "$WORK/boot"/*.dtb; do
+    [ -f "$candidate" ] || continue
+    DTB="$candidate"
+    break
+done
 if [ ! -f "$KERNEL" ] || [ -z "$DTB" ]; then
     echo "ERROR: no kernel8.img or dtb in the image's boot partition" >&2
     ls -la "$WORK/boot" >&2
@@ -317,10 +350,12 @@ fi
 # not reproduce PARTUUIDs -- false. A PARTUUID is the MBR disk identifier
 # plus a partition number, both of which ship inside the image file, so it
 # resolves under QEMU exactly as on the device. The real reason is that
-# cmdline.txt is replaced wholesale (it also carries init=...firstboot and
-# quiet, neither wanted here), so root= must be restated -- and an explicit
-# device name beats depending on which revision of cmdline.txt this build
-# happened to produce.
+# cmdline.txt is replaced wholesale, so root= must be restated -- and an
+# explicit device name beats depending on which revision of cmdline.txt
+# this build happened to produce. What it says cmdline.txt "also carries"
+# was wrong twice over and is gone: pi-gen's arm64 stage1 cmdline.txt has
+# no init= at all (see the header) and no `quiet` either, and the token it
+# does carry, a bare `resize`, is one device/install.sh takes back out.
 # One boot, into its own directory. Everything a phase produces -- both
 # consoles, qemu's exit code, whether the harness stopped it -- is written
 # down there, so the verdict below is a function of files on disk rather
@@ -711,7 +746,18 @@ for phase in $PHASES; do
     if [ -n "$EARLY_STOP" ]; then
         echo "$phase: qemu stopped by the harness at ${EARLY_STOP}s wall, after the guest reported done (rc=$QEMU_RC)" >&2
     elif [ "$QEMU_RC" = 124 ]; then
-        echo "$phase: qemu ran to the ${TIMEOUT}s backstop without a guest report (rc=124)" >&2
+        # "without a guest report" only if there is no report. rc=124 with
+        # an empty early-stop means the sampler never saw the done line
+        # while the boot was running -- which is not the same as the guest
+        # never printing one: the sampler looks every 30 seconds and at the
+        # backstop it has stopped looking, so a done line in the last
+        # sampling window lands in the console and not in early-stop. The
+        # console is on disk by now and can simply be asked.
+        if grep -qF "OTP-GUEST-DONE $phase" "$CONSOLE_TXT" 2>/dev/null; then
+            echo "$phase: the guest DID report done, but not in time for the sampler to stop qemu: ran to the ${TIMEOUT}s backstop (rc=124)" >&2
+        else
+            echo "$phase: qemu ran to the ${TIMEOUT}s backstop without a guest report (rc=124)" >&2
+        fi
     else
         echo "$phase: qemu exited rc=$QEMU_RC before the backstop" >&2
     fi

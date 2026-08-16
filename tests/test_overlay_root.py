@@ -23,6 +23,7 @@ boot directory and the command-line file are variables, and the verification
 that decides whether provisioning fails is entirely inside that boundary.
 """
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -577,6 +578,39 @@ def test_the_refusal_comes_before_anything_the_probe_writes():
                         ('> "$SENTINEL"', "the sentinel write"),
                         ("config.save(saved)", "the config.save() into /boot")):
         assert guard < text.index(later), what
+
+
+def test_the_probe_is_given_longer_than_its_own_bounded_wait(tmp_path):
+    """
+    systemd's default TimeoutStartSec is 90s and the probe's own poll for
+    otp-unit.service is 45 iterations of `sleep 2` -- 90s exactly, before
+    cupsd -t and two Python starts under TCG. On the default, a slow but
+    healthy boot loses its probe mid-poll and the phase reports nothing,
+    which the harness fails for having no OTP-GUEST-DONE line. It fails red
+    rather than green, so this is a flake risk and not a false pass, but the
+    number is worth stating rather than inheriting.
+
+    Both halves are read out of the shipped files: the bound out of the
+    probe, the backstop out of the workflow.
+    """
+    probe = GUEST_CHECK.read_text()
+    iterations = int(re.search(r"for _ in \$\(seq 1 (\d+)\); do", probe).group(1))
+    interval = int(re.search(r"^\s*sleep (\d+)$", probe, re.M).group(1))
+    poll_bound = iterations * interval
+
+    unit = IMGCHECK_UNIT.read_text()
+    match = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.M)
+    assert match, "otp-unit-imgcheck.service has no explicit TimeoutStartSec"
+    timeout = int(match.group(1))
+    assert timeout > poll_bound, (
+        f"TimeoutStartSec={timeout}s does not clear the probe's own "
+        f"{poll_bound}s poll, so a slow boot loses its report")
+
+    workflow = (REPO / ".github" / "workflows" / "image.yml").read_text()
+    backstop = int(re.search(r"OTP_IMG_TIMEOUT:\s*(\d+)", workflow).group(1))
+    assert timeout < backstop, (
+        f"TimeoutStartSec={timeout}s is not inside the {backstop}s per-boot "
+        f"backstop, so a wedged probe eats the run instead of being killed")
 
 
 def test_the_probe_checks_the_sentinel_before_it_writes_one():

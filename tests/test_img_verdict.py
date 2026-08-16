@@ -483,6 +483,31 @@ def test_early_stop_is_reported_as_the_harnesss_own_hand(tmp_path):
     assert "stopped by the harness at 397s" in proc.stderr
 
 
+def test_a_backstopped_boot_that_did_report_is_not_called_silent(tmp_path):
+    """
+    rc=124 with no early stop used to print "ran to the backstop without a
+    guest report" whatever the console said. The sampler looks every 30
+    seconds, so a done line printed inside the last window is in the
+    console and not in early-stop -- and the diagnosis then contradicts the
+    evidence sitting next to it in the same directory. The healthy fixture
+    IS this case: rc=124, no early stop, a complete guest report.
+    """
+    proc, _ = run_verdict(tmp_path, {"boot1": healthy("boot1")},
+                          qemu_rc="124", early_stop="")
+    assert proc.returncode == 0, proc.stderr
+    assert "without a guest report" not in proc.stderr, proc.stderr
+    assert "the guest DID report done" in proc.stderr, proc.stderr
+
+
+def test_a_backstopped_boot_that_said_nothing_is_still_called_silent(tmp_path):
+    # The other half: an empty console at the backstop is exactly what the
+    # old wording described, and it must keep saying so.
+    proc, _ = run_verdict(tmp_path, {"boot1": kernel_lines()},
+                          qemu_rc="124", early_stop="")
+    assert proc.returncode == 1
+    assert "without a guest report" in proc.stderr, proc.stderr
+
+
 def test_guest_self_reset_is_explained_when_checks_fail(tmp_path):
     proc, verdict = run_verdict(tmp_path, {"boot1": kernel_lines()}, qemu_rc="0")
     assert proc.returncode == 1
