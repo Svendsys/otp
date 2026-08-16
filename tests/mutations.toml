@@ -1516,3 +1516,45 @@ tests = [
 file = "device/install.sh"
 find = '''systemctl stop getty@tty1.service 2>/dev/null || true'''
 replace = '''systemctl status getty@tty1.service 2>/dev/null || true'''
+
+
+[[mutation]]
+name = "guest-userconf-run-not-read-off-the-log"
+tier = "fast"
+guard = """
+The only account of the apply that survives it. cancel-rename ends a
+successful seed apply with `systemctl disable userconfig` and a
+daemon-reload, so the oneshot is inactive and unreferenced and systemd
+garbage-collects it: run 31972140190 read `condition=no result=success` off
+a freshly loaded default for a boot whose console says `Finished
+userconfig.service`. Without the log clause the check has nothing left that
+distinguishes a wizard that ran from one that was skipped -- both are
+`inactive` with no job."""
+# The skipped-wizard case is NOT listed: its journal carries "was skipped",
+# which the trouble clause catches on its own, so it was not observed red for
+# this edit. A row is only worth what its tests were seen to do.
+tests = [
+  "tests/test_overlay_root.py::test_a_seeded_boot_whose_wizard_never_ran_at_all_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''          "$(if [ "$UC_FINISHED" = yes ] && [ "$UC_TROUBLE" = no ] \'''
+replace = '''          "$(if [ "$UC_TROUBLE" = no ] \'''
+
+
+[[mutation]]
+name = "guest-userconf-restart-loop-called-clean"
+tier = "fast"
+guard = """
+"Finished" on its own is not the whole answer. Stock userconfig.service
+carries Restart=on-failure, so a boot that met a bad seed can fail, restart
+and finish -- printing "Failed with result" and "Scheduled restart job",
+two of the strings img-boot.sh hard-fails a release on. A guest that called
+that boot clean would be arguing with the host gate over the same console."""
+tests = [
+  "tests/test_overlay_root.py::test_a_wizard_that_only_finished_after_a_restart_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''          "$(if [ "$UC_FINISHED" = yes ] && [ "$UC_TROUBLE" = no ] \'''
+replace = '''          "$(if [ "$UC_FINISHED" = yes ] \'''

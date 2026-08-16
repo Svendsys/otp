@@ -412,6 +412,37 @@ uncertain about: whiptail with no `TERM` **fails** rather than blocking —
 `rc=1 ... TERM environment variable needs set.` — so the fail-fast is real
 and the 60s bound was never reached.
 
+### Run 18 (31972140190): the image was fixed, and the probe was not
+
+With both blockers gone the boot changed shape completely: **`multi-user.target`
+reached in both boots**, `network-online.target` with it, boot 1 at 12/13 and
+boot 2 at **15/15**. The credential path did every documented thing —
+`Finished userconfig.service - User configuration dialog.` on the console,
+`userconf-seed-applied PASS ... begins $6$otpimgcheck$: yes`,
+`userconf-seed-consumed PASS` off the card, and
+`front-panel-survives-the-credential-apply PASS otp-unit=active
+getty@tty1=inactive`.
+
+The one red was the probe measuring a unit that no longer exists. A
+successful apply ends in `cancel-rename`, which runs `systemctl disable
+userconfig` and a daemon-reload; the oneshot is inactive and unreferenced by
+then, so **systemd garbage-collects it**, and every property a later
+`systemctl show` returns is a pristine default:
+
+```
+OTP-CHECK boot1 userconf-seeded-boot-ran-no-wizard FAIL
+  condition=no result=success is-active=inactive jobs=0
+```
+
+— on the boot whose console says the unit finished. The 120s settle poll
+spent all of itself waiting for a `ConditionTimestamp` that had been
+collected with the unit, which is why boot 1 took 307s of guest time. The
+check now reads systemd's own **log** for the unit (`Finished
+userconfig.service`, and no `Failed with result` / `Scheduled restart job` /
+`was skipped`), which outlives the unit object and says more than
+`ConditionResult=yes` ever did: not "systemd let it start" but "it ran to
+completion, once, cleanly".
+
 Three details worth knowing about that last row. It is run **by hand from
 the probe** rather than left on the card for the unit to find at boot,
 because the stock `userconfig.service` carries `Restart=on-failure`: a boot

@@ -215,6 +215,16 @@
 # environment variable needs set." -- so the fail-fast is real, not a
 # stopwatch artifact, and the 60s bound was never reached.
 #
+# RUN 18 (31972140190) booted the fixed image: multi-user.target reached in
+# both boots for the first time in this tier's history, boot2 15/15, and
+# boot1 12/13 with the seed applied, consumed, and the front panel still on
+# tty1 afterwards. Its one red was the probe rather than the image -- a
+# successful apply ends in cancel-rename, which disables userconfig.service,
+# and systemd then garbage-collects the inactive unreferenced unit, so
+# `systemctl show` answers with pristine defaults for a unit whose own
+# console line says "Finished userconfig.service". The guest check reads the
+# journal for that now; see harness/img-guest-check.sh.
+#
 # PARTLY cmdline.txt and config.txt now, where it used to be neither. QEMU
 # still reads no firmware configuration -- -append below REPLACES the kernel
 # command line wholesale, and dtparam=i2c_arm=on and the disable-wifi/bt

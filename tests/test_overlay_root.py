@@ -850,6 +850,19 @@ case "$1 $2" in
 esac
 """
 
+# The wizard's own log, which is the only account of it that survives the
+# apply: cancel-rename disables the unit, systemd collects it, and every
+# `systemctl show` after that describes a freshly loaded default. The
+# default text is what run 31972140190's console recorded, verbatim.
+JOURNALCTL_STUB = """#!/bin/sh
+case "$*" in
+    *userconfig.service*) printf '%s\\n' "${UC_JOURNAL-\
+Aug 16 22:05:01 otp-unit systemd[1]: Starting userconfig.service - User configuration dialog...
+Aug 16 22:06:11 otp-unit systemd[1]: Finished userconfig.service - User configuration dialog.}" ;;
+    *) echo "stub: unexpected journalctl $*" >&2; exit 64 ;;
+esac
+"""
+
 # What upstream does to a seed it will not accept: append the reason, rename
 # it out of the way, and -- with no tty for the whiptail that comes next --
 # die rather than prompt. The probe measures three things about this: that it
@@ -896,6 +909,8 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "systemctl").write_text(SYSTEMCTL_STUB)
     (bin_dir / "systemctl").chmod(0o755)
+    (bin_dir / "journalctl").write_text(JOURNALCTL_STUB)
+    (bin_dir / "journalctl").chmod(0o755)
 
     block = userconf_block()
     for original, replacement, why in (
@@ -1039,20 +1054,87 @@ def test_a_wizard_parked_mid_start_fails_the_first_boot(tmp_path):
     assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
 
 
-def test_a_seeded_boot_whose_wizard_never_ran_fails(tmp_path):
+def test_a_seeded_boot_whose_wizard_was_skipped_fails(tmp_path):
     # The condition came out false with a seed sitting on the card: the
     # drop-in's paths and the file the operator wrote disagree, or the unit
-    # was masked. The credentials are silently ignored either way.
+    # was masked. The credentials are silently ignored either way, and the
+    # log says so in systemd's words rather than the unit's fields.
+    proc, _ = run_userconf(tmp_path, phase="boot1", env={
+        **HEALTHY_BOOT1, "UC_COND": "no",
+        "UC_JOURNAL": "Aug 16 22:05:01 otp-unit systemd[1]: userconfig.service"
+                      " - User configuration dialog was skipped because of an"
+                      " unmet condition check (ConditionPathExists=|/boot/"
+                      "firmware/userconf)."})
+    assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
+
+
+def test_a_seeded_boot_whose_wizard_never_ran_at_all_fails(tmp_path):
+    """
+    Nothing in the log, nothing in the queue, nothing wrong with the unit --
+    which is what a masked or never-pulled-in wizard looks like from every
+    other field, and what run 31968966879's boots looked like once their
+    queued job is taken out of the picture. The operator's credentials are
+    ignored in silence.
+
+    An empty journal is the one thing a garbage-collected unit and a
+    never-started one do NOT share: the collected one leaves its "Finished"
+    line behind, which is the whole reason this check reads the log.
+    """
     proc, _ = run_userconf(tmp_path, phase="boot1",
-                           env={**HEALTHY_BOOT1, "UC_COND": "no"})
+                           env={**HEALTHY_BOOT1, "UC_JOURNAL": ""})
     assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
 
 
 def test_a_wizard_that_failed_on_the_seed_fails_the_first_boot(tmp_path):
-    proc, _ = run_userconf(tmp_path, phase="boot1",
-                           env={**HEALTHY_BOOT1, "UC_RESULT": "exit-code",
-                                "UC_ACTIVE": "failed"})
+    # A malformed seed met at BOOT: userconf-service dies on the whiptail it
+    # cannot draw, and Restart=on-failure prints the two strings img-boot.sh
+    # fails a release on. The log carries both, so the check does not have to
+    # ask a unit that may already have been collected.
+    proc, _ = run_userconf(tmp_path, phase="boot1", env={
+        **HEALTHY_BOOT1, "UC_RESULT": "exit-code", "UC_ACTIVE": "failed",
+        "UC_JOURNAL": "Aug 16 22:05:01 otp-unit systemd[1]: userconfig.service:"
+                      " Failed with result 'exit-code'. Aug 16 22:05:02 otp-unit"
+                      " systemd[1]: userconfig.service: Scheduled restart job,"
+                      " restart counter is at 1."})
     assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
+
+
+def test_a_wizard_that_only_finished_after_a_restart_fails(tmp_path):
+    """
+    "Finished" on its own is not the whole answer, because stock
+    userconfig.service carries Restart=on-failure: a boot that met a bad seed
+    can fail, be restarted, and finish. That boot printed "Failed with result"
+    and "Scheduled restart job" -- two of the strings img-boot.sh hard-fails a
+    release on -- so the guest must not call it clean either.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env={
+        **HEALTHY_BOOT1,
+        "UC_JOURNAL": "Aug 16 22:05:01 otp-unit systemd[1]: userconfig.service:"
+                      " Failed with result 'exit-code'. Aug 16 22:05:31 otp-unit"
+                      " systemd[1]: userconfig.service: Scheduled restart job,"
+                      " restart counter is at 1. Aug 16 22:06:11 otp-unit"
+                      " systemd[1]: Finished userconfig.service - User"
+                      " configuration dialog."})
+    assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
+
+
+def test_a_finished_line_from_a_collected_unit_is_still_a_pass(tmp_path):
+    """
+    The measurement this check was rewritten around, stated as a test.
+
+    A seeded apply ends in cancel-rename, which runs `systemctl disable
+    userconfig` and a daemon-reload; the oneshot is inactive and unreferenced
+    by then, so systemd garbage-collects it and every property a later
+    `systemctl show` returns is a pristine default. Run 31972140190 measured
+    exactly that -- `condition=no result=success is-active=inactive jobs=0`
+    on a boot whose console says `Finished userconfig.service`, whose shadow
+    entry carries the seeded salt and whose card came back with the seed
+    consumed. Failing that boot would be the harness calling a correct
+    machine broken.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env={
+        **HEALTHY_BOOT1, "UC_TS": "", "UC_COND": "no", "UC_RESULT": "success"})
+    assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "PASS", proc.stdout
 
 
 def test_a_seed_deleted_without_being_applied_fails(tmp_path):

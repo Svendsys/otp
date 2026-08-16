@@ -311,12 +311,29 @@ USERCONF_SERVICE=/usr/lib/userconf-pi/userconf-service
 # the job was queued behind a network wait that was never going to return.
 # That diagnosis came out of the fields printed below, so the timeout still
 # reports rather than aborting -- it is longer now, not softer.
+#
+# THE JOURNAL IS ONE OF THE TWO SIGNALS, and it has to be, because on a
+# SEEDED boot the machine destroys the other one at exactly the moment of
+# interest. The apply ends in cancel-rename, which runs `systemctl disable
+# userconfig` and a daemon-reload; the oneshot is by then inactive and
+# nothing references it, so systemd garbage-collects the unit and every
+# property below comes back a pristine default. Run 31972140190 measured
+# that: `condition=no result=success is-active=inactive jobs=0` for a unit
+# whose own console says `Finished userconfig.service - User configuration
+# dialog.`, with the seeded hash in the shadow file and the seed gone from
+# the card --
+# and the poll spent its whole 120 seconds waiting for a timestamp that had
+# been collected along with the unit. Log entries outlive unit objects.
 UC_COND_TS=""
 UC_JOBS=1
+UC_LOG=""
 for _ in $(seq 1 60); do
     UC_COND_TS=$(systemctl show userconfig.service -p ConditionTimestamp --value 2>/dev/null)
     UC_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -c "userconfig\.service" || true)
-    if [ -n "$UC_COND_TS" ] && [ "${UC_JOBS:-1}" = 0 ]; then break; fi
+    UC_LOG=$(journalctl -u userconfig.service --no-pager 2>/dev/null | tr '\n' ' ')
+    if [ "${UC_JOBS:-1}" = 0 ] \
+       && { [ -n "$UC_COND_TS" ] || [ "${UC_LOG#*Finished userconfig.service}" != "$UC_LOG" ]; }
+    then break; fi
     sleep 2
 done
 UC_COND=$(systemctl show userconfig.service -p ConditionResult --value 2>/dev/null)
@@ -363,14 +380,33 @@ if [ "$PHASE" = "boot1" ]; then
           "${USERCONF_USER}'s shadow entry (${#UC_SHADOW} chars) begins $USERCONF_SALT: $UC_APPLIED"
 
     # NO WIZARD, which is the clause issue #20 is written around. A seeded
-    # boot must take the non-interactive path: the condition passed (the
-    # drop-in let it run), the oneshot finished successfully, and it has left
-    # no job of its own in the queue holding multi-user.target open.
+    # boot must take the non-interactive path: the oneshot RAN and FINISHED
+    # successfully, nothing skipped or failed it, and it has left no job of
+    # its own in the queue holding multi-user.target open.
+    #
+    # READ OFF THE LOG, not off the unit, and that is a strengthening rather
+    # than a softening. `ConditionResult=yes` said only that systemd let the
+    # unit start; "Finished userconfig.service" is systemd's own success line
+    # and a unit that was skipped, that is still running, or that failed
+    # never prints it. It is also the only one of the two that still exists
+    # after the apply: see the poll above for what cancel-rename's `systemctl
+    # disable` plus a daemon-reload do to the unit object, measured in run
+    # 31972140190. ConditionResult is still REPORTED, so a future reader can
+    # see the collected-unit default for what it is.
+    UC_TROUBLE=no
+    case "$UC_LOG" in
+        *"Failed with result"*|*"Failed to start"*|*"Scheduled restart job"*|\
+        *"was skipped"*|*"skipped, unmet condition"*) UC_TROUBLE=yes ;;
+    esac
+    UC_FINISHED=no
+    if [ "${UC_LOG#*Finished userconfig.service}" != "$UC_LOG" ]; then
+        UC_FINISHED=yes
+    fi
     check userconf-seeded-boot-ran-no-wizard \
-          "$(if [ "$UC_COND" = yes ] && [ "$UC_RESULT" = success ] \
+          "$(if [ "$UC_FINISHED" = yes ] && [ "$UC_TROUBLE" = no ] \
                 && [ "$UC_ACTIVE" = inactive ] && [ "${UC_JOBS:-1}" = 0 ]; \
              then echo yes; else echo no; fi)" \
-          "condition=${UC_COND:-?} result=${UC_RESULT:-?} is-active=$UC_ACTIVE jobs=${UC_JOBS:-?}"
+          "journal-finished=$UC_FINISHED trouble=$UC_TROUBLE is-active=$UC_ACTIVE jobs=${UC_JOBS:-?} condition=${UC_COND:-?} result=${UC_RESULT:-?}"
 
     # AND THE PANEL IS STILL THERE AFTERWARDS, which is the half nobody was
     # looking at. Applying a seed ends in userconf-pi's cancel-rename, and
