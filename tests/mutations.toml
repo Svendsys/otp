@@ -1479,8 +1479,34 @@ tests = [
 ]
 [[mutation.edit]]
 file = "device/install.sh"
-find = '''ConditionPathExists=!/etc/systemd/system/otp-unit.service'''
-replace = '''ConditionPathExists=/etc/systemd/system/otp-unit.service'''
+find = '''ConditionFileNotEmpty=|!/etc/systemd/system/otp-unit.service'''
+replace = '''ConditionFileNotEmpty=/etc/systemd/system/otp-unit.service'''
+
+
+[[mutation]]
+name = "install-getty-condition-keys-on-the-unit-file"
+tier = "fast"
+guard = """
+The condition has to key on the panel BEING GOING TO RUN, not on its unit
+file being on disk. The single `ConditionPathExists=!` on the unit path that
+shipped first got that wrong in the direction that costs a login: `systemctl
+mask otp-unit` replaces that exact path with a symlink to /dev/null and
+ConditionPathExists follows symlinks, and `systemctl disable` removes only
+the .wants symlink -- so both left the condition false and tty1 with NO getty
+at all, on a machine whose panel was never going to start either. That is the
+half-provisioned state the drop-in's own comment says the prompt exists for.
+Evaluated with `systemd-analyze condition` over all four states."""
+tests = [
+  "tests/test_overlay_root.py::test_no_login_prompt_can_start_on_the_front_panels_tty",
+  "tests/test_overlay_root.py::test_masking_or_disabling_the_panel_gives_tty1_its_login_back[masked]",
+  "tests/test_overlay_root.py::test_masking_or_disabling_the_panel_gives_tty1_its_login_back[disabled]",
+  "tests/test_service_unit.py::TestTheUnitCanActuallyStart::test_nothing_can_stop_the_panel_by_starting_a_getty_on_tty1",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''ConditionPathExists=|!/etc/systemd/system/multi-user.target.wants/otp-unit.service
+ConditionFileNotEmpty=|!/etc/systemd/system/otp-unit.service'''
+replace = '''ConditionPathExists=!/etc/systemd/system/otp-unit.service'''
 
 
 [[mutation]]

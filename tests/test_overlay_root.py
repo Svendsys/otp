@@ -24,8 +24,11 @@ that decides whether provisioning fails is entirely inside that boundary.
 """
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -761,14 +764,77 @@ def test_no_login_prompt_can_start_on_the_front_panels_tty(tmp_path):
     every console-boot machine. A condition, evaluated at start time, is
     what keeps that from ever producing a prompt.
 
-    Negated and pointed at the unit file install.sh writes, so the prompt
-    comes back on a machine where the front panel is not installed -- a
-    half-provisioned unit is exactly when a login is wanted.
+    THE SPELLING IS THE PROPERTY here, which is why this reads the exact
+    directives rather than "a condition mentioning otp-unit". The form that
+    shipped first --
+    `ConditionPathExists=!/etc/systemd/system/otp-unit.service` -- keys on
+    the unit FILE, and `systemctl mask` writes a symlink to /dev/null at
+    exactly that path while `systemctl disable` leaves the file alone. Both
+    therefore left the condition false and tty1 with no getty at all, on a
+    machine whose panel was not going to run either. The truth table is in
+    the test below; this is the always-runs half of it.
     """
     text, _ = run_getty_dropin(tmp_path)
-    assert ("ConditionPathExists=!/etc/systemd/system/otp-unit.service"
+    assert ("ConditionPathExists=|!/etc/systemd/system/multi-user.target"
+            ".wants/otp-unit.service" in text), text
+    assert ("ConditionFileNotEmpty=|!/etc/systemd/system/otp-unit.service"
             in text), text
+    # The `|` on both is what makes them an OR. Un-prefixed, systemd ANDs
+    # them and the prompt comes back only on a panel that is disabled AND
+    # masked -- neither of the two states this exists for.
+    assert "\nConditionPathExists=!" not in text, (
+        "an un-prefixed condition is ANDed with the other one: " + text)
     assert text.lstrip().startswith("[Unit]"), text
+
+
+GETTY_STATES = ("healthy", "masked", "disabled", "absent")
+
+
+@pytest.mark.skipif(shutil.which("systemd-analyze") is None,
+                    reason="no systemd-analyze here to evaluate the "
+                           "conditions with; the text assertions above "
+                           "still run")
+@pytest.mark.parametrize("state", GETTY_STATES)
+def test_masking_or_disabling_the_panel_gives_tty1_its_login_back(
+        tmp_path, state):
+    """
+    The four states a machine can be in, evaluated by real systemd.
+
+    Only the healthy one may skip the getty. On the other three the panel is
+    not going to take tty1, and a tty with neither a panel nor a login is a
+    device an operator cannot reach -- the exact half-provisioned case the
+    drop-in's own comment says the prompt exists for. The shipped form got
+    two of the three wrong: `systemctl mask` REPLACES the unit file with a
+    symlink to /dev/null and ConditionPathExists follows symlinks, and
+    `systemctl disable` does not touch the unit file at all.
+
+    The conditions are lifted out of the drop-in install.sh writes and only
+    the /etc prefix is rewritten, so what systemd is handed here is the
+    shipped directive with a different root.
+    """
+    text, _ = run_getty_dropin(tmp_path)
+    etc = tmp_path / "sysroot" / "etc" / "systemd" / "system"
+    (etc / "multi-user.target.wants").mkdir(parents=True)
+    unit = etc / "otp-unit.service"
+    wants = etc / "multi-user.target.wants" / "otp-unit.service"
+    if state != "absent":
+        unit.write_text("[Unit]\nDescription=OTP pad print unit\n")
+        wants.symlink_to(unit)
+    if state == "masked":
+        unit.unlink()
+        unit.symlink_to("/dev/null")
+    if state == "disabled":
+        wants.unlink()
+
+    conditions = [ln.replace("/etc/systemd/system", str(etc))
+                  for ln in text.splitlines() if ln.startswith("Condition")]
+    assert len(conditions) == 2, text
+    proc = subprocess.run(["systemd-analyze", "condition", *conditions],
+                          capture_output=True, text=True, timeout=30)
+    starts = proc.returncode == 0
+    assert starts == (state != "healthy"), (
+        f"with the panel {state}, systemd says the tty1 getty "
+        f"{'starts' if starts else 'is skipped'}: {proc.stdout}{proc.stderr}")
 
 
 def test_a_getty_already_running_on_tty1_is_stopped(tmp_path):

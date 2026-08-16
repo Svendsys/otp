@@ -152,10 +152,26 @@ class TestTheUnitCanActuallyStart:
             f"by cancel-rename after a credential apply stops the panel")
         # The replacement has to be in the file that provisions the machine,
         # or removing the conflict just hands tty1 to the login prompt.
+        #
+        # The messages are real messages. `install[:0]` was here, which is
+        # the empty string -- a failing assert printed its own source and
+        # nothing else, on the one test that says why tty1 belongs to the
+        # panel.
         install = INSTALL.read_text()
-        assert "/etc/systemd/system/getty@tty1.service.d" in install, install[:0]
-        assert ("ConditionPathExists=!/etc/systemd/system/otp-unit.service"
-                in install)
+        assert "/etc/systemd/system/getty@tty1.service.d" in install, (
+            "install.sh writes no drop-in for getty@tty1, so with Conflicts= "
+            "gone there is nothing keeping a login prompt off the panel's tty")
+        # The condition keys on the panel being GOING TO RUN. Pointed at the
+        # unit file alone it read false on a masked panel too -- mask writes
+        # a symlink to /dev/null there -- and left tty1 with no getty and no
+        # panel. tests/test_overlay_root.py has the four-state truth table.
+        for directive_line in (
+                "ConditionPathExists=|!/etc/systemd/system/"
+                "multi-user.target.wants/otp-unit.service",
+                "ConditionFileNotEmpty=|!/etc/systemd/system/otp-unit.service"):
+            assert directive_line in install, (
+                f"install.sh no longer writes {directive_line!r}, so the "
+                f"getty drop-in does not say what it is conditional on")
 
     def test_restart_on_failure_is_paired_with_a_backoff(self):
         # Without RestartSec above systemd's burst limit, a unit that

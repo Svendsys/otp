@@ -446,9 +446,28 @@ systemctl enable getty@tty2.service 2>/dev/null || true
 #     multi-user.target, so cloud-config.service is not in the transaction
 #     at all and the wizard's `After=` on it is void rather than waiting.
 #
-# harness/img-guest-check.sh reads the mask back off the booted machine and
-# checks the queue for its job; the kill switch is measured by what it
-# unblocks, which is the wizard's job count in the same probe.
+# THE TWO LOCKS ARE NOT EQUALLY WELL MEASURED, and the difference is worth
+# knowing before anyone trusts a green tier 3 here.
+#
+#   - The mask IS measured on the booted image:
+#     harness/img-guest-check.sh reads is-enabled back off the running
+#     machine and asks the job queue for its job
+#     (network-wait-cannot-hold-the-boot-open).
+#   - The kill switch is NOT. Its only coverage is that install.sh writes
+#     the file -- tests/test_overlay_root.py runs this block into a fake
+#     /etc and looks for it. An earlier version of this comment claimed it
+#     was "measured by what it unblocks, which is the wizard's job count in
+#     the same probe", and that is false: once the wait above is masked,
+#     network-online.target is satisfied by NetworkManager-wait-online in
+#     about thirty seconds, so a cloud-init that came back would let every
+#     guest check pass, just more slowly. No probe here can tell the two
+#     apart, and no check goes red if this line stops working.
+#
+# It stays for the reasons in its bullet -- 57 wasted seconds, and a
+# provisioning agent reading user-data off an operator's partition on an
+# air-gapped key printer -- not because anything is watching it. A check
+# that could tell would have to read the boot's own timing or ask systemd
+# whether cloud-init.target is in the transaction; neither exists yet.
 systemctl mask systemd-networkd-wait-online.service
 install -d /etc/cloud
 : > /etc/cloud/cloud-init.disabled
@@ -562,13 +581,48 @@ DROPIN
 #
 # A condition-skipped start does neither: systemd reports the job done, no
 # getty ever runs on tty1, the seed is deleted and the unit succeeds. The
-# condition names the unit file THIS script installs, so a machine without
-# the front panel still gets its login prompt -- including one where
-# provisioning failed half way, which is when it is wanted most.
+# machine without a front panel still gets its login prompt -- including one
+# where provisioning failed half way, which is when it is wanted most.
+#
+# WHAT THE CONDITION KEYS ON: the panel BEING GOING TO RUN, not its unit file
+# being on disk. The single `ConditionPathExists=!/etc/systemd/system/otp-\
+# unit.service` that used to be here got that wrong in the direction that
+# costs a login. `systemctl mask otp-unit` REPLACES that path with a symlink
+# to /dev/null, and ConditionPathExists follows symlinks -- /dev/null exists
+# -- so the condition stayed false and no getty ever started, on a machine
+# whose panel was masked and therefore never started either. `systemctl
+# disable otp-unit` is the same story from the other end: it removes the
+# multi-user.target.wants symlink and leaves the unit file exactly where it
+# was. Either one left tty1 dark and login-less forever, which is precisely
+# the half-provisioned state the paragraph above says the prompt is for.
+#
+# Evaluated by systemd itself (`systemd-analyze condition`), over the four
+# states a machine can be in:
+#
+#                    old: PathExists=!unit     new: the pair below
+#   healthy            getty skipped             getty skipped
+#   panel masked       getty skipped   <-- bug   getty starts
+#   panel disabled     getty skipped   <-- bug   getty starts
+#   panel absent       getty starts              getty starts
+#
+# TWO conditions, both `|`-prefixed so they are TRIGGERING: systemd starts
+# the unit when at least one triggering condition holds, so this reads "give
+# tty1 a login if the panel is not enabled OR its unit is masked/gone",
+# which is the OR the property needs. Un-prefixed they would be ANDed, and
+# the getty would come back only on a machine that was both disabled and
+# masked.
+#
+#   - the .wants symlink is what `enable` creates and `disable` removes, so
+#     it answers "is the panel going to be pulled into the boot".
+#   - ConditionFileNotEmpty, not PathExists, on the unit file: it requires a
+#     REGULAR file of non-zero size, and a mask is a symlink to a
+#     zero-length character device. That is the whole reason this line is
+#     spelled differently from the one it replaces.
 install -d /etc/systemd/system/getty@tty1.service.d
 cat > /etc/systemd/system/getty@tty1.service.d/otp-appliance.conf <<'GETTY'
 [Unit]
-ConditionPathExists=!/etc/systemd/system/otp-unit.service
+ConditionPathExists=|!/etc/systemd/system/multi-user.target.wants/otp-unit.service
+ConditionFileNotEmpty=|!/etc/systemd/system/otp-unit.service
 GETTY
 
 # AND THE ONE ALREADY RUNNING, because a condition only stops a getty
