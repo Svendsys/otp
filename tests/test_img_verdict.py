@@ -318,6 +318,112 @@ def test_the_harness_and_the_guest_agree_on_which_checks_exist():
         assert only, f"{phase} demands nothing of its own"
 
 
+# --- the seed itself, which three files have to agree about ---------------
+
+BUILD_SH = REPO / "image" / "build.sh"
+
+
+def shell_value(path: Path, name: str) -> str:
+    """A plain `NAME=value` assignment, read out of a shipped script."""
+    match = re.search(rf"^[ \t]*{name}=(?:'([^']*)'|\"([^\"]*)\"|(\S+))[ \t]*$",
+                      path.read_text(), re.M)
+    assert match, f"{name} is gone from {path}"
+    return next(g for g in match.groups() if g is not None)
+
+
+def test_the_seed_names_the_account_the_image_actually_ships(tmp_path):
+    """
+    Three files, one account, and the reason it matters is what happens when
+    they disagree.
+
+    /usr/lib/userconf-pi/userconf RENAMES the UID-1000 user when the seed
+    names a different one: usermod -l, a home directory move, sed over
+    /etc/subuid, /etc/subgid and the sudoers drop-in. That is a much larger
+    experiment than "were the credentials applied", and it is one this tier
+    would be running by accident. Naming the image's own first user keeps the
+    rename branch out of it -- so if image/build.sh ever changes
+    FIRST_USER_NAME, this seed silently starts testing something else.
+    """
+    first_user = shell_value(BUILD_SH, "FIRST_USER_NAME")
+    assert shell_value(IMG_BOOT, "USERCONF_USER") == first_user
+    assert shell_value(GUEST_CHECK, "USERCONF_USER") == first_user
+
+
+def test_the_guest_looks_for_the_salt_the_harness_actually_planted():
+    # The guest never sees the hash -- it is not installed on a unit -- so
+    # what it compares is the salt marker. A hash regenerated with a different
+    # salt would leave the guest looking for a string nothing writes.
+    salt = shell_value(GUEST_CHECK, "USERCONF_SALT")
+    assert salt.startswith("$6$") and salt.endswith("$"), salt
+    assert shell_value(IMG_BOOT, "USERCONF_HASH").startswith(salt)
+
+
+def userconf_pi_rejects(line: str) -> bool:
+    """userconf-pi's own validation, transcribed from userconf-service.
+
+        NEW_USER="$(echo "$LINE" | cut -f1 -d:)"
+        NEW_PASS="$(echo "$LINE" | cut -f2 -d:)"
+        ... [ -z "$NEW_USER" ] || [ ${#NEW_USER} -gt 32 ]        -> invalid
+        ... grep -q '^[a-z]\\{1\\}[a-z0-9\\-]*$'                   -> required
+        ... [ "$NEW_USER" = "root" ]                             -> invalid
+        ... [ -z "$NEW_PASS" ]                                   -> invalid
+
+    A seed it rejects is renamed failed_userconf.txt; a seed it accepts is
+    applied and deleted. Which of the two the harness plants is the whole
+    difference between the two experiments this tier now runs.
+    """
+    fields = line.split(":")
+    user, password = fields[0], (fields[1] if len(fields) > 1 else "")
+    return not (user and len(user) <= 32
+                and re.fullmatch(r"[a-z][a-z0-9-]*", user)
+                and user != "root" and password)
+
+
+def test_the_planted_seed_is_one_userconf_pi_accepts():
+    user = shell_value(IMG_BOOT, "USERCONF_USER")
+    seed = f"{user}:{shell_value(IMG_BOOT, 'USERCONF_HASH')}"
+    assert not userconf_pi_rejects(seed), seed
+    # And it is one line: userconf-service reads `head -n1` and nothing else.
+    assert "\n" not in seed
+
+
+def test_the_malformed_fixture_is_one_userconf_pi_rejects():
+    """
+    The other half, and it is not decoration: a "malformed" seed that happens
+    to be valid would be APPLIED and deleted, leaving no failed_userconf.txt
+    -- the boot2 gate would go red for a fixture bug, and the fail-fast it
+    exists to observe would never have been exercised.
+    """
+    bad = shell_value(GUEST_CHECK, "UC_BAD")
+    assert userconf_pi_rejects(bad), bad
+    # Both validators, not one: the username has spaces and capitals and the
+    # password half is empty.
+    assert userconf_pi_rejects(bad.split(":")[0] + ":something")
+    assert userconf_pi_rejects("validname:")
+
+
+def test_the_before_listing_is_taken_before_the_boot():
+    """
+    Ordering, because the control is worthless if it is taken afterwards.
+
+    boot-files-before.txt is what says the seed reached the card. Snapshot it
+    after qemu has run and it says only that the boot left the partition in
+    some state, and "the seed was planted" becomes a statement about nothing.
+    """
+    text = IMG_BOOT.read_text()
+    before = text.index('fat_listing "$dir/boot-files-before.txt"')
+    launch = text.index("qemu-system-aarch64 \\")
+    after = text.index('fat_listing "$dir/boot-files-after.txt"')
+    assert before < launch < after, (before, launch, after)
+
+
+def test_the_seed_is_planted_before_the_first_boot():
+    # The mcopy has to happen before the boot loop, or boot1 boots a card the
+    # operator never wrote to.
+    text = IMG_BOOT.read_text()
+    assert text.index("::userconf.txt") < text.index('for phase in $PHASES; do')
+
+
 def test_a_healthy_two_boot_run_passes(tmp_path):
     proc, verdict = run_verdict(
         tmp_path,
@@ -333,6 +439,116 @@ def test_a_healthy_two_boot_run_passes(tmp_path):
     # rc 124 is the NORMAL ending of a healthy appliance boot (the guest
     # idles; only the stopwatch ends it). It must not fail the run.
     assert proc.returncode == 0, proc.stderr + verdict
+
+
+def test_a_healthy_run_reports_the_credential_file_too(tmp_path):
+    # The four host-side lines the seeded path adds, on the healthy fixture.
+    proc, verdict = run_verdict(
+        tmp_path,
+        {"boot1": healthy("boot1"), "boot2": healthy("boot2")},
+        phases=("boot1", "boot2"),
+    )
+    for line in ("IMG-CHECK boot1 boot-partition-listed PASS",
+                 "IMG-CHECK boot1 userconf-seed-planted PASS",
+                 "IMG-CHECK boot1 userconf-seed-consumed PASS",
+                 "IMG-CHECK boot2 userconf-malformed-seed-quarantined PASS"):
+        assert line in verdict, verdict
+    assert proc.returncode == 0, proc.stderr + verdict
+
+
+def test_a_seed_that_never_reached_the_card_fails(tmp_path):
+    """
+    The positive control, and the reason the before-listing is taken at all.
+
+    mcopy against a wrong partition offset writes nothing and says nothing --
+    that is how run 1 read a harness bug as a bad image -- and a seed that was
+    never written is gone after the boot in exactly the way a seed that was
+    consumed is. Without this the whole credential gate is satisfied by an
+    image the harness never touched.
+    """
+    before, after = healthy_listings("boot1")
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1")},
+        boot_files={"boot1": ([x for x in before if "userconf" not in x], after)})
+    assert "IMG-CHECK boot1 userconf-seed-planted FAIL" in verdict, verdict
+    # And the consumption check still says PASS on that evidence, which is the
+    # whole point of having the control: absence is not consumption.
+    assert "IMG-CHECK boot1 userconf-seed-consumed PASS" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_a_seed_still_sitting_on_the_card_after_the_first_boot_fails(tmp_path):
+    # The seeded branch not running at all: the condition never matched, the
+    # unit was masked, or the wizard is parked on it right now.
+    before, after = healthy_listings("boot1")
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1")},
+        boot_files={"boot1": (before, after + ["::/userconf.txt"])})
+    assert "IMG-CHECK boot1 userconf-seed-consumed FAIL" in verdict, verdict
+    assert "userconf.txt" in verdict
+    assert proc.returncode == 1
+
+
+def test_a_seed_the_image_rejected_fails_the_first_boot(tmp_path):
+    """
+    Consumed has two halves and this is the second one.
+
+    A first boot that renamed the operator's file to failed_userconf.txt took
+    the seed and gave them NO credentials -- and from the outside that looks
+    the same as success: userconf.txt is gone either way. A device that lands
+    here has an unknowable login on the tty2 recovery getty.
+    """
+    before, after = healthy_listings("boot1")
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1")},
+        boot_files={"boot1": (before, after + ["::/failed_userconf.txt"])})
+    assert "IMG-CHECK boot1 userconf-seed-consumed FAIL" in verdict, verdict
+    assert "failed_userconf.txt" in verdict
+    assert proc.returncode == 1
+
+
+def test_a_malformed_seed_that_left_no_evidence_fails_boot2(tmp_path):
+    # The guest ran the experiment and userconf-service did not quarantine the
+    # file -- or the experiment never ran. Either way the operator would get
+    # no failed_userconf.txt to read.
+    before, after = healthy_listings("boot2")
+    proc, verdict = run_verdict(
+        tmp_path, {"boot2": healthy("boot2")}, phases=("boot2",),
+        boot_files={"boot2": (before, [x for x in after if "failed_" not in x])})
+    assert "IMG-CHECK boot2 userconf-malformed-seed-quarantined FAIL" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_a_bad_seed_left_where_the_next_wizard_finds_it_fails_boot2(tmp_path):
+    # Quarantined means MOVED. A failed_userconf.txt beside a userconf.txt
+    # still holding the bad line is a card that prompts on every boot from
+    # here on.
+    before, after = healthy_listings("boot2")
+    proc, verdict = run_verdict(
+        tmp_path, {"boot2": healthy("boot2")}, phases=("boot2",),
+        boot_files={"boot2": (before, after + ["::/userconf.txt"])})
+    assert "IMG-CHECK boot2 userconf-malformed-seed-quarantined FAIL" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_a_boot_partition_nothing_could_read_fails_rather_than_passing(tmp_path):
+    """
+    Every credential check above an absence is satisfied by an empty listing.
+
+    mdir against a wrong offset, an image that moved, mtools missing: all
+    produce no lines, and no lines means no userconf.txt, which reads as
+    consumed. kernel8.img is the positive control -- it is the file the
+    harness pulled off that partition to boot the guest with, so a listing
+    without it is not a listing of the boot partition.
+    """
+    proc, verdict = run_verdict(
+        tmp_path,
+        {"boot1": healthy("boot1"), "boot2": healthy("boot2")},
+        phases=("boot1", "boot2"),
+        boot_files={"boot1": ([], []), "boot2": ([], [])})
+    assert "IMG-CHECK boot1 boot-partition-listed FAIL" in verdict, verdict
+    assert "IMG-CHECK boot2 boot-partition-listed FAIL" in verdict, verdict
+    assert proc.returncode == 1
 
 
 def test_the_second_boot_must_report_too(tmp_path):

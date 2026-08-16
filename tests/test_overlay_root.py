@@ -580,6 +580,285 @@ def test_the_refusal_comes_before_anything_the_probe_writes():
         assert guard < text.index(later), what
 
 
+# --- the seeded userconf.txt path, as the guest sees it -------------------
+
+# The stock unit is `StandardInput=tty`, `TTYPath=/dev/tty8` and
+# `Restart=on-failure` (RPi-Distro/userconf-pi, debian/*.userconfig.service),
+# and userconf-service goes INTERACTIVE whenever raspi-config's get_boot_cli
+# says the machine boots to a console -- which this image does. That is the
+# whiptail run 12's boot parked on. device/install.sh's drop-in is what stops
+# it: the ConditionPathExists pair keeps the unit out of an unseeded boot
+# entirely, and StandardInput=null turns a malformed seed into a fast failure
+# instead of a prompt nobody can answer. These run the shipped block that
+# checks all of that, against a systemd that says whatever the case needs.
+
+HELPERS = ('check() {',
+           'yesno() { if "$@" >/dev/null 2>&1; then echo yes; else echo no; fi; }')
+
+SYSTEMCTL_STUB = """#!/bin/sh
+# Answers only what the probe asks, and says so loudly otherwise: a stub that
+# silently returned "" for an unexpected question would make a check pass by
+# accident, which is the failure this file exists to prevent.
+case "$1 $2" in
+    "show userconfig.service")
+        case "$4" in
+            ConditionTimestamp) printf '%s' "${UC_TS-}" ;;
+            ConditionResult)    printf '%s' "${UC_COND-}" ;;
+            Result)             printf '%s' "${UC_RESULT-}" ;;
+            StandardInput)      printf '%s' "${UC_STDIN-}" ;;
+            *) echo "stub: unexpected property $4" >&2; exit 64 ;;
+        esac
+        echo ;;
+    "is-active userconfig.service")  echo "${UC_ACTIVE-inactive}" ;;
+    "is-enabled userconfig.service") echo "${UC_ENABLED-enabled}" ;;
+    "list-jobs --no-legend")         printf '%s' "${UC_JOBLINE-}" ;;
+    *) echo "stub: unexpected systemctl $*" >&2; exit 64 ;;
+esac
+"""
+
+# What upstream does to a seed it will not accept: append the reason, rename
+# it out of the way, and -- with no tty for the whiptail that comes next --
+# die rather than prompt. The probe measures three things about this: that it
+# ENDED, that userconf.txt is gone, and that the evidence is there.
+USERCONF_SERVICE_STUB = """#!/bin/sh
+cat "$BOOTDIR/userconf.txt" >> "$BOOTDIR/failed_userconf.txt"
+rm -f "$BOOTDIR/userconf.txt"
+echo "Entered username is invalid:"
+exit 1
+"""
+
+
+def userconf_block() -> str:
+    text = GUEST_CHECK.read_text()
+    start = text.index("# --- the seeded userconf.txt path")
+    return text[start:text.index("\nsync 2>/dev/null || true", start)]
+
+
+def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
+                 executable=True, shadow=None, env=None):
+    """Run the shipped userconf block with a substituted systemd and shadow.
+
+    Three absolute paths are rewritten rather than stubbed on the filesystem
+    -- /etc/shadow, the userconf-service the experiment runs, and the boot
+    directory -- for the reason run_phase_guard gives: everything else in the
+    block, including both `check` calls' conditions and the wording they
+    print, is the code that ships. The two waits are shortened, and only
+    those: the 30s condition poll and the 60s bound on the experiment are
+    real time in a real boot, and test_the_probe_is_given_longer_than_its_own
+    _bounded_wait is what holds them against the unit's TimeoutStartSec.
+    """
+    bootdir = tmp_path / "firmware"
+    bootdir.mkdir(parents=True, exist_ok=True)
+    shadow_file = tmp_path / "shadow"
+    shadow_file.write_text(
+        "root:!:20000:0:99999:7:::\n"
+        + (shadow if shadow is not None
+           else "otp:$6$otpimgcheck$hashbytes:20000:0:99999:7:::\n"))
+    svc = tmp_path / "userconf-service"
+    if service is not None:
+        svc.write_text(service)
+        svc.chmod(0o755 if executable else 0o644)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "systemctl").write_text(SYSTEMCTL_STUB)
+    (bin_dir / "systemctl").chmod(0o755)
+
+    block = userconf_block()
+    for original, replacement, why in (
+        ("/etc/shadow", str(shadow_file), "the shadow file"),
+        ("/usr/lib/userconf-pi/userconf-service", str(svc), "the service"),
+        ("timeout -k 5 60", "timeout -k 1 2", "the experiment's bound"),
+        ("sleep 2", "sleep 0", "the condition poll"),
+    ):
+        assert block.count(original) == 1, f"{why}: {original!r} in the block"
+        block = block.replace(original, replacement)
+
+    runner = tmp_path / "userconf.sh"
+    runner.write_text(
+        "set -uo pipefail\n"
+        f'PHASE="{phase}"\nBOOTDIR="{bootdir}"\nPASS=0\nTOTAL=0\n'
+        + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
+        + block + '\nprintf "TOTALS %s/%s\\n" "$PASS" "$TOTAL"\n')
+    proc = subprocess.run(
+        ["bash", str(runner)], capture_output=True, text=True, timeout=120,
+        env={**os.environ, **(env or {}), "BOOTDIR": str(bootdir),
+             "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    return proc, bootdir
+
+
+HEALTHY_BOOT1 = {"UC_TS": "Sat 2026-08-15 10:00:00 UTC", "UC_COND": "yes",
+                 "UC_RESULT": "success", "UC_ACTIVE": "inactive",
+                 "UC_ENABLED": "enabled", "UC_STDIN": "null", "UC_JOBLINE": ""}
+HEALTHY_BOOT2 = {**HEALTHY_BOOT1, "UC_COND": "no", "UC_RESULT": ""}
+
+
+def results(proc) -> dict:
+    """The check lines the block printed, name -> PASS/FAIL."""
+    return {name: state for name, state in
+            re.findall(r"^OTP-CHECK \S+ (\S+) (PASS|FAIL)", proc.stdout, re.M)}
+
+
+def test_a_seeded_first_boot_reports_applied_credentials_and_no_wizard(tmp_path):
+    # The positive control for everything below: every other test here
+    # asserts a FAIL, and a block that failed unconditionally would satisfy
+    # all of them.
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1)
+    assert proc.returncode == 0, proc.stderr
+    assert results(proc) == {"userconf-seed-applied": "PASS",
+                             "userconf-seeded-boot-ran-no-wizard": "PASS"}, proc.stdout
+
+
+def test_a_wizard_still_holding_a_job_fails_the_first_boot(tmp_path):
+    """
+    Run 12's shape, stated as a check.
+
+    The wizard did not fail and did not refuse: it sat on a whiptail on tty8
+    that nobody could see, with its job holding multi-user.target open. The
+    unit is "activating" the whole time, which is also what a healthy unit
+    two seconds into starting looks like -- so the job queue is what is
+    asked.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env={
+        **HEALTHY_BOOT1, "UC_ACTIVE": "activating", "UC_RESULT": "",
+        "UC_JOBLINE": "42 userconfig.service start running\n"})
+    assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
+
+
+def test_a_seeded_boot_whose_wizard_never_ran_fails(tmp_path):
+    # The condition came out false with a seed sitting on the card: the
+    # drop-in's paths and the file the operator wrote disagree, or the unit
+    # was masked. The credentials are silently ignored either way.
+    proc, _ = run_userconf(tmp_path, phase="boot1",
+                           env={**HEALTHY_BOOT1, "UC_COND": "no"})
+    assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
+
+
+def test_a_wizard_that_failed_on_the_seed_fails_the_first_boot(tmp_path):
+    proc, _ = run_userconf(tmp_path, phase="boot1",
+                           env={**HEALTHY_BOOT1, "UC_RESULT": "exit-code",
+                                "UC_ACTIVE": "failed"})
+    assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
+
+
+def test_a_seed_deleted_without_being_applied_fails(tmp_path):
+    """
+    The gap the shadow check exists to close.
+
+    From the host the file is gone, which is exactly what success looks like.
+    A userconf-service that unlinked the seed without running chpasswd would
+    leave the operator with an account whose password is pi-gen's random
+    FIRST_USER_PASS -- a value nobody has -- and a green tier 3.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           shadow="otp:$6$rEaLsAlT$otherbytes:20000:0:99999:7:::\n")
+    assert results(proc)["userconf-seed-applied"] == "FAIL", proc.stdout
+
+
+def test_no_shadow_entry_at_all_fails(tmp_path):
+    # The account renamed out from under the seed, or never created.
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           shadow="pi:$6$otpimgcheck$hashbytes:20000::::::\n")
+    assert results(proc)["userconf-seed-applied"] == "FAIL", proc.stdout
+
+
+def test_an_unseeded_second_boot_is_quiet_and_leaves_evidence(tmp_path):
+    # The positive control for the boot2 half, and the healthy path: skipped
+    # but enabled, no prompt possible, and the malformed seed quarantined.
+    proc, bootdir = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2)
+    assert proc.returncode == 0, proc.stderr
+    assert results(proc) == {"userconf-unseeded-boot-skips-the-wizard": "PASS",
+                             "userconf-wizard-cannot-prompt": "PASS",
+                             "userconf-malformed-seed-fails-fast": "PASS"}, proc.stdout
+    assert (bootdir / "failed_userconf.txt").exists()
+    assert not (bootdir / "userconf.txt").exists()
+
+
+def test_a_masked_wizard_is_quiet_for_the_wrong_reason(tmp_path):
+    """
+    Quiet is not the property. Masking userconfig.service also stops the
+    prompt -- an earlier fix did exactly that -- and it silently discards
+    every credential an operator ever writes to userconf.txt, because that
+    unit is the file's only consumer. With no SSH and no network, the tty2
+    recovery getty is then a login nobody can pass.
+    """
+    for state in ("masked", "disabled"):
+        proc, _ = run_userconf(tmp_path / state, phase="boot2",
+                               env={**HEALTHY_BOOT2, "UC_ENABLED": state})
+        assert results(proc)["userconf-unseeded-boot-skips-the-wizard"] == "FAIL", \
+            proc.stdout
+
+
+def test_a_condition_systemd_never_evaluated_is_not_a_skip(tmp_path):
+    # An empty ConditionTimestamp is "systemd has not looked at this unit",
+    # which is what a probe that ran too early sees -- and it is
+    # indistinguishable from a skip in every other field.
+    proc, _ = run_userconf(tmp_path, phase="boot2",
+                           env={**HEALTHY_BOOT2, "UC_TS": ""})
+    assert results(proc)["userconf-unseeded-boot-skips-the-wizard"] == "FAIL", proc.stdout
+
+
+def test_a_wizard_that_can_still_reach_a_tty_fails(tmp_path):
+    # The drop-in gone, or overridden by another one: the stock unit's
+    # StandardInput=tty is back and a malformed seed is a hang again.
+    proc, _ = run_userconf(tmp_path, phase="boot2",
+                           env={**HEALTHY_BOOT2, "UC_STDIN": "tty"})
+    assert results(proc)["userconf-wizard-cannot-prompt"] == "FAIL", proc.stdout
+
+
+def test_a_malformed_seed_that_hangs_fails_instead_of_timing_the_boot_out(tmp_path):
+    """
+    The failure this experiment exists for. A userconf-service that blocks --
+    a whiptail that found a terminal after all, a read on a stdin that is not
+    really closed -- holds multi-user.target open on a device forever. Here it
+    is bounded and reported: the probe kills it and says rc=124.
+    """
+    proc, bootdir = run_userconf(
+        tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+        service="#!/bin/sh\nsleep 30\n")
+    assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
+    assert "rc=124" in proc.stdout, proc.stdout
+    # And the probe carried on to report, rather than being the hang itself.
+    assert "TOTALS" in proc.stdout, proc.stdout
+
+
+def test_a_malformed_seed_that_leaves_no_evidence_fails(tmp_path):
+    # It ended, and it took the operator's file with it. failed_userconf.txt
+    # is the only thing that tells them why they have no login.
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+                           service='#!/bin/sh\nrm -f "$BOOTDIR/userconf.txt"\nexit 1\n')
+    assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
+
+
+def test_a_seed_left_in_place_by_the_service_fails(tmp_path):
+    # Quarantine means moved: a card that still holds the bad line prompts on
+    # every boot from here on.
+    proc, _ = run_userconf(
+        tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+        service='#!/bin/sh\ncp "$BOOTDIR/userconf.txt" "$BOOTDIR/failed_userconf.txt"\nexit 1\n')
+    assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
+
+
+def test_an_image_without_userconf_pi_fails_rather_than_passing_silently(tmp_path):
+    """
+    An absent userconf-service is not a pass.
+
+    Nothing would have been written, nothing would have failed, and both
+    "userconf.txt is gone" and "the boot did not hang" would be true -- of an
+    image on which the documented credential mechanism does not exist at all.
+    """
+    proc, bootdir = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+                                 service=None)
+    assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
+    assert "rc=none" in proc.stdout, proc.stdout
+    # And nothing was planted on a card whose machine cannot consume it.
+    assert not (bootdir / "userconf.txt").exists()
+
+    # The other way it goes missing: present, and not runnable.
+    proc, _ = run_userconf(tmp_path / "not-executable", phase="boot2",
+                           env=HEALTHY_BOOT2, executable=False)
+    assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
+
+
 def test_the_probe_is_given_longer_than_its_own_bounded_wait(tmp_path):
     """
     systemd's default TimeoutStartSec is 90s and the probe's own poll for
