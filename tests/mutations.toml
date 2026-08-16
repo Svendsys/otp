@@ -614,15 +614,36 @@ half the evidence, and image.yml puts the two-boot claim in the body of a
 tagged release."""
 tests = [
   "tests/test_img_verdict.py::test_a_phase_list_without_boot2_is_refused",
+  "tests/test_img_verdict.py::test_a_phase_list_without_boot1_is_refused_too",
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
-find = '''case " $PHASES " in
-    *" boot2 "*) ;;
-    *)'''
-replace = '''case " $PHASES " in
-    *) ;;
-    *)'''
+find = '''        *) PHASES_MISSING="$PHASES_MISSING $want" ;;'''
+replace = '''        *) : ;;'''
+
+
+[[mutation]]
+name = "tier3-boot1-not-required"
+tier = "fast"
+guard = """
+The seed is mcopy'd onto the card with no phase test around it -- deliberately,
+because the FAT listing taken before boot1 is the only vantage point the
+credential path can be observed from. So a phase list of just boot2 was
+ACCEPTED and booted a SEEDED card into the checks that assume an unseeded one:
+nothing has consumed the seed, the wizard's condition is true, and
+userconf-unseeded-boot-skips-the-wizard goes red over a card the harness set
+up that way itself. A debugging switch whose one-boot setting produces a red
+with no relation to the image is one people learn to distrust the harness
+over."""
+tests = [
+  "tests/test_img_verdict.py::test_a_phase_list_without_boot1_is_refused_too",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''PHASES_MISSING=""
+for want in boot1 boot2; do'''
+replace = '''PHASES_MISSING=""
+for want in boot2; do'''
 
 
 [[mutation]]

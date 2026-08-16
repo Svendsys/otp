@@ -204,7 +204,7 @@ def phase_list_block() -> str:
     text = IMG_BOOT.read_text()
     assert PHASES_ASSIGNMENT in text, f"{IMG_BOOT} no longer sets PHASES"
     start = text.index(PHASES_ASSIGNMENT)
-    end = text.index("\nesac", start) + len("\nesac")
+    end = text.index("\n    exit 1\nfi", start) + len("\n    exit 1\nfi")
     return text[start:end]
 
 
@@ -234,6 +234,13 @@ def test_an_empty_phase_list_falls_back_to_the_default(tmp_path):
     assert "PHASES=boot1 boot2" in proc.stdout, proc.stdout
 
 
+def phases_refused(proc) -> list:
+    """The phases the guard named as missing, off its first line."""
+    head = proc.stderr.splitlines()[0]
+    assert "leaves out:" in head, proc.stderr
+    return head.split("leaves out:")[1].split()
+
+
 def test_a_phase_list_without_boot2_is_refused(tmp_path):
     """
     OTP_IMG_PHASES drives the boot loop, the verdict loop and the set of
@@ -247,14 +254,40 @@ def test_a_phase_list_without_boot2_is_refused(tmp_path):
     for phases in ("boot1", "boot1 boot3", "noboot2", "boot22"):
         proc = run_phase_list(tmp_path, phases)
         assert proc.returncode != 0, f"{phases!r} was accepted"
-        assert "leaves out boot2" in proc.stderr, proc.stderr
+        assert "boot2" in phases_refused(proc), proc.stderr
         assert "PHASES=" not in proc.stdout, proc.stdout
 
 
-def test_a_phase_list_that_keeps_boot2_is_accepted(tmp_path):
+def test_a_phase_list_without_boot1_is_refused_too(tmp_path):
+    """
+    The half that was missing, and it fails in the confusing direction.
+
+    The seed is mcopy'd onto the card unconditionally -- no phase test
+    guards it, deliberately, because the FAT listing taken before boot1 is
+    the only vantage point the credential path can be observed from. So
+    PHASES="boot2" was ACCEPTED and booted a seeded card straight into the
+    checks that assume an unseeded one: nothing has consumed the seed, the
+    wizard's condition is true, and userconf-unseeded-boot-skips-the-wizard
+    goes red over a card the harness set up that way itself.
+
+    A debugging switch whose one-boot setting produces a red with no
+    relation to the image is one people learn to distrust the harness over.
+    """
+    for phases in ("boot2", "boot2 boot3", "boot2 boot2"):
+        proc = run_phase_list(tmp_path, phases)
+        assert proc.returncode != 0, f"{phases!r} was accepted"
+        assert "boot1" in phases_refused(proc), proc.stderr
+        assert "PHASES=" not in proc.stdout, proc.stdout
+    # And the reason is stated, not just the name: the next person to try
+    # this has to be told the card is seeded whatever they asked for.
+    proc = run_phase_list(tmp_path, "boot2")
+    assert "seeded" in proc.stderr, proc.stderr
+
+
+def test_a_phase_list_that_keeps_both_boots_is_accepted(tmp_path):
     # The positive control: a guard that refused everything would satisfy
-    # the test above.
-    for phases in ("boot1 boot2", "boot2"):
+    # the two tests above.
+    for phases in ("boot1 boot2", "boot1 boot2 boot3"):
         proc = run_phase_list(tmp_path, phases)
         assert proc.returncode == 0, proc.stderr
         assert f"PHASES={phases}" in proc.stdout, proc.stdout

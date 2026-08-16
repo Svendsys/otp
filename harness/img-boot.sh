@@ -262,7 +262,7 @@ ESC=$(printf '\033')
 # not" says anything: a fresh copy of the image would answer both questions
 # with the image build's own contents.
 PHASES="${OTP_IMG_PHASES:-boot1 boot2}"
-# AND BOOT2 IS NOT OPTIONAL. This variable exists so a run debugging the
+# AND NEITHER BOOT IS OPTIONAL. This variable exists so a run debugging the
 # boot itself can stop after one, and nothing used to stop it dropping the
 # second -- the same list drives the boot loop, the verdict loop and the set
 # of guest checks demanded of each phase, so removing boot2 removes the two
@@ -273,19 +273,38 @@ PHASES="${OTP_IMG_PHASES:-boot1 boot2}"
 # image.yml attaches to the tag says a file written to / in the first boot
 # was gone in the second. Halving the CI time must cost a red run, not a
 # true-looking sentence in someone's release body.
-case " $PHASES " in
-    *" boot2 "*) ;;
-    *)
-        echo "ERROR: OTP_IMG_PHASES='$PHASES' leaves out boot2." >&2
-        echo "       The power-cycle is what this tier exists for: the" >&2
-        echo "       sentinel written to / in boot1 has to be GONE and the" >&2
-        echo "       setting written to /boot/firmware has to still be" >&2
-        echo "       there, and only a second boot of the same card can" >&2
-        echo "       say either. A one-boot run proves neither and must" >&2
-        echo "       not be able to pass this gate." >&2
-        exit 1
-        ;;
-esac
+#
+# BOOT1 IS DEMANDED TOO, and it was not, which is the newer half. The seed
+# is mcopy'd onto the card unconditionally below -- there is no phase test
+# around it, deliberately, because the listing taken before boot1 is the only
+# vantage point the credential path can be observed from. So PHASES="boot2"
+# was accepted and booted a SEEDED card straight into the unseeded checks:
+# userconf-unseeded-boot-skips-the-wizard reads a condition that is TRUE
+# because nothing has consumed the seed yet, and the run goes red for a
+# reason that has nothing to do with the image. A debugging switch whose
+# one-boot setting produces a confusing red is a switch people learn to
+# distrust the harness over. Both phases, or say which one is missing.
+PHASES_MISSING=""
+for want in boot1 boot2; do
+    case " $PHASES " in
+        *" $want "*) ;;
+        *) PHASES_MISSING="$PHASES_MISSING $want" ;;
+    esac
+done
+if [ -n "$PHASES_MISSING" ]; then
+    echo "ERROR: OTP_IMG_PHASES='$PHASES' leaves out:$PHASES_MISSING" >&2
+    echo "       boot1 is the seeded boot. The credential file is copied" >&2
+    echo "       onto the card whatever the phase list says, so a run" >&2
+    echo "       without boot1 hands a seeded card to the checks that" >&2
+    echo "       expect an unseeded one and fails for the wrong reason." >&2
+    echo "       boot2 is the power-cycle, which is what this tier exists" >&2
+    echo "       for: the sentinel written to / in boot1 has to be GONE" >&2
+    echo "       and the setting written to /boot/firmware has to still be" >&2
+    echo "       there, and only a second boot of the same card can say" >&2
+    echo "       either. A one-boot run proves neither and must not be" >&2
+    echo "       able to pass this gate." >&2
+    exit 1
+fi
 
 log() { printf '\n== %s\n' "$*" >&2; }
 

@@ -259,9 +259,9 @@ def test_the_release_notes_two_boot_claim_is_backed_by_the_harness():
     body = step_named(build_steps(), ATTACH)["with"]["body"]
     assert "twice" in body, body
     harness = (REPO / "harness" / "img-boot.sh").read_text()
-    assert "leaves out boot2" in harness, \
-        ("img-boot.sh no longer refuses a phase list without boot2, so the "
-         "release note's two-boot claim is no longer backed by anything")
+    assert "leaves out:$PHASES_MISSING" in harness, \
+        ("img-boot.sh no longer refuses a phase list that drops a boot, so "
+         "the release note's two-boot claim is no longer backed by anything")
     phases = (step_named(build_steps(), BOOT).get("env") or {}).get("OTP_IMG_PHASES")
     if phases is not None:
         for boot in ("boot1", "boot2"):
