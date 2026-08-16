@@ -163,8 +163,10 @@ Runs in CI as the `hardware` job.
 `./harness/vm-check.sh`, or the `vm` job in CI.
 
 The riskiest untested change in the repository is `otp-unit.service`
-binding `tty1` — `StandardInput=tty-force`, `TTYPath=/dev/tty1`,
-`Conflicts=getty@tty1.service`. If that is wrong the unit restart-loops
+binding `tty1` — `StandardInput=tty-force`, `TTYPath=/dev/tty1`, and a
+getty that `install.sh` conditions off that tty instead of conflicting
+with it (issue #20 — see tier 3 below for why the conflict had to go).
+If that is wrong the unit restart-loops
 instead of starting, and **nothing else will say so**: pi-gen never boots
 the image it builds, a container has no virtual terminals at all, and the
 unit tests substitute systemd entirely.
@@ -173,7 +175,8 @@ So this boots a Debian 13 cloud image, runs `device/install.sh` on it, and
 asks the questions only a booted system can answer:
 
 - is `otp-unit.service` active, and has it restarted more than once?
-- did `Conflicts=` actually stop `getty@tty1`?
+- is `getty@tty1` off the panel's tty — conditioned off for every boot,
+  and stopped on the live machine `install.sh` just provisioned?
 - is the unit's main process really holding `/dev/tty1`?
 - is a login prompt still reachable on tty2?
 - is swap off, is the journal volatile, are core dumps disabled?
@@ -295,8 +298,12 @@ naming a device this DTB doesn't have (`ttyAMA1`, not `ttyAMA0` — six
 runs diagnosed a "freeze" that was a dead console), and Raspberry Pi
 OS's first-boot wizard holding `multi-user.target` open forever — a
 real bug that would have shipped to hardware, now handled by a
-systemd drop-in in `install.sh`. The harness stops the emulator the
-moment the guest reports done and judges the boot on ANSI-stripped
+systemd drop-in in `install.sh`. Run 17 found two more of that kind:
+an unbounded wait for a network the appliance does not have holding
+`multi-user.target` open on every boot, and the credential path
+stopping the front panel as its last act. Both are `install.sh` fixes
+with checks on the booted image, below. The harness stops the emulator
+the moment the guest reports done and judges the boot on ANSI-stripped
 console evidence, not qemu's exit code. The full fifteen-run narrative
 lives in `img-boot.sh`'s header and issue #17.
 
@@ -311,8 +318,8 @@ different mechanism, and pi-gen never boots what it builds.
 
 | Phase | What is true of it |
 |---|---|
-| `boot1` | The overlay is engaged. Writes a sentinel to `/` and a setting to `/boot/firmware` through `config.save()`. |
-| `boot2` | The **same card image**, booted again. The sentinel must be gone; the setting must still be there. |
+| `boot1` | The overlay is engaged. Writes a sentinel to `/` and a setting to `/boot/firmware` through `config.save()`. Goes in with a valid `userconf.txt` seeded into the FAT partition, which has to be consumed. |
+| `boot2` | The **same card image**, booted again. The sentinel must be gone; the setting must still be there; the consumed seed must still be consumed. |
 
 One image file across both boots is the whole mechanism: a write that
 reached the card is there in boot 2 and a write that only reached the
@@ -325,6 +332,15 @@ reaching ~150s guest time with one kernel entry, and both ANSI-stripped
 consoles carrying `random: crng init done` and `bcm2835-rng 3f104000.rng:
 hwrng registered`. Measured cost on a cache miss: 6m58s of pi-gen, then
 7m59s for the pair of boots, 16m16s for the whole job.
+
+Those two totals are run 16's and stay run 16's. The credential checks
+below added three names to what boot 1 must report and three to boot 2, and
+one more — the network wait — to both, so a green run now counts
+differently: 13 in boot 1 and 15 in boot 2. Run 17 measured 9/11 and 13/14
+against the counts as they stood then, which is a different arithmetic
+again; the numbers move with the list and only the list is authoritative.
+The cost is unchanged: no extra boot, and the one bounded experiment inside
+boot 2 is capped at 60 seconds.
 
 **`OTP_IMG_PHASES` picks the boots, and it may not drop `boot2`.** It
 defaults to `boot1 boot2`; a run debugging the boot itself can shorten it,
@@ -340,6 +356,115 @@ on a read-only overlay"*, and `image.yml` puts that claim, in its own
 words, into the body of a tagged release. The concluding line is now
 conditional on the phases that actually ran as well, so the two guards
 have to fail together for the claim to be wrong.
+
+### The seeded `userconf.txt`, which is the other thing a first boot does
+
+Issue #20. The wizard that held run 12's boot open is also the only consumer
+of Raspberry Pi OS's documented headless credential file: an operator writes
+`name:crypted-password` into `/boot/firmware/userconf.txt`, and the first
+boot applies it non-interactively and deletes it. That is why `install.sh`
+replaced the mask with a `ConditionPathExists` drop-in rather than turning
+the unit off. Every run up to #32 exercised only the branch where nobody had
+written one — no seed, no wizard, boot green — so the two branches an
+operator actually meets rode along with the two boots that already existed:
+
+| Branch | Where | What has to be true |
+|---|---|---|
+| seeded | `boot1` | The seed reaches the card (checked *before* the boot), is gone afterwards with no `failed_userconf.txt` beside it, its hash is in `/etc/shadow`, `userconfig.service` finished successfully holding no job, and the front panel still owns tty1 afterwards. |
+| unseeded | `boot2` | The delete stuck — the FAT partition is outside the overlay — so the condition is false and the unit is skipped **while staying enabled**. |
+| malformed | `boot2` | The shipped `userconf-service`, handed a bad seed with stdin closed and no `TERM`, terminates inside a 60s bound and leaves `failed_userconf.txt` with no `userconf.txt` behind it. |
+
+### Run 17 (31968966879): the first seeded boot, and what it found
+
+Every credential check failed, in both boots, and the image was what was
+wrong. The guest reported `condition=no result=success is-active=inactive
+jobs=1` in boot 1 and `condition=no checked-at='never'` in boot 2, with
+`userconf-seed-planted PASS` beside them: the seed reached the card and
+nothing on the machine ever looked at it. A **queued start job** with the
+condition never evaluated is not a skip, and the consoles say what it was
+queued behind — both of them end on
+
+```
+Job systemd-networkd-wait-online.service/start running (2min 37s / no limit)
+```
+
+with `multi-user.target` never reached in either boot. That unit is
+`TimeoutStartSec=infinity` on an appliance whose links NetworkManager owns,
+so it blocks `network-online.target`, which blocks cloud-init's
+`cloud-config.service`, which stock `userconfig.service` is ordered after.
+**Every unit this image would have produced ignored the operator's
+`userconf.txt` in silence** — the outcome `install.sh` replaced a mask to
+avoid, arriving through the ordering instead of the condition.
+`install.sh` masks the wait and switches cloud-init off, and the probe reads
+the mask back with its job queue rather than trusting the line that wrote it.
+
+The apply's own tail came out of the same reading. It ends in
+`/usr/lib/userconf-pi/userconf` → `cancel-rename` → `systemctl --no-block
+start getty@tty1`, and `otp-unit.service` carried
+`Conflicts=getty@tty1.service`: setting a password the documented way would
+have **stopped the print unit** until the next power-cycle. A condition on
+the getty replaces the conflict — masking it would fail that start, and
+`userconf-service` runs under `sh -e`, so it would die before deleting the
+applied seed and `Restart=on-failure` would loop it.
+
+The same run settled the one question the malformed-seed experiment was
+uncertain about: whiptail with no `TERM` **fails** rather than blocking —
+`rc=1 ... TERM environment variable needs set.` — so the fail-fast is real
+and the 60s bound was never reached.
+
+### Run 18 (31972140190): the image was fixed, and the probe was not
+
+With both blockers gone the boot changed shape completely: **`multi-user.target`
+reached in both boots**, `network-online.target` with it, boot 1 at 12/13 and
+boot 2 at **15/15**. The credential path did every documented thing —
+`Finished userconfig.service - User configuration dialog.` on the console,
+`userconf-seed-applied PASS ... begins $6$otpimgcheck$: yes`,
+`userconf-seed-consumed PASS` off the card, and
+`front-panel-survives-the-credential-apply PASS otp-unit=active
+getty@tty1=inactive`.
+
+The one red was the probe measuring a unit that no longer exists. A
+successful apply ends in `cancel-rename`, which runs `systemctl disable
+userconfig` and a daemon-reload; the oneshot is inactive and unreferenced by
+then, so **systemd garbage-collects it**, and every property a later
+`systemctl show` returns is a pristine default:
+
+```
+OTP-CHECK boot1 userconf-seeded-boot-ran-no-wizard FAIL
+  condition=no result=success is-active=inactive jobs=0
+```
+
+— on the boot whose console says the unit finished. The 120s settle poll
+spent all of itself waiting for a `ConditionTimestamp` that had been
+collected with the unit, which is why boot 1 took 307s of guest time. The
+check now reads systemd's own **log** for the unit (`Finished
+userconfig.service`, and no `Failed with result` / `Scheduled restart job` /
+`was skipped`), which outlives the unit object and says more than
+`ConditionResult=yes` ever did: not "systemd let it start" but "it ran to
+completion, once, cleanly".
+
+Three details worth knowing about that last row. It is run **by hand from
+the probe** rather than left on the card for the unit to find at boot,
+because the stock `userconfig.service` carries `Restart=on-failure`: a boot
+that met a malformed seed would print `Failed with result` and `Scheduled
+restart job`, two of the strings `img-boot.sh` fails a release on, and
+weakening a release gate to accommodate a fault the harness injected itself
+is the wrong trade. What the unit contributes to the fail-fast,
+`StandardInput=null`, is instead read back off the running machine with
+`systemctl show`. And what is *gated* is that it ended and left the
+evidence; the exit status is reported rather than gated, because the failure
+that hurts on a device is a script that never returns.
+
+The seed names the image's own first user (`FIRST_USER_NAME=otp`) on
+purpose: `/usr/lib/userconf-pi/userconf` renames the UID-1000 account when
+the seed names a different one, and that is a much larger experiment than
+"were the credentials applied". Its hash is sha512-crypt with a fixed salt,
+generated with `openssl passwd -6 -salt otpimgcheck` and verified against
+glibc's `crypt(3)`; pi-gen salts `FIRST_USER_PASS` randomly, so that salt
+appearing in a shadow entry can only have come from the seed. It never
+reaches a shipped image — `img-boot.sh` writes it into the decompressed
+working copy it boots, and `image/deploy/*.img.xz` is never opened for
+writing.
 
 The other variables: `OTP_IMG_TIMEOUT` is the per-boot backstop in seconds
 (CI sets 600; the local default is 1200 because someone running this by
@@ -383,8 +508,13 @@ to fail loudly without costing anything, and the verdict is written to the
 run's step summary as well as the log.
 
 The image build also now runs on any pull request touching `image/**`,
-`device/**`, `harness/img-boot.sh` or the workflow itself. Before that,
-nothing checked the image on the PR that broke it.
+`device/**`, `harness/img-boot.sh`, `harness/img-guest-check.sh` or the
+workflow itself. Before that, nothing checked the image on the PR that broke
+it. The probe is in that list, and in the cache key, because it **runs
+inside the image**: the pi-gen stage copies `harness/` into the rootfs and
+`install.sh` installs it to `/opt/otp-unit`. While it was in neither, a pull
+request that changed only a guest check ran no image job at all, and a run
+that did would have restored an image built before the edit.
 
 It answers the questions nothing else can: **does the thing that gets
 flashed to a card actually boot, and does it boot the way it is supposed

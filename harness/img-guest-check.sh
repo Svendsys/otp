@@ -274,6 +274,274 @@ check setting-saved-to-the-boot-partition \
       "$(if [ "${SAVED#*save=True}" != "$SAVED" ]; then echo yes; else echo no; fi)" \
       "$SAVED"
 
+# --- the seeded userconf.txt path -----------------------------------------
+
+# WHY THIS IS HERE. Issue #18 replaced a mask on userconfig.service with a
+# ConditionPathExists drop-in so that the documented headless credential file
+# keeps working, and until issue #20 only the branch where nobody ever wrote
+# one had been exercised: no seed, no wizard, boot green. The harness plants a
+# real seed in the boot partition before boot1; what follows is the machine's
+# side of it.
+#
+# The account the seed names and the salt its hash carries. The hash itself
+# stays in harness/img-boot.sh, which is not installed on a unit; only this
+# marker travels here, and a salt is a comparison string rather than a
+# credential. tests/test_img_verdict.py holds the two files against each other
+# and against image/build.sh's FIRST_USER_NAME.
+USERCONF_USER=otp
+# shellcheck disable=SC2016  # the $ signs are crypt(3) field separators
+USERCONF_SALT='$6$otpimgcheck$'
+USERCONF_SERVICE=/usr/lib/userconf-pi/userconf-service
+
+# POLLED UNTIL SYSTEMD HAS DEALT WITH THE UNIT, not for a fixed few seconds.
+# Nothing orders this probe after userconfig.service -- the two run in the
+# same stretch of a boot -- and "systemd has not looked at it yet" and
+# "systemd looked and skipped it" are the same two empty fields from here.
+# Reading the first as the second passes on exactly the boot run 12 died on.
+#
+# SETTLED means both halves: a condition timestamp says systemd evaluated the
+# unit, and an empty job queue says it is not still waiting to. A JOB is what
+# held run 12's boot open (a whiptail nobody could see, with
+# multi-user.target waiting on the job) and it is what run 31968966879 found
+# again for a different reason -- a unit whose ExecStart has not been reached
+# reads `inactive` in every other field systemd offers.
+#
+# 120 seconds, against a 30-second wait that was not enough: in run
+# 31968966879 the wait expired, the probe reported `condition=no jobs=1`, and
+# the job was queued behind a network wait that was never going to return.
+# That diagnosis came out of the fields printed below, so the timeout still
+# reports rather than aborting -- it is longer now, not softer.
+#
+# THE JOURNAL IS ONE OF THE TWO SIGNALS, and it has to be, because on a
+# SEEDED boot the machine destroys the other one at exactly the moment of
+# interest. The apply ends in cancel-rename, which runs `systemctl disable
+# userconfig` and a daemon-reload; the oneshot is by then inactive and
+# nothing references it, so systemd garbage-collects the unit and every
+# property below comes back a pristine default. Run 31972140190 measured
+# that: `condition=no result=success is-active=inactive jobs=0` for a unit
+# whose own console says `Finished userconfig.service - User configuration
+# dialog.`, with the seeded hash in the shadow file and the seed gone from
+# the card --
+# and the poll spent its whole 120 seconds waiting for a timestamp that had
+# been collected along with the unit. Log entries outlive unit objects.
+#
+# TWO NARROWINGS ON THE READ, both of them one config line away from
+# mattering:
+#
+#   -b, THIS BOOT. `journalctl -u` with no boot filter answers out of every
+#   boot the journal still holds. That is harmless only because
+#   device/install.sh sets Storage=volatile in journald.conf.d -- delete that
+#   one line and a PREVIOUS boot's `Finished userconfig.service` satisfies a
+#   boot on which the unit never ran at all, which is precisely the reading
+#   this whole block exists to make impossible. A probe must not depend for
+#   its correctness on a setting three hundred lines away in another file.
+#
+#   systemd[1], NOT just the phrase. `journalctl -u` returns the unit's own
+#   STDOUT as well as PID 1's status lines about it -- that is what
+#   StandardOutput=journal means -- so a userconf-service that merely PRINTED
+#   "Finished userconfig.service" passed this check. Demonstrated with a
+#   synthetic journal. `Finished` is systemd's own success line and only
+#   systemd may say it, so the match carries the speaker: no other process on
+#   the machine writes with the identifier systemd and PID 1.
+#
+# The needle is quoted inside the ${#} patterns below. Unquoted, `[1]` is a
+# glob character class and the match would also accept `systemd1: Finished`.
+UC_DONE='systemd[1]: Finished userconfig.service'
+UC_COND_TS=""
+UC_JOBS=1
+UC_LOG=""
+for _ in $(seq 1 60); do
+    UC_COND_TS=$(systemctl show userconfig.service -p ConditionTimestamp --value 2>/dev/null)
+    UC_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -c "userconfig\.service" || true)
+    UC_LOG=$(journalctl -b -u userconfig.service --no-pager 2>/dev/null | tr '\n' ' ')
+    if [ "${UC_JOBS:-1}" = 0 ] \
+       && { [ -n "$UC_COND_TS" ] || [ "${UC_LOG#*"$UC_DONE"}" != "$UC_LOG" ]; }
+    then break; fi
+    sleep 2
+done
+UC_COND=$(systemctl show userconfig.service -p ConditionResult --value 2>/dev/null)
+UC_RESULT=$(systemctl show userconfig.service -p Result --value 2>/dev/null)
+UC_STDIN=$(systemctl show userconfig.service -p StandardInput --value 2>/dev/null)
+UC_ACTIVE=$(systemctl is-active userconfig.service 2>&1 || true)
+UC_ENABLED=$(systemctl is-enabled userconfig.service 2>&1 || true)
+
+# --- what the wizard's job was waiting for --------------------------------
+
+# THE JOB THAT WAS NEVER GOING TO FINISH, asked about directly. Stock
+# systemd-networkd-wait-online.service carries TimeoutStartSec=infinity, and
+# on this appliance -- NetworkManager owns the link, networkd configures
+# nothing -- it never returns. In run 31968966879 both boots ended with that
+# job still running ("no limit"), network-online.target never reached,
+# cloud-init's config stage never run, and userconfig.service queued behind
+# it: the seeded credential file came off the card untouched. device/install.sh
+# masks it and switches cloud-init off; this reads the first back off the
+# running machine and looks for its job in the queue, because a mask that
+# reached the image and a boot that is not waiting on it are different
+# claims.
+NETWAIT=systemd-networkd-wait-online.service
+NETWAIT_ENABLED=$(systemctl is-enabled "$NETWAIT" 2>&1 || true)
+NETWAIT_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -cF "$NETWAIT" || true)
+check network-wait-cannot-hold-the-boot-open \
+      "$(if [ "$NETWAIT_ENABLED" = masked ] && [ "${NETWAIT_JOBS:-1}" = 0 ]; \
+         then echo yes; else echo no; fi)" \
+      "$NETWAIT is-enabled=$NETWAIT_ENABLED jobs=${NETWAIT_JOBS:-?}"
+
+if [ "$PHASE" = "boot1" ]; then
+    # APPLIED, not merely deleted. From outside, the harness can watch the
+    # file vanish from the FAT partition; only the machine can say the
+    # credentials in it were put anywhere, and a userconf-service that
+    # deleted the seed without applying it would look identical from there.
+    # pi-gen hashes FIRST_USER_PASS with a random salt, so this marker in the
+    # shadow entry can only have come from the seed. The entry itself is
+    # never printed: this console is uploaded as a CI artifact.
+    UC_SHADOW=$(awk -F: -v u="$USERCONF_USER" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
+    UC_APPLIED=no
+    if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; then
+        UC_APPLIED=yes
+    fi
+    check userconf-seed-applied "$UC_APPLIED" \
+          "${USERCONF_USER}'s shadow entry (${#UC_SHADOW} chars) begins $USERCONF_SALT: $UC_APPLIED"
+
+    # NO WIZARD, which is the clause issue #20 is written around. A seeded
+    # boot must take the non-interactive path: the oneshot RAN and FINISHED
+    # successfully, nothing skipped or failed it, and it has left no job of
+    # its own in the queue holding multi-user.target open.
+    #
+    # READ OFF THE LOG, not off the unit, and that is a strengthening rather
+    # than a softening. `ConditionResult=yes` said only that systemd let the
+    # unit start; `systemd[1]: Finished userconfig.service` is systemd's own
+    # success line and a unit that was skipped, that is still running, or
+    # that failed never prints it. It is also the only one of the two that
+    # still exists after the apply: see the poll above for what
+    # cancel-rename's `systemctl disable` plus a daemon-reload do to the unit
+    # object, measured in run 31972140190. ConditionResult is still REPORTED,
+    # so a future reader can see the collected-unit default for what it is.
+    #
+    # WITH THE SPEAKER, and out of THIS boot: $UC_DONE and the `-b` on the
+    # read carry both narrowings, and the poll above says why each is there.
+    UC_TROUBLE=no
+    case "$UC_LOG" in
+        *"Failed with result"*|*"Failed to start"*|*"Scheduled restart job"*|\
+        *"was skipped"*|*"skipped, unmet condition"*) UC_TROUBLE=yes ;;
+    esac
+    # The trouble strings above are deliberately NOT speaker-scoped: a
+    # userconf-service that printed one of them on its own stdout is a boot
+    # worth failing either way, and that is the safe direction. "Finished" is
+    # the clause that has to be earned.
+    UC_FINISHED=no
+    if [ "${UC_LOG#*"$UC_DONE"}" != "$UC_LOG" ]; then
+        UC_FINISHED=yes
+    fi
+    check userconf-seeded-boot-ran-no-wizard \
+          "$(if [ "$UC_FINISHED" = yes ] && [ "$UC_TROUBLE" = no ] \
+                && [ "$UC_ACTIVE" = inactive ] && [ "${UC_JOBS:-1}" = 0 ]; \
+             then echo yes; else echo no; fi)" \
+          "journal-finished=$UC_FINISHED trouble=$UC_TROUBLE is-active=$UC_ACTIVE jobs=${UC_JOBS:-?} condition=${UC_COND:-?} result=${UC_RESULT:-?}"
+
+    # AND THE PANEL IS STILL THERE AFTERWARDS, which is the half nobody was
+    # looking at. Applying a seed ends in userconf-pi's cancel-rename, and
+    # cancel-rename starts a getty on tty1 -- the tty otp-unit.service holds
+    # as its front panel. While that unit carried Conflicts=getty@tty1.service
+    # the start stopped it, so setting a password the documented way took the
+    # print unit down until the next power-cycle. device/install.sh answers
+    # that with a condition on the getty; both halves are read here, after
+    # the apply and in the only boot that performs one.
+    #
+    # `unit-active` above cannot stand in for this: it runs before the seed
+    # is applied and passes on a machine the apply is about to take down.
+    PANEL=$(systemctl is-active otp-unit.service 2>&1 || true)
+    TTY1=$(systemctl is-active getty@tty1.service 2>&1 || true)
+    TTY1_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -cF "getty@tty1.service" || true)
+    check front-panel-survives-the-credential-apply \
+          "$(if [ "$PANEL" = active ] && [ "$TTY1" != active ] \
+                && [ "${TTY1_JOBS:-1}" = 0 ]; then echo yes; else echo no; fi)" \
+          "otp-unit=$PANEL getty@tty1=$TTY1 getty-jobs=${TTY1_JOBS:-?}"
+fi
+
+if [ "$PHASE" = "boot2" ]; then
+    # THE UNSEEDED BRANCH, which is every boot a unit does after its first.
+    # The delete boot1's wizard made stuck, because the FAT partition is
+    # outside the overlay, so the condition is false here and the unit is
+    # skipped -- instantly, with no prompt.
+    #
+    # `enabled` is asserted in the same breath, and it is the half that is
+    # easy to lose. Masking or disabling the unit would also make it quiet,
+    # and it is the ONLY consumer of userconf.txt: a quiet-by-masking image
+    # ignores an operator's credentials in silence and leaves the tty2
+    # recovery getty with no knowable login. That is the trade
+    # device/install.sh's comment refuses, stated as a check.
+    #
+    # `condition=no` IS THE NAMED PROPERTY, and until run 19 nothing tested
+    # it: no boot2 fixture ever set the condition true, so deleting that
+    # clause left the suite green and this check went on being believed for
+    # the one thing its name promises. What a true condition on boot2 means
+    # is that the seed OUTLIVED the boot that consumed it -- the delete
+    # failed, or the operator's file is still on the FAT partition -- so the
+    # wizard is armed on this boot and every boot after it, with an
+    # operator's credential line still readable on a partition any reader can
+    # mount. `skipped` and `enabled` do not imply each other and neither
+    # implies this; all three are asserted.
+    check userconf-unseeded-boot-skips-the-wizard \
+          "$(if [ "$UC_COND" = no ] && [ -n "$UC_COND_TS" ] \
+                && [ "$UC_ACTIVE" = inactive ] && [ "$UC_ENABLED" = enabled ]; \
+             then echo yes; else echo no; fi)" \
+          "condition=${UC_COND:-?} checked-at='${UC_COND_TS:-never}' is-active=$UC_ACTIVE is-enabled=$UC_ENABLED"
+
+    # StandardInput=null, read back off the running machine rather than out
+    # of the file install.sh wrote. It is the whole of the fail-fast: with a
+    # tty a malformed seed becomes a whiptail nobody can answer, which is how
+    # run 12's boot was held open. This says the drop-in reached the image,
+    # parsed, and is in effect on the unit.
+    check userconf-wizard-cannot-prompt \
+          "$(if [ "$UC_STDIN" = null ]; then echo yes; else echo no; fi)" \
+          "StandardInput=${UC_STDIN:-unset}"
+
+    # THE MALFORMED SEED, run by hand and not left on the card for the unit
+    # to find at boot. Stock userconfig.service carries Restart=on-failure,
+    # so a boot that met one prints "Failed with result" and "Scheduled
+    # restart job" -- two of the strings harness/img-boot.sh fails a release
+    # on -- and relaxing a release gate to accommodate a fault the harness
+    # injected itself is the wrong way round. The conditions the unit would
+    # supply are supplied here instead: stdin closed, and no TERM, which is
+    # what a unit with no tty is given. The drop-in's own half is the check
+    # directly above.
+    #
+    # WHAT IS GATED is what matters on a device: the thing TERMINATED, and it
+    # left the operator the evidence under the failed_ name. The exit status
+    # is reported and NOT gated -- the failure mode that hurts is a script
+    # that never returns, and whether the return is 0 or 1 is upstream's
+    # business.
+    #
+    # "TERMINATED" IS rc < 124, NOT rc != 124, and the difference is the exact
+    # failure this experiment exists to catch. The `timeout` below answers 124
+    # only when the child took the SIGTERM and died of it; a child that IGNORES
+    # SIGTERM -- which is the interesting hang, a whiptail with a handler or a
+    # shell with `trap "" TERM` -- has to be SIGKILLed by the -k escalation,
+    # and then timeout answers 128+9 = 137. Measured: a fixture that
+    # quarantines the seed and then ignores TERM scored `rc=137` and PASSED
+    # this check while it read `!= 124`. Everything at or above 124 is
+    # `timeout` reporting that it could not get a clean status out of the
+    # child -- 124 timed out, 125 timeout itself failed, 126/127 could not
+    # execute, 128+n died on a signal -- and none of those is "the script
+    # returned". A clean return is a small number, so that is what is
+    # required. The `2>/dev/null` covers rc=none: the clause left of it
+    # short-circuits, but `[ none -lt 124 ]` would otherwise be free to print.
+    UC_BAD='NOT A VALID NAME:'
+    UC_SAID="the probe never ran it: $USERCONF_SERVICE is not executable here"
+    UC_RC=none
+    if [ -x "$USERCONF_SERVICE" ]; then
+        printf '%s\n' "$UC_BAD" > "$BOOTDIR/userconf.txt"
+        UC_SAID=$(timeout -k 5 60 env -u TERM "$USERCONF_SERVICE" < /dev/null 2>&1)
+        UC_RC=$?
+        UC_SAID=${UC_SAID//[$'\n\r']/ }
+    fi
+    check userconf-malformed-seed-fails-fast \
+          "$(if [ "$UC_RC" != none ] && [ "$UC_RC" -lt 124 ] 2>/dev/null \
+                && [ -e "$BOOTDIR/failed_userconf.txt" ] \
+                && [ ! -e "$BOOTDIR/userconf.txt" ]; then echo yes; else echo no; fi)" \
+          "rc=$UC_RC (>=124 = no clean status at the 60s bound: 124 killed by TERM, 137 ignored it and needed KILL) quarantined=$(yesno test -e "$BOOTDIR/failed_userconf.txt") leftover-seed=$(yesno test -e "$BOOTDIR/userconf.txt") said: ${UC_SAID:0:160}"
+fi
+
 sync 2>/dev/null || true
 
 echo "--- otp-unit journal ($PHASE) ---"

@@ -259,15 +259,127 @@ def test_the_release_notes_two_boot_claim_is_backed_by_the_harness():
     body = step_named(build_steps(), ATTACH)["with"]["body"]
     assert "twice" in body, body
     harness = (REPO / "harness" / "img-boot.sh").read_text()
-    assert "leaves out boot2" in harness, \
-        ("img-boot.sh no longer refuses a phase list without boot2, so the "
-         "release note's two-boot claim is no longer backed by anything")
+    assert "leaves out:$PHASES_MISSING" in harness, \
+        ("img-boot.sh no longer refuses a phase list that drops a boot, so "
+         "the release note's two-boot claim is no longer backed by anything")
     phases = (step_named(build_steps(), BOOT).get("env") or {}).get("OTP_IMG_PHASES")
     if phases is not None:
         for boot in ("boot1", "boot2"):
             assert boot in str(phases).split(), \
                 (f"the boot step pins OTP_IMG_PHASES={phases!r}, which does "
                  f"not run {boot}, but the release note claims both")
+
+
+def test_the_release_notes_credential_claim_is_backed_by_the_harness():
+    """
+    The note tells whoever downloads a tagged image that a seeded
+    userconf.txt was applied and consumed, that the second boot stayed quiet
+    without the unit being disabled, and that a malformed seed failed fast.
+    None of that is made true by this workflow: the harness demands those
+    checks by name, and if it stops demanding them the sentence is a
+    statement about nothing.
+    """
+    body = step_named(build_steps(), ATTACH)["with"]["body"]
+    assert "userconf" in body, body
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    for name in ("userconf-seed-applied", "userconf-seeded-boot-ran-no-wizard",
+                 "userconf-unseeded-boot-skips-the-wizard",
+                 "userconf-malformed-seed-fails-fast"):
+        assert name in harness, (
+            f"the release note claims the credential path was checked, but "
+            f"img-boot.sh no longer requires {name}")
+    # And the harness has to plant one, or the seeded branch is untested and
+    # every check above it passes on an empty boot partition. The COPY, not
+    # the name: the log line next to it says ::userconf.txt as well.
+    assert re.search(r"^mcopy[^\n]*::userconf\.txt", harness, re.M), \
+        "nothing seeds a userconf.txt, so the note's first clause is empty"
+
+
+def test_the_release_notes_boot_completion_claim_is_backed_by_the_harness():
+    """
+    Two sentences that only exist because run 31968966879 disproved them.
+
+    Neither boot in that run finished: an unbounded
+    systemd-networkd-wait-online held network-online.target, which held
+    cloud-init's config stage, which held the credential wizard -- and the
+    apply the wizard performs ends by starting a getty on the front panel's
+    tty. Both are checks on the booted image now, and a note that says so
+    has to be backed by a harness that still demands them by name.
+    """
+    body = step_named(build_steps(), ATTACH)["with"]["body"]
+    assert "front panel" in body, body
+    assert "network" in body, body
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    for name in ("front-panel-survives-the-credential-apply",
+                 "network-wait-cannot-hold-the-boot-open"):
+        assert name in harness, (
+            f"the release note claims the boot finished with its panel "
+            f"intact, but img-boot.sh no longer requires {name}")
+
+
+# --- what counts as a change to the image --------------------------------
+#
+# The probe runs INSIDE the image. install.sh installs
+# harness/img-guest-check.sh into /opt/otp-unit and enables a unit that runs
+# it on every tier-3 boot, so editing a check edits the artifact -- and both
+# of the mechanisms that decide whether to rebuild it were written before
+# that was true.
+
+PROBE = "harness/img-guest-check.sh"
+
+
+def test_the_probe_is_really_part_of_the_image():
+    # The premise of the two tests below, stated rather than assumed: if
+    # install.sh stops installing it, they are guarding nothing.
+    assert PROBE in (REPO / "device" / "install.sh").read_text()
+
+
+def test_a_change_to_the_probe_runs_the_image_job():
+    """
+    The filter decides whether the expensive job runs at all. The probe was
+    not in it, so a pull request that changed only a guest check ran five
+    fast jobs, none of which can execute that file, and reported green.
+
+    The shipped regex is applied to real paths here rather than searched for
+    as a substring: `harness/img-boot\\.sh$` contains the word harness and
+    matches none of this.
+    """
+    filter_run = None
+    for step in workflow()["jobs"]["changes"]["steps"]:
+        if "grep -qE" in str(step.get("run", "")):
+            filter_run = str(step["run"])
+    assert filter_run, "the changes job no longer filters with grep -qE"
+    pattern = re.search(r"grep -qE \\\s*\n\s*'([^']+)'", filter_run)
+    assert pattern, filter_run
+    matcher = re.compile(pattern.group(1))
+    for path in (PROBE, "harness/img-boot.sh", "device/install.sh",
+                 "image/build.sh", ".github/workflows/image.yml"):
+        assert matcher.search(path), f"{path} does not trigger the image job"
+    # And the filter still filters: a docs-only change must not pay for a
+    # pi-gen build.
+    for path in ("README.md", "tests/test_img_verdict.py", "harness/README.md"):
+        assert not matcher.search(path), f"{path} needlessly triggers a build"
+
+
+def test_the_cache_key_covers_the_probe_the_image_ships():
+    """
+    A key that ignores the probe restores an image built before the edit and
+    boots yesterday's guest checks. That does not fail honestly: the harness
+    demands each named check by name, so the run goes red for checks the
+    guest never emitted -- which reads as a broken image rather than a stale
+    cache, and the first place anyone looks is the boot.
+    """
+    for step in build_steps():
+        if str(step.get("uses", "")).startswith("actions/cache/restore"):
+            key = str(step["with"]["key"])
+            break
+    else:
+        raise AssertionError("no cache restore step in the build job")
+    assert PROBE in key, key
+    # The things already in it stay in it: an image built before otpunit
+    # changed is the wrong image to boot even though pi-gen would not care.
+    for pattern in ("image/**", "device/**", "otpunit/**", "codewords/**"):
+        assert pattern in key, key
 
 
 def test_the_gate_never_fires_on_a_branch_or_a_pull_request():

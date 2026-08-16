@@ -154,6 +154,77 @@
 # EARLY_STOP being empty as well. Without that it would have fired on two
 # perfectly healthy boots.
 #
+# THE SEEDED userconf.txt PATH, which is issue #20 and rides on the same two
+# boots. Run 12 found the built image parked forever on userconf-pi's
+# first-boot wizard; #18 fixed that with a ConditionPathExists drop-in rather
+# than a mask, precisely so the documented headless credential file keeps
+# working -- an operator writes `name:crypted-password` into
+# /boot/firmware/userconf.txt, the first boot applies it non-interactively and
+# deletes it. Every run since has exercised only the UNSEEDED branch: nothing
+# in the boot partition, no wizard, boot green. The other two branches ride
+# along now, at the cost of no extra boot:
+#
+#   boot1  a VALID seed is mcopied into the FAT partition before the boot. It
+#          has to be GONE afterwards with no failed_userconf.txt beside it,
+#          and the guest has to find the seeded hash in /etc/shadow and
+#          userconfig.service finished, successful and holding no job.
+#   boot2  the delete boot1's wizard made has stuck -- the FAT partition is
+#          outside the overlay -- so the wizard's condition is false, and it
+#          has to be SKIPPED while staying enabled rather than masked. The
+#          guest then hands the shipped userconf-service a MALFORMED seed by
+#          hand with stdin closed: it has to fail fast and leave
+#          failed_userconf.txt, not hang.
+#
+# The malformed seed is deliberately NOT left on the card for the unit to
+# find at boot. Stock userconfig.service carries Restart=on-failure, so a
+# boot that met one prints "Failed with result" and "Scheduled restart job",
+# two of the strings this file hard-fails a release on -- and relaxing a
+# release gate to accommodate a fault the harness injected itself is the
+# wrong trade. What the drop-in contributes to that path, StandardInput=null,
+# is read back off the running machine instead of assumed.
+#
+# RUN 17 (31968966879) is what the first real execution of all that found,
+# and it found the image rather than the harness. Every credential check
+# failed the same way in both boots:
+#
+#   OTP-CHECK boot1 userconf-seeded-boot-ran-no-wizard FAIL
+#     condition=no result=success is-active=inactive jobs=1
+#   OTP-CHECK boot2 userconf-unseeded-boot-skips-the-wizard FAIL
+#     condition=no checked-at='never' is-active=inactive is-enabled=enabled
+#   IMG-CHECK boot1 userconf-seed-consumed FAIL still there: userconf.txt
+#
+# with userconf-seed-planted PASS beside them: the seed reached the card and
+# nothing on the machine ever looked at it. `jobs=1` with the condition never
+# evaluated is a unit whose START JOB IS STILL QUEUED, and the consoles say
+# what it was queued behind -- both of them end on
+#
+#   Job systemd-networkd-wait-online.service/start running (2min 37s / no limit)
+#
+# neither boot having reached multi-user.target at all. That wait is
+# TimeoutStartSec=infinity on an appliance whose links NetworkManager owns;
+# it blocks network-online.target, which blocks cloud-init's
+# cloud-config.service, which stock userconfig.service is ordered after. So
+# the documented headless credential file was ignored in silence on every
+# unit this image would have produced. device/install.sh masks the wait and
+# switches cloud-init off, and the probe now reads the mask back and asks
+# the queue for its job.
+#
+# The same run's boot2 answered the one question the malformed-seed
+# experiment was uncertain about: whiptail with no TERM FAILS rather than
+# blocking. "rc=1 ... said: Entered username is invalid: ... TERM
+# environment variable needs set." -- so the fail-fast is real, not a
+# stopwatch artifact, and the 60s bound was never reached.
+#
+# RUN 18 (31972140190) booted the fixed image: multi-user.target reached in
+# both boots for the first time in this tier's history, boot2 15/15, and
+# boot1 12/13 with the seed applied, consumed, and the front panel still on
+# tty1 afterwards. Its one red was the probe rather than the image -- a
+# successful apply ends in cancel-rename, which disables userconfig.service,
+# and systemd then garbage-collects the inactive unreferenced unit, so
+# `systemctl show` answers with pristine defaults for a unit whose own
+# console line says "Finished userconfig.service". The guest check reads the
+# journal for that now; see harness/img-guest-check.sh.
+#
 # PARTLY cmdline.txt and config.txt now, where it used to be neither. QEMU
 # still reads no firmware configuration -- -append below REPLACES the kernel
 # command line wholesale, and dtparam=i2c_arm=on and the disable-wifi/bt
@@ -191,7 +262,7 @@ ESC=$(printf '\033')
 # not" says anything: a fresh copy of the image would answer both questions
 # with the image build's own contents.
 PHASES="${OTP_IMG_PHASES:-boot1 boot2}"
-# AND BOOT2 IS NOT OPTIONAL. This variable exists so a run debugging the
+# AND NEITHER BOOT IS OPTIONAL. This variable exists so a run debugging the
 # boot itself can stop after one, and nothing used to stop it dropping the
 # second -- the same list drives the boot loop, the verdict loop and the set
 # of guest checks demanded of each phase, so removing boot2 removes the two
@@ -202,19 +273,38 @@ PHASES="${OTP_IMG_PHASES:-boot1 boot2}"
 # image.yml attaches to the tag says a file written to / in the first boot
 # was gone in the second. Halving the CI time must cost a red run, not a
 # true-looking sentence in someone's release body.
-case " $PHASES " in
-    *" boot2 "*) ;;
-    *)
-        echo "ERROR: OTP_IMG_PHASES='$PHASES' leaves out boot2." >&2
-        echo "       The power-cycle is what this tier exists for: the" >&2
-        echo "       sentinel written to / in boot1 has to be GONE and the" >&2
-        echo "       setting written to /boot/firmware has to still be" >&2
-        echo "       there, and only a second boot of the same card can" >&2
-        echo "       say either. A one-boot run proves neither and must" >&2
-        echo "       not be able to pass this gate." >&2
-        exit 1
-        ;;
-esac
+#
+# BOOT1 IS DEMANDED TOO, and it was not, which is the newer half. The seed
+# is mcopy'd onto the card unconditionally below -- there is no phase test
+# around it, deliberately, because the listing taken before boot1 is the only
+# vantage point the credential path can be observed from. So PHASES="boot2"
+# was accepted and booted a SEEDED card straight into the unseeded checks:
+# userconf-unseeded-boot-skips-the-wizard reads a condition that is TRUE
+# because nothing has consumed the seed yet, and the run goes red for a
+# reason that has nothing to do with the image. A debugging switch whose
+# one-boot setting produces a confusing red is a switch people learn to
+# distrust the harness over. Both phases, or say which one is missing.
+PHASES_MISSING=""
+for want in boot1 boot2; do
+    case " $PHASES " in
+        *" $want "*) ;;
+        *) PHASES_MISSING="$PHASES_MISSING $want" ;;
+    esac
+done
+if [ -n "$PHASES_MISSING" ]; then
+    echo "ERROR: OTP_IMG_PHASES='$PHASES' leaves out:$PHASES_MISSING" >&2
+    echo "       boot1 is the seeded boot. The credential file is copied" >&2
+    echo "       onto the card whatever the phase list says, so a run" >&2
+    echo "       without boot1 hands a seeded card to the checks that" >&2
+    echo "       expect an unseeded one and fails for the wrong reason." >&2
+    echo "       boot2 is the power-cycle, which is what this tier exists" >&2
+    echo "       for: the sentinel written to / in boot1 has to be GONE" >&2
+    echo "       and the setting written to /boot/firmware has to still be" >&2
+    echo "       there, and only a second boot of the same card can say" >&2
+    echo "       either. A one-boot run proves neither and must not be" >&2
+    echo "       able to pass this gate." >&2
+    exit 1
+fi
 
 log() { printf '\n== %s\n' "$*" >&2; }
 
@@ -345,6 +435,48 @@ else
     INITRD=""
 fi
 
+# --- the seeded credential file, planted before the first boot -----------
+
+# THE ACCOUNT IN THE SEED IS THE IMAGE'S OWN FIRST USER, and that is a
+# deliberate narrowing. /usr/lib/userconf-pi/userconf renames the UID-1000
+# account whenever the seed names a different one -- `usermod -l`, a home
+# directory move, sed over /etc/subuid, /etc/subgid and the sudoers drop-in
+# -- and none of that is what this is here to observe. image/build.sh builds
+# with FIRST_USER_NAME='otp', so naming otp here skips the rename branch and
+# leaves exactly the part under test: the decision not to prompt, the
+# `chpasswd -e`, and the delete. tests/test_img_verdict.py holds this name
+# against image/build.sh so the two cannot drift.
+USERCONF_USER="otp"
+# sha512-crypt, generated with
+#
+#   openssl passwd -6 -salt otpimgcheck 'otp-imgcheck-not-a-credential'
+#
+# and verified byte-for-byte against glibc crypt(3) via Python's crypt
+# module. NOT a secret and it reaches no shipped image: this is written into
+# $WORK/card.img, the decompressed working copy this harness boots, and
+# image/deploy/*.img.xz is never opened for writing. The SALT is the marker
+# the guest looks for in /etc/shadow -- pi-gen hashes FIRST_USER_PASS with a
+# random salt, so a shadow entry beginning $6$otpimgcheck$ can only be the
+# line planted here.
+# shellcheck disable=SC2016  # the $ signs are crypt(3) field separators
+USERCONF_HASH='$6$otpimgcheck$xPbFgUo86.IHXj9q2xsofEuqNQoZjMUYoMw/E51qX6xuUT1zEPNF7hilpqHDnUoQ2F9YOlvzIbPyQOwpAHGPm0'
+log "Seeding ::userconf.txt for $USERCONF_USER (the headless credential path, issue #20)"
+printf '%s:%s\n' "$USERCONF_USER" "$USERCONF_HASH" > "$WORK/userconf.txt"
+# NOT fatal if it fails, for the reason the initramfs copy is not: a run that
+# aborts here produces no verdict at all, and "the seed never reached the
+# card" is a thing the verdict can say precisely, out of the listing taken
+# below.
+mcopy -o -n -i "$IMG@@$BOOT_OFFSET" "$WORK/userconf.txt" ::userconf.txt || true
+
+# The FAT root as the host sees it, listed either side of every boot. This is
+# the only vantage point from which the credential path can be observed at
+# all: the file is deleted by the machine that consumes it, so afterwards a
+# seed that was applied and a seed that was never written look identical, and
+# only the before-listing tells them apart.
+fat_listing() {
+    mdir -b -i "$IMG@@$BOOT_OFFSET" :: > "$1" 2>/dev/null || : > "$1"
+}
+
 # root=/dev/mmcblk0p2 rather than cmdline.txt's root=PARTUUID=..., but not
 # for the reason previously written here. The old comment claimed QEMU does
 # not reproduce PARTUUIDs -- false. A PARTUUID is the MBR disk identifier
@@ -367,6 +499,7 @@ boot_phase() {
     local dir="$WORK/$phase"
     rm -rf "$dir"
     mkdir -p "$dir"
+    fat_listing "$dir/boot-files-before.txt"
     # BOTH UARTs, captured separately. A Pi 3 has two, and the measured QEMU
     # mapping is: FIRST -serial = the PL011 (which this DTB names ttyAMA1),
     # SECOND -serial = the mini-UART, where the earlycon bootconsole lives.
@@ -495,6 +628,9 @@ boot_phase() {
     # A power-cycle, not a reset button: the emulator is gone and the image
     # file is flushed before the next phase opens it again.
     sync 2>/dev/null || true
+    # AFTER the sync, so what is listed is what reached the card rather than
+    # what was still in a page cache when qemu was stopped.
+    fat_listing "$dir/boot-files-after.txt"
 }
 
 for phase in $PHASES; do
@@ -617,7 +753,27 @@ per_boot_verdict() {
     #
     # loglevel=7 keeps both: the crng line is KERN_NOTICE and the hwrng
     # line is KERN_INFO, and neither is DEBUG.
+    #
+    # AND multi-user.target BY NAME, which is the second string in this list
+    # to arrive by the report-then-gate route. "Reached target" on its own is
+    # satisfied by remote-fs.target at 30 seconds: run 31968966879 reached
+    # fourteen targets, passed that clause in both boots, and never finished
+    # either -- both consoles ended on
+    # `systemd-networkd-wait-online.service/start running (2min 37s / no
+    # limit)`, with the credential wizard's job still queued behind it. The
+    # only thing that says the boot FINISHED is multi-user.target, and it was
+    # carried as a note (below) for exactly one run because nothing in this
+    # repository had printed it yet. Run 31972140190 then printed it in BOTH
+    # boots -- see the RUN 18 paragraph in this file's header. It is evidence
+    # now, so it gates now, which is the same rule the hwrng line above was
+    # promoted under.
+    #
+    # The margin is real rather than assumed: the sampler stops the emulator
+    # ten seconds after OTP-GUEST-DONE, and the probe that prints that line
+    # is a Type=oneshot WantedBy=multi-user.target -- so the target is
+    # reached in the instant after the probe exits, well inside the drain.
     for want in "Linux version" "systemd[1]:" "Reached target" \
+                "Reached target multi-user.target" \
                 "crng init done" "hwrng registered"; do
         if grep -qF -- "$want" "$CONSOLE_TXT" 2>/dev/null; then
             printf 'IMG-CHECK %s %s PASS\n' "$phase" "$(printf '%s' "$want" | tr ' ' '-')"
@@ -634,6 +790,20 @@ per_boot_verdict() {
             "$(grep -ioE '.{0,40}(hwrng|hw_random|rng_core).{0,44}' \
                  "$CONSOLE_TXT" 2>/dev/null | head -1)"
     fi
+    # WHICH targets, and not merely that one was reached. This began as the
+    # evidence multi-user.target needed before it could gate, and it printed
+    # that evidence in run 31972140190; the gate is in the list above now.
+    #
+    # IT STAYS, as a note, because the gate and the note answer different
+    # questions. The gate says whether the ONE target that means "the boot
+    # finished" was reached. The note says which fourteen were and which one
+    # was not, which is the only thing that made run 31968966879 legible at
+    # all -- a red gate on its own says a boot did not finish and nothing
+    # about where it stopped. It is also what the NEXT promotion will be
+    # argued from, whatever target that turns out to be.
+    printf 'IMG-NOTE %s targets-reached: %s\n' "$phase" \
+        "$(grep -ohE 'Reached target [a-zA-Z0-9@:._-]+' "$CONSOLE_TXT" 2>/dev/null \
+             | sort -u | tr '\n' ' ')"
 }
 
 # --- what the guest said about the overlay -------------------------------
@@ -647,9 +817,13 @@ per_boot_verdict() {
 # against each other so they cannot drift apart in the other direction.
 GUEST_CHECKS_COMMON="root-is-overlay root-write-lands-and-is-readable \
 unit-active unit-not-restart-looping etc-cups-is-its-own-tmpfs cups-running \
-cupsd-config-valid boot-partition-separate setting-saved-to-the-boot-partition"
+cupsd-config-valid boot-partition-separate setting-saved-to-the-boot-partition \
+network-wait-cannot-hold-the-boot-open"
+GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
+front-panel-survives-the-credential-apply"
 GUEST_CHECKS_BOOT2="root-writes-discarded-by-the-power-cycle \
-settings-survive-the-power-cycle"
+settings-survive-the-power-cycle userconf-unseeded-boot-skips-the-wizard \
+userconf-wizard-cannot-prompt userconf-malformed-seed-fails-fast"
 
 guest_gate() {
     local phase="$1" count counts passed total missing want name
@@ -706,9 +880,14 @@ guest_gate() {
 
     missing=""
     want="$GUEST_CHECKS_COMMON"
-    if [ "$phase" = "boot2" ]; then
-        want="$want $GUEST_CHECKS_BOOT2"
-    fi
+    # Per phase, because the two boots do not ask the same questions: only
+    # boot1 has a seed to consume, and only boot2 can speak about what
+    # survived the power-cycle. A phase-blind list would demand boot2's
+    # checks of boot1 and fail every run.
+    case "$phase" in
+        boot1) want="$want $GUEST_CHECKS_BOOT1" ;;
+        boot2) want="$want $GUEST_CHECKS_BOOT2" ;;
+    esac
     for name in $want; do
         grep -qE "OTP-CHECK[[:space:]]+${phase}[[:space:]]+${name}[[:space:]]+PASS" \
              "$CONSOLE_TXT" 2>/dev/null || missing="$missing $name"
@@ -719,6 +898,78 @@ guest_gate() {
         printf 'IMG-CHECK %s guest-ran-every-named-check FAIL missing:%s\n' \
                "$phase" "$missing"
     fi
+}
+
+# --- the credential file, watched from outside the guest -----------------
+
+# `mdir -b` prints one absolute path per line, "::/kernel8.img". Matched
+# whole-line and case-insensitively: FAT stores an 8.3 name in upper case and
+# the lower-case flag in a byte the tools do not all honour the same way, so
+# a case-sensitive match here would be a property of whichever tool wrote the
+# file rather than of whether the file is there.
+fat_lists() {
+    grep -qixF -- "::/$2" "$1" 2>/dev/null
+}
+
+userconf_gate() {
+    local phase="$1"
+    local before="$WORK/$phase/boot-files-before.txt"
+    local after="$WORK/$phase/boot-files-after.txt"
+
+    # THE POSITIVE CONTROL for every absence below, in the same fixture and
+    # from the same command. "userconf.txt is gone" is just as true of a
+    # partition nothing could read -- a bad offset, an mdir that failed, an
+    # empty file -- and that is the shape of failure this repository keeps
+    # being bitten by. kernel8.img is on the boot partition of every image
+    # this harness can boot at all: it is the file it hands to qemu.
+    if fat_lists "$after" kernel8.img; then
+        printf 'IMG-CHECK %s boot-partition-listed PASS\n' "$phase"
+    else
+        printf 'IMG-CHECK %s boot-partition-listed FAIL %s lines, no kernel8.img\n' \
+               "$phase" "$(wc -l < "$after" 2>/dev/null || echo 0)"
+    fi
+
+    case "$phase" in
+        boot1)
+            # The seed reached the card. Without this the check below is
+            # satisfied by a `mcopy` that silently did nothing, which is
+            # exactly how the first version of this harness read a wrong
+            # partition offset as a bad image.
+            if fat_lists "$before" userconf.txt; then
+                printf 'IMG-CHECK %s userconf-seed-planted PASS\n' "$phase"
+            else
+                printf 'IMG-CHECK %s userconf-seed-planted FAIL not in the boot partition before the boot\n' \
+                       "$phase"
+            fi
+            # CONSUMED means both halves. userconf.txt gone says the file was
+            # taken; failed_userconf.txt absent says it was taken and APPLIED
+            # rather than rejected as malformed -- the same two states an
+            # operator's own card can end a first boot in, and the difference
+            # between working credentials and none.
+            if ! fat_lists "$after" userconf.txt && ! fat_lists "$after" failed_userconf.txt; then
+                printf 'IMG-CHECK %s userconf-seed-consumed PASS\n' "$phase"
+            else
+                printf 'IMG-CHECK %s userconf-seed-consumed FAIL still there:%s%s\n' "$phase" \
+                       "$(fat_lists "$after" userconf.txt && printf ' userconf.txt')" \
+                       "$(fat_lists "$after" failed_userconf.txt && printf ' failed_userconf.txt')"
+            fi
+            ;;
+        boot2)
+            # The other end of the guest's malformed-seed experiment, from
+            # the host: a bad seed has to end up quarantined under its failed_
+            # name and must not be left sitting where the next boot's wizard
+            # would find it. This is the artefact the operator is told to look
+            # for, read off the card rather than off the console.
+            if fat_lists "$after" failed_userconf.txt && ! fat_lists "$after" userconf.txt; then
+                printf 'IMG-CHECK %s userconf-malformed-seed-quarantined PASS\n' "$phase"
+            else
+                printf 'IMG-CHECK %s userconf-malformed-seed-quarantined FAIL failed_userconf.txt:%s userconf.txt:%s\n' \
+                       "$phase" \
+                       "$(fat_lists "$after" failed_userconf.txt && printf yes || printf no)" \
+                       "$(fat_lists "$after" userconf.txt && printf yes || printf no)"
+            fi
+            ;;
+    esac
 }
 
 : > "$VERDICT"
@@ -735,6 +986,7 @@ for phase in $PHASES; do
         printf -- '--- %s ---\n' "$phase"
         per_boot_verdict "$phase"
         guest_gate "$phase"
+        userconf_gate "$phase"
     } >> "$VERDICT"
     # qemu's exit code is CONTEXT, not the verdict. A healthy boot of this
     # image never exits the emulator -- the unit starts, the guest check

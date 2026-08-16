@@ -17,17 +17,19 @@ After=otp-unit.service cups.service otp-unit-etc-cups.service
 Type=oneshot
 ExecStart=/opt/otp-unit/img-guest-check.sh
 # EXPLICIT, because systemd's default is 90s and the probe's own bounded
-# wait is 90s. img-guest-check.sh polls `systemctl is-active otp-unit` 45
-# times at 2s intervals -- 90s exactly -- before it has even reached the
-# CUPS checks, and after that come `cupsd -t` and two Python interpreters
-# importing otpunit.config, all of it under TCG emulation at a few percent
-# of native speed. On the default, a slow-but-healthy boot has its probe
-# killed mid-poll and reports nothing, which is a phase the harness fails
-# for having no OTP-GUEST-DONE line. 300s clears the bounded part more than
-# three times over and still lands well inside the 600s per-boot backstop
-# CI gives the emulator, so a probe that really is wedged is killed and
-# reported rather than eating the whole run.
-TimeoutStartSec=300
+# waits now sum to 270s. img-guest-check.sh polls `systemctl is-active
+# otp-unit` 45 times at 2s intervals -- 90s exactly -- before it has even
+# reached the CUPS checks; it then waits up to 120s for systemd to be done
+# with userconfig.service, and bounds the malformed-seed experiment at 60s.
+# Around those come `cupsd -t` and two Python interpreters importing
+# otpunit.config, all of it under TCG emulation at a few percent of native
+# speed. On the default, a slow-but-healthy boot has its probe killed
+# mid-poll and reports nothing, which is a phase the harness fails for
+# having no OTP-GUEST-DONE line. 420s clears the bounded part with room for
+# the work between the waits, and still lands inside the 600s per-boot
+# backstop CI gives the emulator, so a probe that really is wedged is killed
+# and reported rather than eating the whole run.
+TimeoutStartSec=420
 # The console, because that is the only channel out of the emulator. The
 # harness reads a serial port; the journal is volatile by design and dies
 # with the guest.
