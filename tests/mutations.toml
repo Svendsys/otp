@@ -601,6 +601,49 @@ replace = '''        :'''
 
 
 [[mutation]]
+name = "tier3-one-boot-run-accepted"
+tier = "fast"
+guard = """
+boot2 is not optional. OTP_IMG_PHASES drives the boot loop, the verdict
+loop and the set of guest checks each phase must have reported, so dropping
+boot2 drops root-writes-discarded-by-the-power-cycle and
+settings-survive-the-power-cycle from what the run demands along with the
+boot that would have produced them. Measured before the guard:
+PHASES="boot1" over a healthy boot1 console exits 0 -- the whole gate, on
+half the evidence, and image.yml puts the two-boot claim in the body of a
+tagged release."""
+tests = [
+  "tests/test_img_verdict.py::test_a_phase_list_without_boot2_is_refused",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''case " $PHASES " in
+    *" boot2 "*) ;;
+    *)'''
+replace = '''case " $PHASES " in
+    *) ;;
+    *)'''
+
+
+[[mutation]]
+name = "tier3-two-boot-claim-unconditional"
+tier = "fast"
+guard = """
+The other half of the same defect, and the half that survives a phase list
+nobody thought of: the concluding line said "the image boots twice on a
+read-only overlay" whatever ran. It is the sentence a reader takes away and
+the sentence image.yml's release note restates, so it states only what the
+phases that ran support."""
+tests = [
+  "tests/test_img_verdict.py::test_the_two_boot_claim_is_only_made_by_a_run_that_booted_twice",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''if [ -z "$CLAIM_MISSING" ]; then'''
+replace = '''if true; then'''
+
+
+[[mutation]]
 name = "guest-probe-runs-without-a-phase-token"
 tier = "fast"
 guard = """
