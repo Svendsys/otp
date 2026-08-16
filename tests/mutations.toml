@@ -1300,3 +1300,162 @@ file = "device/install.sh"
 find = '''ConditionPathExists=|$BOOT_DIR/userconf.txt
 '''
 replace = ''''''
+
+
+# --- the boot that never finished, and what it hid (run 31968966879) ------
+
+[[mutation]]
+name = "guest-network-wait-job-ignored"
+tier = "fast"
+guard = """
+The job both boots of run 31968966879 ended on. systemd-networkd-wait-online
+carries TimeoutStartSec=infinity, and on an appliance with no networkd
+configuration it never returns: network-online.target is never reached,
+cloud-init's config stage never runs, and userconfig.service -- ordered after
+it -- holds a queued start job for the life of the boot. From the wizard's
+own fields that is indistinguishable from a skip, so the queue is asked
+directly rather than inferred from anything's state."""
+tests = [
+  "tests/test_overlay_root.py::test_a_boot_still_waiting_on_the_network_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ "$NETWAIT_ENABLED" = masked ] && [ "${NETWAIT_JOBS:-1}" = 0 ]; \'''
+replace = '''      "$(if [ "$NETWAIT_ENABLED" = masked ]; \'''
+
+
+[[mutation]]
+name = "guest-network-wait-mask-not-read-back"
+tier = "fast"
+guard = """
+An empty queue at the moment the probe looks is a statement about this boot
+and not about the next one: what pulls network-online.target in decides that,
+and on the image run 31968966879 booted it was cloud-init, which a later
+package could reintroduce. The mask is what makes the answer the same every
+boot, so it is read back off the running machine rather than assumed from a
+line in install.sh."""
+tests = [
+  "tests/test_overlay_root.py::test_an_unmasked_network_wait_fails_even_with_an_empty_queue",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ "$NETWAIT_ENABLED" = masked ] && [ "${NETWAIT_JOBS:-1}" = 0 ]; \'''
+replace = '''      "$(if [ "${NETWAIT_JOBS:-1}" = 0 ]; \'''
+
+
+[[mutation]]
+name = "guest-front-panel-not-checked-after-the-apply"
+tier = "fast"
+guard = """
+Applying a seed ends in userconf-pi's cancel-rename, which starts a getty on
+tty1 -- the tty otp-unit.service holds as the front panel. With the unit's
+old Conflicts=getty@tty1.service that start STOPPED it, so an operator who
+used the documented credential file got a dark panel until the next
+power-cycle, with every other check in the phase green because the seed
+really was applied. `unit-active` cannot stand in: it runs before the apply
+and passes on a machine the apply is about to take down."""
+tests = [
+  "tests/test_overlay_root.py::test_a_credential_apply_that_took_the_front_panel_down_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''          "$(if [ "$PANEL" = active ] && [ "$TTY1" != active ] \'''
+replace = '''          "$(if [ "$TTY1" != active ] \'''
+
+
+[[mutation]]
+name = "guest-login-prompt-sharing-tty1-accepted"
+tier = "fast"
+guard = """
+The other outcome of the same start, now that no Conflicts= stops it: a getty
+that runs shares /dev/tty1 with a unit holding it through
+StandardInput=tty-force -- output interleaves, keystrokes go to whichever
+grabbed them, and otp-unit is still `active` throughout. A getty merely
+queued is the same thing a moment later, which is why the queue counts as
+well as the state."""
+tests = [
+  "tests/test_overlay_root.py::test_a_login_prompt_sharing_the_panels_tty_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''                && [ "${TTY1_JOBS:-1}" = 0 ]; then echo yes; else echo no; fi)" \'''
+replace = '''                ; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "install-network-wait-not-masked"
+tier = "fast"
+guard = """
+The one line that stops an unbounded wait for a network this appliance does
+not have from holding a boot open. Without it run 31968966879 repeats: three
+minutes of emulated boot, multi-user.target never reached, and the operator's
+seeded credentials never read because the unit that reads them is ordered
+behind network-online.target."""
+tests = [
+  "tests/test_overlay_root.py::test_the_unbounded_network_wait_is_masked",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''systemctl mask systemd-networkd-wait-online.service'''
+replace = '''systemctl unmask systemd-networkd-wait-online.service'''
+
+
+[[mutation]]
+name = "install-cloud-init-left-running"
+tier = "fast"
+guard = """
+cloud-init is what pulls network-online.target into this image's boot, it
+spends a minute of every boot finding no datasource, and it takes user-data
+off the boot partition -- the partition an operator is told to write files
+on -- on a device that prints one-time pads and has no network by design.
+The kill switch is read by its generator before cloud-init.target is linked
+into multi-user.target, which is what takes cloud-config.service out of the
+transaction and voids the wizard's `After=` on it."""
+tests = [
+  "tests/test_overlay_root.py::test_cloud_init_is_switched_off_on_an_air_gapped_printer",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = ''': > /etc/cloud/cloud-init.disabled'''
+replace = ''': > /etc/cloud/cloud-init.enabled'''
+
+
+[[mutation]]
+name = "install-getty-tty1-condition-dropped"
+tier = "fast"
+guard = """
+What keeps a login prompt off the front panel's tty now that
+otp-unit.service no longer carries Conflicts=getty@tty1.service. Drop it and
+the getty cancel-rename starts at the end of every credential apply runs for
+real, sharing /dev/tty1 with a unit that holds it through
+StandardInput=tty-force."""
+tests = [
+  "tests/test_overlay_root.py::test_no_login_prompt_can_start_on_the_front_panels_tty",
+  "tests/test_service_unit.py::TestTheUnitCanActuallyStart::test_nothing_can_stop_the_panel_by_starting_a_getty_on_tty1",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''ConditionPathExists=!/etc/systemd/system/otp-unit.service'''
+replace = '''ConditionPathExists=/etc/systemd/system/otp-unit.service'''
+
+
+[[mutation]]
+name = "unit-conflicts-with-the-getty-again"
+tier = "fast"
+guard = """
+Conflicts= is symmetric: it reads as "keep a login prompt off tty1" and also
+means "anything that starts that getty stops this unit". userconf-pi's
+cancel-rename does exactly that at the end of every successful credential
+apply, so the line turns a supported way of setting a password into a print
+unit that stops until the next power-cycle."""
+tests = [
+  "tests/test_service_unit.py::TestTheUnitCanActuallyStart::test_nothing_can_stop_the_panel_by_starting_a_getty_on_tty1",
+]
+[[mutation.edit]]
+file = "device/systemd/otp-unit.service"
+find = '''[Service]
+Type=simple'''
+replace = '''Conflicts=getty@tty1.service
+
+[Service]
+Type=simple'''
