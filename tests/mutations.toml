@@ -1115,6 +1115,27 @@ replace = '''          "$(if [ "$UC_COND" = no ] \'''
 
 
 [[mutation]]
+name = "guest-userconf-wizard-still-armed-accepted"
+tier = "fast"
+guard = """
+The clause this check is NAMED for, and the one that had no fixture. Every
+boot2 fixture left the condition false, so deleting `condition = no` kept the
+suite green -- the check read as "the wizard was skipped" while measuring
+only "enabled, evaluated, not running", and a oneshot systemd DID start and
+which has since finished answers all three of those the same way a skipped
+one does. On the device a true condition in boot2 means the seed outlived the
+boot that consumed it: the wizard is armed on this boot and every boot after,
+with the operator's credential line still readable on the FAT partition."""
+tests = [
+  "tests/test_overlay_root.py::test_a_second_boot_whose_condition_is_still_true_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''          "$(if [ "$UC_COND" = no ] && [ -n "$UC_COND_TS" ] \'''
+replace = '''          "$(if [ -n "$UC_COND_TS" ] \'''
+
+
+[[mutation]]
 name = "guest-userconf-standardinput-not-checked"
 tier = "fast"
 guard = """

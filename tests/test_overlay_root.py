@@ -1196,6 +1196,32 @@ def test_a_condition_systemd_never_evaluated_is_not_a_skip(tmp_path):
     assert results(proc)["userconf-unseeded-boot-skips-the-wizard"] == "FAIL", proc.stdout
 
 
+def test_a_second_boot_whose_condition_is_still_true_fails(tmp_path):
+    """
+    The property this check is NAMED for, which nothing was testing.
+
+    Every other boot2 fixture leaves the condition false, so the
+    `condition = no` clause could be DELETED and the whole suite stayed
+    green -- the check went on being read as "the wizard was skipped" while
+    only ever measuring "the unit is enabled, evaluated, and not running".
+    Those do not imply it: a unit whose condition came out TRUE is one
+    systemd let start, and on a oneshot that has already finished it is
+    `inactive` with an evaluation timestamp and `enabled`, exactly like a
+    skip.
+
+    On the device a true condition here means the seed OUTLIVED the boot
+    that was supposed to consume it -- the delete failed, or the operator
+    wrote the file again -- so the wizard is armed on this boot and on every
+    boot after it, and a credential line is still sitting on a FAT partition
+    anybody can read in any card reader.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot2",
+                           env={**HEALTHY_BOOT2, "UC_COND": "yes"})
+    assert results(proc)["userconf-unseeded-boot-skips-the-wizard"] == "FAIL", proc.stdout
+    # And the reader is told which half went wrong.
+    assert "condition=yes" in proc.stdout, proc.stdout
+
+
 def test_a_wizard_that_can_still_reach_a_tty_fails(tmp_path):
     # The drop-in gone, or overridden by another one: the stock unit's
     # StandardInput=tty is back and a malformed seed is a hang again.

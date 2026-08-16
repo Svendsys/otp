@@ -440,6 +440,17 @@ if [ "$PHASE" = "boot2" ]; then
     # ignores an operator's credentials in silence and leaves the tty2
     # recovery getty with no knowable login. That is the trade
     # device/install.sh's comment refuses, stated as a check.
+    #
+    # `condition=no` IS THE NAMED PROPERTY, and until run 19 nothing tested
+    # it: no boot2 fixture ever set the condition true, so deleting that
+    # clause left the suite green and this check went on being believed for
+    # the one thing its name promises. What a true condition on boot2 means
+    # is that the seed OUTLIVED the boot that consumed it -- the delete
+    # failed, or the operator's file is still on the FAT partition -- so the
+    # wizard is armed on this boot and every boot after it, with an
+    # operator's credential line still readable on a partition any reader can
+    # mount. `skipped` and `enabled` do not imply each other and neither
+    # implies this; all three are asserted.
     check userconf-unseeded-boot-skips-the-wizard \
           "$(if [ "$UC_COND" = no ] && [ -n "$UC_COND_TS" ] \
                 && [ "$UC_ACTIVE" = inactive ] && [ "$UC_ENABLED" = enabled ]; \
