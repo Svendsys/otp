@@ -397,6 +397,7 @@ USERCONF_USER="otp"
 # the guest looks for in /etc/shadow -- pi-gen hashes FIRST_USER_PASS with a
 # random salt, so a shadow entry beginning $6$otpimgcheck$ can only be the
 # line planted here.
+# shellcheck disable=SC2016  # the $ signs are crypt(3) field separators
 USERCONF_HASH='$6$otpimgcheck$xPbFgUo86.IHXj9q2xsofEuqNQoZjMUYoMw/E51qX6xuUT1zEPNF7hilpqHDnUoQ2F9YOlvzIbPyQOwpAHGPm0'
 log "Seeding ::userconf.txt for $USERCONF_USER (the headless credential path, issue #20)"
 printf '%s:%s\n' "$USERCONF_USER" "$USERCONF_HASH" > "$WORK/userconf.txt"

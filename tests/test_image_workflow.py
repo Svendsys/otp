@@ -270,6 +270,31 @@ def test_the_release_notes_two_boot_claim_is_backed_by_the_harness():
                  f"not run {boot}, but the release note claims both")
 
 
+def test_the_release_notes_credential_claim_is_backed_by_the_harness():
+    """
+    The note tells whoever downloads a tagged image that a seeded
+    userconf.txt was applied and consumed, that the second boot stayed quiet
+    without the unit being disabled, and that a malformed seed failed fast.
+    None of that is made true by this workflow: the harness demands those
+    checks by name, and if it stops demanding them the sentence is a
+    statement about nothing.
+    """
+    body = step_named(build_steps(), ATTACH)["with"]["body"]
+    assert "userconf" in body, body
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    for name in ("userconf-seed-applied", "userconf-seeded-boot-ran-no-wizard",
+                 "userconf-unseeded-boot-skips-the-wizard",
+                 "userconf-malformed-seed-fails-fast"):
+        assert name in harness, (
+            f"the release note claims the credential path was checked, but "
+            f"img-boot.sh no longer requires {name}")
+    # And the harness has to plant one, or the seeded branch is untested and
+    # every check above it passes on an empty boot partition. The COPY, not
+    # the name: the log line next to it says ::userconf.txt as well.
+    assert re.search(r"^mcopy[^\n]*::userconf\.txt", harness, re.M), \
+        "nothing seeds a userconf.txt, so the note's first clause is empty"
+
+
 # --- what counts as a change to the image --------------------------------
 #
 # The probe runs INSIDE the image. install.sh installs

@@ -289,6 +289,7 @@ check setting-saved-to-the-boot-partition \
 # credential. tests/test_img_verdict.py holds the two files against each other
 # and against image/build.sh's FIRST_USER_NAME.
 USERCONF_USER=otp
+# shellcheck disable=SC2016  # the $ signs are crypt(3) field separators
 USERCONF_SALT='$6$otpimgcheck$'
 USERCONF_SERVICE=/usr/lib/userconf-pi/userconf-service
 

@@ -419,9 +419,13 @@ def test_the_before_listing_is_taken_before_the_boot():
 
 def test_the_seed_is_planted_before_the_first_boot():
     # The mcopy has to happen before the boot loop, or boot1 boots a card the
-    # operator never wrote to.
+    # operator never wrote to. Matched on the COPY rather than on the name --
+    # the log line above it says ::userconf.txt too, and an assertion that
+    # the string appears somewhere is satisfied by the announcement alone.
     text = IMG_BOOT.read_text()
-    assert text.index("::userconf.txt") < text.index('for phase in $PHASES; do')
+    plant = re.search(r"^mcopy[^\n]*::userconf\.txt", text, re.M)
+    assert plant, "nothing copies a seed into the boot partition"
+    assert plant.start() < text.index('for phase in $PHASES; do')
 
 
 def test_a_healthy_two_boot_run_passes(tmp_path):

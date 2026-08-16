@@ -1229,6 +1229,60 @@ replace = '''DROPIN'''
 
 
 [[mutation]]
+name = "tier3-no-seed-planted-at-all"
+tier = "fast"
+guard = """
+The seed itself. Every check of the credential path is downstream of a file
+reaching the FAT partition before boot1 -- and with nothing planted, the
+image.yml release note still tells whoever downloads a tagged image that a
+seeded userconf.txt was applied and consumed."""
+tests = [
+  "tests/test_image_workflow.py::test_the_release_notes_credential_claim_is_backed_by_the_harness",
+  "tests/test_img_verdict.py::test_the_seed_is_planted_before_the_first_boot",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''mcopy -o -n -i "$IMG@@$BOOT_OFFSET" "$WORK/userconf.txt" ::userconf.txt || true'''
+replace = ''':'''
+
+
+[[mutation]]
+name = "image-cache-key-ignores-the-probe"
+tier = "fast"
+guard = """
+The probe RUNS INSIDE the image, so it belongs to the image's identity: the
+pi-gen stage copies harness/ into the rootfs and install.sh installs it to
+/opt/otp-unit. Left out of the key, an edited check restores an image built
+before the edit -- and the harness then fails the run for named checks
+yesterday's guest never emitted, which reads as a broken image rather than a
+stale cache."""
+tests = [
+  "tests/test_image_workflow.py::test_the_cache_key_covers_the_probe_the_image_ships",
+]
+[[mutation.edit]]
+file = ".github/workflows/image.yml"
+find = "'codewords/**', 'harness/img-guest-check.sh', 'otp_generator.py'"
+replace = "'codewords/**', 'otp_generator.py'"
+
+
+[[mutation]]
+name = "image-filter-ignores-the-probe"
+tier = "fast"
+guard = """
+The other half of the same miss, one level up: the path filter decides
+whether the image job runs at all, and a pull request that changed only a
+guest check ran five fast jobs -- none of which can execute that file -- and
+reported green."""
+tests = [
+  "tests/test_image_workflow.py::test_a_change_to_the_probe_runs_the_image_job",
+]
+[[mutation.edit]]
+file = ".github/workflows/image.yml"
+find = '''harness/img-boot\.sh$|harness/img-guest-check\.sh$|'''
+replace = '''harness/img-boot\.sh$|'''
+
+
+[[mutation]]
 name = "install-userconf-dropin-loses-a-spelling"
 tier = "fast"
 guard = """

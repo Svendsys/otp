@@ -311,8 +311,8 @@ different mechanism, and pi-gen never boots what it builds.
 
 | Phase | What is true of it |
 |---|---|
-| `boot1` | The overlay is engaged. Writes a sentinel to `/` and a setting to `/boot/firmware` through `config.save()`. |
-| `boot2` | The **same card image**, booted again. The sentinel must be gone; the setting must still be there. |
+| `boot1` | The overlay is engaged. Writes a sentinel to `/` and a setting to `/boot/firmware` through `config.save()`. Goes in with a valid `userconf.txt` seeded into the FAT partition, which has to be consumed. |
+| `boot2` | The **same card image**, booted again. The sentinel must be gone; the setting must still be there; the consumed seed must still be consumed. |
 
 One image file across both boots is the whole mechanism: a write that
 reached the card is there in boot 2 and a write that only reached the
@@ -325,6 +325,12 @@ reaching ~150s guest time with one kernel entry, and both ANSI-stripped
 consoles carrying `random: crng init done` and `bcm2835-rng 3f104000.rng:
 hwrng registered`. Measured cost on a cache miss: 6m58s of pi-gen, then
 7m59s for the pair of boots, 16m16s for the whole job.
+
+Those two totals are run 16's and stay run 16's. The credential checks
+below added two names to what boot 1 must report and three to boot 2, so a
+green run now counts differently — and the first run of *those* is whichever
+CI run this paragraph was written for. The cost is unchanged: no extra boot,
+and the one bounded experiment inside boot 2 is capped at 60 seconds.
 
 **`OTP_IMG_PHASES` picks the boots, and it may not drop `boot2`.** It
 defaults to `boot1 boot2`; a run debugging the boot itself can shorten it,
@@ -340,6 +346,46 @@ on a read-only overlay"*, and `image.yml` puts that claim, in its own
 words, into the body of a tagged release. The concluding line is now
 conditional on the phases that actually ran as well, so the two guards
 have to fail together for the claim to be wrong.
+
+### The seeded `userconf.txt`, which is the other thing a first boot does
+
+Issue #20. The wizard that held run 12's boot open is also the only consumer
+of Raspberry Pi OS's documented headless credential file: an operator writes
+`name:crypted-password` into `/boot/firmware/userconf.txt`, and the first
+boot applies it non-interactively and deletes it. That is why `install.sh`
+replaced the mask with a `ConditionPathExists` drop-in rather than turning
+the unit off. Every run up to #32 exercised only the branch where nobody had
+written one — no seed, no wizard, boot green — so the two branches an
+operator actually meets rode along with the two boots that already existed:
+
+| Branch | Where | What has to be true |
+|---|---|---|
+| seeded | `boot1` | The seed reaches the card (checked *before* the boot), is gone afterwards with no `failed_userconf.txt` beside it, its hash is in `/etc/shadow`, and `userconfig.service` finished successfully holding no job. |
+| unseeded | `boot2` | The delete stuck — the FAT partition is outside the overlay — so the condition is false and the unit is skipped **while staying enabled**. |
+| malformed | `boot2` | The shipped `userconf-service`, handed a bad seed with stdin closed and no `TERM`, terminates inside a 60s bound and leaves `failed_userconf.txt` with no `userconf.txt` behind it. |
+
+Three details worth knowing about that last row. It is run **by hand from
+the probe** rather than left on the card for the unit to find at boot,
+because the stock `userconfig.service` carries `Restart=on-failure`: a boot
+that met a malformed seed would print `Failed with result` and `Scheduled
+restart job`, two of the strings `img-boot.sh` fails a release on, and
+weakening a release gate to accommodate a fault the harness injected itself
+is the wrong trade. What the unit contributes to the fail-fast,
+`StandardInput=null`, is instead read back off the running machine with
+`systemctl show`. And what is *gated* is that it ended and left the
+evidence; the exit status is reported rather than gated, because the failure
+that hurts on a device is a script that never returns.
+
+The seed names the image's own first user (`FIRST_USER_NAME=otp`) on
+purpose: `/usr/lib/userconf-pi/userconf` renames the UID-1000 account when
+the seed names a different one, and that is a much larger experiment than
+"were the credentials applied". Its hash is sha512-crypt with a fixed salt,
+generated with `openssl passwd -6 -salt otpimgcheck` and verified against
+glibc's `crypt(3)`; pi-gen salts `FIRST_USER_PASS` randomly, so that salt
+appearing in a shadow entry can only have come from the seed. It never
+reaches a shipped image — `img-boot.sh` writes it into the decompressed
+working copy it boots, and `image/deploy/*.img.xz` is never opened for
+writing.
 
 The other variables: `OTP_IMG_TIMEOUT` is the per-boot backstop in seconds
 (CI sets 600; the local default is 1200 because someone running this by
@@ -383,8 +429,13 @@ to fail loudly without costing anything, and the verdict is written to the
 run's step summary as well as the log.
 
 The image build also now runs on any pull request touching `image/**`,
-`device/**`, `harness/img-boot.sh` or the workflow itself. Before that,
-nothing checked the image on the PR that broke it.
+`device/**`, `harness/img-boot.sh`, `harness/img-guest-check.sh` or the
+workflow itself. Before that, nothing checked the image on the PR that broke
+it. The probe is in that list, and in the cache key, because it **runs
+inside the image**: the pi-gen stage copies `harness/` into the rootfs and
+`install.sh` installs it to `/opt/otp-unit`. While it was in neither, a pull
+request that changed only a guest check ran no image job at all, and a run
+that did would have restored an image built before the edit.
 
 It answers the questions nothing else can: **does the thing that gets
 flashed to a card actually boot, and does it boot the way it is supposed

@@ -443,10 +443,14 @@ jobs:
             QEMU twice, `otp-unit.service` reached `Started` on both, the
             root filesystem was a RAM overlay over a read-only card, a file
             written to `/` in the first boot was gone in the second, and a
-            setting written to `/boot/firmware` was still there. That gate
-            does not exercise the OLED, the buttons or a printer -- see the
-            header of `harness/img-boot.sh` for exactly what it does and
-            does not prove.
+            setting written to `/boot/firmware` was still there. A
+            `userconf.txt` seeded into the boot partition was applied and
+            consumed by the first boot with no wizard, the second boot
+            skipped the wizard without disabling it, and a malformed seed
+            failed fast and left `failed_userconf.txt` rather than holding
+            the boot open. That gate does not exercise the OLED, the buttons
+            or a printer -- see the header of `harness/img-boot.sh` for
+            exactly what it does and does not prove.
 
       # The bar, stated where it can be seen. Ten minutes is the budget for
       # a run that did not have to rebuild the image; a run that did is
