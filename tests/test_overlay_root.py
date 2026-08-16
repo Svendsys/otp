@@ -787,14 +787,22 @@ def test_a_seeded_first_boot_reports_applied_credentials_and_no_wizard(tmp_path)
 
 def test_a_wizard_still_holding_a_job_fails_the_first_boot(tmp_path):
     """
-    Run 12's shape, stated as a check.
+    Run 12's shape, stated as a check, with everything else looking healthy.
 
-    The wizard did not fail and did not refuse: it sat on a whiptail on tty8
-    that nobody could see, with its job holding multi-user.target open. The
-    unit is "activating" the whole time, which is also what a healthy unit
-    two seconds into starting looks like -- so the job queue is what is
-    asked.
+    A queued job for a unit that has not started yet reads as `inactive` in
+    every other field -- and a job is the thing that actually held run 12's
+    boot open, with multi-user.target waiting on a whiptail nobody could
+    see. So the queue is asked directly rather than inferred from is-active.
     """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env={
+        **HEALTHY_BOOT1,
+        "UC_JOBLINE": "42 userconfig.service start waiting\n"})
+    assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
+
+
+def test_a_wizard_parked_mid_start_fails_the_first_boot(tmp_path):
+    # The other half of the same shape: the prompt is up, the unit has been
+    # "activating" for as long as the boot has been waiting.
     proc, _ = run_userconf(tmp_path, phase="boot1", env={
         **HEALTHY_BOOT1, "UC_ACTIVE": "activating", "UC_RESULT": "",
         "UC_JOBLINE": "42 userconfig.service start running\n"})
@@ -896,6 +904,20 @@ def test_a_malformed_seed_that_hangs_fails_instead_of_timing_the_boot_out(tmp_pa
     assert "rc=124" in proc.stdout, proc.stdout
     # And the probe carried on to report, rather than being the hang itself.
     assert "TOTALS" in proc.stdout, proc.stdout
+
+
+def test_the_experiment_supplies_the_conditions_the_unit_would(tmp_path):
+    """
+    Stdin closed and TERM removed, which is what the drop-in plus a unit
+    with no tty add up to. Run it with the probe's own stdin and whiptail
+    may find a terminal after all -- and then the experiment measures a
+    machine nobody ships instead of the appliance.
+    """
+    block = userconf_block()
+    line = next(ln for ln in block.splitlines() if "USERCONF_SERVICE" in ln
+                and "timeout" in ln)
+    assert "< /dev/null" in line, line
+    assert "env -u TERM" in line, line
 
 
 def test_a_malformed_seed_that_leaves_no_evidence_fails(tmp_path):

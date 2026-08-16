@@ -592,6 +592,24 @@ def test_a_dropped_guest_check_fails_even_with_no_fail_lines(tmp_path):
     assert proc.returncode == 1
 
 
+def test_a_dropped_boot1_check_fails_too(tmp_path):
+    """
+    The same gate, for the phase that grew its own list.
+
+    boot1's two checks are the seeded credential path, and they are the ones
+    a phase-blind list would silently stop demanding: every other check in
+    boot1 would still pass without them, and the run would go green having
+    observed nothing about the file the operator wrote.
+    """
+    kept = [n for n in required_checks("boot1") if n != "userconf-seed-applied"]
+    lines = kernel_lines() + [SUCCESS] + guest_report("boot1", checks=kept)
+    proc, verdict = run_verdict(tmp_path, {"boot1": lines})
+    assert "IMG-CHECK boot1 guest-no-fail-lines PASS" in verdict, verdict
+    assert "guest-ran-every-named-check FAIL" in verdict, verdict
+    assert "userconf-seed-applied" in verdict
+    assert proc.returncode == 1
+
+
 def test_a_phase_that_reported_twice_fails(tmp_path):
     # A guest that reported twice rebooted underneath the harness, and the
     # second lap's evidence would otherwise stand as the whole answer.
