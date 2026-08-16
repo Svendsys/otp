@@ -8,6 +8,8 @@
 # command line carries otp.imgcheck=<phase> -- something nothing but
 # harness/img-boot.sh puts there. The phase is read from /proc/cmdline rather
 # than passed as an argument so that the unit file needs no per-boot edit.
+# The script refuses to do anything at all without that token; see the phase
+# guard below for why the unit's condition is not enough on its own.
 #
 # WHY THIS EXISTS. The read-only overlay was the largest completely
 # unobserved surface in the project (issue #9). Tier 2 cannot see it: two
@@ -46,20 +48,63 @@
 # lesson tier 2's three-phase gate was built out of.
 #
 # Never exits non-zero on a failed check. It reports them all and lets the
-# host decide; stopping at the first would hide the rest behind it.
+# host decide; stopping at the first would hide the rest behind it. Refusing
+# to run at all is a different thing and does exit non-zero -- see below.
 set -uo pipefail
 
-PHASE=unknown
-for token in $(tr -d '\n' < /proc/cmdline); do
+BOOTDIR=/boot/firmware
+
+# THE PHASE, and every write in this file hangs off it.
+#
+# `set -f` around the loop because the substitution is deliberately word
+# split and must NOT also be pathname expanded. This runs as root from a
+# systemd unit, whose working directory is /, so with globbing left on a
+# cmdline token of `*` is replaced by the listing of the root directory
+# before the case below ever sees it -- and a file in / whose name happens
+# to start otp.imgcheck= would then choose the phase.
+PHASE=""
+set -f
+for token in $(tr -d '\n' < /proc/cmdline 2>/dev/null); do
     case "$token" in
         otp.imgcheck=*) PHASE="${token#otp.imgcheck=}" ;;
     esac
 done
+set +f
+
+# REFUSE anything that is not one of the two phases the harness supplies,
+# and refuse it here, before a single check has run.
+#
+# This script WRITES. It puts a sentinel in / and it puts a marker page
+# count through config.save() into $BOOTDIR/otp-unit.conf -- which is
+# OUTSIDE the overlay, on the boot partition, and therefore permanent on a
+# real unit. install.sh ships it 0755 in /opt/otp-unit and enables its unit
+# on every appliance, so until this guard existed the only thing between an
+# operator's settings and that write was the ConditionKernelCommandLine=
+# line in otp-unit-imgcheck.service: one line, in one file, that a drop-in,
+# a hand-run `systemctl start`, or anyone resolving the ExecStart path
+# steps straight past.
+#
+# Measured rather than argued. Given a realistic device command line with
+# no otp.imgcheck token, the previous version set PHASE=unknown and ran
+# every check regardless: the unit's page count went 500 -> 137 on the boot
+# partition and a sentinel was left in /. The unit condition stays where it
+# is -- this is a second lock on the same door, not a replacement.
+case "$PHASE" in
+    boot1|boot2) ;;
+    *)
+        echo "OTP-GUEST refusing to run: the kernel command line carries no" >&2
+        echo "  otp.imgcheck=boot1 or otp.imgcheck=boot2 token (phase read:" >&2
+        echo "  '${PHASE:-none}'). This probe writes a sentinel to / and a" >&2
+        echo "  marker page count into $BOOTDIR/otp-unit.conf, which is" >&2
+        echo "  outside the read-only overlay and would overwrite the" >&2
+        echo "  operator's settings for good. It runs only inside the" >&2
+        echo "  emulated boot harness/img-boot.sh sets up." >&2
+        exit 1
+        ;;
+esac
 
 PASS=0
 TOTAL=0
-
-BOOTDIR=/boot/firmware
 # Written to / in every phase and looked for at the start of the next one.
 # At the root of the filesystem on purpose: /tmp and /run are tmpfs whatever
 # the root is, so a sentinel there would vanish across a power-cycle on a

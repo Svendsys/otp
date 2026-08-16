@@ -281,6 +281,104 @@ def test_the_guest_probe_cannot_run_on_a_flashed_unit():
     assert "otp.imgcheck=$phase" in IMG_BOOT.read_text()
 
 
+# --- the probe refuses to run on anything but a harness boot -------------
+
+PHASE_GUARD_BLOCK = ('PHASE=""', "\nesac")
+
+# What a provisioned unit actually boots with: install.sh prepends
+# boot=overlay and strips `resize`, and nothing anywhere adds otp.imgcheck.
+DEVICE_CMDLINE = ("boot=overlay console=serial0,115200 console=tty1 "
+                  "root=PARTUUID=1a2b3c4d-02 rootfstype=ext4 fsck.repair=yes "
+                  "rootwait\n")
+
+
+def run_phase_guard(tmp_path, cmdline, *, cwd=None):
+    """Run the shipped phase parse and guard against a substituted cmdline.
+
+    The path is rewritten rather than the file stubbed, so the test still
+    describes the shipped bytes: everything else in the block -- the `set
+    -f`, the token match, the case -- is the code that ships.
+    """
+    block = slice_between(GUEST_CHECK.read_text(), *PHASE_GUARD_BLOCK)
+    assert block.count("/proc/cmdline") == 1, block
+    fake = tmp_path / "cmdline"
+    fake.write_text(cmdline)
+    runner = tmp_path / "phase.sh"
+    runner.write_text(
+        "set -uo pipefail\n"
+        "BOOTDIR=/boot/firmware\n"
+        + block.replace("/proc/cmdline", str(fake))
+        + '\nprintf "REACHED-THE-CHECKS phase=%s\\n" "$PHASE"\n')
+    return subprocess.run(["bash", str(runner)], capture_output=True,
+                          text=True, timeout=30, cwd=str(cwd or tmp_path))
+
+
+def test_the_probe_is_inert_on_a_command_line_without_the_token(tmp_path):
+    """
+    The HIGH one. This script ships 0755 in /opt/otp-unit on every unit and
+    its service is enabled unconditionally, and what it does is WRITE: a
+    sentinel to /, and pages=137 through config.save() into
+    /boot/firmware/otp-unit.conf, which is outside the overlay and therefore
+    permanent. The version before this guard read no token, set
+    PHASE=unknown and ran every check anyway -- run against a realistic
+    device command line it took an operator's page count from 500 to 137.
+    """
+    proc = run_phase_guard(tmp_path, DEVICE_CMDLINE)
+    assert proc.returncode != 0, proc.stdout
+    assert "REACHED-THE-CHECKS" not in proc.stdout, proc.stdout
+    assert "refusing to run" in proc.stderr, proc.stderr
+
+
+def test_the_probe_runs_for_the_two_phases_the_harness_supplies(tmp_path):
+    # The positive control: everything else here asserts a refusal, and a
+    # script that refused everything would satisfy all of them.
+    for phase in ("boot1", "boot2"):
+        proc = run_phase_guard(
+            tmp_path, f"{DEVICE_CMDLINE.strip()} otp.imgcheck={phase}\n")
+        assert proc.returncode == 0, proc.stderr
+        assert f"REACHED-THE-CHECKS phase={phase}" in proc.stdout, proc.stdout
+
+
+def test_a_phase_that_is_not_one_of_the_two_is_refused(tmp_path):
+    # `otp.imgcheck` bare is the interesting one: systemd's
+    # ConditionKernelCommandLine matches a bare word as well as an
+    # assignment, so that token starts the unit and names no phase.
+    for token in ("otp.imgcheck", "otp.imgcheck=", "otp.imgcheck=boot3",
+                  "otp.imgcheck=unknown"):
+        proc = run_phase_guard(tmp_path, f"{DEVICE_CMDLINE.strip()} {token}\n")
+        assert proc.returncode != 0, token
+        assert "REACHED-THE-CHECKS" not in proc.stdout, token
+
+
+def test_the_command_line_is_split_but_not_glob_expanded(tmp_path):
+    """
+    The unit runs as root with a working directory of /, and the token loop
+    reads an unquoted command substitution. With pathname expansion left on,
+    a bare `*` in the command line is replaced by the listing of the current
+    directory before the case sees it -- so a FILE whose name begins
+    otp.imgcheck= chooses the phase, and the probe starts writing.
+    """
+    root = tmp_path / "fake-root"
+    root.mkdir()
+    (root / "otp.imgcheck=boot2").write_text("")
+    (root / "vmlinuz").write_text("")
+    proc = run_phase_guard(tmp_path, "console=tty1 * rootwait\n", cwd=root)
+    assert proc.returncode != 0, proc.stdout
+    assert "REACHED-THE-CHECKS" not in proc.stdout, proc.stdout
+    assert "vmlinuz" not in proc.stderr, proc.stderr
+
+
+def test_the_refusal_comes_before_anything_the_probe_writes():
+    # Position, not behaviour: a guard that refuses AFTER the first write
+    # has already rewritten the operator's settings.
+    text = GUEST_CHECK.read_text()
+    guard = text.index('case "$PHASE" in')
+    for later, what in (("check root-is-overlay", "the first check"),
+                        ('> "$SENTINEL"', "the sentinel write"),
+                        ("config.save(saved)", "the config.save() into /boot")):
+        assert guard < text.index(later), what
+
+
 def test_the_probe_checks_the_sentinel_before_it_writes_one():
     """
     Ordering is the whole test in boot2: reading the sentinel after writing
