@@ -75,33 +75,51 @@ all. That is deliberate — see
 want the status sheet, unplug the printer when it lands, or set
 `auto_print = no` in `otp-unit.conf` on the boot partition first.
 
-One step is left manual, because it makes the filesystem read-only and you
-want to be sure everything works first:
+## The read-only overlay
 
-```bash
-sudo raspi-config nonint enable_overlayfs
-sudo reboot
+**It is already on.** `device/install.sh` enables it, so the image ships with
+it and so does any Pi you provision by hand. Nothing is left for you to run.
+
+The root filesystem is a RAM overlay over a card mounted read-only: nothing a
+session touches survives a power-cycle, and pulling the plug cannot corrupt
+the card, because nothing writes to it. Settings still persist — they live on
+the boot partition, which is outside the overlay.
+
+This used to be a manual step, printed as advice at the end of `install.sh`.
+It was a manual step nowhere else in this project: the image did not do it,
+the pi-gen stage did not do it, and no tier of the harness had ever booted a
+machine that had it. That is [issue
+#9](https://github.com/Svendsys/otp/issues/9). Tier 3 now boots the built
+image twice and asserts the overlay from inside it — see
+[harness/README.md](../harness/README.md).
+
+**Not `raspi-config nonint enable_overlayfs`, and do not run it.** On
+bookworm and later that command installs Debian's `overlayroot` package and
+puts `overlayroot=tmpfs` on the kernel command line. overlayroot's initramfs
+script moves the root aside with `mount --move`, and the `mount` an
+initramfs-tools initrd actually contains is klibc's, which has no such
+option:
+
+```
+$ /usr/lib/klibc/bin/mount --move /a /b
+mount: invalid option --
 ```
 
-This is what turns the Pi into an appliance rather than a computer that runs
-one program. Afterwards the root filesystem is read-only with a RAM overlay:
-nothing a session touches survives a power-cycle, and pulling the plug
-cannot corrupt the card. Settings still persist — they live on the boot
-partition, which is outside the overlay.
+That is the exact message the tier-2 guest printed immediately before
+`Kernel panic - not syncing: Attempted to kill init!`. It survives only where
+busybox happens to have been packed into the initramfs, because busybox's
+`mount` does accept `--move`.
 
-**Until you do this, the image boots with a writable root.** Every test
-print before that point leaves whatever CUPS and systemd wrote on the SD
-card permanently. It is a manual step because you want to confirm the unit
-works before making the filesystem read-only — but it is not optional if you
-want the reset-on-power-cycle property.
+What `install.sh` sets up instead is initramfs-tools' own `boot=` hook, which
+is what raspi-config itself used before the switch: `boot=overlay` on the
+kernel command line makes the initrd source `/etc/initramfs-tools/scripts/overlay`,
+which mounts the card read-only and lays a tmpfs overlay over it. Every mount
+it runs is one klibc's `mount` accepts.
 
-Note that `enable_overlayfs` leaves `/boot` writable; making it read-only is
-a separate `enable_bootro`, and raspi-config refuses to run it once the
-overlay is active. Do that one first if you want it.
-
-To change the software afterwards, disable the overlay
-(`sudo raspi-config nonint disable_overlayfs`), make the change, re-enable
-it.
+To change the software afterwards, take `boot=overlay` out of
+`/boot/firmware/cmdline.txt` on another computer (or from a shell on the
+unit, since the boot partition stays writable), reboot, make the change, and
+rerun `install.sh` to put it back.
 
 ## What the image does to the system
 
@@ -140,6 +158,14 @@ to be read:
 - Mounts a tmpfs over `/etc/cups` at boot from a baked-in template, so the
   print queue is rebuilt from whatever is plugged in. The template excludes
   `printers.conf`, which holds the last printer's make, model and serial.
+- **Enables the read-only root overlay**, and refuses to finish if it cannot
+  prove it did: the initramfs it built has to contain `scripts/overlay` and
+  the command line has to carry `boot=overlay`. Every way this can go wrong
+  is otherwise silent — a unit that boots read-write looks exactly like one
+  that does not.
+- Drops the `resize` token from `cmdline.txt` and disables `rpi-resize`. An
+  online resize cannot grow a filesystem mounted read-only as the overlay's
+  lower layer, and there is nothing to grow: what the unit writes is RAM.
 
 ## Why pi-gen and not rpi-image-gen
 

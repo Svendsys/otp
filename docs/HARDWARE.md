@@ -243,10 +243,11 @@ Run through this once before trusting the unit with anything:
 - [ ] `swapon --show` prints nothing
 - [ ] After a job, `ls /var/spool/cups` is empty and `findmnt /var/spool/cups`
       or `/run/cups` shows tmpfs
-- [ ] **`findmnt /` reports `overlay`.** This is the single most load-bearing
-      step in the design and the easiest to forget: the panel looks identical
-      before and after you enable it, so nothing else will tell you. Until it
-      does, everything a session writes stays on the card.
+- [ ] **`findmnt /` reports `overlay`.** `install.sh` enables it, so this is
+      a confirmation rather than a step you have to remember — but it is
+      still the single most load-bearing property in the design, and the
+      panel looks identical whether or not it holds. If it says `ext4`, the
+      overlay is off and everything a session writes stays on the card.
 - [ ] Power-cycle, then confirm the job left no trace
 
 ## Developing without hardware

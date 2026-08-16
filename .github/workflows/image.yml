@@ -123,14 +123,21 @@ jobs:
     # timeout costs the diagnosis as well as the run -- learned the hard
     # way when a 15-minute cap fired before the boot script's own timeout,
     # cancelled qemu mid-experiment, and skipped the verdict and the
-    # evidence upload (failure() is false on cancellation). Sized from
-    # measured worst case: ~10 minutes of non-boot work on a cache-miss
-    # rebuild (checkout, apt, pi-gen at 7m24s, cache save, upload,
-    # decompress) + the 600s boot backstop + timeout's 30s kill grace +
-    # verdict overhead = ~21.5; 25 leaves real margin. Healthy runs never
-    # go near this: the harness stops qemu at the unit's success line
-    # (~4.5 minutes cached, run 14 measured).
-    timeout-minutes: 25
+    # evidence upload (failure() is false on cancellation).
+    #
+    # TWO boots now, for the read-only overlay (issue #9): the second is a
+    # power-cycle of the same card, and the backstop is per boot. The
+    # arithmetic that sizes this is the WORST case, where neither boot ever
+    # reports: ~10 minutes of non-boot work on a cache-miss rebuild
+    # (checkout, apt, pi-gen, cache save, upload, decompress) + 2 x (600s
+    # backstop + timeout's 30s kill grace) + verdict overhead = ~31.5, so 40
+    # keeps the same kind of margin 25 gave one boot.
+    #
+    # Healthy runs are nowhere near it, and that is measured rather than
+    # hoped: run 31752321387, a cache MISS with both boots, took 16m16s end
+    # to end -- 6m58s of pi-gen and 7m59s for the pair of boots, because the
+    # harness stops each one the moment its guest check reports done.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -295,9 +302,12 @@ jobs:
       # Tier 3 of the harness: boot the artifact that was just built. Once
       # per image, not per commit -- it is emulated, so it is slow, and its
       # peripheral coverage is WORSE than tier 1's simulators. It answers
-      # exactly one question nothing else can: does the thing that gets
-      # flashed to a card actually come up? pi-gen assembles a filesystem
-      # and never starts it. See harness/README.md.
+      # three questions nothing else can -- it used to be one, and the
+      # overlay work added two: does the thing that gets flashed to a card
+      # actually come up, does the unit start on the read-only overlay it
+      # comes up on, and does a power-cycle discard what the session wrote
+      # while keeping the settings? pi-gen assembles a filesystem and never
+      # starts it. See harness/README.md.
       #
       # LAST, AND ALLOWED TO FAIL LOUDLY. This step used to run before the
       # upload with `continue-on-error: true`, so that an unvalidated check
@@ -312,14 +322,14 @@ jobs:
       # safe, so a red boot costs nothing, and the boot can therefore be
       # honest about failing.
       #
-      # 600 seconds, and it is a BACKSTOP, not a budget: the harness stops
-      # qemu the moment the unit's success line appears (run 14: 4m22s
-      # boot step), so only a boot that never gets there pays this number.
-      # It was 480 when reaching the unit still raced the cap -- run 13's
-      # success line landed ~420s in -- and the early stop is what made
-      # raising it free. If a run does hit 600, the verdict's "guest
-      # reached" line says whether the guest was still moving, and the
-      # sampler's qemu-cpu column says whether it was idle or spinning.
+      # 600 seconds PER BOOT, and it is a BACKSTOP, not a budget: the
+      # harness stops each boot the moment its guest check reports done, so
+      # only a boot that never gets there pays this number. It was 480 when
+      # reaching the unit still raced the cap -- run 13's success line
+      # landed ~420s in -- and the early stop is what made raising it free.
+      # If a boot does hit 600, the verdict's "guest reached" line says
+      # whether the guest was still moving, and the sampler's qemu-cpu
+      # column says whether it was idle or spinning.
       - name: Boot the image
         env:
           OTP_IMG_TIMEOUT: 600
@@ -415,8 +425,11 @@ jobs:
           # in this file.
           body: >
             This image passed the tier-3 boot gate: it was booted under
-            QEMU and `otp-unit.service` reached `Started`. That gate does
-            not exercise the OLED, the buttons or a printer -- see the
+            QEMU twice, `otp-unit.service` reached `Started` on both, the
+            root filesystem was a RAM overlay over a read-only card, a file
+            written to `/` in the first boot was gone in the second, and a
+            setting written to `/boot/firmware` was still there. That gate
+            does not exercise the OLED, the buttons or a printer -- see the
             header of `harness/img-boot.sh` for exactly what it does and
             does not prove.
 
@@ -431,9 +444,9 @@ jobs:
           CACHED='${{ steps.imgcache.outputs.cache-hit }}'
           {
             echo
-            echo "Budget: healthy boots stop at the unit start line"
-              echo "(~4.5 minutes wall, run 14 measured); 600s is the"
-              echo "backstop only broken boots pay."
+            echo "Budget: each of the two boots stops as soon as the"
+              echo "guest check reports done; 600s per boot is the"
+              echo "backstop only a boot that never reports pays."
             echo
             if [ "$CACHED" = "true" ]; then
               echo "This run restored the image from cache and went straight"
@@ -447,19 +460,22 @@ jobs:
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # The job log shows the last hundred console lines; this carries
-      # everything -- both UARTs in full, the verdict, and the boot
-      # partition's own cmdline.txt and config.txt, so the divergence
-      # between what the device would boot and what this harness booted is
-      # part of the record. Two diagnoses this week were built on a
-      # truncated tail; this is the end of that.
+      # The job log shows the last eighty console lines per boot; this
+      # carries everything -- both UARTs of both boots in full, the verdict,
+      # and the boot partition's own cmdline.txt and config.txt, so the
+      # divergence between what the device would boot and what this harness
+      # booted is part of the record. Two diagnoses this week were built on
+      # a truncated tail; this is the end of that.
+      #
+      # The consoles moved into a directory per boot when tier 3 grew a
+      # second one, so the glob has a level in it that the old path did not.
       - name: Upload the boot evidence
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: tier3-boot-evidence
           path: |
-            ${{ runner.temp }}/otp-img/console*.log
+            ${{ runner.temp }}/otp-img/*/console*.log
             ${{ runner.temp }}/otp-img/verdict.txt
             ${{ runner.temp }}/otp-img/boot/cmdline.txt
             ${{ runner.temp }}/otp-img/boot/config.txt

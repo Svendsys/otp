@@ -133,8 +133,7 @@ Flash the .img.xz with Raspberry Pi Imager or:
 First boot takes a minute or so. The unit needs no network and no keyboard:
 plug in a USB printer and use the three buttons.
 
-Then enable the read-only overlay, which is what makes a power-cycle a full
-reset (see docs/IMAGE.md):
-
-    sudo raspi-config nonint enable_overlayfs
+The read-only overlay is already on -- device/install.sh enables it during
+the build, so a power-cycle is a full reset from the first boot. Confirm it
+with `findmnt /`, which should say `overlay` (see docs/IMAGE.md).
 EOF

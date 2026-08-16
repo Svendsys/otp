@@ -212,7 +212,7 @@ any of them. Those mutations are no longer applied by hand: they are rows in
 `tests/mutations.toml`, and CI runs them on every pull request. See
 [proving the guards can fail](#proving-the-guards-can-fail).
 
-### The read-only overlay is NOT tested here — issue #9
+### The read-only overlay is NOT tested here — tier 3 owns it
 
 Two mechanisms were tried in this guest and neither works. Both are worth
 writing down, because both look like they should:
@@ -224,8 +224,26 @@ writing down, because both look like they should:
   Debian's initramfs-tools initrd has no systemd in it. Measured: the flag
   present in `/proc/cmdline`, and `/` still plain `rw` ext4.
 
-Rather than fake it, tier 2 claims only what it demonstrates. The overlay
-stays open as issue #9.
+The first of those turned out not to be a property of this guest at all. The
+option `mount` rejects is `--move`, and the `mount` in an initramfs-tools
+initrd is klibc's, which does not implement it:
+
+```
+$ /usr/lib/klibc/bin/mount --move /a /b
+mount: invalid option --
+```
+
+— byte for byte the string the guest printed. Raspberry Pi OS trixie
+installs the same `overlayroot` and builds its initrd the same way, so
+`raspi-config nonint enable_overlayfs`, which is what the documentation told
+operators to run, would have taken a flashed unit down the same way. It
+survives only where busybox happens to be in the initramfs, because
+busybox's `mount` accepts `--move`.
+
+So the overlay is enabled by `install.sh` through initramfs-tools' own
+`boot=overlay` hook, and **tier 3 is what proves it** — the tier that boots
+the real image. Tier 2 still claims only what it demonstrates, and what it
+demonstrates does not include a read-only root.
 
 `/boot/firmware` still gets its own virtio disk, formatted FAT and mounted
 by label, mirroring the Pi's geometry — the device keeps settings there
@@ -278,9 +296,82 @@ runs diagnosed a "freeze" that was a dead console), and Raspberry Pi
 OS's first-boot wizard holding `multi-user.target` open forever — a
 real bug that would have shipped to hardware, now handled by a
 systemd drop-in in `install.sh`. The harness stops the emulator the
-moment the unit's success line appears and judges the boot on
-ANSI-stripped console evidence, not qemu's exit code. The full
-fifteen-run narrative lives in `img-boot.sh`'s header and issue #17.
+moment the guest reports done and judges the boot on ANSI-stripped
+console evidence, not qemu's exit code. The full fifteen-run narrative
+lives in `img-boot.sh`'s header and issue #17.
+
+### Two boots, because the overlay is only observable across a power-cycle
+
+Issue #9: the read-only root was the largest completely unobserved surface
+in the project, and it is the property everything else rests on — a
+power-cycle is meant to be a full reset. `install.sh` enables the overlay
+now, so the artifact this tier boots has it, and this is the only tier that
+can ask whether it works: tier 2's guest is a Debian cloud image with a
+different mechanism, and pi-gen never boots what it builds.
+
+| Phase | What is true of it |
+|---|---|
+| `boot1` | The overlay is engaged. Writes a sentinel to `/` and a setting to `/boot/firmware` through `config.save()`. |
+| `boot2` | The **same card image**, booted again. The sentinel must be gone; the setting must still be there. |
+
+One image file across both boots is the whole mechanism: a write that
+reached the card is there in boot 2 and a write that only reached the
+overlay's tmpfs is not. A fresh copy would answer both questions with the
+image build's own contents.
+
+**Run 16 (31752321387) is the first one that did this, and it went green on
+its first attempt** — 9/9 guest checks in boot 1, 11/11 in boot 2, each boot
+reaching ~150s guest time with one kernel entry, and both ANSI-stripped
+consoles carrying `random: crng init done` and `bcm2835-rng 3f104000.rng:
+hwrng registered`. Measured cost on a cache miss: 6m58s of pi-gen, then
+7m59s for the pair of boots, 16m16s for the whole job.
+
+**`OTP_IMG_PHASES` picks the boots, and it may not drop `boot2`.** It
+defaults to `boot1 boot2`; a run debugging the boot itself can shorten it,
+and `img-boot.sh` exits 1 with a message if what is left does not include
+`boot2`. That guard is not tidiness. The same list drives the boot loop,
+the verdict loop *and* the set of guest checks each phase is required to
+have reported, so removing `boot2` removed
+`root-writes-discarded-by-the-power-cycle` and
+`settings-survive-the-power-cycle` from what the run demanded, along with
+the boot that would have produced them: measured, `OTP_IMG_PHASES=boot1`
+over a healthy boot-1 console exited 0 and printed *"the image boots twice
+on a read-only overlay"*, and `image.yml` puts that claim, in its own
+words, into the body of a tagged release. The concluding line is now
+conditional on the phases that actually ran as well, so the two guards
+have to fail together for the claim to be wrong.
+
+The other variables: `OTP_IMG_TIMEOUT` is the per-boot backstop in seconds
+(CI sets 600; the local default is 1200 because someone running this by
+hand is debugging), and `OTP_IMG_WORK` is where the decompressed card, the
+per-phase console directories and `verdict.txt` are written.
+
+The reporting comes from inside the guest, because `findmnt /` and
+`cupsd -t` need a running machine. `otp-unit-imgcheck.service` **ships in
+the image** and is gated on `otp.imgcheck` in the kernel command line, which
+nothing but `img-boot.sh` supplies — so it never runs on a flashed unit.
+The probe refuses to run without that token too: it writes a sentinel to
+`/` and a marker page count into `/boot/firmware/otp-unit.conf`, which is
+outside the overlay, and one `ConditionKernelCommandLine=` line in one unit
+file is thin protection for a 0755 script that ships on every appliance.
+What tier 3 boots is still the artifact people flash rather than a variant
+built for testing.
+
+The gate over what it says names the checks it expects rather than only
+counting `FAIL` lines. Zero FAIL lines is trivially true of a guest that
+checked nothing, which is row 4 of issue #14 arriving somewhere new;
+`tests/test_img_verdict.py` holds the harness's list and the guest script
+against each other so neither can shrink quietly.
+
+**One correction to how the issue phrased it.** "A write to `/` fails" is
+not what a working overlay does, and asserting it would have been asserting
+a broken one. Writes to `/` succeed and land in the tmpfs upper layer; the
+card underneath is mounted read-only and is never written. What tier 3
+gates on is therefore that `/` is an overlay, that a write to it succeeds,
+and that it is *gone after the power-cycle* — reported last, after two
+positive controls in the same phase, because an absence on its own is
+equally satisfied by a boot 1 that never ran, a sentinel written somewhere
+else, and a rig that cannot write to `/` at all.
 
 It no longer carries `continue-on-error`. It used to, so that an
 unvalidated step could not cost anyone the image — and the effect on its
@@ -295,17 +386,22 @@ The image build also now runs on any pull request touching `image/**`,
 `device/**`, `harness/img-boot.sh` or the workflow itself. Before that,
 nothing checked the image on the PR that broke it.
 
-It answers exactly one question nothing else can: **does the thing that
-gets flashed to a card actually boot?** pi-gen assembles a filesystem and
-never starts it; tier 2 boots a Debian cloud image rather than this one. A
-missing kernel module, a broken `cmdline.txt`, an fstab naming a partition
-that moved — all invisible until something powers it on.
+It answers the questions nothing else can: **does the thing that gets
+flashed to a card actually boot, and does it boot the way it is supposed
+to?** pi-gen assembles a filesystem and never starts it; tier 2 boots a
+Debian cloud image rather than this one. A missing kernel module, a broken
+`cmdline.txt`, an fstab naming a partition that moved, an overlay that was
+configured but never assembled — all invisible until something powers it on.
 
-Two details that make it fiddly, both handled in the script: QEMU does not
-run the Pi's proprietary bootloader, so `kernel8.img` and the DTB are
-pulled off the FAT boot partition with `mcopy` and passed directly; and
-QEMU's `sd` interface refuses any image whose size is not a power of two,
-which pi-gen's output never is.
+Three details that make it fiddly, all handled in the script: QEMU does not
+run the Pi's proprietary bootloader, so `kernel8.img`, the DTB **and the
+initramfs** are pulled off the FAT boot partition with `mcopy` and passed
+directly (`auto_initramfs=1` means nothing to an emulator that reads no
+firmware configuration); `-append` replaces the kernel command line
+wholesale, so `boot=overlay` is *copied out of the image's own cmdline.txt*
+rather than added — an image built without the overlay boots without it here
+too, and fails; and QEMU's `sd` interface refuses any image whose size is
+not a power of two, which pi-gen's output never is.
 
 **Its peripheral coverage is worse than tier 1's**, and that is not a
 defect in the plan — a QEMU Pi is a Pi with nothing plugged into it. Once
@@ -329,6 +425,18 @@ true of a guest killed after two checks; and a group guard that matched the
 found by hand and mutated by hand, and the next one was found the same way a
 round later.
 
+A sixth arrived with the overlay work, and it points the other way: a check
+that could not *pass*. `install.sh` runs under `pipefail`, and the new
+"does this initramfs contain the overlay script" check was first written as
+`lsinitramfs … | grep -q scripts/overlay`. `grep -q` closes the pipe on its
+first match, the producer dies of SIGPIPE, and the pipeline returns 141 — so
+the condition is false for exactly the initramfs that should pass, and the
+image build fails on a good image. Measured at rc 141 against a 300k-line
+producer. It survived its own unit test at first because a three-line
+fixture finishes writing before grep can exit; the fixture is twenty
+thousand lines now, and `install-overlay-listing-piped-into-grep-q` is what
+keeps it that size.
+
 `tests/mutations.toml` is that round as a table, and `tests/mutation_gate.py`
 runs it: for each row it applies exact edits to the shipped files, runs the
 tests named as having to notice, restores the tree, and fails if the suite
@@ -336,14 +444,14 @@ stayed green.
 
 ```sh
 python3 tests/mutation_gate.py --list
-python3 tests/mutation_gate.py --tier fast       # 19 rows, 11s
+python3 tests/mutation_gate.py --tier fast       # 38 rows, 29s
 sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
 ```
 
 **Runtime decided the trigger.** The issue expected nightly or
-label-triggered; measured, the fast tier is eleven seconds — cheaper than the
-suite it audits — so it runs per pull request as its own `mutation` job, and
-the ordinary suite's wall clock does not move. The three CUPS-rig rows run in
+label-triggered; measured, the fast tier is twenty-nine seconds at 38 rows —
+still cheaper than the suite it audits — so it runs per pull request as its
+own `mutation` job, and the ordinary suite's wall clock does not move. The three CUPS-rig rows run in
 the existing `hardware` job, the only place with a real `cupsd`, for 36
 seconds on top of about eight minutes.
 
@@ -368,13 +476,17 @@ Both were single-edit rows that survived:
   than printing one. Together they are red in 3.8 seconds. The number stopped
   being what protects that sequence; the wait is.
 
-**What is not covered.** No row needs a booted guest, and the tier-2 checks
-that only exist *inside* the guest — the spool redirect above, tty1
-ownership, the persistence phases — cannot be mutated from here. Proving
-those needs a `vm` tier with its own trigger; tiers carry their own pytest
-arguments and timeout, so adding one is a table entry rather than a change to
-the runner. None is seeded, because a row whose red was never observed is
-worse than no row at all.
+**What is not covered.** No row needs a booted guest, and the checks that
+only exist *inside* one — tier 2's spool redirect above, tty1 ownership, the
+persistence phases, and now tier 3's overlay probe — cannot be mutated from
+here. What the nineteen overlay rows attack is the *host-side gate* over what the
+guest says and the *provisioning* that sets the overlay up; that the guest
+reports the truth about a machine with a read-only root is a claim only a
+booted image can settle, and only the image build makes one. Proving the
+guest's own checks needs a `vm` or `img` tier with its own trigger; tiers
+carry their own pytest arguments and timeout, so adding one is a table entry
+rather than a change to the runner. None is seeded, because a row whose red
+was never observed is worse than no row at all.
 
 **Restoring the tree.** Not `git checkout` — a hand-run round used it and
 destroyed an uncommitted fix. Not `git stash push` + `git stash drop` either:

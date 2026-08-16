@@ -220,15 +220,22 @@ guard = """
 systemd colors the unit name, so the raw bytes of the success line are
 "Started ESC[0;1;39motp-unit.serviceESC[0m - ...". Run 12 started the unit
 and the verdict still said FAIL, because no pattern can straddle that
-escape."""
+escape.
+
+The guest gate reads through the same strip and does NOT depend on it, which
+was worth measuring rather than assuming: with this edit applied, only the
+healthy-boot test goes red. Every line otp-unit-imgcheck.service prints
+arrives over the serial console with a trailing CR, but \\r is in
+[[:space:]], so the phase patterns match across it and `grep -oE` never puts
+it in front of a comparison. The ANSI half is what is load-bearing here."""
 tests = [
-  "tests/test_img_verdict.py::test_healthy_boot_passes_on_console_evidence_despite_rc_124",
+  "tests/test_img_verdict.py::test_a_healthy_two_boot_run_passes",
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
-find = '''sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' \
-    "$CONSOLE_ALL" > "$CONSOLE_TXT" 2>/dev/null || cp "$CONSOLE_ALL" "$CONSOLE_TXT"'''
-replace = '''cp "$CONSOLE_ALL" "$CONSOLE_TXT"'''
+find = '''    sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' \
+        "$CONSOLE_ALL" > "$CONSOLE_TXT" 2>/dev/null || cp "$CONSOLE_ALL" "$CONSOLE_TXT"'''
+replace = '''    cp "$CONSOLE_ALL" "$CONSOLE_TXT"'''
 
 
 [[mutation]]
@@ -509,3 +516,413 @@ tests = [
 file = "tests/cupsrig.py"
 find = '''        (self.jobs / ".mode").write_text(mode)'''
 replace = '''        (self.jobs / ".mode-disabled").write_text(mode)'''
+
+
+# --- tier 3: the overlay, and the guest that reports on it ----------------
+#
+# Issue #9. The read-only root was the largest completely unobserved surface
+# in the project, and what observes it now is a guest reporting over a serial
+# console into a gate. Every row here is a way for that gate to accept a boot
+# that proved nothing -- which is the shape of four of the five defects in
+# issue #14.
+
+[[mutation]]
+name = "tier3-guest-phase-never-reported-accepted"
+tier = "fast"
+guard = """
+Exactly one OTP-RESULT per phase. Boot 2 is the entire power-cycle half of
+issue #9, and a boot 2 that never happened produces an empty console -- which
+is indistinguishable from a boot 2 with nothing to say. Accepting silence
+greens a run in which the overlay was never asked to discard anything."""
+tests = [
+  "tests/test_img_verdict.py::test_the_second_boot_must_report_too",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ "${count:-0}" = "1" ]; then
+        printf 'IMG-CHECK %s guest-reported-once PASS\n' "$phase"'''
+replace = '''    if true; then
+        printf 'IMG-CHECK %s guest-reported-once PASS\n' "$phase"'''
+
+
+[[mutation]]
+name = "tier3-guest-unfinished-phase-accepted"
+tier = "fast"
+guard = """
+OTP-GUEST-DONE is the only evidence a phase ran out rather than being killed
+part way through -- and this tier kills the emulator by hand the moment that
+line appears, so the difference between "finished" and "cut off" is a single
+line of output. Counts printed without it agree with themselves right up to
+the axe."""
+tests = [
+  "tests/test_img_verdict.py::test_a_phase_that_started_but_never_finished_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ "${count:-0}" = "1" ]; then
+        printf 'IMG-CHECK %s guest-finished PASS\n' "$phase"'''
+replace = '''    if true; then
+        printf 'IMG-CHECK %s guest-finished PASS\n' "$phase"'''
+
+
+[[mutation]]
+name = "tier3-guest-fail-lines-ignored"
+tier = "fast"
+guard = """
+Belt and braces over the counts, which come from the guest -- the thing under
+test. A guest that miscounts must not be able to talk its way to a green run,
+so one OTP-CHECK FAIL fails the phase on its own."""
+tests = [
+  "tests/test_img_verdict.py::test_a_guest_fail_line_fails_the_phase",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ "${count:-1}" = "0" ]; then'''
+replace = '''    if true; then'''
+
+
+[[mutation]]
+name = "tier3-guest-named-checks-not-required"
+tier = "fast"
+guard = """
+Zero FAIL lines is trivially true of a guest that checked nothing -- row 4 of
+issue #14 arriving somewhere new. The gate names the checks it expects, so a
+check deleted from img-guest-check.sh fails the run instead of quietly
+shrinking what tier 3 proves. The overlay checks are the ones worth losing by
+accident: everything else in the phase would still pass without them."""
+tests = [
+  "tests/test_img_verdict.py::test_a_dropped_guest_check_fails_even_with_no_fail_lines",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        grep -qE "OTP-CHECK[[:space:]]+${phase}[[:space:]]+${name}[[:space:]]+PASS" \
+             "$CONSOLE_TXT" 2>/dev/null || missing="$missing $name"'''
+replace = '''        :'''
+
+
+[[mutation]]
+name = "tier3-one-boot-run-accepted"
+tier = "fast"
+guard = """
+boot2 is not optional. OTP_IMG_PHASES drives the boot loop, the verdict
+loop and the set of guest checks each phase must have reported, so dropping
+boot2 drops root-writes-discarded-by-the-power-cycle and
+settings-survive-the-power-cycle from what the run demands along with the
+boot that would have produced them. Measured before the guard:
+PHASES="boot1" over a healthy boot1 console exits 0 -- the whole gate, on
+half the evidence, and image.yml puts the two-boot claim in the body of a
+tagged release."""
+tests = [
+  "tests/test_img_verdict.py::test_a_phase_list_without_boot2_is_refused",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''case " $PHASES " in
+    *" boot2 "*) ;;
+    *)'''
+replace = '''case " $PHASES " in
+    *) ;;
+    *)'''
+
+
+[[mutation]]
+name = "tier3-two-boot-claim-unconditional"
+tier = "fast"
+guard = """
+The other half of the same defect, and the half that survives a phase list
+nobody thought of: the concluding line said "the image boots twice on a
+read-only overlay" whatever ran. It is the sentence a reader takes away and
+the sentence image.yml's release note restates, so it states only what the
+phases that ran support."""
+tests = [
+  "tests/test_img_verdict.py::test_the_two_boot_claim_is_only_made_by_a_run_that_booted_twice",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''if [ -z "$CLAIM_MISSING" ]; then'''
+replace = '''if true; then'''
+
+
+[[mutation]]
+name = "tier3-backstop-message-contradicts-the-console"
+tier = "fast"
+guard = """
+rc=124 with an empty early-stop is not the same as a guest that said
+nothing: the sampler looks every 30 seconds, so a done line printed inside
+the last window reaches the console and never reaches early-stop. The old
+wording announced "ran to the backstop without a guest report" over a
+console holding a complete report -- a diagnosis contradicted by the file
+next to it, which is how a healthy-but-slow boot gets read as a dead one."""
+tests = [
+  "tests/test_img_verdict.py::test_a_backstopped_boot_that_did_report_is_not_called_silent",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        if grep -qF "OTP-GUEST-DONE $phase" "$CONSOLE_TXT" 2>/dev/null; then'''
+replace = '''        if false; then'''
+
+
+[[mutation]]
+name = "imgcheck-unit-start-timeout-too-short"
+tier = "fast"
+guard = """
+The probe's own poll for otp-unit.service is 45 iterations of `sleep 2` --
+90 seconds, exactly systemd's default TimeoutStartSec -- before cupsd -t
+and two Python interpreters under TCG. A timeout that does not clear that
+bound kills the probe mid-poll on a slow but healthy boot, and the phase
+then has no OTP-GUEST-DONE line, which the harness fails it for. Red rather
+than green, so a flake risk rather than a false pass, but the number has to
+be stated rather than inherited."""
+tests = [
+  "tests/test_overlay_root.py::test_the_probe_is_given_longer_than_its_own_bounded_wait",
+]
+[[mutation.edit]]
+file = "device/systemd/otp-unit-imgcheck.service"
+find = "TimeoutStartSec=300"
+replace = "TimeoutStartSec=60"
+
+
+[[mutation]]
+name = "guest-probe-runs-without-a-phase-token"
+tier = "fast"
+guard = """
+The probe refuses to run unless the kernel command line names boot1 or
+boot2, and that guard protects a REAL UNIT rather than a test. The script
+ships 0755 in /opt/otp-unit and its service is enabled on every appliance;
+what it does is write a sentinel to / and pages=137 through config.save()
+into /boot/firmware/otp-unit.conf, which is outside the overlay and so
+permanent. Before the guard, an absent token meant PHASE=unknown and every
+check ran regardless -- measured against a realistic device command line,
+the operator's page count went 500 -> 137. The unit's
+ConditionKernelCommandLine= is the other lock; this row is the one that
+holds when a drop-in, a hand-run `systemctl start` or anything resolving
+the ExecStart path steps past it."""
+tests = [
+  "tests/test_overlay_root.py::test_the_probe_is_inert_on_a_command_line_without_the_token",
+  "tests/test_overlay_root.py::test_a_phase_that_is_not_one_of_the_two_is_refused",
+  "tests/test_overlay_root.py::test_the_command_line_is_split_but_not_glob_expanded",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''case "$PHASE" in
+    boot1|boot2) ;;'''
+replace = '''case "$PHASE" in
+    *) ;;'''
+
+
+[[mutation]]
+name = "guest-probe-cmdline-glob-expanded"
+tier = "fast"
+guard = """
+The token loop word-splits an unquoted command substitution, which is
+wanted, and `set -f` is what stops it being PATHNAME EXPANDED as well. The
+unit runs as root with a working directory of /, so with globbing on a bare
+`*` in the command line becomes the listing of the root directory before
+the case sees it. Measured with the guard removed and a directory holding a
+file named `otp.imgcheck=boot2`: the probe selected phase boot2 from that
+filename and ran."""
+tests = [
+  "tests/test_overlay_root.py::test_the_command_line_is_split_but_not_glob_expanded",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''PHASE=""
+set -f
+'''
+replace = '''PHASE=""
+'''
+
+
+# --- what provisioning is allowed to leave behind -------------------------
+
+[[mutation]]
+name = "install-overlay-initramfs-not-verified"
+tier = "fast"
+guard = """
+The initramfs has to CONTAIN scripts/overlay, not merely exist. One built
+before the overlay script was written has the right name and the right size,
+the firmware loads it, and boot=overlay is then read by nothing -- so the
+unit comes up on a writable root and nothing anywhere says so. install.sh
+reads the archive rather than stat()ing the file for exactly that case."""
+tests = [
+  "tests/test_overlay_root.py::test_an_initramfs_without_the_overlay_script_fails_the_install",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''        case "$LISTING" in
+            *scripts/overlay*)'''
+replace = '''        case "anything" in
+            *)'''
+
+
+[[mutation]]
+name = "install-overlay-listing-piped-into-grep-q"
+tier = "fast"
+guard = """
+The check reads the listing into a variable instead of piping it, and that
+is not a style choice. install.sh runs under pipefail; `grep -q` closes the
+pipe on its first match, lsinitramfs dies of SIGPIPE, and the pipeline
+returns 141 -- so the condition is false for exactly the initramfs that
+passes and the build fails on a good image. Measured with a 300k-line
+producer: `NO MATCH (rc of pipeline was nonzero)`, rc=141.
+
+This is the form the check was FIRST WRITTEN IN, and a three-line fixture
+never catches it: the producer finishes before grep can exit. The listing
+in tests/test_overlay_root.py is 20k lines with scripts/overlay near the
+top for that reason, and this row is what keeps it that size."""
+tests = [
+  "tests/test_overlay_root.py::test_a_good_initramfs_passes_the_verification",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''        LISTING=$(lsinitramfs "$candidate" 2>/dev/null || true)
+        case "$LISTING" in
+            *scripts/overlay*)
+                OVERLAY_INITRAMFS="$candidate"
+                break
+                ;;
+        esac'''
+replace = '''        if lsinitramfs "$candidate" 2>/dev/null | grep -q "scripts/overlay"; then
+            OVERLAY_INITRAMFS="$candidate"
+            break
+        fi'''
+
+
+[[mutation]]
+name = "overlay-lower-layer-mounted-writable"
+tier = "fast"
+guard = """
+`-r` on the lower mount is the line that makes the card read-only for the
+whole life of the boot: without it the running system has a writable handle
+on the filesystem it booted from, and the appliance is a slower way of
+writing to an SD card rather than a machine a power-cycle resets. It is the
+most safety-critical line in the overlay script and it had no row."""
+tests = [
+  "tests/test_overlay_root.py::test_the_lower_layer_is_mounted_read_only",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''	if ! mount -r ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${ROOT}" /lower; then'''
+replace = '''	if ! mount ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${ROOT}" /lower; then'''
+
+
+[[mutation]]
+name = "initramfs-updated-instead-of-created"
+tier = "fast"
+guard = """
+`-c`, not `-u`, and the comment above the line has always named this exact
+defect: pi-gen sets update_initramfs=no in update-initramfs.conf, and
+update-initramfs honours that setting on its UPDATE path only. `-u` prints
+"Not updating initramfs." and exits 0, leaving the overlay script out of an
+initramfs that already exists, has the right name and is the right size --
+the firmware loads it, boot=overlay is read by nothing, and the unit comes
+up on a writable root. The edit survived the whole fast suite until the
+build loop was run against a recording stub."""
+tests = [
+  "tests/test_overlay_root.py::test_the_initramfs_is_created_and_not_merely_updated",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''        update-initramfs -c -k "$kern"'''
+replace = '''        update-initramfs -u -k "$kern"'''
+
+
+[[mutation]]
+name = "empty-kernel-list-not-refused"
+tier = "fast"
+guard = """
+The kernel list is read out of /lib/modules because in pi-gen's chroot
+`uname -r` is the build host's kernel -- which is what stops raspi-config's
+enable_overlayfs working at image-build time at all. An empty list means no
+initramfs can be built and the overlay cannot be enabled, so provisioning
+stops there rather than building nothing and leaving the later verification
+as the only thing between that and a released image."""
+tests = [
+  "tests/test_overlay_root.py::test_no_kernel_under_lib_modules_stops_provisioning",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''        echo "       can be built and the overlay cannot be enabled." >&2
+        exit 1'''
+replace = '''        echo "       can be built and the overlay cannot be enabled." >&2
+        :'''
+
+
+[[mutation]]
+name = "image-build-ships-an-unprobeable-image"
+tier = "fast"
+guard = """
+Every other overlay precondition in install.sh exits 1 under --image-build.
+The probe install printed a NOTE, so a build could produce, upload and
+release an image whose read-only root nothing can observe -- and the miss
+does not surface until a pi-gen build and two emulated boots later, as a
+guest that never reported, which reads as a boot failure rather than the
+packaging error it is."""
+tests = [
+  "tests/test_overlay_root.py::test_an_image_build_without_the_probe_fails",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''elif [ "$IMAGE_BUILD" -eq 1 ]; then'''
+replace = '''elif [ "$IMAGE_BUILD" -eq 9 ]; then'''
+
+
+[[mutation]]
+name = "image-build-probe-not-installed"
+tier = "fast"
+guard = """
+The other end of the same thing: the file can be present and simply not
+copied. Deleting this one line survived the entire fast suite, and what it
+costs is the whole of tier 3's view inside the guest."""
+tests = [
+  "tests/test_overlay_root.py::test_the_probe_is_installed_when_it_is_there",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''    install -m 0755 "$REPO_DIR/harness/img-guest-check.sh" \
+        "$PREFIX/img-guest-check.sh"'''
+replace = '''    :'''
+
+
+[[mutation]]
+name = "image-stage-skips-a-missing-item"
+tier = "fast"
+guard = """
+The pi-gen stage copies what install.sh reads, and it copied
+`if [ -e ]` -- so a name dropped from the list, or a directory missing from
+the checkout, was a silent no-op. Most of them then fail inside the chroot
+on a path error; `harness` did not fail at all, and produced an image whose
+overlay nothing could probe."""
+tests = [
+  "tests/test_overlay_root.py::test_a_missing_item_stops_the_stage_instead_of_being_skipped",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''	if [ ! -e "${REPO_SRC}/${item}" ]; then
+		echo "ERROR: ${REPO_SRC}/${item} is missing, and install.sh reads" >&2
+		echo "       it inside the chroot. Refusing to build an image" >&2
+		echo "       without it." >&2
+		exit 1
+	fi
+	cp -a "${REPO_SRC}/${item}" "${ROOTFS_DIR}${STAGING}/"'''
+replace = '''	if [ -e "${REPO_SRC}/${item}" ]; then
+		cp -a "${REPO_SRC}/${item}" "${ROOTFS_DIR}${STAGING}/"
+	fi'''
+
+
+[[mutation]]
+name = "install-overlay-token-not-added"
+tier = "fast"
+guard = """
+boot=overlay on the kernel command line is what makes the initrd source
+/scripts/overlay at all. Without it the initramfs is built, loaded, and takes
+the default local mount path -- a read-write root, with every other trace of
+the overlay in place."""
+tests = [
+  "tests/test_overlay_root.py::test_the_overlay_token_is_added_to_the_command_line",
+  "tests/test_overlay_root.py::test_adding_the_token_twice_does_not_add_it_twice",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''        sed -i -e "s|^|boot=overlay |" "$CMDLINE_TXT"'''
+replace = '''        :'''
