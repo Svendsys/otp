@@ -326,11 +326,35 @@ consoles carrying `random: crng init done` and `bcm2835-rng 3f104000.rng:
 hwrng registered`. Measured cost on a cache miss: 6m58s of pi-gen, then
 7m59s for the pair of boots, 16m16s for the whole job.
 
+**`OTP_IMG_PHASES` picks the boots, and it may not drop `boot2`.** It
+defaults to `boot1 boot2`; a run debugging the boot itself can shorten it,
+and `img-boot.sh` exits 1 with a message if what is left does not include
+`boot2`. That guard is not tidiness. The same list drives the boot loop,
+the verdict loop *and* the set of guest checks each phase is required to
+have reported, so removing `boot2` removed
+`root-writes-discarded-by-the-power-cycle` and
+`settings-survive-the-power-cycle` from what the run demanded, along with
+the boot that would have produced them: measured, `OTP_IMG_PHASES=boot1`
+over a healthy boot-1 console exited 0 and printed *"the image boots twice
+on a read-only overlay"*, and `image.yml` puts that claim, in its own
+words, into the body of a tagged release. The concluding line is now
+conditional on the phases that actually ran as well, so the two guards
+have to fail together for the claim to be wrong.
+
+The other variables: `OTP_IMG_TIMEOUT` is the per-boot backstop in seconds
+(CI sets 600; the local default is 1200 because someone running this by
+hand is debugging), and `OTP_IMG_WORK` is where the decompressed card, the
+per-phase console directories and `verdict.txt` are written.
+
 The reporting comes from inside the guest, because `findmnt /` and
 `cupsd -t` need a running machine. `otp-unit-imgcheck.service` **ships in
 the image** and is gated on `otp.imgcheck` in the kernel command line, which
-nothing but `img-boot.sh` supplies — so it never runs on a flashed unit, and
-what tier 3 boots is still the artifact people flash rather than a variant
+nothing but `img-boot.sh` supplies — so it never runs on a flashed unit.
+The probe refuses to run without that token too: it writes a sentinel to
+`/` and a marker page count into `/boot/firmware/otp-unit.conf`, which is
+outside the overlay, and one `ConditionKernelCommandLine=` line in one unit
+file is thin protection for a 0755 script that ships on every appliance.
+What tier 3 boots is still the artifact people flash rather than a variant
 built for testing.
 
 The gate over what it says names the checks it expects rather than only

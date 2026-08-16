@@ -241,6 +241,35 @@ def test_the_note_is_appended_so_it_cannot_eat_the_release_notes():
         "the note carries hard line breaks and will render ragged"
 
 
+def test_the_release_notes_two_boot_claim_is_backed_by_the_harness():
+    """
+    The note tells whoever downloads a tagged image that it was booted
+    twice, that a file written to `/` in the first boot was gone in the
+    second, and that a setting written to `/boot/firmware` was not. Nothing
+    in this workflow makes any of that true: `OTP_IMG_PHASES` decides which
+    boots happen, and the harness is what reads it.
+
+    So the claim rests on two things, and both are asserted here. The
+    harness must refuse a phase list without boot2 -- a one-boot run used to
+    pass the whole gate and still print the two-boot conclusion -- and this
+    workflow must not set the variable to something that drops a boot. A
+    run halved to save CI minutes has to go red rather than ship a release
+    body that says what did not happen.
+    """
+    body = step_named(build_steps(), ATTACH)["with"]["body"]
+    assert "twice" in body, body
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    assert "leaves out boot2" in harness, \
+        ("img-boot.sh no longer refuses a phase list without boot2, so the "
+         "release note's two-boot claim is no longer backed by anything")
+    phases = (step_named(build_steps(), BOOT).get("env") or {}).get("OTP_IMG_PHASES")
+    if phases is not None:
+        for boot in ("boot1", "boot2"):
+            assert boot in str(phases).split(), \
+                (f"the boot step pins OTP_IMG_PHASES={phases!r}, which does "
+                 f"not run {boot}, but the release note claims both")
+
+
 def test_the_gate_never_fires_on_a_branch_or_a_pull_request():
     """
     `tag_name` defaults to `github.ref_name`, so a gate that let a branch

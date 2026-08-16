@@ -20,6 +20,7 @@ and the gate has the failure mode every gate in this repository has been
 caught with -- a phase that never ran produces no output, which looks
 exactly like a phase with nothing to say.
 """
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -157,6 +158,95 @@ def run_verdict(tmp_path, consoles, *, phases=("boot1",), uart1_lines=None,
     )
     verdict = work / "verdict.txt"
     return proc, (verdict.read_text() if verdict.exists() else None)
+
+
+# --- which boots the run is allowed to consist of -------------------------
+
+PHASES_ASSIGNMENT = 'PHASES="${OTP_IMG_PHASES:-boot1 boot2}"'
+
+
+def phase_list_block() -> str:
+    """The phase list and the guard on it, sliced out of img-boot.sh.
+
+    Sits above the verdict block and outside it, so it is a second slice
+    rather than part of `run_verdict`'s.
+    """
+    text = IMG_BOOT.read_text()
+    assert PHASES_ASSIGNMENT in text, f"{IMG_BOOT} no longer sets PHASES"
+    start = text.index(PHASES_ASSIGNMENT)
+    end = text.index("\nesac", start) + len("\nesac")
+    return text[start:end]
+
+
+def run_phase_list(tmp_path, phases=None):
+    runner = tmp_path / "phases.sh"
+    runner.write_text("set -euo pipefail\n" + phase_list_block()
+                      + '\nprintf "PHASES=%s\\n" "$PHASES"\n')
+    env = {k: v for k, v in os.environ.items() if k != "OTP_IMG_PHASES"}
+    if phases is not None:
+        env["OTP_IMG_PHASES"] = phases
+    return subprocess.run(["bash", str(runner)], capture_output=True,
+                          text=True, timeout=30, env=env)
+
+
+def test_the_default_is_two_boots(tmp_path):
+    # The default is the whole tier: one boot cannot observe a power-cycle.
+    proc = run_phase_list(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "PHASES=boot1 boot2" in proc.stdout, proc.stdout
+
+
+def test_an_empty_phase_list_falls_back_to_the_default(tmp_path):
+    # `:-`, not `-`: OTP_IMG_PHASES="" is an empty run, and an empty run
+    # would boot nothing at all and have no phase to fail on.
+    proc = run_phase_list(tmp_path, "")
+    assert proc.returncode == 0, proc.stderr
+    assert "PHASES=boot1 boot2" in proc.stdout, proc.stdout
+
+
+def test_a_phase_list_without_boot2_is_refused(tmp_path):
+    """
+    OTP_IMG_PHASES drives the boot loop, the verdict loop and the set of
+    guest checks each phase must have reported -- so dropping boot2 dropped
+    root-writes-discarded-by-the-power-cycle and
+    settings-survive-the-power-cycle from what the run required, and the
+    gate passed. Measured before this guard: PHASES="boot1" over a healthy
+    boot1 console exited 0 and still printed the two-boot conclusion, which
+    image.yml quotes into a tagged release's body.
+    """
+    for phases in ("boot1", "boot1 boot3", "noboot2", "boot22"):
+        proc = run_phase_list(tmp_path, phases)
+        assert proc.returncode != 0, f"{phases!r} was accepted"
+        assert "leaves out boot2" in proc.stderr, proc.stderr
+        assert "PHASES=" not in proc.stdout, proc.stdout
+
+
+def test_a_phase_list_that_keeps_boot2_is_accepted(tmp_path):
+    # The positive control: a guard that refused everything would satisfy
+    # the test above.
+    for phases in ("boot1 boot2", "boot2"):
+        proc = run_phase_list(tmp_path, phases)
+        assert proc.returncode == 0, proc.stderr
+        assert f"PHASES={phases}" in proc.stdout, proc.stdout
+
+
+def test_the_two_boot_claim_is_only_made_by_a_run_that_booted_twice(tmp_path):
+    # The concluding line is what a reader takes away, and image.yml's
+    # release note says the same thing in its own words.
+    proc, _ = run_verdict(tmp_path, {"boot1": healthy("boot1")},
+                          phases=("boot1",))
+    assert proc.returncode == 0, proc.stderr
+    assert "boots twice" not in proc.stderr, proc.stderr
+    assert "NOT the two-boot claim" in proc.stderr, proc.stderr
+
+
+def test_a_two_phase_run_does_make_the_two_boot_claim(tmp_path):
+    proc, _ = run_verdict(
+        tmp_path, {"boot1": healthy("boot1"), "boot2": healthy("boot2")},
+        phases=("boot1", "boot2"))
+    assert proc.returncode == 0, proc.stderr
+    assert "the image boots twice on a read-only overlay" in proc.stderr, \
+        proc.stderr
 
 
 def test_fixture_success_line_really_carries_escape_codes():

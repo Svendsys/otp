@@ -172,6 +172,30 @@ ESC=$(printf '\033')
 # not" says anything: a fresh copy of the image would answer both questions
 # with the image build's own contents.
 PHASES="${OTP_IMG_PHASES:-boot1 boot2}"
+# AND BOOT2 IS NOT OPTIONAL. This variable exists so a run debugging the
+# boot itself can stop after one, and nothing used to stop it dropping the
+# second -- the same list drives the boot loop, the verdict loop and the set
+# of guest checks demanded of each phase, so removing boot2 removes the two
+# checks tier 3 was built for along with the boot that would have made them.
+# Measured against the real verdict block: PHASES="boot1" plus a healthy
+# boot1 console exits 0, with root-writes-discarded-by-the-power-cycle and
+# settings-survive-the-power-cycle silently absent -- and the release note
+# image.yml attaches to the tag says a file written to / in the first boot
+# was gone in the second. Halving the CI time must cost a red run, not a
+# true-looking sentence in someone's release body.
+case " $PHASES " in
+    *" boot2 "*) ;;
+    *)
+        echo "ERROR: OTP_IMG_PHASES='$PHASES' leaves out boot2." >&2
+        echo "       The power-cycle is what this tier exists for: the" >&2
+        echo "       sentinel written to / in boot1 has to be GONE and the" >&2
+        echo "       setting written to /boot/firmware has to still be" >&2
+        echo "       there, and only a second boot of the same card can" >&2
+        echo "       say either. A one-boot run proves neither and must" >&2
+        echo "       not be able to pass this gate." >&2
+        exit 1
+        ;;
+esac
 
 log() { printf '\n== %s\n' "$*" >&2; }
 
@@ -710,4 +734,22 @@ if grep -q "FAIL" "$VERDICT"; then
     done
     exit 1
 fi
-log "the image boots twice on a read-only overlay, and the unit starts on both"
+# WHAT THE PHASES THAT RAN ACTUALLY SUPPORT, and nothing beyond it. This
+# line was unconditional, so a run with boot2 taken out of PHASES ended by
+# claiming two boots on the strength of one -- and image.yml quotes this
+# claim, in its own words, into the body of a tagged release. The guard on
+# PHASES above stops that combination happening at all; this is the second
+# half of the same fix, and it is the half a future phase list nobody
+# thought of still lands on.
+CLAIM_MISSING=""
+for want in boot1 boot2; do
+    case " $PHASES " in
+        *" $want "*) ;;
+        *) CLAIM_MISSING="$CLAIM_MISSING $want" ;;
+    esac
+done
+if [ -z "$CLAIM_MISSING" ]; then
+    log "the image boots twice on a read-only overlay, and the unit starts on both"
+else
+    log "the image boots on a read-only overlay and the unit starts; phases run:$PHASES -- NOT the two-boot claim, which needs:$CLAIM_MISSING"
+fi
