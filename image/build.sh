@@ -101,6 +101,10 @@ FIRST_USER_NAME='otp'
 FIRST_USER_PASS='${OTP_USER_PASS_HASH:-$(head -c 18 /dev/urandom | base64)}'
 DISABLE_FIRST_BOOT_USER_RENAME=1
 ENABLE_SSH=0
+# Does NOT remove the packages: stage2/04-cloud-init/00-packages installs
+# cloud-init unconditionally and this knob only skips the seed files, so
+# the image ships a cloud-init that runs. device/install.sh is what
+# actually switches it off. See issue #34.
 ENABLE_CLOUD_INIT=0
 LOCALE_DEFAULT='en_GB.UTF-8'
 KEYBOARD_KEYMAP='gb'
