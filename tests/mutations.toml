@@ -757,6 +757,68 @@ replace = '''        if lsinitramfs "$candidate" 2>/dev/null | grep -q "scripts/
 
 
 [[mutation]]
+name = "image-build-ships-an-unprobeable-image"
+tier = "fast"
+guard = """
+Every other overlay precondition in install.sh exits 1 under --image-build.
+The probe install printed a NOTE, so a build could produce, upload and
+release an image whose read-only root nothing can observe -- and the miss
+does not surface until a pi-gen build and two emulated boots later, as a
+guest that never reported, which reads as a boot failure rather than the
+packaging error it is."""
+tests = [
+  "tests/test_overlay_root.py::test_an_image_build_without_the_probe_fails",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''elif [ "$IMAGE_BUILD" -eq 1 ]; then'''
+replace = '''elif [ "$IMAGE_BUILD" -eq 9 ]; then'''
+
+
+[[mutation]]
+name = "image-build-probe-not-installed"
+tier = "fast"
+guard = """
+The other end of the same thing: the file can be present and simply not
+copied. Deleting this one line survived the entire fast suite, and what it
+costs is the whole of tier 3's view inside the guest."""
+tests = [
+  "tests/test_overlay_root.py::test_the_probe_is_installed_when_it_is_there",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''    install -m 0755 "$REPO_DIR/harness/img-guest-check.sh" \
+        "$PREFIX/img-guest-check.sh"'''
+replace = '''    :'''
+
+
+[[mutation]]
+name = "image-stage-skips-a-missing-item"
+tier = "fast"
+guard = """
+The pi-gen stage copies what install.sh reads, and it copied
+`if [ -e ]` -- so a name dropped from the list, or a directory missing from
+the checkout, was a silent no-op. Most of them then fail inside the chroot
+on a path error; `harness` did not fail at all, and produced an image whose
+overlay nothing could probe."""
+tests = [
+  "tests/test_overlay_root.py::test_a_missing_item_stops_the_stage_instead_of_being_skipped",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''	if [ ! -e "${REPO_SRC}/${item}" ]; then
+		echo "ERROR: ${REPO_SRC}/${item} is missing, and install.sh reads" >&2
+		echo "       it inside the chroot. Refusing to build an image" >&2
+		echo "       without it." >&2
+		exit 1
+	fi
+	cp -a "${REPO_SRC}/${item}" "${ROOTFS_DIR}${STAGING}/"'''
+replace = '''	if [ -e "${REPO_SRC}/${item}" ]; then
+		cp -a "${REPO_SRC}/${item}" "${ROOTFS_DIR}${STAGING}/"
+	fi'''
+
+
+[[mutation]]
 name = "install-overlay-token-not-added"
 tier = "fast"
 guard = """
