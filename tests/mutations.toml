@@ -2168,10 +2168,12 @@ tmpfs: the copy and the original agree perfectly on every boot while nothing
 survives any of them, and every other field reads green."""
 tests = [
   "tests/test_overlay_root.py::test_a_store_inside_the_overlay_is_not_persistence",
+  "tests/test_overlay_root.py::test_a_root_nothing_could_describe_does_not_make_the_store_separate",
 ]
 [[mutation.edit]]
 file = "harness/img-guest-check.sh"
 find = '''      "$(if [ "$MACHINE_ID_KEPT" = yes ] && [ "$STORE_SRC" != "?" ] \
+            && [ -n "$ROOT_SOURCE" ] \
             && [ "$STORE_SRC" != "$ROOT_SOURCE" ]; then echo yes; else echo no; fi)" \'''
 replace = '''      "$(if [ "$MACHINE_ID_KEPT" = yes ]; then echo yes; else echo no; fi)" \'''
 

@@ -1816,7 +1816,7 @@ esac
 def run_identity(tmp_path, *, phase="boot1", live_id=LIVE_ID, stored_id=LIVE_ID,
                  host_keys=("ed25519-a", "rsa-a"), recorded=None,
                  store_src="/dev/mmcblk0p1", boot_dir="boot",
-                 make_boot=True):
+                 make_boot=True, root_source="overlay"):
     """Run the shipped identity checks against a tree this test builds.
 
     Everything the block reads is a path it takes from a variable -- $BOOTDIR,
@@ -1853,7 +1853,7 @@ def run_identity(tmp_path, *, phase="boot1", live_id=LIVE_ID, stored_id=LIVE_ID,
         f'BOOTDIR="{boot}"\n'
         f'ETC_MACHINE_ID="{machine_id}"\n'
         f'ETC_SSH="{etc_ssh}"\n'
-        'ROOT_SOURCE="overlay"\n'
+        f'ROOT_SOURCE="{root_source}"\n'
         + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
         + slice_between(GUEST_CHECK.read_text(), *IDENTITY_BLOCK) + "\n")
     proc = subprocess.run(
@@ -1997,6 +1997,19 @@ def test_a_store_inside_the_overlay_is_not_persistence(tmp_path):
     is the state named here.
     """
     proc, _ = run_identity(tmp_path, store_src="overlay")
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_root_nothing_could_describe_does_not_make_the_store_separate(tmp_path):
+    """
+    The other end of the same comparison. If findmnt could not answer for
+    `/`, $ROOT_SOURCE is empty and "the store is not on the root's
+    filesystem" is true of every store there is. `root-is-overlay` would be
+    red on that machine too, but a check that is only correct because a
+    different check failed is a coincidence with a name.
+    """
+    proc, _ = run_identity(tmp_path, root_source="")
     assert results(proc)["machine-id-persisted-outside-the-overlay"] \
         == "FAIL", proc.stdout
 
