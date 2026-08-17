@@ -931,6 +931,17 @@ deliberate waiting.** Against 16m16s.
 | `console-test` | Which consoles actually registered, what the DTB aliases say, and which port a write lands on. This is the one that ended six runs of misdiagnosed "freeze". |
 | `idle-survive` | Sit still and see whether the machine resets. The watchdog re-verification. |
 
+**The exit code means "the probe did its work", in three states, and it is
+safe to script on.** `0` the probe reported and did its work; `2` the probe
+reported and said its work did not happen — a module disk that would not
+mount, a `/dev/random` that could not be read, a `/proc` that never
+appeared, so read the `FAIL:` lines on uart0 before believing anything else
+it printed; `1` no marker at all, meaning the guest hung, reset or never
+reached `/init`, which is a different problem and stays a different code.
+Until QA on PR #36 the code meant only "something printed a marker":
+`./harness/img-local-rig.sh coldplug-replay && echo clean` printed *clean*
+for a replay that mounted nothing.
+
 **The worked example, which is why the rig is in the repository at all.**
 Issue #17's boot "froze" at ~29.5–31.6s guest, always the moment journald
 started, and three theories died against it: dwc_otg wedging coldplug, TCG
@@ -945,7 +956,12 @@ rig answered all three in an afternoon:
   under TCG, so the load-bearing fact is that it happens early and always,
   not the digits — with `entropy_avail=256` (a full pool), hwrng
   `3f104000.rng` registered, and sixteen *blocking* bytes of `/dev/random`
-  returning in 0.02s every time.
+  returning in 0.02s every time. **That last figure was unfalsifiable until
+  QA on PR #36.** The probe threw away `dd`'s exit status and its stderr, so
+  the "16 blocking bytes" line printed whatever happened: booting the
+  verbatim probe with `/dev/random` deleted still reported `uptime 3.29 ->
+  3.31` and the rig still exited 0. The status is read now and the run fails
+  loudly, which is what makes the sentence above worth quoting.
 - **coldplug** — all 41 modaliases probed, no hangs. Re-measured with the
   rig as committed: `modules.dep` 1911 lines, **41 modaliases replayed, 4
   returning non-zero, 19 modules loaded**, 41 START lines and 41 DONE lines.

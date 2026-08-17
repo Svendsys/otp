@@ -166,6 +166,13 @@ environment:
   OTP_RIG_BUSYBOX   a static arm64 busybox to use instead of fetching one
   OTP_RIG_TIMEOUT   backstop seconds (default ${TIMEOUT})
   OTP_RIG_IDLE_SECONDS  how long idle-survive waits (default ${IDLE_SECONDS})
+
+exit status -- it means "the probe did its work", not "something ran":
+  0  the probe reported, and did its work
+  2  the probe reported, and said its work did not happen. Read the
+     FAIL lines on uart0 before believing anything else it printed
+  1  no marker at all: the guest hung, reset, or never reached /init.
+     A different problem, so a different code
 USAGE
 }
 

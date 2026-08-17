@@ -1006,6 +1006,12 @@ per_boot_verdict() {
     # committed now: `harness/img-local-rig.sh rng` re-measured it at
     # 2.62s, 2.63s and 3.32s over three runs on the image's own kernel,
     # with a blocking read of /dev/random returning in 0.02s each time.
+    # That last clause is only evidence because the rig's rng probe now
+    # reads dd's exit status: it used to print the timing unconditionally,
+    # and booting it with /dev/random deleted reported a 0.02s read and
+    # exited 0. Fixed and mutation-guarded in QA on PR #36; if the figure
+    # ever needs re-taking, `./harness/img-local-rig.sh rng` now exits
+    # non-zero rather than inventing one.
     # The wording is confirmed verbatim against a running kernel:
     # "[    0.193894] random: crng init done". A hard gate.
     #

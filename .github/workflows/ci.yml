@@ -42,12 +42,26 @@ jobs:
     # tests/mutations.toml.
     #
     # PER PR, not nightly, and that is measured rather than assumed: the fast
-    # tier is 145 mutations in 123 seconds, which is cheaper than the suite it
-    # audits. Counted, not carried forward -- this line said 19 in 11 seconds
-    # for a long time after both had moved, 114 for one round after it was
-    # 115, and 124 for several rounds after it was 143. Re-run
+    # tier is 157 mutations in 172 seconds ON THE DEVELOPMENT CONTAINER, not
+    # on this runner -- the number is a development-time figure and always has
+    # been, and a reader meeting it inside this job's own comment block will
+    # otherwise take it for this job's runtime, which is a different and
+    # usually smaller number (115s for the 145-row version of this line).
+    # Counted, not carried forward -- this line said 19 in 11 seconds for a
+    # long time after both had moved, 114 for one round after it was 115, and
+    # 124 for several rounds after it was 143. Re-run
     # `python3 tests/mutation_gate.py --tier fast` and read its last line
     # before touching this sentence.
+    #
+    # It stopped being cheaper than the suite it audits at that count. Twelve
+    # of the rows added for the local rig (issue #22) are behavioural rather
+    # than textual: they run rig_boot against a fake emulator and TIME it,
+    # because the property under test -- the guest's marker stops the run in
+    # seconds instead of at the backstop -- is a clock, and the rows that
+    # replaced were caught by "the source contains this string" and could not
+    # fail. Four of them cost between four and twelve seconds each. That is
+    # the price of the gate being able to fail, which is the only thing it is
+    # for.
     #
     # The issue expected nightly or label-triggered; at this price
     # that would be the wrong call, because a gate that reports on the commit
