@@ -918,9 +918,11 @@ the same `archive.raspberrypi.com` `.deb` pi-gen would install, resolved
 through the `linux-image-rpi-v8` metapackage so it stays current by itself;
 the root filesystem is a ~1MB busybox initramfs; the question is a shell
 heredoc in the one file. **Measured on the container it was written in
-(x86_64, QEMU 8.2.2, TCG): 27 seconds for the first `rng` run including a
-cold 32,739,088-byte kernel download, and 20 seconds a run afterwards
-against the cache.** Against 16m16s.
+(x86_64, QEMU 8.2.2, TCG): 24–27 seconds for the first `rng` run including
+a cold 32,739,088-byte kernel download, then against the warm cache 20s for
+`console-test`, 35s for `coldplug-replay` (which builds and `depmod`s a
+module disk on its first run) and 67s for `idle-survive`, which is 45s of
+deliberate waiting.** Against 16m16s.
 
 | Probe | The question it was built to answer |
 |---|---|
@@ -939,11 +941,11 @@ rig answered all three in an afternoon:
   returning immediately. The claim that the line was "absent in every
   console" was an artifact of reading job-log *tails* that begin after 8s
   guest, past where it prints. Re-measured with the rig as committed, over
-  two runs: crng init at **2.63s and 3.32s** — it moves run to run under
-  TCG, so the load-bearing fact is that it happens early and always, not
-  the digits — with `entropy_avail=256` (a full pool), hwrng
+  three runs: crng init at **2.62s, 2.63s and 3.32s** — it moves run to run
+  under TCG, so the load-bearing fact is that it happens early and always,
+  not the digits — with `entropy_avail=256` (a full pool), hwrng
   `3f104000.rng` registered, and sixteen *blocking* bytes of `/dev/random`
-  returning in 0.02s both times.
+  returning in 0.02s every time.
 - **coldplug** — all 41 modaliases probed, no hangs. Re-measured with the
   rig as committed: `modules.dep` 1911 lines, **41 modaliases replayed, 4
   returning non-zero, 19 modules loaded**, 41 START lines and 41 DONE lines.
