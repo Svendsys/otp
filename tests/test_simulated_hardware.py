@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import errno
 import os
-import queue
 import re
 import subprocess
 import sys
@@ -51,6 +50,10 @@ sys.path.insert(0, str(REPO / "tests"))
 
 import cupsrig                                   # noqa: E402
 import pirig                                     # noqa: E402
+# One definition, shared with the fast tier that first used it: a queue
+# whose semantics ("MemoryError on the next N puts") have to mean the same
+# thing in both places, or the two tiers stop testing the same property.
+from test_hardware import MemoryStarvedQueue     # noqa: E402
 from otpunit import config, diagnostics, hmi, printer, unattended  # noqa: E402
 
 SIM_STATE = Path("/run/otp-kernel-sim")
@@ -1348,28 +1351,6 @@ class TestTheFactoryTeardownBetweenPanels:
         assert LocalPiFactory.pins == {}
 
 
-class MemoryStarvedQueue(queue.Queue):
-    """
-    The panel's event queue, with no memory for the next `failures` puts.
-
-    `self._events.put(...)` is the one allocation every one of the three
-    shipped callbacks makes, so starving it raises from INSIDE the shipped
-    callback rather than beside it. MemoryError because that is what this
-    board is exposed to: a Pi Zero 2 W has 512 MiB and no swap, and a
-    1000-page pad peaks near the ceiling (tests/test_memory_budget.py).
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.failures = 0
-
-    def put(self, item, *args, **kwargs):
-        if self.failures > 0:
-            self.failures -= 1
-            raise MemoryError("no memory to record a press")
-        return super().put(item, *args, **kwargs)
-
-
 @needs_sim("gpio-chip", "gpio-sim")
 class TestTheRealButtonPath:
     """
@@ -1692,9 +1673,12 @@ class TestTheRealButtonPath:
             while buttons.dropped == 0 and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert buttons.dropped == 1, (
-                f"the press meant to raise never reached the shipped "
-                f"callback, so nothing here was tested.\n  "
-                + self.why(PIN_UP))
+                "the press meant to raise was never counted as lost. "
+                "Either the edge did not reach the shipped callback, in "
+                "which case nothing here was tested, or there is no guard "
+                "in front of it to do the counting -- and then the "
+                "exception went into lgpio's dispatch thread and this "
+                "panel is already dead.\n  " + self.why(PIN_UP))
         finally:
             buttons._events = healthy
 
