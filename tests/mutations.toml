@@ -1755,3 +1755,273 @@ tests = [
 file = "harness/img-guest-check.sh"
 find = '''          "$(if [ "$UC_FINISHED" = yes ] && [ "$UC_TROUBLE" = no ] \'''
 replace = '''          "$(if [ "$UC_FINISHED" = yes ] \'''
+
+
+# --- tier 3: the journal on the console, and what it brought with it ------
+#
+# Issue #21. Until the journal was forwarded, tier 3 could see that the unit
+# STARTED and nothing it did afterwards -- the journal is volatile by design
+# and died with the guest. The rows here are the two halves of that: the
+# forwarding itself, which is one token in one string and otherwise
+# unobservable from the fast suite, and the console greps that were written
+# for a console carrying only kernel output and PID 1.
+
+[[mutation]]
+name = "tier3-journal-forwarding-not-requested"
+tier = "fast"
+guard = """
+The parameter itself. Everything else about the forwarding is checked
+against evidence -- the verdict wants the marker on the console, the probe
+wants the journal to have taken it -- but both of those only speak during a
+CI boot. Delete the token and the fast suite stays entirely green for the
+sixteen minutes it takes an arm64 runner to say otherwise."""
+tests = [
+  "tests/test_img_verdict.py::test_the_emulated_boot_asks_for_the_journal_on_its_console",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = "systemd.show_status=1 systemd.journald.forward_to_console=1 initcall_blacklist"
+replace = "systemd.show_status=1 initcall_blacklist"
+
+
+[[mutation]]
+name = "tier3-journal-forwarding-not-gated"
+tier = "fast"
+guard = """
+A kernel parameter that is accepted and ignored looks exactly like one that
+works: from outside, "the unit logged nothing worth reading" and "nothing
+the unit logged could get out" are the same silence. The probe's marker
+reaches the journal and nothing else, so this gate is the only thing that
+can tell those apart -- and every behavioural reading this tier now makes
+rests on the answer."""
+tests = [
+  "tests/test_img_verdict.py::test_a_console_the_journal_never_reached_fails",
+  "tests/test_img_verdict.py::test_the_marker_has_to_name_the_phase_that_is_being_judged",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if grep -qE "OTP-JOURNAL-FORWARDED[[:space:]]+${phase}([[:space:]]|\$)" \
+            "$CONSOLE_TXT" 2>/dev/null; then'''
+replace = '''    if true; then'''
+
+
+[[mutation]]
+name = "tier3-journal-marker-not-scoped-to-the-phase"
+tier = "fast"
+guard = """
+Per phase, like every other marker this tier reads. Both boots write into
+one evidence pipeline, so a phase-blind grep lets boot1's marker answer for
+a boot2 whose journald forwarded nothing -- the trap the OTP-RESULT and
+OTP-GUEST-DONE counts are phase-scoped to avoid."""
+tests = [
+  "tests/test_img_verdict.py::test_the_marker_has_to_name_the_phase_that_is_being_judged",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '"OTP-JOURNAL-FORWARDED[[:space:]]+${phase}([[:space:]]|\$)"'
+replace = '"OTP-JOURNAL-FORWARDED"'
+
+
+[[mutation]]
+name = "tier3-forbidden-phrases-unscoped"
+tier = "fast"
+guard = """
+Who said it. With the journal on the console these greps run over every
+unit's stdout, including this harness's own probe -- which quotes
+userconf-service's output into a check detail and dumps thirty lines of the
+unit's journal at the end of every phase. Failing a release because a unit
+REPEATED "Failed with result" is row 2 of issue #14 in a new place: the
+harness matching text it wrote itself."""
+tests = [
+  "tests/test_img_verdict.py::test_a_unit_quoting_a_systemd_phrase_does_not_fail_the_release",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        if grep -qF -- "$bad" "$SPOKEN" 2>/dev/null; then'''
+replace = '''        if grep -qF -- "$bad" "$CONSOLE_TXT" 2>/dev/null; then'''
+
+
+[[mutation]]
+name = "tier3-forbidden-phrases-scoped-to-nothing"
+tier = "fast"
+guard = """
+The other direction, and the one scoping breaks in. "A unit quoting the
+phrase does not fail the run" is equally true of a filter that kept nothing
+at all -- and then a kernel panic and systemd's own verdict on a failed unit
+both go unseen, on a release gate reporting green."""
+tests = [
+  "tests/test_img_verdict.py::test_systemds_own_verdict_on_a_unit_still_fails_the_release",
+  "tests/test_img_verdict.py::test_kernel_panic_fails_a_boot_that_also_started_the_unit",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    awk '!/^\[[^]]*\] [^ ]+\[[0-9]+\]:/ || /^\[[^]]*\] systemd\[1\]:/' \
+        "$1" 2>/dev/null || true'''
+replace = '''    awk '/^\[[^]]*\] never-matches-anything:/' "$1" 2>/dev/null || true'''
+
+
+[[mutation]]
+name = "tier3-kernel-entry-count-sees-the-journals-copy"
+tier = "fast"
+guard = """
+The count that says "reboot loop", kept immune to the forwarding. journald
+imports /dev/kmsg from the start of the buffer and labels those entries
+`kernel`; if it forwards them to the console as well, every early kernel
+line arrives twice and a healthy boot is failed as a loop. Whether it does
+has not been measured -- there is no systemd on the machine this was written
+on -- so the count excludes the shape instead of betting on the answer, and
+tier3-reboot-loop-accepted is the control that a real second entry, which
+carries no identifier in front of it, still fails."""
+tests = [
+  "tests/test_img_verdict.py::test_a_journald_copy_of_a_kernel_line_is_not_a_second_boot",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    KERNEL_ENTRIES=$(grep -vE '^\[[^]]*\] kernel: ' "$CONSOLE_TXT" 2>/dev/null \
+                     | grep -c "Booting Linux on physical CPU" || true)'''
+replace = '''    KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/null || true)'''
+
+
+[[mutation]]
+name = "guest-journal-marker-echoed-onto-the-console"
+tier = "fast"
+guard = """
+The one thing that makes the host's gate mean anything. This probe's stdout
+IS the console -- otp-unit-imgcheck.service carries
+StandardOutput=journal+console -- so a marker quoted back into a check's
+detail reaches the serial port with the forwarding switched off, and the
+host passes a boot that proved nothing. The block may say how MANY journal
+lines carry it and never what they say."""
+tests = [
+  "tests/test_overlay_root.py::test_the_marker_is_never_written_where_the_console_would_get_it_anyway",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "journalctl -b -t $JOURNAL_TAG holds ${MARKED:-0} line(s) for this phase"'''
+replace = '''      "journalctl -b -t $JOURNAL_TAG holds ${MARKED:-0} line(s): $JOURNAL_MARK"'''
+
+
+[[mutation]]
+name = "guest-journal-marker-has-no-positive-control"
+tier = "fast"
+guard = """
+The positive control the host cannot supply for itself. From outside the
+guest, a console with no marker is equally "forwarding is off" and
+"systemd-cat is missing, or wrote nothing" -- so this check has to be able
+to say no."""
+tests = [
+  "tests/test_overlay_root.py::test_a_journal_that_never_took_the_marker_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''check journal-marker-accepted \
+      "$(if [ "${MARKED:-0}" != 0 ]; then echo yes; else echo no; fi)" \'''
+replace = '''check journal-marker-accepted \
+      yes \'''
+
+
+[[mutation]]
+name = "guest-headless-check-does-not-need-the-probe"
+tier = "fast"
+guard = """
+Both halves of the headless decision, because either alone describes a
+different machine. Without "no OLED (" the unit never probed the display at
+all, and a unit reporting that it is printing unattended having never looked
+is not the behaviour issue #21 asked to see."""
+tests = [
+  "tests/test_overlay_root.py::test_a_unit_that_never_looked_for_a_panel_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ "$NO_OLED" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \'''
+replace = '''      "$(if [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "guest-headless-check-does-not-need-the-decision"
+tier = "fast"
+guard = """
+The other half. otpunit/hmi.Interface.prove exists because opening GPIO
+buttons proves nothing about whether buttons exist: a unit that noticed the
+missing OLED and entered the menu anyway blocks on an empty button queue
+forever, with no pad, no log line and no timeout. That machine logs the
+first string and never the second."""
+tests = [
+  "tests/test_overlay_root.py::test_a_unit_that_saw_no_panel_and_went_on_anyway_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ "$NO_OLED" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \'''
+replace = '''      "$(if [ "$NO_OLED" = yes ]; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "guest-headless-journal-not-scoped-to-this-boot"
+tier = "fast"
+guard = """
+`-b`, and why it is load bearing three hundred lines from the file that
+makes it safe. device/install.sh sets Storage=volatile, so an unscoped
+`journalctl -u` sees only this boot today. Delete that one line and a
+PREVIOUS boot's "no usable interface" answers for a boot on which the unit
+never got that far -- the same argument the userconf read carries."""
+tests = [
+  "tests/test_overlay_root.py::test_a_previous_boots_headless_decision_does_not_answer_for_this_one",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = "UNIT_LOG=$(journalctl -b -u otp-unit.service --no-pager 2>/dev/null | tr '\\n' ' ')"
+replace = "UNIT_LOG=$(journalctl -u otp-unit.service --no-pager 2>/dev/null | tr '\\n' ' ')"
+
+
+[[mutation]]
+name = "guest-sheet-bytes-not-checked-for-being-a-page"
+tier = "fast"
+guard = """
+Bytes are not a page. reportlab writing an empty or truncated file raises
+nothing, so "no exception" is the whole of what a bare success would prove
+-- and this sheet is the only thing a unit with no panel can say anything
+with. %PDF is the cheapest thing that separates a page from an artefact."""
+tests = [
+  "tests/test_overlay_root.py::test_a_sheet_that_is_not_a_pdf_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''    case "$SHEET_SAID" in *"RENDER ok bytes="*"magic=%PDF"*) SHEET_RENDERED=yes ;; esac'''
+replace = '''    case "$SHEET_SAID" in *"RENDER ok"*) SHEET_RENDERED=yes ;; esac'''
+
+
+[[mutation]]
+name = "guest-sheet-enqueued-without-a-job-id"
+tier = "fast"
+guard = """
+ENQUEUED means cupsd gave the job an id, and that the id names the queue
+this experiment made. Cups.submit() returns "" when lp's "request id is
+<id>" is absent, so an lp that exited 0 and said nothing useful is a job
+nobody can point at -- and the queue it went to has no printer behind it to
+notice either way."""
+tests = [
+  "tests/test_overlay_root.py::test_an_lp_that_returned_no_job_id_is_not_an_enqueued_sheet",
+  "tests/test_overlay_root.py::test_a_job_on_somebody_elses_queue_is_not_this_experiment",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''        *"SUBMIT ok job=$SHEET_QUEUE-"*) SHEET_ENQUEUED=yes ;;'''
+replace = '''        *"SUBMIT ok"*) SHEET_ENQUEUED=yes ;;'''
+
+
+[[mutation]]
+name = "unit-renames-the-line-the-probe-greps-for"
+tier = "fast"
+guard = """
+The strings are written in otpunit/ and matched in harness/, which is how a
+check stops checking with nothing going red. A rewording leaves the probe
+matching nothing, forever -- and because both halves are gated together the
+tier-3 run does go red, but for a reason nobody would guess from the
+failure. This says it in the fast suite instead."""
+tests = [
+  "tests/test_img_verdict.py::test_the_probe_looks_for_the_words_the_unit_actually_logs",
+]
+[[mutation.edit]]
+file = "otpunit/hmi.py"
+find = '            log(f"no OLED ({exc})")'
+replace = '            log(f"no display ({exc})")'

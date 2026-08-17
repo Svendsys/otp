@@ -495,6 +495,34 @@ def test_the_malformed_fixture_is_one_userconf_pi_rejects():
     assert userconf_pi_rejects("validname:")
 
 
+def test_the_emulated_boot_asks_for_the_journal_on_its_console():
+    """
+    The parameter the whole of issue #21 hangs off, asserted where a fast
+    test can see it.
+
+    Everything else about the forwarding is checked against evidence: the
+    verdict requires the marker on the console, and the probe requires the
+    journal to have taken it. But both of those only speak during a CI boot,
+    and the token itself lives in one string in one line. Delete it and the
+    fast suite is entirely green -- for sixteen minutes, until an arm64
+    runner says otherwise.
+
+    On -append and nowhere else, deliberately: -append REPLACES the kernel
+    command line under emulation, so this changes nothing about a flashed
+    unit, and the image's own cmdline.txt must not grow it. A device with its
+    journal on the console is a device narrating itself to anyone watching
+    the serial header.
+    """
+    text = IMG_BOOT.read_text()
+    append = next(line for line in text.splitlines()
+                  if line.strip().startswith("-append "))
+    assert "systemd.journald.forward_to_console=1" in append, append
+    for shipped in (REPO / "device" / "install.sh",
+                    REPO / "image" / "build.sh"):
+        assert "forward_to_console" not in shipped.read_text(), \
+            f"{shipped.name} puts journal forwarding on the DEVICE"
+
+
 def test_the_before_listing_is_taken_before_the_boot():
     """
     Ordering, because the control is worthless if it is taken afterwards.
