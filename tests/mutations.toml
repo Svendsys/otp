@@ -779,6 +779,39 @@ replace = '''        case "anything" in
 
 
 [[mutation]]
+name = "install-overlay-leaves-systemds-own-grower-running"
+tier = "fast"
+guard = """
+TWO units grow the root filesystem, and for the life of this project only
+one of them was taken out. pi-gen's is rpi-resize.service, keyed on the
+`resize` token, and it is disabled. systemd's is systemd-growfs-root.service
+-- which nothing enables: systemd-fstab-generator hooks it onto the root
+mount on every boot, so `disable` has no symlink to remove and rpi-resize's
+Wants= only made it LOOK handled.
+
+On an overlay root it cannot succeed. `/` is an overlayfs, systemd-growfs
+wants a block device, and every boot of every image this project has built
+therefore printed:
+
+    systemd-growfs[293]: File system "/" not backed by block device.
+    [FAILED] Failed to start systemd-growfs-root.service - Grow Root File System.
+
+The `[FAILED]` line was on the console the whole time and nothing gated on
+it; it took issue #21 forwarding the journal, and PID 1's `Failed with
+result` wording reaching tier 3's forbidden list, for anyone to look. The
+verb is `mask` and the mutation is its absence, because `disable` here is
+the no-op that hid this for so long."""
+tests = [
+  "tests/test_overlay_root.py::test_systemds_own_grower_is_masked_as_well_as_pi_gens",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''    systemctl mask systemd-growfs-root.service
+    systemctl disable rpi-resize.service 2>/dev/null || true'''
+replace = '''    systemctl disable rpi-resize.service 2>/dev/null || true'''
+
+
+[[mutation]]
 name = "install-overlay-listing-piped-into-grep-q"
 tier = "fast"
 guard = """
@@ -1862,17 +1895,67 @@ replace = '''    awk '/^\[[^]]*\] never-matches-anything:/' "$1" 2>/dev/null || 
 
 
 [[mutation]]
+name = "tier3-forbidden-phrase-red-does-not-say-which-unit"
+tier = "fast"
+guard = """
+The red has to name the unit. Run 72 failed on `no-Failed-with-result` and
+printed those four words and nothing else -- the same verdict for one
+failing unit as for three -- so finding out WHICH unit meant downloading
+the evidence artifact and grepping a thousand-line console by hand. Three
+units were failing on every boot of the shipped image and the verdict named
+none of them. The gate was right; only its report was useless, and a report
+nobody can act on is most of the way to no gate at all."""
+tests = [
+  "tests/test_img_verdict.py::test_the_forbidden_phrase_says_which_lines_it_found",
+  "tests/test_img_verdict.py::test_a_quoted_phrase_is_not_dumped_as_if_the_system_had_said_it",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            grep -F -- "$bad" "$SPOKEN" 2>/dev/null \
+                | head -10 | cut -c1-200 | sed 's/^/    /' || true'''
+replace = '''            true'''
+
+
+[[mutation]]
+name = "tier3-forbidden-phrase-dump-wider-than-its-gate"
+tier = "fast"
+guard = """
+The dump is scoped exactly as the gate is, and the two must not drift
+apart. If the FAIL branch quoted the whole console while the gate read the
+filtered copy, a boot where PID 1 failed one unit and this harness's own
+probe quoted the phrase would print the probe's line under the red as
+though systemd had said it -- and the reader would go hunting a unit that
+never failed, from a verdict file that told them to. Wider is the safe
+direction for a GATE; for a report it is how you lose an afternoon."""
+tests = [
+  "tests/test_img_verdict.py::test_a_quoted_phrase_is_not_dumped_as_if_the_system_had_said_it",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            grep -F -- "$bad" "$SPOKEN" 2>/dev/null \
+                | head -10'''
+replace = '''            grep -F -- "$bad" "$CONSOLE_TXT" 2>/dev/null \
+                | head -10'''
+
+
+[[mutation]]
 name = "tier3-kernel-entry-count-sees-the-journals-copy"
 tier = "fast"
 guard = """
 The count that says "reboot loop", kept immune to the forwarding. journald
 imports /dev/kmsg from the start of the buffer and labels those entries
 `kernel`; if it forwards them to the console as well, every early kernel
-line arrives twice and a healthy boot is failed as a loop. Whether it does
-has not been measured -- there is no systemd on the machine this was written
-on -- so the count excludes the shape instead of betting on the answer, and
-tier3-reboot-loop-accepted is the control that a real second entry, which
-carries no identifier in front of it, still fails."""
+line arrives twice and a healthy boot is failed as a loop.
+
+MEASURED IN RUN 72, the first console this repository captured with
+forwarding actually on: zero `kernel: ` lines, "Booting Linux on physical
+CPU" once, both boots reporting one kernel entry. journald does not
+re-forward what it imported, so the doubling this guard was written against
+does not happen today. It stays because the exclusion costs one grep and
+the behaviour belongs to a systemd setting rather than to us -- a
+regression guard now, where it used to be a guess. tier3-reboot-loop-accepted
+is the control that a real second entry, which carries no identifier in
+front of it, still fails."""
 tests = [
   "tests/test_img_verdict.py::test_a_journald_copy_of_a_kernel_line_is_not_a_second_boot",
 ]

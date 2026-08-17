@@ -83,7 +83,7 @@ def systemctl_calls(tmp_path) -> list:
 # --- the kernel command line ---------------------------------------------
 
 CMDLINE_BLOCK = ('    if ! grep -q "boot=overlay" "$CMDLINE_TXT"; then',
-                 '    systemctl mask systemd-growfs-root.service')
+                 '    systemctl disable rpi-resize.service 2>/dev/null || true')
 
 # pi-gen's own stage1 cmdline.txt, with export-image's PARTUUID substituted,
 # which is what install.sh actually finds in the chroot.
