@@ -1048,10 +1048,15 @@ def run_journal(tmp_path, *, phase="boot1", unit_journal=HEADLESS_JOURNAL,
         (bin_dir / name).chmod(0o755)
 
     block = journal_block()
-    # Only the wait is shortened, and only the wait: every condition and
-    # every string the block prints is the code that ships.
-    assert block.count("sleep 1") == 1, "the marker poll's interval moved"
-    block = block.replace("sleep 1", "sleep 0")
+    # Only the two waits are shortened, and only the waits: every condition
+    # and every string the block prints is the code that ships. Both are real
+    # time in a real boot, and
+    # test_the_probe_is_given_longer_than_its_own_bounded_wait is what holds
+    # them against the unit's TimeoutStartSec.
+    for interval, why in (("sleep 1", "the marker poll"),
+                          ("sleep 2", "the panel poll")):
+        assert block.count(interval) == 1, f"{why}'s interval moved"
+        block = block.replace(interval, "sleep 0")
 
     runner = tmp_path / "journal.sh"
     runner.write_text(
@@ -1900,9 +1905,16 @@ def test_the_probe_is_given_longer_than_its_own_bounded_wait(tmp_path):
     poll and a `timeout` when the credential checks landed, and a test that
     kept reading only the unit poll would have gone on approving a budget
     against 90s of a worst case several times that. Measured as this stands:
-    90s polling for otp-unit, 120s polling for systemd's verdict on the
-    wizard, 60s bounding the malformed-seed experiment -- 270s against a
-    TimeoutStartSec of 420 inside a 600s per-boot backstop.
+    90s polling for otp-unit, 15s waiting for journald to index the
+    forwarding marker, 60s waiting for the unit to decide it has no panel,
+    120s polling for systemd's verdict on the wizard, 90s bounding the
+    diagnostic sheet and 60s bounding the malformed seed -- 435s against a
+    TimeoutStartSec of 480 inside a 600s per-boot backstop.
+
+    That sum is deliberately pessimistic: the two experiments are in
+    different phases, so no single boot can pay both (boot1's worst case is
+    375s, boot2's 345s). Summing them anyway keeps the assertion below
+    arithmetic rather than bookkeeping about which phase runs what.
 
     Those three numbers are prose and the assertions below are not: the sums
     are re-derived from the shipped files on every run, so a wait that

@@ -790,8 +790,23 @@ per_boot_verdict() {
     # keeps kernel output and PID 1, and drops journald-forwarded lines from
     # anything else; a phrase found only in one of those is reported instead
     # of gated, so the scoping can never swallow one in silence.
+    #
+    # The note quotes the line, and the quote can itself trip the `grep -q
+    # FAIL` over verdict.txt at the bottom of this file if what it repeats
+    # contains that word. That is the safe direction -- a run that stops to be
+    # read -- and the note sitting next to the red says exactly why.
+    #
+    # FALLS BACK TO THE WHOLE CONSOLE if the filtered copy cannot be written.
+    # A failed redirect under errexit would otherwise kill the script here,
+    # mid-verdict, with the file half written -- the no-evidence failure this
+    # block already carries two `|| true`s for. Guarding it into an unwritten
+    # $SPOKEN would be worse than either: every phrase would then be looked
+    # for in a file that does not exist and none would ever be found. Wider
+    # is the safe direction for a gate.
     SPOKEN="$WORK/$phase/console-system.log"
-    system_lines "$CONSOLE_TXT" > "$SPOKEN"
+    if ! system_lines "$CONSOLE_TXT" > "$SPOKEN" 2>/dev/null; then
+        SPOKEN="$CONSOLE_TXT"
+    fi
     for bad in "status=216" "Failed with result" "Scheduled restart job" \
                "Kernel panic" "Unable to mount root"; do
         if grep -qF -- "$bad" "$SPOKEN" 2>/dev/null; then

@@ -687,10 +687,11 @@ replace = '''        if false; then'''
 name = "imgcheck-unit-start-timeout-too-short"
 tier = "fast"
 guard = """
-The probe's own bounded waits sum to 270 seconds -- 90 polling for
-otp-unit.service, 120 for systemd's verdict on the wizard, 60 bounding the
-malformed-seed experiment -- with cupsd -t and two Python interpreters under
-TCG in between. A timeout that does not clear that kills the probe mid-poll
+The probe's own bounded waits sum to 435 seconds -- 90 polling for
+otp-unit.service, 15 for journald to index the forwarding marker, 60 for the
+unit to decide it has no panel, 120 for systemd's verdict on the wizard, 90
+bounding the diagnostic sheet and 60 bounding the malformed seed -- with
+cupsd -t and three Python interpreters under TCG in between. A timeout that does not clear that kills the probe mid-poll
 on a slow but healthy boot, and the phase then has no OTP-GUEST-DONE line,
 which the harness fails it for. Red rather than green, so a flake risk
 rather than a false pass, but the number has to be stated rather than
@@ -700,7 +701,7 @@ tests = [
 ]
 [[mutation.edit]]
 file = "device/systemd/otp-unit-imgcheck.service"
-find = "TimeoutStartSec=420"
+find = "TimeoutStartSec=480"
 replace = "TimeoutStartSec=60"
 
 

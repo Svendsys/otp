@@ -333,14 +333,21 @@ consoles carrying `random: crng init done` and `bcm2835-rng 3f104000.rng:
 hwrng registered`. Measured cost on a cache miss: 6m58s of pi-gen, then
 7m59s for the pair of boots, 16m16s for the whole job.
 
-Those two totals are run 16's and stay run 16's. The credential checks
-below added three names to what boot 1 must report and three to boot 2, and
-one more — the network wait — to both, so a green run now counts
-differently: 13 in boot 1 and 15 in boot 2. Run 17 measured 9/11 and 13/14
-against the counts as they stood then, which is a different arithmetic
-again; the numbers move with the list and only the list is authoritative.
-The cost is unchanged: no extra boot, and the one bounded experiment inside
-boot 2 is capped at 60 seconds.
+Those two totals are run 16's and stay run 16's. Every count below them is
+a different arithmetic again: the credential checks added three names to
+boot 1 and three to boot 2 with one — the network wait — to both, and run 20
+(31979545889) measured **13/13 and 15/15** against that list, at 175.5s and
+151.1s of guest time, 7m58s for the pair of boots on top of 7m06s of pi-gen
+and 16m14s for the whole job. The journal work then added two names to both
+boots and two more to boot 1, so a green run is **17 and 17** now. The
+numbers move with the list and only the list is authoritative;
+`tests/test_img_verdict.py` reads it out of `img-boot.sh` rather than
+restating it, so no fixture here can describe a healthy boot that is missing
+a check.
+
+The cost stays inside one budget: no extra boot, and the two bounded
+experiments are in different phases — 90 seconds for the diagnostic sheet in
+boot 1, 60 for the malformed seed in boot 2.
 
 **`OTP_IMG_PHASES` picks the boots, and it may not drop `boot2`.** It
 defaults to `boot1 boot2`; a run debugging the boot itself can shorten it,
@@ -465,6 +472,91 @@ appearing in a shadow entry can only have come from the seed. It never
 reaches a shipped image — `img-boot.sh` writes it into the decompressed
 working copy it boots, and `image/deploy/*.img.xz` is never opened for
 writing.
+
+### The journal on the console, which is an emulation-only lever
+
+Issue #21. Run 20 (31979545889) was the first fully green pair of boots —
+13/13 in boot 1, 15/15 in boot 2, both reaching `multi-user.target`, 46848
+and 45302 bytes of uart0 — and everything in it was a statement about
+*getting started*. Whether the unit **did** anything afterwards was
+unobservable: the journal is volatile by design (`Storage=volatile`,
+`RuntimeMaxUse=16M` from `install.sh`), it dies with the guest, and nothing
+carried it to the serial port the harness captures. The only exception was
+the thirty lines the probe dumps at the very end, and nothing asserted them.
+
+`-append` now carries **`systemd.journald.forward_to_console=1`**, and that
+is where it stays. `-append` replaces the kernel command line wholesale
+under emulation — the same reason `root=` has to be restated and
+`boot=overlay` has to be copied out of the image — so the image's own
+`cmdline.txt` is untouched and a flashed unit keeps its quiet console. A
+device narrating its journal to whoever is holding the serial header is not
+a feature; a test rig doing it is the whole point.
+
+**The flag is not taken on trust**, because a kernel parameter that is
+accepted and ignored looks exactly like one that works. The probe writes one
+marker into the journal with `systemd-cat` and by *no other route* — not on
+its own stdout, which `StandardOutput=journal+console` already copies to the
+console, and never echoed back into a check's detail — and the verdict
+requires it. The guest's `journal-marker-accepted` is the other half: it says
+the journal *took* the marker, so a console without it is a forwarding
+failure rather than a `systemd-cat` that did nothing.
+
+**Two behavioural checks ride on it.** `unit-detects-no-panel` reads the
+unit's own journal for `no OLED (` and `no usable interface; printing
+unattended` — the emulated Pi has no I²C panel and `-append` drops the
+`dtparam=i2c_arm=on` that would give the bus a node, so the headless route
+is the correct one and nothing had ever watched the shipped code choose it.
+Both strings are held against `otpunit/hmi.py` and `otpunit/__main__.py` by
+`tests/test_img_verdict.py`, because a check whose needle lives in another
+file is one rewording away from matching nothing forever.
+
+`diagnostic-sheet-renders` and `diagnostic-sheet-reaches-cups` are the print
+path, and they come with a correction to how the issue framed it. **The
+headless path does not fire under QEMU**, by design rather than by accident:
+`otpunit/__main__` falls into `diagnostics.run_headless()`, which loops on
+`cups.devices()`, and `Cups.devices()` is built from `lpinfo -v` and keeps
+only `usb://`, a loopback IPP endpoint, or a `dnssd://` entry matching an
+attached USB device. An emulated Pi has no printer of any kind, so the list
+is empty on every poll and the unit waits in silence — a unit with neither a
+panel nor a printer says nothing at all, which is worth knowing about a
+design whose answer to a missing panel is "the printer becomes the console".
+So the probe supplies the one thing the emulator cannot, a queue, and drives
+the rest through the shipped code: `diagnostics.collect()` over the real
+machine, `render_bytes()` through the image's own reportlab, and
+`Cups.submit()` into the shipped `cupsd`. What is gated is that the bytes are
+a PDF and that cupsd answered with a job id naming that queue — enqueued,
+not printed; there is nothing behind the URI and there does not need to be.
+The queue is the probe's own name, removed afterwards, and `/etc/cups` is a
+tmpfs, so none of it can reach the card. `lpadmin -p NAME -E -v usb://…`
+with no `-m` at all was measured against a real cupsd 2.4.7 configured from
+`install.sh`'s own directives before being relied on; the image is asked for
+the first time in CI.
+
+**The forbidden-pattern list was re-read at the same time**, because it had
+to be. `status=216`, `Failed with result`, `Scheduled restart job`, `Kernel
+panic` and `Unable to mount root` were written for a console carrying kernel
+output and PID 1's status lines and nothing else — once journald started,
+every unit's stdout stayed in the journal. Now the console carries whatever
+anything on the machine writes, *including this harness's own probe*, which
+quotes `userconf-service`'s output into a check detail and dumps the unit's
+journal at the end of every phase. Failing a release because a unit
+**repeated** one of those phrases is row 2 of issue #14 in a new place. The
+greps run over the lines the *system* wrote: journald prefixes a forwarded
+line with `[   45.123456] python3[412]: `, the kernel's own output has the
+timestamp and no speaker, and `systemd[1]` is kept by name because it is the
+one speaker whose "Failed with result" is a verdict rather than a quotation.
+A phrase found only in a forwarded line is reported as an `IMG-NOTE` instead,
+so the scoping cannot swallow one in silence.
+
+One more thing moved for the same reason and it is a guess rather than a
+measurement: `single-kernel-entry` counts `Booting Linux on physical CPU`,
+and journald imports `/dev/kmsg` from the start of the buffer. If it forwards
+those entries to the console too, every early kernel line arrives twice and a
+healthy boot is failed as a reboot loop. Whether it does has **not** been
+measured here — there is no systemd on the machine this was written on — so
+the count excludes the `kernel:` identifier journald would label such a copy
+with. It costs nothing if the copy never comes, and it cannot hide a real
+loop, whose second entry prints with no speaker in front of it.
 
 The other variables: `OTP_IMG_TIMEOUT` is the per-boot backstop in seconds
 (CI sets 600; the local default is 1200 because someone running this by

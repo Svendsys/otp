@@ -260,11 +260,23 @@ check journal-marker-accepted \
 # second without the first is a unit that never looked. Both strings are held
 # against the modules that print them by tests/test_img_verdict.py, so a
 # rewording there cannot leave this check quietly matching nothing.
-UNIT_LOG=$(journalctl -b -u otp-unit.service --no-pager 2>/dev/null | tr '\n' ' ')
+# POLLED, and it has to be. otp-unit.service is Type=simple, so systemd calls
+# it active the instant the process is SPAWNED -- `unit-active` above breaks
+# out of its poll before the interpreter has imported luma, gpiozero or
+# anything else, and under TCG that import is seconds of real work. Reading
+# the journal straight afterwards asks a unit that has not decided anything
+# yet, and reads "it never looked for a panel". Bounded, because a unit that
+# is never going to say it must still produce a report.
 NO_OLED=no
-case "$UNIT_LOG" in *"no OLED ("*) NO_OLED=yes ;; esac
 HEADLESS=no
-case "$UNIT_LOG" in *"no usable interface; printing unattended"*) HEADLESS=yes ;; esac
+UNIT_LOG=""
+for _ in $(seq 1 30); do
+    UNIT_LOG=$(journalctl -b -u otp-unit.service --no-pager 2>/dev/null | tr '\n' ' ')
+    case "$UNIT_LOG" in *"no OLED ("*) NO_OLED=yes ;; esac
+    case "$UNIT_LOG" in *"no usable interface; printing unattended"*) HEADLESS=yes ;; esac
+    [ "$NO_OLED" = yes ] && [ "$HEADLESS" = yes ] && break
+    sleep 2
+done
 # What it decided it had, quoted back. Display and input are chosen
 # independently, so WHICH of them was missing is the half worth reading: a
 # QEMU Pi may well offer a gpiochip and no screen.
@@ -404,10 +416,13 @@ if [ "$PHASE" = "boot1" ]; then
     # in it, under TCG, and otp-unit-imgcheck.service's TimeoutStartSec is
     # what a slow one would eat -- a probe killed mid-run reports nothing at
     # all, and the phase fails for having no OTP-GUEST-DONE line rather than
-    # for anything about the image. 90s, and the same reading of `timeout`'s
-    # exit codes as the malformed-seed experiment below: anything at or above
-    # 124 is timeout(1) saying it could not get a clean status out of the
-    # child, not the script returning.
+    # for anything about the image. 90s, and the exit code is REPORTED rather
+    # than gated -- the two checks below read what the program SAID, and a
+    # bound that fired leaves that output incomplete and turns them red on
+    # its own. The number is in the detail so that a red reads as "it never
+    # finished" instead of "it failed", which are different diagnoses:
+    # anything at or above 124 is timeout(1) saying it could not get a clean
+    # status out of the child, not the program returning.
     SHEET_SAID=$(SHEET_QUEUE="$SHEET_QUEUE" timeout -k 5 90 python3 - <<'PY' 2>&1
 import os, sys
 sys.path.insert(0, "/opt/otp-unit")
