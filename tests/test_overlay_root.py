@@ -1037,7 +1037,8 @@ def test_the_refusal_comes_before_anything_the_probe_writes():
 # appearance: `slice_between` takes the first match, and "DROPIN\n" first
 # appears on the `cat <<DROPIN` line itself -- which cut the body off and
 # wrote an empty drop-in that these tests then passed judgement on.
-DROPIN_BLOCK = ("systemctl unmask userconfig.service", "StandardInput=null\nDROPIN")
+DROPIN_BLOCK = ("systemctl unmask userconfig.service",
+                "systemctl enable userconfig.service 2>/dev/null || true")
 DROPIN_DIR = "/etc/systemd/system/userconfig.service.d"
 
 
@@ -1084,6 +1085,32 @@ def test_the_wizard_runs_only_when_an_operator_seeded_it(tmp_path):
     # prompt and silently discards every credential file too.
     assert "unmask userconfig.service" in log, log
     assert "mask userconfig.service" not in log.replace("unmask", ""), log
+
+
+def test_the_wizard_is_enabled_in_the_image_and_not_by_accident(tmp_path):
+    """
+    Run 32020772161, boot 2, the first boot pair with the machine-id
+    persisted:
+
+      OTP-CHECK boot2 userconf-unseeded-boot-skips-the-wizard FAIL
+        condition=no checked-at='never' is-active=inactive is-enabled=disabled
+
+    `is-enabled=disabled` on a boot where nothing disabled anything -- /etc is
+    the overlay, so boot1's `systemctl disable userconfig` died with the
+    power. That is the IMAGE's state, and it always was: what had been hiding
+    it is that every boot used to be a first boot, so `preset-all` re-enabled
+    the unit every time. The same run shows the change directly, in the
+    targets it reached: boot1 has first-boot-complete.target, boot2 does not.
+
+    userconfig.service is the ONLY consumer of the documented headless
+    credential file, so leaving it disabled means a userconf.txt an operator
+    writes to the card is ignored in silence on every boot after the first --
+    which is exactly the trade the drop-in above replaced a `mask` to avoid.
+    Enabling it is what that drop-in was written for: the condition pair costs
+    an unseeded boot two ConditionPathExists and a skip.
+    """
+    _, log = run_dropin(tmp_path, boot_dir="/boot/firmware")
+    assert "enable userconfig.service" in log, log
 
 
 def test_the_wizard_cannot_reach_a_terminal(tmp_path):

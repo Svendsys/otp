@@ -556,6 +556,43 @@ ConditionPathExists=|$BOOT_DIR/userconf.txt
 StandardInput=null
 DROPIN
 
+# AND ENABLED, IN THE IMAGE, which until now nothing did.
+#
+# MEASURED, in run 32020772161 -- the first boot pair with the machine-id
+# persisted. boot2 reported
+#
+#   OTP-CHECK boot2 userconf-unseeded-boot-skips-the-wizard FAIL
+#     condition=no checked-at='never' is-active=inactive is-enabled=disabled
+#
+# `is-enabled=disabled`, on a boot where nothing had disabled anything: /etc
+# is the overlay, so boot1's `systemctl disable userconfig` -- cancel-rename's
+# own last-but-one act -- died with the power. That reading is the IMAGE's
+# state, and it always was. What had been hiding it is that every boot used to
+# be a first boot, so systemd ran `preset-all` every time and re-enabled the
+# unit every time. Persisting the machine-id stopped that, and the accident
+# stopped with it. The same run shows the change directly: boot1's targets
+# include first-boot-complete.target and boot2's do not.
+#
+# WHAT IT COSTS IF LEFT, and it is the exact trade the comment above refuses
+# to make by masking: userconfig.service is the ONLY consumer of the
+# documented headless credential file, so a disabled unit means a
+# userconf.txt an operator writes to the card is ignored, in silence, on
+# every boot after the first. Arriving by preset-all instead of by `mask`
+# does not make it a different outcome.
+#
+# ENABLING IT IS WHAT THE DROP-IN ABOVE WAS WRITTEN FOR. The condition pair
+# exists so that a unit which IS pulled into every boot costs nothing on the
+# boots with no seed: systemd evaluates two ConditionPathExists, finds
+# neither, and skips the unit before its ExecStart -- no prompt, no job, no
+# time. Enabled plus that condition is the design; enabled by accident of a
+# machine-id bug was not.
+#
+# `|| true`, unlike the masks in this file, because this one is not load
+# bearing for the boot: an image whose userconfig.service cannot be enabled
+# still boots and still prints pads. Tier 3's
+# userconf-unseeded-boot-skips-the-wizard is what fails if it does not land.
+systemctl enable userconfig.service 2>/dev/null || true
+
 # AND THE LAST THING THAT APPLY PATH DOES, which is where it bites. Applying
 # a seed ends in /usr/lib/userconf-pi/userconf, whose final act is
 # `cancel-rename`, and cancel-rename ends -- on every machine that boots to a

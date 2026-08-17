@@ -794,6 +794,56 @@ readable by anyone who can mount the card. That is the same set of people who
 can already read them off the unencrypted ext4 root, and the release note and
 `install.sh`'s closing summary both say so rather than implying otherwise.
 
+### Run 32020772161: what stopping the first-boot loop uncovered
+
+The first boot pair with all of the above in it. Boot 1 went **19/19** and
+every host-side check passed. Boot 2 went **18/19**, and the single failure is
+the interesting part of the run.
+
+**All three of run 72's unit failures are gone**, in both boots: no
+`Failed with result` reached the speaker-scoped console at all, so neither
+`rpi-eeprom-update.service` nor `ssh.service` nor `systemd-growfs-root.service`
+failed. `unit-detects-no-panel` passed in both boots — the board revision let
+gpiozero construct a `Button` exactly as predicted, and the check keyed on the
+display instead, exactly as intended. `machine-id-persisted-outside-the-overlay`
+passed in both, `ssh-host-key-fingerprint-recorded` in boot 1 and
+`ssh-host-keys-identical-across-the-power-cycle` in boot 2: **the same card,
+powered off and on, came back with the same host keys.**
+
+The targets each boot reached carry the machine-id fix independently, without
+reading a single check: boot 1 reached `first-boot-complete.target` and boot 2
+**did not**. `regenerate_ssh_host_keys.service` pulls that target in and is
+`ConditionFirstBoot=yes`, so its absence in boot 2 is systemd saying the second
+boot was not a first boot — which had never been true of this image before.
+
+What failed was:
+
+```
+OTP-CHECK boot2 userconf-unseeded-boot-skips-the-wizard FAIL
+  condition=no checked-at='never' is-active=inactive is-enabled=disabled
+```
+
+`condition=no` and `is-active=inactive` are the wanted answers. The other two
+are not, and both come from `is-enabled=disabled` — a unit systemd never
+looked at has no condition timestamp either.
+
+**Nothing disabled it on that boot.** `/etc` is inside the overlay, so boot 1's
+`systemctl disable userconfig` — `cancel-rename`'s own second-to-last act —
+died with the power. `disabled` is what the IMAGE says, and it always was.
+What had been hiding it is the bug this branch fixed: every boot was a first
+boot, systemd ran `preset-all` every time, and `preset-all` re-enabled the
+unit every time. Stop the first-boot loop and the accident stops with it.
+
+That is a real regression for an operator, not a stale expectation:
+`userconfig.service` is the only consumer of `userconf.txt`, so a disabled
+unit means a credential file written to the card is ignored in silence on
+every boot after the first — precisely the trade `install.sh`'s comment
+refuses to make by masking, arriving through a different door. So the fix is
+`systemctl enable userconfig.service` in the image, which is what the
+`ConditionPathExists` drop-in was written for in the first place: an unseeded
+boot pays two condition evaluations and a skip. The check was right; the image
+was wrong.
+
 ## Proving the guards can fail
 
 Every tier above is a check, and a check has one failure mode that nothing

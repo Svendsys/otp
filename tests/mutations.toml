@@ -2431,3 +2431,23 @@ file = "harness/img-boot.sh"
 find = '''network-wait-cannot-hold-the-boot-open \
 machine-id-persisted-outside-the-overlay"'''
 replace = '''network-wait-cannot-hold-the-boot-open"'''
+
+
+[[mutation]]
+name = "install-userconf-wizard-never-enabled"
+tier = "fast"
+guard = """
+The unit that consumes the documented headless credential file has to be
+pulled into the boot, and until run 32020772161 nothing in this repository
+enabled it -- first-boot `preset-all` did, on every boot, because every boot
+was a first boot. Persisting the machine-id ended that and boot2 reported
+`is-enabled=disabled`. A disabled unit ignores an operator's userconf.txt in
+silence on every boot after the first, which is the outcome the drop-in above
+replaced a `mask` to avoid."""
+tests = [
+  "tests/test_overlay_root.py::test_the_wizard_is_enabled_in_the_image_and_not_by_accident",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = "systemctl enable userconfig.service 2>/dev/null || true"
+replace = "systemctl status userconfig.service >/dev/null 2>&1 || true"
