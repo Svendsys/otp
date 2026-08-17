@@ -887,16 +887,79 @@ file the **probe** owns, and boot 2 is held against that. The
 
 **The cost, said out loud.** `/boot/firmware` is vfat mounted with
 `defaults`, so everything on it is `0755 root:root` — readable by **every
-account on the unit**, including the `otp` user the print unit runs as, not
-only by someone holding the card. A machine-id is an identifier rather than a
-secret and no pad byte or password is written there; the release note and
-`install.sh`'s closing summary both say so in those terms rather than the
-older "the same people who can already read the root filesystem", which
-understated who that is. Tightening the mount to `fmask=0077,dmask=0077` was
-considered and not done: `otp-unit.service` carries
-`ReadWritePaths=-/boot/firmware` so that `otpunit/config.py` can save the
-operator's settings there, and a store only root could write would break that
-without protecting anything that is a secret.
+account on the unit**, including the `otp` user and the `lp` uid CUPS runs
+filters as, not only by someone holding the card. A machine-id is an
+identifier rather than a secret; the release note and `install.sh`'s closing
+summary both say so in those terms rather than the older "the same people who
+can already read the root filesystem", which understated who that is.
+
+**"and no password is written there" is no longer true.** The operator's
+login is kept on that partition now — see the section below — and that is the
+one thing there which is not an identifier. No pad byte is, and none ever may
+be.
+
+**Tightening the mount to `fmask=0077,dmask=0077`** was considered and not
+done, and the reason recorded here was **wrong**: it said
+`otp-unit.service` carries `ReadWritePaths=-/boot/firmware` so
+`otpunit/config.py` can save settings there, and that a root-only partition
+would break that. But that unit has no `User=` — it runs as **root**, and so
+do all four units in `device/systemd`; `ReadWritePaths` is a mount-namespace
+grant, not a uid drop, and root writes through `0700` vfat. No non-root writer
+to that partition exists in this repository. The real costs are different
+ones: `install.sh` would have to rewrite `/etc/fstab`, which it deliberately
+does not; a wrong entry there costs the boot-partition mount and takes the
+settings, the machine-id and the credential with it, on a machine with no
+network to recover over; and `config.py`'s `mount -o remount,rw` fallback
+would need checking, because vfat re-parses its options on remount. It is the
+obvious next narrowing for whoever wants one.
+
+### The operator's login, which used to last exactly one boot
+
+`userconf-service` applies `/boot/firmware/userconf.txt` with `chpasswd -e`
+into `/etc/shadow` and then **deletes the seed**. On a normal Pi that is
+right; here `/etc` is inside the overlay and the FAT partition is not, so the
+credential died with the power while the only file that could reapply it was
+destroyed by the boot that consumed it. The account reverted to the random
+`FIRST_USER_PASS` `image/build.sh` generates, which nobody has — on a device
+that can be connected to a keyboard and a screen, where that login is the
+recovery path. The owner's decision out of *refuse the seed loudly*, *persist
+it* and *keep the seed file* is **persist it**.
+
+Three named guest checks read it back off the machine:
+
+| check | boot | what it says |
+|---|---|---|
+| `credential-recorded-outside-the-overlay` | 1 | the applied hash is in `/boot/firmware/otp-identity/credential`, under the account the seed named, on a filesystem that is not the root's |
+| `credential-recorded-for-the-next-boot` | 1 | the positive control: a digest of the applied hash reached a **probe-owned** file and read back |
+| `credential-survives-the-power-cycle` | 2 | the hash in force carries the seed's salt, digests to what boot 1 recorded, and there is no seed on the card it could have come from |
+
+**Boot 1 is the control for the same reason it is on the machine-id side.**
+`credential-recorded-outside-the-overlay` compares the store against
+`/etc/shadow`, and both were written this boot — so it cannot tell "kept"
+from "written a moment ago". The probe's own record is what boot 2 is held
+against, and it predates boot 2 entirely.
+
+**The hash never travels and never prints.** This console is uploaded as a CI
+artifact, so what crosses the power cycle is a `sha256` of the hash, required
+to be 64 characters on **both** sides: two empty strings compare equal, and a
+missing `sha256sum` empties both at once, which is exactly how *the credential
+survived* would come to mean *there was never a credential*. That was found by
+the mutation gate rather than by review — the length clauses looked like
+belt-and-braces until a row proved no test could tell if they went.
+
+**What this costs is a password hash on a world-readable partition**, and it
+is not narrower than the *keep the seed file* option it was chosen over: a
+`userconf.txt` **is** `user:hash`, so both leave the same crypt string on the
+same vfat at the same `0755`. What persisting buys is that `userconf-pi`'s
+apply path — which ends in `cancel-rename` starting a getty on the front
+panel's tty — runs once rather than every boot, that the store gets the
+validation and the outside-the-overlay refusal, and that a new `userconf.txt`
+still works. It is written **only** from the wizard's own `ExecStartPost`, so
+the only hash that reaches a card is one the operator put on that card
+themselves.
+
+The counts move with it: **21 guest checks in boot 1 and 20 in boot 2**, up
+from 19 and 19. The run recorded below predates all three.
 
 ### Run 32020772161: what stopping the first-boot loop uncovered
 

@@ -85,13 +85,81 @@ session touches survives a power-cycle, and pulling the plug cannot corrupt
 the card, because nothing writes to it. Settings still persist — they live on
 the boot partition, which is outside the overlay.
 
-**One other thing lives there, and it is the only exception to the sentence
-above.** `/boot/firmware/otp-identity` holds this unit's `machine-id`.
-Without it `/etc/machine-id` reverted to `uninitialized` on every
-power-cycle and systemd read every boot as a *first* boot — re-running
+**Two other things live there, and they are the only exceptions to the
+sentence above.** Both are in `/boot/firmware/otp-identity`.
+
+`machine-id`. Without it `/etc/machine-id` reverted to `uninitialized` on
+every power-cycle and systemd read every boot as a *first* boot — re-running
 `preset-all`, re-enabling `ssh.socket`, and regenerating the host keys each
 time. The machine-id is put back by the initramfs, because systemd reads that
 file before any service exists.
+
+`credential`, **but only if you set a password yourself.** See the next
+section: it is the one thing here that is not merely an identifier, and it is
+worth reading before you decide it is acceptable.
+
+## Your login, and what keeping it costs
+
+**Set a password the documented way** — write a `userconf.txt` holding
+`username:hash` to the boot partition, with the hash from `openssl passwd -6`,
+or let Raspberry Pi Imager do it. `userconfig.service` applies it on the next
+boot and deletes the file. The account is `otp`; the login prompt is on tty2
+(**Alt+F2**), because tty1 is the front panel.
+
+**Until recently that password worked for exactly one boot.** The apply is
+`chpasswd -e` into `/etc/shadow`, `/etc` is inside the RAM overlay, and the
+seed file that could have reapplied it is deleted by the boot that consumes
+it. The account then reverted to the random password the image was built with,
+which nobody has — on a device you can plug a keyboard and a screen into,
+where that login is the only way in that does not involve taking the card out.
+
+**It is now kept**, in `/boot/firmware/otp-identity/credential`, and restored
+early in every boot before any login prompt exists. The precedence, if you
+ever write a new `userconf.txt` onto a unit that already has a kept password:
+
+| what is there | what wins this boot | what the next boot uses |
+|---|---|---|
+| a kept credential only | the kept one | the kept one |
+| a kept credential **and** a fresh `userconf.txt` | the fresh one | the fresh one |
+| a fresh `userconf.txt` only | the fresh one | the fresh one |
+| a malformed `userconf.txt` | the kept one | the kept one |
+
+so writing a new `userconf.txt` is always how you change the password, and a
+seed the wizard rejects costs you nothing — it is renamed `failed_userconf.txt`
+and the password you already had still works.
+
+**THE COST, which you should decide about rather than discover.** That file is
+a password hash on a vfat partition mounted with `defaults` — `0755
+root:root`, readable by **every account on the unit** and by anyone who can
+put the card in a reader. A hash is not a password, but it can be attacked
+offline for as long as somebody likes: `sha512crypt` at the rounds `openssl
+passwd -6` uses verifies in about two milliseconds on an ordinary core, before
+anyone reaches for a GPU. **Do not use a password you use anywhere else.**
+
+Two things make that bound smaller than it sounds. The bytes are the same
+bytes your own `userconf.txt` put on that same partition — persisting them
+adds no exposure that seeding them did not — and nothing is written there at
+all unless you seeded a credential yourself, so a unit whose owner never set a
+password has no hash on its card.
+
+**Deleting `userconf.txt` no longer takes it off the card.** This does:
+
+```
+sudo rm -f /boot/firmware/otp-identity/credential
+```
+
+after which the account goes back to the build-time password nobody has, and
+the tty2 prompt is no use to you. Set a new one with a fresh `userconf.txt`
+instead.
+
+**A password you set with `passwd` at the console is NOT kept.** It lives in
+`/etc/shadow`, which is inside the overlay, so it lasts until the power goes
+off — only the wizard's path is persisted, because that is the path where you
+have already chosen to put the hash on the card. **Tightening the partition**
+so that only root could read it (`fmask=0077`) is possible and is discussed in
+the comments in `device/install.sh`; it is not done, because it means
+rewriting `/etc/fstab`, and an `/etc/fstab` that is wrong costs you the boot
+partition and everything on it.
 
 **The SSH host keys are deliberately not kept.** They were, briefly, so that
 the fingerprint of a machine that prints one-time pads stopped changing —
@@ -104,9 +172,10 @@ outside the overlay.
 
 The boot partition is vfat mounted with `defaults`, so every file on it is
 `0755 root:root` — readable by **every account on the unit**, not only by
-someone who takes the card out. Nothing secret is written there: a
-machine-id is an identifier, and settings are the operator's own. It is worth
-knowing before you decide to put anything else on that partition.
+someone who takes the card out. A machine-id is an identifier and the
+settings are the operator's own; the one thing there that is neither is the
+kept login hash, which is why it has a section of its own above. No pad byte
+is ever written to that partition.
 
 This used to be a manual step, printed as advice at the end of `install.sh`.
 It was a manual step nowhere else in this project: the image did not do it,
