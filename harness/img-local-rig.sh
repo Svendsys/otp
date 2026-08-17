@@ -378,18 +378,54 @@ if ! mount -t ext4 -o ro /dev/mmcblk0 /mnt/modules 2>/dev/null; then
     echo "   FAIL: could not mount the module disk at /dev/mmcblk0"
     echo "   (block devices: $(ls /dev/mmcblk* 2>/dev/null || echo none))"
 else
+    # /lib/modules, NOT `modprobe -d`. busybox's modprobe has no -d option
+    # -- that is kmod's -- and the first version of this probe used it.
+    # Every one of the 41 invocations died on "invalid option -- 'd'" in
+    # microseconds, and the probe reported "41/41, zero hangs", which is
+    # the exact number issue #17 recorded and therefore the most
+    # convincing possible way to be wrong. A coldplug replay in which no
+    # modprobe can run is not a clean coldplug replay.
+    mkdir -p /lib
+    ln -sf /mnt/modules/lib/modules /lib/modules
+    release=$(uname -r)
     echo "   modules: $(ls /mnt/modules/lib/modules 2>/dev/null)"
-    total=0
-    for m in $(find /sys/devices -name modalias -print 2>/dev/null | sort); do
-        alias=$(cat "$m" 2>/dev/null) || continue
-        [ -n "$alias" ] || continue
-        total=$((total + 1))
-        echo "   PROBE-START $total $alias"
-        modprobe -d /mnt/modules "$alias" 2>&1 | sed 's/^/     /' || true
-        echo "   PROBE-DONE $total $alias"
-    done
-    echo "   coldplug replayed $total modaliases"
-    echo "   loaded: $(wc -l < /proc/modules) modules"
+    if [ ! -f "/lib/modules/$release/modules.dep" ]; then
+        echo "   FAIL: no modules.dep for $release -- modprobe can resolve nothing,"
+        echo "   so every probe below would 'succeed' without doing anything."
+        echo "   (the host-side depmod in rig_build_module_disk is what makes it)"
+    else
+        echo "   modules.dep: $(wc -l < "/lib/modules/$release/modules.dep") lines"
+        total=0; failed=0
+        for m in $(find /sys/devices -name modalias -print 2>/dev/null | sort); do
+            alias=$(cat "$m" 2>/dev/null) || continue
+            [ -n "$alias" ] || continue
+            total=$((total + 1))
+            echo "   PROBE-START $total $alias"
+            # rc CAPTURED and counted. "No such module" is a legitimate
+            # answer for an alias with no driver; what must not go
+            # unnoticed is EVERY probe failing, which is what a broken
+            # invocation looks like.
+            #
+            # Substitution rather than a pipe into sed: the guest shell is
+            # busybox ash, which has no PIPESTATUS, so `modprobe | sed`
+            # would leave $? holding SED's status -- always 0 -- and the
+            # failure tally below would read zero however badly modprobe
+            # was doing. That is the same defect this probe already had
+            # once, one level further in.
+            out=$(modprobe -q "$alias" 2>&1)
+            rc=$?
+            [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/     /'
+            [ "$rc" = "0" ] || failed=$((failed + 1))
+            echo "   PROBE-DONE $total $alias rc=$rc"
+        done
+        echo "   coldplug replayed $total modaliases, $failed of them non-zero"
+        echo "   loaded: $(wc -l < /proc/modules) modules now in /proc/modules"
+        if [ "$total" -gt 0 ] && [ "$failed" = "$total" ]; then
+            echo "   FAIL: EVERY probe returned non-zero. That is a broken"
+            echo "   invocation, not a clean coldplug -- read the lines above"
+            echo "   before believing the count."
+        fi
+    fi
 fi
 PROBE
         ;;
@@ -405,8 +441,19 @@ echo "-- /proc/consoles (the registered ones, C = preferred):"
 cat /proc/consoles 2>/dev/null || echo "   (none)"
 echo "-- kernel cmdline:"
 cat /proc/cmdline
-echo "-- serial devices present:"
-ls -l /dev/ttyAMA* /dev/ttyS* /dev/console 2>/dev/null || echo "   (none)"
+echo "-- tty device nodes devtmpfs actually made:"
+# `ls /dev/ttyAMA*` was the first form and it lied: with no match busybox ls
+# still lists the paths that DO exist, then exits nonzero, so the `|| echo
+# none` fired underneath a successful listing and the output said both. A
+# glob that matched nothing must be reported as nothing.
+found_tty=""
+for t in /dev/tty[A-Z]*[0-9] /dev/ttyS[0-9]; do
+    [ -e "$t" ] || continue
+    found_tty="yes"
+    echo "   $(ls -l "$t")"
+done
+[ -n "$found_tty" ] || echo "   (no serial tty nodes at all)"
+echo "   /dev/console: $(ls -l /dev/console 2>/dev/null || echo absent)"
 echo "-- what the device tree calls them:"
 for a in /proc/device-tree/aliases/serial*; do
     [ -e "$a" ] || continue
@@ -417,10 +464,16 @@ tr -d '\000' < /proc/device-tree/chosen/stdout-path 2>/dev/null || echo "   (uns
 echo ""
 echo "-- writing a distinct line to each port; whichever appears in which"
 echo "   console file is the mapping, and that is the whole finding:"
-for t in /dev/ttyAMA0 /dev/ttyAMA1 /dev/ttyS0; do
-    [ -e "$t" ] || continue
-    echo "OTP-RIG-PORTMARK $t" > "$t" 2>/dev/null \
-        && echo "   wrote to $t" || echo "   could not write to $t"
+for t in /dev/ttyAMA0 /dev/ttyAMA1 /dev/ttyS0 /dev/console; do
+    if [ ! -e "$t" ]; then
+        echo "   $t does not exist"
+        continue
+    fi
+    if echo "OTP-RIG-PORTMARK $t" > "$t" 2>/dev/null; then
+        echo "   wrote to $t"
+    else
+        echo "   could not write to $t"
+    fi
 done
 PROBE
         ;;
