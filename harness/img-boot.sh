@@ -553,6 +553,21 @@ boot_phase() {
 # "Reached target" are systemd status lines, not kernel output -- and
 # they need the WORKING console above to reach the capture at all.
 #
+# systemd.journald.forward_to_console=1 IS AN OBSERVABILITY LEVER, AND
+# EMULATION-ONLY. Issue #21: tier 3 could see that the unit STARTED and
+# nothing it did afterwards. The journal is volatile by design
+# (device/install.sh writes Storage=volatile, RuntimeMaxUse=16M), it dies
+# with the guest, and nothing carried it to the serial port this harness
+# captures -- so every line otp-unit.service logs about the hardware it
+# found, and every line any other unit logs, was written to RAM and thrown
+# away. With this the journal streams to /dev/console, which is the PL011
+# named above, which is uart0. It changes nothing about a flashed device:
+# -append REPLACES the kernel command line wholesale here (see the header),
+# the image's own cmdline.txt is not edited, and the unit keeps its quiet
+# console on real hardware. The flag is not assumed to have worked either
+# -- harness/img-guest-check.sh puts a marker into the journal and NOWHERE
+# else, and the verdict below requires it on the console.
+#
 # otp.imgcheck=<phase> is what wakes otp-unit-imgcheck.service, whose
 # ConditionKernelCommandLine is that word. It ships in the image and is
 # inert on a flashed card, where nothing puts the word there.
@@ -563,7 +578,7 @@ boot_phase() {
         -M raspi3b -m 1024 \
         -kernel "$KERNEL" -dtb "$DTB" \
         ${INITRD:+-initrd "$INITRD"} \
-        -append "rw earlycon loglevel=7 console=ttyAMA1,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait $OVERLAY_TOKENS otp.imgcheck=$phase" \
+        -append "rw earlycon loglevel=7 console=ttyAMA1,115200 systemd.show_status=1 systemd.journald.forward_to_console=1 initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait $OVERLAY_TOKENS otp.imgcheck=$phase" \
         -drive "file=$IMG,if=sd,format=raw" \
         -serial "file:$console" \
         -serial "file:$console2" \
@@ -666,6 +681,28 @@ phase_paths() {
         "$CONSOLE_ALL" > "$CONSOLE_TXT" 2>/dev/null || cp "$CONSOLE_ALL" "$CONSOLE_TXT"
 }
 
+# The lines the SYSTEM wrote, as opposed to the lines it carried for
+# somebody else.
+#
+# journald formats a forwarded line as a monotonic timestamp, the speaker and
+# its pid, then the text:
+#
+#   [   45.123456] python3[412]: no OLED (...)
+#
+# The kernel's own output has the timestamp and no speaker at all, and PID 1
+# writes its status lines with no timestamp ("[  OK  ] Started ..."). Neither
+# shape matches, so both are kept; systemd[1] is kept by name, because it is
+# the one speaker whose "Failed with result" is systemd's verdict on a unit
+# rather than a phrase inside somebody's log output.
+#
+# `|| true` for the same reason every other read of a console here carries
+# one: an absent or empty file must produce an empty result, not kill the
+# verdict before it has been written.
+system_lines() {
+    awk '!/^\[[^]]*\] [^ ]+\[[0-9]+\]:/ || /^\[[^]]*\] systemd\[1\]:/' \
+        "$1" 2>/dev/null || true
+}
+
 per_boot_verdict() {
     local phase="$1"
 # Max over every timestamp in BOTH files, not the concat's last line:
@@ -678,9 +715,24 @@ per_boot_verdict() {
 # script BEFORE verdict.txt was written: no IMG-CHECK lines, no rc
 # report, no console tail, precisely in the no-evidence case. Found by
 # the review panel; the identical guard was already on the next line.
-    local LAST_TS KERNEL_ENTRIES
+    local LAST_TS KERNEL_ENTRIES SPOKEN
     LAST_TS=$(grep -oE '\[ *[0-9]+\.[0-9]+\]' "$CONSOLE_TXT" 2>/dev/null | tr -d '[] ' | sort -g | tail -1 || true)
-    KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/null || true)
+    # `kernel: ` EXCLUDED, and that is a consequence of the journal now
+    # streaming to this console. journald labels a forwarded kernel message
+    # with the identifier `kernel`, and the kernel's own console output never
+    # prefixes itself that way -- so if journald forwards the kmsg entries it
+    # imported (it reads /dev/kmsg from the start of the buffer), the whole
+    # early boot arrives a second time and a healthy boot counts TWO kernel
+    # entries and is failed as a reboot loop.
+    #
+    # Whether journald does that is NOT measured: there is no systemd on the
+    # machine this was written on, and no console in this repository has been
+    # captured with forwarding on yet. The exclusion costs nothing if it does
+    # not, and it cannot hide a real loop -- a second kernel entry prints its
+    # own "Booting Linux on physical CPU" with a timestamp and no identifier,
+    # which is what is still counted.
+    KERNEL_ENTRIES=$(grep -vE '^\[[^]]*\] kernel: ' "$CONSOLE_TXT" 2>/dev/null \
+                     | grep -c "Booting Linux on physical CPU" || true)
     printf 'qemu exit: %s\n' "$QEMU_RC"
     # How far it got and how many times the kernel STARTED. Entries > 1 is
     # a reboot loop stated as a number, instead of an inference from byte
@@ -702,10 +754,52 @@ per_boot_verdict() {
     else
         printf 'IMG-CHECK %s unit-started FAIL\n' "$phase"
     fi
+    # THE JOURNAL REACHED THE CONSOLE, which is issue #21's first clause and
+    # the thing every behavioural reading below now rests on. -append carries
+    # systemd.journald.forward_to_console=1; a kernel parameter that is
+    # accepted and does nothing looks exactly like one that works, so this is
+    # not taken on trust. harness/img-guest-check.sh writes a marker into the
+    # journal with systemd-cat and NOWHERE else -- deliberately not to its own
+    # stdout, which systemd already copies to this console through
+    # StandardOutput=journal+console, and deliberately never echoed back into
+    # a check's detail either. Forwarding is the only thing that can have put
+    # it here.
+    #
+    # The guest's journal-marker-accepted is the other half of the pair: it
+    # says the journal TOOK the marker, so an absence here is a forwarding
+    # failure rather than a systemd-cat that did nothing.
+    if grep -qE "OTP-JOURNAL-FORWARDED[[:space:]]+${phase}([[:space:]]|\$)" \
+            "$CONSOLE_TXT" 2>/dev/null; then
+        printf 'IMG-CHECK %s journal-forwarded-to-console PASS\n' "$phase"
+    else
+        printf 'IMG-CHECK %s journal-forwarded-to-console FAIL\n' "$phase"
+    fi
+    # THE FORBIDDEN PHRASES, AND WHO IS ALLOWED TO SAY THEM.
+    #
+    # Until the journal was forwarded, this console carried kernel output and
+    # PID 1's status lines and nothing else: once journald started, every
+    # unit's stdout and stderr went into the journal and stayed there. Now it
+    # carries whatever anything on the machine writes -- including this
+    # harness's own probe, which quotes userconf-service's output into a check
+    # detail and dumps thirty lines of the unit's journal at the end. Failing
+    # a release because a unit QUOTED "Failed with result" is the same defect
+    # as failing one because the image's hostname contains "otp-unit", which
+    # is row 2 of issue #14.
+    #
+    # So the phrases are looked for in what the SYSTEM said. system_lines()
+    # keeps kernel output and PID 1, and drops journald-forwarded lines from
+    # anything else; a phrase found only in one of those is reported instead
+    # of gated, so the scoping can never swallow one in silence.
+    SPOKEN="$WORK/$phase/console-system.log"
+    system_lines "$CONSOLE_TXT" > "$SPOKEN"
     for bad in "status=216" "Failed with result" "Scheduled restart job" \
                "Kernel panic" "Unable to mount root"; do
-        if grep -qF -- "$bad" "$CONSOLE_TXT" 2>/dev/null; then
+        if grep -qF -- "$bad" "$SPOKEN" 2>/dev/null; then
             printf 'IMG-CHECK %s no-%s FAIL\n' "$phase" "$(printf '%s' "$bad" | tr ' =' '--')"
+        elif grep -qF -- "$bad" "$CONSOLE_TXT" 2>/dev/null; then
+            printf 'IMG-NOTE %s quoted-%s: %s\n' "$phase" \
+                   "$(printf '%s' "$bad" | tr ' =' '--')" \
+                   "$(grep -m1 -F -- "$bad" "$CONSOLE_TXT" 2>/dev/null | cut -c1-120)"
         fi
     done
     # "systemd[1]:" and not "systemd". The bare string matches the
@@ -816,11 +910,13 @@ per_boot_verdict() {
 # what this tier proves; tests/test_img_verdict.py holds the two lists
 # against each other so they cannot drift apart in the other direction.
 GUEST_CHECKS_COMMON="root-is-overlay root-write-lands-and-is-readable \
-unit-active unit-not-restart-looping etc-cups-is-its-own-tmpfs cups-running \
+unit-active unit-not-restart-looping journal-marker-accepted \
+unit-detects-no-panel etc-cups-is-its-own-tmpfs cups-running \
 cupsd-config-valid boot-partition-separate setting-saved-to-the-boot-partition \
 network-wait-cannot-hold-the-boot-open"
 GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
-front-panel-survives-the-credential-apply"
+front-panel-survives-the-credential-apply diagnostic-sheet-renders \
+diagnostic-sheet-reaches-cups"
 GUEST_CHECKS_BOOT2="root-writes-discarded-by-the-power-cycle \
 settings-survive-the-power-cycle userconf-unseeded-boot-skips-the-wizard \
 userconf-wizard-cannot-prompt userconf-malformed-seed-fails-fast"

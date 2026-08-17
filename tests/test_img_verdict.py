@@ -131,8 +131,28 @@ def guest_report(phase, *, checks=None, failing=(), done=True, counts=None):
     return lines
 
 
+# WHAT JOURNAL FORWARDING LOOKS LIKE ON THE WIRE, which is a shape and not
+# just a string. journald writes a forwarded line as a monotonic timestamp,
+# the syslog identifier, the pid, and the text:
+#
+#   [   45.123456] otp-imgcheck[912]: OTP-JOURNAL-FORWARDED boot1
+#
+# The probe writes this marker with `systemd-cat -t otp-imgcheck` and by no
+# other route -- never on its own stdout, which systemd already copies to the
+# console -- so the line can only be here if the journal reached the console.
+# Issue #21.
+def journal_forwarded(phase, ident="otp-imgcheck", pid=912, ts="45.123456"):
+    return f"[   {ts}] {ident}[{pid}]: OTP-JOURNAL-FORWARDED {phase}\r"
+
+
+def forwarded(text, *, ident="python3", pid=412, ts="46.000000"):
+    """Any other line journald carried to the console for somebody else."""
+    return f"[   {ts}] {ident}[{pid}]: {text}\r"
+
+
 def healthy(phase):
-    return kernel_lines() + [SUCCESS] + guest_report(phase)
+    return (kernel_lines() + [SUCCESS] + [journal_forwarded(phase)]
+            + guest_report(phase))
 
 
 # What `mdir -b` prints for the FAT partition of an image this harness can
@@ -722,7 +742,9 @@ def test_the_hardware_rng_line_is_quoted_back_with_its_driver(tmp_path):
     plain = [ln for ln in kernel_lines() if "hwrng" not in ln.lower()]
     real = "[    2.401337] bcm2835-rng 3f104000.rng: hwrng registered"
     proc, verdict = run_verdict(
-        tmp_path, {"boot1": plain + [real, SUCCESS] + guest_report("boot1")})
+        tmp_path,
+        {"boot1": plain + [real, SUCCESS, journal_forwarded("boot1")]
+                  + guest_report("boot1")})
     assert "IMG-CHECK boot1 hwrng-registered PASS" in verdict, verdict
     assert "bcm2835-rng" in verdict, \
         "the note clipped the driver name off, which is the only thing " \
@@ -787,7 +809,9 @@ def test_every_target_reached_is_named_not_just_counted(tmp_path):
                "[  180.3] systemd[1]: Reached target multi-user.target - Multi-User System."]
     proc, verdict = run_verdict(
         tmp_path,
-        {"boot1": kernel_lines() + reached + [SUCCESS] + guest_report("boot1")})
+        {"boot1": kernel_lines() + reached
+                  + [SUCCESS, journal_forwarded("boot1")]
+                  + guest_report("boot1")})
     note = next(ln for ln in verdict.splitlines() if "targets-reached" in ln)
     assert "multi-user.target" in note, note
     assert "remote-fs.target" in note, note

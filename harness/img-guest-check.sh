@@ -192,6 +192,87 @@ check unit-not-restart-looping \
       "$(if [ "${RESTARTS:-9}" -le 1 ] 2>/dev/null; then echo yes; else echo no; fi)" \
       "NRestarts=$RESTARTS"
 
+# --- the journal, now that the console carries it -------------------------
+
+# ONE MARKER, PUT WHERE ONLY THE JOURNAL CAN CARRY IT. Issue #21 added
+# systemd.journald.forward_to_console=1 to the emulated kernel command line so
+# that what this machine logs reaches the serial port the harness captures --
+# until then the journal was volatile, died with the guest, and everything the
+# unit did after starting was invisible. A kernel parameter that is accepted
+# and ignored looks exactly like one that works, so the harness does not take
+# it on trust: this line goes into the journal through systemd-cat and by no
+# other route. NOT through this script's stdout, which systemd already copies
+# to the console (StandardOutput=journal+console in
+# otp-unit-imgcheck.service), and the marker text is never echoed back into a
+# check's detail either -- either of those would put it on the console with
+# the forwarding switched off, and the host's gate would pass for the wrong
+# reason.
+#
+# THIS check is the other half of that pair, and it is the positive control:
+# it says the journal ACCEPTED the marker. Without it, a console with no
+# marker is equally "forwarding is off" and "systemd-cat is missing or wrote
+# nothing", and nothing outside the guest can tell those apart.
+#
+# -p notice because journald's MaxLevelConsole decides what forwarding lets
+# through. It defaults to info, and device/install.sh's journald.conf.d sets
+# only Storage and RuntimeMaxUse, so notice clears the default with a margin
+# and would still clear a console level tightened as far as notice.
+JOURNAL_TAG=otp-imgcheck
+JOURNAL_MARK="OTP-JOURNAL-FORWARDED $PHASE"
+printf '%s\n' "$JOURNAL_MARK" | systemd-cat -t "$JOURNAL_TAG" -p notice 2>/dev/null || true
+# Polled: systemd-cat returns once it has written to journald's socket, and
+# the entry is indexed on journald's own schedule rather than ours.
+MARKED=0
+for _ in $(seq 1 15); do
+    MARKED=$(journalctl -b -t "$JOURNAL_TAG" --no-pager 2>/dev/null \
+             | grep -cF "$JOURNAL_MARK" || true)
+    [ "${MARKED:-0}" != 0 ] && break
+    sleep 1
+done
+check journal-marker-accepted \
+      "$(if [ "${MARKED:-0}" != 0 ]; then echo yes; else echo no; fi)" \
+      "journalctl -b -t $JOURNAL_TAG holds ${MARKED:-0} line(s) for this phase"
+
+# --- the panel this machine does not have ---------------------------------
+
+# THE HEADLESS ROUTE, WATCHED BEING TAKEN. QEMU's raspi3b is a Pi with
+# nothing plugged into it: no OLED on the I2C bus, and -append drops the
+# dtparam=i2c_arm=on that would give the bus a device node at all. That is
+# exactly the case otpunit/diagnostics.py exists for -- "a print unit with no
+# OLED is mute" -- and until now nothing had ever watched the shipped code
+# make that decision on the artifact people flash. Issue #21.
+#
+# Read out of the unit's journal rather than off the console, for the reason
+# the userconf block below reads one: it is scoped to the unit and to this
+# boot, and it does not depend on which serial port a line landed on or on
+# the console forwarding that this same probe is busy proving.
+#
+# -b, THIS BOOT. Same argument as the userconf poll: device/install.sh's
+# Storage=volatile is the only thing that makes an unscoped read safe today,
+# and a probe must not depend for its correctness on a line in another file.
+#
+# BOTH HALVES, because either alone describes a different machine. "no OLED ("
+# is otpunit/hmi.open_display reporting that the display probe raised, with
+# the exception in the brackets; "no usable interface; printing unattended" is
+# otpunit/__main__ choosing the headless route off the back of it. The first
+# without the second is a unit that saw the missing panel and walked into the
+# menu anyway -- the hang otpunit/hmi.Interface.prove was written to stop; the
+# second without the first is a unit that never looked. Both strings are held
+# against the modules that print them by tests/test_img_verdict.py, so a
+# rewording there cannot leave this check quietly matching nothing.
+UNIT_LOG=$(journalctl -b -u otp-unit.service --no-pager 2>/dev/null | tr '\n' ' ')
+NO_OLED=no
+case "$UNIT_LOG" in *"no OLED ("*) NO_OLED=yes ;; esac
+HEADLESS=no
+case "$UNIT_LOG" in *"no usable interface; printing unattended"*) HEADLESS=yes ;; esac
+# What it decided it had, quoted back. Display and input are chosen
+# independently, so WHICH of them was missing is the half worth reading: a
+# QEMU Pi may well offer a gpiochip and no screen.
+UNIT_IFACE=$(printf '%s' "$UNIT_LOG" | grep -m1 -oE 'interface -- .{0,60}' || true)
+check unit-detects-no-panel \
+      "$(if [ "$NO_OLED" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \
+      "no-oled=$NO_OLED headless=$HEADLESS ${UNIT_IFACE:-no 'interface --' line in the unit journal}"
+
 # --- CUPS, which is the half of the design the overlay could break --------
 
 # /etc/cups has to be writable for cupsd to start at all, and on a read-only
@@ -273,6 +354,112 @@ SAVED=${SAVED//$'\n'/ }
 check setting-saved-to-the-boot-partition \
       "$(if [ "${SAVED#*save=True}" != "$SAVED" ]; then echo yes; else echo no; fi)" \
       "$SAVED"
+
+if [ "$PHASE" = "boot1" ]; then
+    # --- the diagnostic sheet, and how far the print path really gets -----
+
+    # WHAT THIS IS NOT, because issue #21 expected something else and the
+    # difference is the finding. It said "the headless diagnostic path should
+    # fire under QEMU by design". It does not fire, and cannot:
+    # otpunit/__main__ falls through to diagnostics.run_headless(), which
+    # loops on cups.devices(); Cups.devices() is built from `lpinfo -v` and
+    # keeps only usb://, a loopback IPP endpoint, or a dnssd:// entry that
+    # identifies itself as one of the attached USB devices. An emulated Pi has
+    # no printer of any kind, so that list is empty on every poll and the unit
+    # waits in silence -- no sheet is submitted, and none can be. A unit with
+    # neither a panel nor a printer says nothing at all, which is worth
+    # knowing about a design whose answer to a missing panel is "the printer
+    # becomes the console". The unit's own half of that decision is
+    # unit-detects-no-panel above, and it is the half that IS observable.
+    #
+    # WHAT THIS IS. The rest of that path, driven by hand, on the real image,
+    # through the shipped code and the shipped cupsd, with the one thing the
+    # emulator cannot provide -- a queue -- supplied here. It answers two
+    # questions a booted image is the only place to ask: can this image RENDER
+    # the sheet (reportlab installed and working, every probe in
+    # diagnostics.collect() returning on a machine rather than in a unit
+    # test), and does the shipped cupsd ACCEPT it.
+    #
+    # THE QUEUE IS THE PROBE'S, NOT THE UNIT'S. A separate name, so nothing
+    # here can be mistaken for something otp-unit did, and so a leftover from
+    # this experiment cannot be what the unit later prints into. It points at
+    # a usb:// URI with nothing behind it, which is the "queue with no
+    # physical printer" the issue asks for: the job is ACCEPTED, which is the
+    # claim, and what the backend does with it afterwards is not. /etc/cups is
+    # a tmpfs (otp-unit-etc-cups.service) so none of this can reach the card,
+    # and the queue is removed below regardless.
+    #
+    # MEASURED, not assumed: `lpadmin -p NAME -E -v usb://...` with no -m at
+    # all creates a queue that `lp` will accept a job into. Checked against a
+    # real cupsd 2.4.7 configured from device/install.sh's own directives (the
+    # rig tests/cupsrig.py builds), which answered `request id is
+    # otpimgcheck-1`. Trixie ships the same CUPS major; this boot is the first
+    # time it is asked of the image.
+    SHEET_QUEUE=otpimgcheck
+    SHEET_URI="usb://OTP/imgcheck"
+    SHEET_LPADMIN=$(/usr/sbin/lpadmin -p "$SHEET_QUEUE" -E -v "$SHEET_URI" 2>&1)
+    SHEET_LPADMIN_RC=$?
+    # BOUNDED, and bounded here rather than trusted to be quick. This is the
+    # only step in the probe that starts a Python interpreter with reportlab
+    # in it, under TCG, and otp-unit-imgcheck.service's TimeoutStartSec is
+    # what a slow one would eat -- a probe killed mid-run reports nothing at
+    # all, and the phase fails for having no OTP-GUEST-DONE line rather than
+    # for anything about the image. 90s, and the same reading of `timeout`'s
+    # exit codes as the malformed-seed experiment below: anything at or above
+    # 124 is timeout(1) saying it could not get a clean status out of the
+    # child, not the script returning.
+    SHEET_SAID=$(SHEET_QUEUE="$SHEET_QUEUE" timeout -k 5 90 python3 - <<'PY' 2>&1
+import os, sys
+sys.path.insert(0, "/opt/otp-unit")
+
+queue = os.environ["SHEET_QUEUE"]
+try:
+    from otpunit import config, diagnostics
+    settings = config.load()
+    sheet = diagnostics.render_bytes(
+        diagnostics.collect(settings=settings, printer=None, queue=queue,
+                            driver="none: the harness supplied this queue"),
+        diagnostics._page_size(settings))
+    print("RENDER ok bytes=%d magic=%s"
+          % (len(sheet), bytes(sheet[:5]).decode("ascii", "replace")))
+except Exception as exc:                         # noqa: BLE001
+    print("RENDER failed %s: %s" % (type(exc).__name__, exc))
+    raise SystemExit(0)
+
+# A SEPARATE try, so "the image cannot draw the sheet" and "cupsd would not
+# take it" are never reported as the same failure.
+try:
+    from otpunit.printer import Cups
+    print("SUBMIT ok job=%s" % (Cups().submit(bytes(sheet), name=queue,
+                                              title="OTP status") or "<no id>"))
+except Exception as exc:                         # noqa: BLE001
+    print("SUBMIT failed %s: %s" % (type(exc).__name__, exc))
+PY
+)
+    SHEET_RC=$?
+    SHEET_SAID=${SHEET_SAID//[$'\n\r']/ }
+    # RENDERED means a PDF, not merely bytes. reportlab writing a truncated
+    # or empty file would satisfy "no exception was raised", and %PDF is the
+    # cheapest thing that separates a page from an artefact.
+    SHEET_RENDERED=no
+    case "$SHEET_SAID" in *"RENDER ok bytes="*"magic=%PDF"*) SHEET_RENDERED=yes ;; esac
+    check diagnostic-sheet-renders "$SHEET_RENDERED" \
+          "rc=$SHEET_RC (>=124 = no clean status at the 90s bound) $SHEET_SAID"
+    # ENQUEUED means cupsd gave it an id. lp exiting 0 is not the same claim:
+    # Cups.submit() pulls "request id is <id>" out of lp's stdout and returns
+    # "" when that is absent, so an lp that succeeded and said nothing useful
+    # reads as no job here, which is the honest answer.
+    SHEET_ENQUEUED=no
+    case "$SHEET_SAID" in
+        *"SUBMIT ok job=$SHEET_QUEUE-"*) SHEET_ENQUEUED=yes ;;
+    esac
+    check diagnostic-sheet-reaches-cups "$SHEET_ENQUEUED" \
+          "lpadmin rc=$SHEET_LPADMIN_RC ${SHEET_LPADMIN:-(silent)} | queue=$(/usr/bin/lpstat -v "$SHEET_QUEUE" 2>&1 | head -1) | $SHEET_SAID"
+    # Removed whatever happened. The overlay would discard it at the next
+    # power-cycle anyway, but boot2's checks read a machine that is supposed
+    # to look like a unit rather than like a test rig.
+    /usr/sbin/lpadmin -x "$SHEET_QUEUE" 2>/dev/null || true
+fi
 
 # --- the seeded userconf.txt path -----------------------------------------
 
