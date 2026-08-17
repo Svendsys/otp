@@ -844,6 +844,23 @@ else
 # which is the behaviour this replaces rather than a new failure. What
 # notices is tier 3, not the boot.
 #
+# RUN IN A REAL INITRAMFS BEFORE IT WAS TRUSTED, because none of the above
+# is worth much as an argument. This function, sliced out of this file
+# unmodified, was packed into a stock Raspberry Pi OS Lite arm64 initramfs as
+# /scripts/otptest and booted under `-M raspi3b` with QEMU 8.2.2, on the real
+# kernel, with klibc's mount and no /lib/modules entry for vfat. Both cards:
+#
+#   with aabbccddeeff00112233445566778899 in ::otp-identity/machine-id
+#     OTP-INITRD rc=0 id=aabbccddeeff00112233445566778899
+#     and userspace read /etc/machine-id back as that, mode 444
+#   with nothing there at all (an unprovisioned card, which is every unit's
+#   first boot)
+#     OTP-INITRD rc=0 id=uninitialized
+#     the file left exactly as the image ships it, and the boot carried on
+#
+# So the vfat mount, the ${ROOT%p[0-9]}p1 derivation, the validation and the
+# write through ${rootmnt} are measured rather than reasoned about.
+#
 # THE MOUNTPOINT IS A VARIABLE for the same reason $BOOTDIR is one in the
 # guest probe: tests/test_overlay_root.py runs this function against a tree
 # it can build, with stub mount/umount on PATH. A hardcoded path would leave

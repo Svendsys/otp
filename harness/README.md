@@ -762,6 +762,17 @@ module: `fat`, `vfat`, `nls_cp437` and `nls_ascii` are in `modules.builtin`
 for every `-rpi-v8` kernel and `CONFIG_FAT_DEFAULT_IOCHARSET` is `"ascii"`.
 It never panics — the overlay is boot-critical, an identity is not.
 
+**That function was run in a real initramfs before it was trusted.** Sliced
+out of `install.sh` unmodified, packed into a stock Raspberry Pi OS Lite arm64
+initramfs as `/scripts/otptest` and booted under the same `-M raspi3b`, twice:
+with a machine-id in `::otp-identity/machine-id` it printed
+`OTP-INITRD rc=0 id=aabbccddeeff00112233445566778899` and userspace read that
+back out of `/etc/machine-id` at mode 444; on an unprovisioned card — which is
+every unit's first boot — it printed `OTP-INITRD rc=0 id=uninitialized`, left
+the file exactly as the image ships it, and the boot carried on. The vfat
+mount with no module, the `${ROOT%p[0-9]}p1` derivation and the write through
+`${rootmnt}` are measurements, not arguments.
+
 `otp-unit-identity.service` is the userspace half: it records the machine-id
 the first boot generated, and restores or adopts the SSH host keys, ordered
 after `regenerate_ssh_host_keys.service` (which opens with
