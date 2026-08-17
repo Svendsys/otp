@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import errno
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -1347,6 +1348,28 @@ class TestTheFactoryTeardownBetweenPanels:
         assert LocalPiFactory.pins == {}
 
 
+class MemoryStarvedQueue(queue.Queue):
+    """
+    The panel's event queue, with no memory for the next `failures` puts.
+
+    `self._events.put(...)` is the one allocation every one of the three
+    shipped callbacks makes, so starving it raises from INSIDE the shipped
+    callback rather than beside it. MemoryError because that is what this
+    board is exposed to: a Pi Zero 2 W has 512 MiB and no swap, and a
+    1000-page pad peaks near the ceiling (tests/test_memory_budget.py).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.failures = 0
+
+    def put(self, item, *args, **kwargs):
+        if self.failures > 0:
+            self.failures -= 1
+            raise MemoryError("no memory to record a press")
+        return super().put(item, *args, **kwargs)
+
+
 @needs_sim("gpio-chip", "gpio-sim")
 class TestTheRealButtonPath:
     """
@@ -1625,6 +1648,70 @@ class TestTheRealButtonPath:
         assert buttons.wait(timeout=0.5) is None, (
             f"a {measured * 1000:.1f}ms glitch arrived as a press through a "
             f"{BOUNCE_SECONDS * 1000:.0f}ms debounce window")
+
+    def test_a_raising_callback_does_not_kill_the_panel(self, buttons):
+        """
+        A callback that throws must cost one edge, not every edge forever.
+
+        lgpio dispatches every GPIO edge in the process from ONE thread and
+        puts no guard around the call (lgpio.py:531-559); the thread is a
+        module-level singleton started at import (lgpio.py:562) and nothing
+        restarts it. So an exception out of a button callback stops every
+        button in the process for the rest of its life, reported only as a
+        warning. On a 512 MiB board with no swap generating 1000-page pads
+        that exception is a MemoryError waiting to happen, and the remedy
+        for a dead panel is a power cycle -- which discards the pad being
+        made. GpioButtons._guarded exists for this.
+
+        The fast tier drives the same property against a stand-in
+        dispatcher and against lgpio's own `run` fed through a pipe. Here
+        it is a real edge on a real gpiochip through the real gpiozero ->
+        lgpio chain, which is the only place all three are the shipped
+        thing at once.
+        """
+        from otpunit.hw.buttons import PIN_DOWN, PIN_UP, Press
+
+        # Control first, on the same panel: this line delivers presses at
+        # all. A panel that was already dead would otherwise sail through
+        # the interesting half, which is exactly how run 31699840801 read.
+        self.press(PIN_UP)
+        assert buttons.wait(timeout=2) is Press.UP, (
+            "a press did not arrive before anything was made to fail, so "
+            "this test cannot say what the guard did.\n  " + self.why(PIN_UP))
+
+        starved = MemoryStarvedQueue()
+        starved.failures = 1
+        healthy, buttons._events = buttons._events, starved
+        try:
+            self.press(PIN_UP)
+            # Wait for the exception to have happened rather than assuming
+            # it has: if the edge never reached the shipped callback there
+            # is nothing under test, and restoring the queue underneath a
+            # late edge would put an UP in front of the DOWN below.
+            deadline = time.monotonic() + 3
+            while buttons.dropped == 0 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert buttons.dropped == 1, (
+                f"the press meant to raise never reached the shipped "
+                f"callback, so nothing here was tested.\n  "
+                + self.why(PIN_UP))
+        finally:
+            buttons._events = healthy
+
+        thread = pirig.notify_thread()
+        assert thread is not None and thread.is_alive(), (
+            "lgpio's notification thread died on a callback exception. "
+            "Every button in this process is now dead for the life of the "
+            "process, and on the unit that is a power cycle -- which "
+            "discards the pad in progress. See GpioButtons._guarded.")
+
+        # The property, and the only one that matters: a later press on a
+        # different line still arrives.
+        self.press(PIN_DOWN)
+        assert buttons.wait(timeout=2) is Press.DOWN, (
+            "no press arrived after a callback raised, which is what a "
+            "dead notification thread looks like.\n  " + self.why(PIN_DOWN))
+        assert buttons.wait(timeout=0.5) is None, "one press, one event"
 
 
 @needs_sim("i2c-bus", "i2c-stub")

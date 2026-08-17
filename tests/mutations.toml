@@ -3319,3 +3319,64 @@ tests = [
 file = "harness/README.md"
 find = '''`./harness/img-local-rig.sh <probe>`'''
 replace = '''`./harness/the-rig.sh <probe>`'''
+
+
+# --- the front panel's callbacks, and lgpio's one dispatch thread ---------
+#
+# These two are product-code rows rather than harness rows, which most of
+# this table is not. They earn it the same way: the failure they defend
+# against is SILENT. A panel whose buttons have stopped working looks
+# exactly like a panel nobody is pressing, and the only report is a warning
+# in a volatile journal.
+
+[[mutation]]
+name = "panel-callback-exceptions-reach-lgpios-dispatch-thread"
+tier = "fast"
+guard = """
+The wrap, and the whole of what it buys. lgpio dispatches every GPIO edge
+in the process from ONE thread and puts no guard around the call
+(lgpio 0.2.2.0, lgpio.py:531-559); that thread is a module-level singleton
+started at import (lgpio.py:562) and nothing restarts it, and gpiozero adds
+no guard on the way in either. So one exception out of a button callback
+ends every button in the process, permanently, and says so only as a
+PytestUnhandledThreadExceptionWarning or an ignored-exception line.
+
+Observed during issue #12: `lgpio: notify thread alive=False go=True`, with
+the gpio-sim line moving perfectly. On the unit the trigger to expect is a
+MemoryError -- 512 MiB, no swap, 1000-page pads -- and the remedy for a
+dead panel is a power cycle, which discards the pad in progress.
+
+The mutation is the guard removed and nothing else: same signature, same
+call, no try. Only the [stand-in] parametrisation is named here because
+[lgpio] skips where lgpio is not installed, which is every CI run of the
+fast tier, and a skipped test cannot go red."""
+tests = [
+  "tests/test_hardware.py::TestNoCallbackExceptionReachesTheDispatchThread::test_a_press_on_another_button_survives_one_that_raises[stand-in]",
+  "tests/test_hardware.py::TestNoCallbackExceptionReachesTheDispatchThread::test_a_raising_release_does_not_cost_the_next_ok[stand-in]",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "        return guarded"
+replace = "        return lambda _button=None: action()"
+
+[[mutation]]
+name = "panel-loses-a-press-without-saying-so"
+tier = "fast"
+guard = """
+The other half of the decision: catching is only half of it. The operator
+cannot be told -- the panel is the thing that just failed, and this device
+has no other output -- so the journal is the only record that an edge was
+ever lost, and a guard that swallows in silence turns a diagnosable fault
+into a unit that "sometimes misses presses".
+
+The named test is the one that watches the DEFAULT reporter rather than a
+monkeypatched one. Every other test in that class replaces `_report` to
+read what it said, so all of them stay green against a `_report` that
+writes nowhere at all -- which is exactly this mutation."""
+tests = [
+  "tests/test_hardware.py::TestALostPressIsSaidOutLoud::test_the_default_report_goes_to_stderr",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "    print(message, file=sys.stderr, flush=True)"
+replace = "    pass"

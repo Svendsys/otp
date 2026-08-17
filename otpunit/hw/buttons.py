@@ -11,6 +11,7 @@ import select
 import sys
 import termios
 import time
+import traceback
 import tty
 from enum import Enum
 
@@ -29,6 +30,20 @@ PIN_DOWN = 6
 PIN_OK = 13
 HOLD_SECONDS = 1.0
 BOUNCE_SECONDS = 0.015
+
+
+def _report(message: str) -> None:
+    """
+    Where a lost press goes.
+
+    stderr, which is what the rest of this program uses (see __main__.main's
+    `log`) and which on the unit is the journal. Not the panel: the panel is
+    a 128x64 OLED showing a menu, and a device driven by three buttons has
+    nowhere to put a message that does not cost the screen someone is
+    reading. A separate function so that there is one place to change if
+    that ever stops being true, and so a test can watch it.
+    """
+    print(message, file=sys.stderr, flush=True)
 
 
 class Buttons:
@@ -150,6 +165,13 @@ class KeyboardButtons(Buttons):
 class GpioButtons(Buttons):
     """The real front panel: three momentary switches to ground."""
 
+    # How many edges the guard below has eaten. A class attribute so that a
+    # unit built with __new__ -- which several tests do, to drive the timing
+    # logic without a gpiozero -- still has one to count with: an
+    # AttributeError raised INSIDE the guard would escape it and cost the
+    # panel the very thread the guard exists to keep.
+    dropped = 0
+
     def __init__(self, up=PIN_UP, down=PIN_DOWN, ok=PIN_OK):
         from gpiozero import Button
 
@@ -159,7 +181,8 @@ class GpioButtons(Buttons):
 
         for pin, press in ((up, Press.UP), (down, Press.DOWN)):
             button = Button(pin, pull_up=True, bounce_time=BOUNCE_SECONDS)
-            button.when_pressed = lambda _b=None, p=press: self._events.put(p)
+            button.when_pressed = self._guarded(
+                lambda p=press: self._events.put(p), f"the {press.name} press")
             self._buttons.append(button)
 
         # OK distinguishes tap from hold by timing the press, and decides on
@@ -176,9 +199,85 @@ class GpioButtons(Buttons):
         # when_pressed and when_released both run on the pin callback thread,
         # so measuring between them needs no lock and cannot double-fire.
         okay = Button(ok, pull_up=True, bounce_time=BOUNCE_SECONDS)
-        okay.when_pressed = self._on_press
-        okay.when_released = self._on_release
+        okay.when_pressed = self._guarded(
+            self._on_press,
+            "the start of an OK press, so the release after it is ignored")
+        okay.when_released = self._guarded(
+            self._on_release, "the OK or BACK this release would have been")
         self._buttons.append(okay)
+
+    def _guarded(self, action, lost):
+        """
+        `action`, wrapped so that nothing at all can get out of it.
+
+        Every GPIO edge in this process is dispatched by ONE thread inside
+        lgpio, and its dispatch loop has no guard around the call
+        (lgpio 0.2.2.0, lgpio.py:531-559):
+
+            for cb in self.callbacks:
+                if cb.chip == chip and cb.gpio == gpio:
+                    cb.func(chip, gpio, level, tick)
+
+        That thread is a module-level singleton started at import
+        (`_notify_thread = _callback_thread()`, lgpio.py:562, whose
+        constructor ends in `self.start()`), and nothing anywhere restarts
+        it. gpiozero adds no guard of its own on the way here either --
+        `LGPIOPin._call_when_changed`, `PiPin._call_when_changed`,
+        `Button._pin_changed`, `EventsMixin._fire_events` and
+        `_fire_activated` each call straight through. So one exception out
+        of the callback below ends that thread, and from then on NO button
+        anywhere in the process ever fires again: not this one, not the
+        other two, not a panel built afterwards. It is reported as a
+        `PytestUnhandledThreadExceptionWarning` under pytest and as an
+        ignored-exception line otherwise, which is to say nowhere anyone is
+        looking. Observed exactly that way while fixing issue #12 --
+        `lgpio: notify thread alive=False go=True` -- where it made the
+        harness's panel work once per process and nothing else.
+
+        On a real unit the panel is built once, so #12's own trigger (a
+        collected Button's dead weakref) does not arise. The class of fault
+        does: this board is a Pi Zero 2 W with 512 MiB and no swap
+        (tests/test_memory_budget.py) making pads of up to 1000 pages, so a
+        `MemoryError` -- or any unexpected `OSError` out of lgpio -- landing
+        in a callback would permanently disable the only input the device
+        has. The remedy for that is a power cycle, which throws away the
+        pad in progress and the key material with it.
+
+        So the trade this makes is deliberate and one-directional: a lost
+        edge, said out loud, in exchange for a panel that is still there
+        for the next press. It does NOT retry, restart or escalate; see the
+        PR for why a supervisor is a separate conversation.
+        """
+        def guarded(_button=None):
+            try:
+                action()
+            except BaseException as exc:        # noqa: BLE001
+                # BaseException rather than Exception, and the reason is
+                # local to this thread. Letting one through does not end
+                # the process the way it would on the main thread --
+                # Python ends the THREAD, and this thread is the only one
+                # delivering edges -- so the usual argument for re-raising
+                # a KeyboardInterrupt or a SystemExit buys nothing here and
+                # costs three dead buttons. MemoryError, the one actually
+                # expected, is an ordinary Exception either way.
+                try:
+                    self.dropped += 1
+                    _report(
+                        f"otp: front panel: {lost} was LOST -- "
+                        f"{type(exc).__name__}: {exc}\n"
+                        f"otp: front panel: {self.dropped} edge(s) lost since "
+                        f"this panel was built; the buttons still work.\n"
+                        f"{traceback.format_exc().rstrip()}")
+                except BaseException:           # noqa: BLE001
+                    # The only swallow in here, and it is the last one
+                    # available. Reporting allocates -- an f-string, a
+                    # formatted traceback -- which is exactly what a
+                    # MemoryError breaks next, and stderr can be a closed
+                    # or full pipe. Losing the log entry is bad; losing
+                    # every button on the device because the log entry
+                    # could not be written is worse.
+                    pass
+        return guarded
 
     def _on_press(self, _button=None):
         self._pressed_at = time.monotonic()

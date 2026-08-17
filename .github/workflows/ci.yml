@@ -42,7 +42,7 @@ jobs:
     # tests/mutations.toml.
     #
     # PER PR, not nightly, and that is measured rather than assumed: the fast
-    # tier is 157 mutations in 172 seconds ON THE DEVELOPMENT CONTAINER, not
+    # tier is 159 mutations in 181 seconds ON THE DEVELOPMENT CONTAINER, not
     # on this runner -- the number is a development-time figure and always has
     # been, and a reader meeting it inside this job's own comment block will
     # otherwise take it for this job's runtime, which is a different and
@@ -274,19 +274,19 @@ jobs:
           # not to police the exact count, which every new test changes.
           PASSED=$(grep -oE '[0-9]+ passed' /tmp/harness.log | tail -1 | cut -d' ' -f1)
           echo "harness tests passed: ${PASSED:-0}"
-          # 54, and derived from a count rather than from the tail of an
+          # 55, and derived from a count rather than from the tail of an
           # old run -- the last three numbers here were all wrong, in
           # both directions, because they were carried forward by hand
           # while the harness kept growing. `pytest -m hardware
-          # --collect-only` on this tree collects 60.
+          # --collect-only` on this tree collects 61.
           #
           # Measured on a kernel with NO simulators at all (this
           # container: CONFIG_GPIOLIB and CONFIG_CONFIGFS_FS unset):
-          # 50 passed, 10 skipped -- the 6 gpio-sim tests, 2 i2c-stub,
-          # 1 vkms, 1 uinput. A runner with modules-extra runs all ten,
-          # so 60 is what this job should see.
+          # 50 passed, 11 skipped -- the 7 gpio-sim tests, 2 i2c-stub,
+          # 1 vkms, 1 uinput. A runner with modules-extra runs all
+          # eleven, so 61 is what this job should see.
           #
-          # 54 leaves six free to skip for a reason already seen and
+          # 55 leaves six free to skip for a reason already seen and
           # accepted, and no more: the debounce test on a box too slow
           # to bounce a line inside the window, the unaided-chip-number
           # test when gpio-sim does not land on gpiochip0, luma refusing
@@ -296,8 +296,8 @@ jobs:
           # If this number needs changing again, COUNT -- do not adjust
           # it to match whatever the last run happened to print, which
           # is how it came to claim the CUPS rig was 37 tests.
-          if [ "${PASSED:-0}" -lt 54 ]; then
-            echo "expected at least 54 passing harness tests (the CUPS rig" >&2
+          if [ "${PASSED:-0}" -lt 55 ]; then
+            echo "expected at least 55 passing harness tests (the CUPS rig" >&2
             echo "alone is 13); got ${PASSED:-0}. Something skipped silently." >&2
             grep -E "^SKIPPED" /tmp/harness.log >&2 || true
             exit 1
@@ -309,10 +309,24 @@ jobs:
           # entire input surface of the device quietly stops being tested.
           # If a future runner kernel loses gpio-sim this goes red on
           # purpose; the reason will be in the lines it prints.
+          #
+          # The last of them is the guard against lgpio's dispatch
+          # thread, which is a module-level singleton with no try around
+          # its callback call: one exception out of a button callback
+          # ends every button in the process for the life of the
+          # process, and on a 512 MiB board with no swap making
+          # 1000-page pads that exception is a MemoryError waiting to
+          # happen. The fast tier proves the same property against a
+          # stand-in dispatcher and against lgpio's own `run` fed
+          # through a pipe; this is the only place it runs with a
+          # kernel, a real gpiochip and the real gpiozero -> lgpio chain
+          # all at once, so it is named here rather than left to the
+          # count.
           for named in test_a_tap_on_up_arrives_as_up \
                        test_a_tap_on_down_arrives_as_down \
                        test_a_tap_on_ok_arrives_as_ok_not_back \
-                       test_a_hold_on_ok_arrives_as_back_exactly_once; do
+                       test_a_hold_on_ok_arrives_as_back_exactly_once \
+                       test_a_raising_callback_does_not_kill_the_panel; do
             if ! grep -q "TestTheRealButtonPath::${named} PASSED" \
                  /tmp/harness.log; then
               echo "${named} did not pass. A real press on a simulated" >&2
