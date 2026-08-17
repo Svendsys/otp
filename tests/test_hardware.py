@@ -9,8 +9,10 @@ gpiozero and luma are not test dependencies -- the tests that need them skip
 when they are absent. What does not need them is the timing logic itself,
 which is deliberately written so it can be driven with a fake clock.
 """
+import fcntl
 import os
 import queue
+import select
 import struct
 import sys
 import threading
@@ -37,16 +39,44 @@ from otpunit.hw.display import ConsoleDisplay, Frame, Ssd1306Display
 
 
 class Clock:
-    """A monotonic clock the test drives by hand."""
+    """
+    A monotonic clock the test drives by hand, optionally broken once.
 
-    def __init__(self):
+    Installed with `use_clock` as buttons.py's whole `time`, rather than by
+    setting `monotonic` on the real time module: that module is shared with
+    every thread in the process, so patching it reaches anything else that
+    happens to be timing something. It matters most for `fails_with`, which
+    arms exactly ONE failure -- a stray reader could spend it, and the test
+    that wanted a broken clock would quietly get a working one.
+
+    `fails_with` is armed for the calling thread only, for the same reason.
+    """
+
+    def __init__(self, fails_with=None):
         self.now = 1000.0
+        self._fails_with = fails_with
+        self._armed_for = threading.get_ident() if fails_with else None
 
-    def __call__(self):
+    @property
+    def armed(self):
+        """True while the one-shot failure has not been spent."""
+        return self._armed_for is not None
+
+    def monotonic(self):
+        if self._armed_for is not None and self._armed_for == threading.get_ident():
+            self._armed_for = None
+            raise self._fails_with
         return self.now
 
     def advance(self, seconds):
         self.now += seconds
+
+
+def use_clock(monkeypatch, clock=None):
+    """Point buttons.py at `clock`, and nothing else in the process."""
+    clock = clock if clock is not None else Clock()
+    monkeypatch.setattr(buttons_mod, "time", clock)
+    return clock
 
 
 def press_handler(monkeypatch):
@@ -56,9 +86,7 @@ def press_handler(monkeypatch):
     unit._events = queue.Queue()
     unit._buttons = []
     unit._pressed_at = None
-    clock = Clock()
-    monkeypatch.setattr(buttons_mod.time, "monotonic", clock)
-    return unit, clock
+    return unit, use_clock(monkeypatch)
 
 
 class TestTapVersusHold:
@@ -286,6 +314,66 @@ class MemoryStarvedQueue(queue.Queue):
             self.failures -= 1
             raise MemoryError("no memory to record a press")
         return super().put(item, *args, **kwargs)
+
+
+class JournalPipe:
+    """
+    Stderr as the unit has it: a pipe with a reader the test can withdraw.
+
+    On the unit stderr is a stream socket to journald. The failure that
+    matters is not a closed one -- that raises, and a raise is caught --
+    but a FULL one, which does not raise: the writer parks inside write(2)
+    until somebody reads, and `except BaseException: pass` is no defence
+    against a call that never returns. journald being restarted, wedged or
+    simply behind is enough to produce it.
+
+    Shrunk to a single page with F_SETPIPE_SZ so `wedge` is quick; the
+    default 64 KiB would do the same job more slowly, and a kernel that
+    refuses the resize just gets the slower version.
+    """
+
+    PAGE = 4096
+    F_SETPIPE_SZ = 1031             # linux/fcntl.h; the module has no name
+
+    def __init__(self):
+        self._read, self._write = os.pipe()
+        try:
+            fcntl.fcntl(self._write, self.F_SETPIPE_SZ, self.PAGE)
+        except OSError:                          # pragma: no cover
+            pass
+        self.stream = os.fdopen(self._write, "w")
+
+    def take(self, timeout=2.0):
+        """Everything written so far, waiting up to `timeout` for a first."""
+        got = ""
+        deadline = time.monotonic() + timeout
+        while True:
+            wait = 0 if got else max(0.0, deadline - time.monotonic())
+            if not select.select([self._read], (), (), wait)[0]:
+                return got
+            got += os.read(self._read, 65536).decode("utf-8", "replace")
+
+    def wedge(self):
+        """Fill it to the brim. From here a write blocks rather than fails."""
+        os.set_blocking(self._write, False)
+        try:
+            while True:
+                os.write(self._write, b"." * self.PAGE)
+        except BlockingIOError:
+            pass
+        finally:
+            os.set_blocking(self._write, True)
+
+    def close(self):
+        # Drain first: anything parked in write(2) on this pipe has to be
+        # let go before the test can end, and a daemon thread left parked
+        # would take its fds with it into the next test.
+        self.take(timeout=0)
+        try:
+            self.stream.close()
+        except OSError:                          # pragma: no cover
+            pass
+        os.close(self._read)
 
 
 def dispatch_for(button):
@@ -547,13 +635,85 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
         assert panel.wait(timeout=0.2) is None
         assert notifier.alive()
 
+    def test_a_journal_nobody_is_reading_does_not_park_the_thread(
+            self, monkeypatch, notifier, panel):
+        """
+        The report is on the dispatch thread too, so it gets the same rule.
+
+        Catching the exception bought a panel that survives a lost edge,
+        and then handed the same thread a `print(..., flush=True)` to
+        stderr -- which on the unit is a stream socket to journald. A
+        socket nobody is draining does not raise, it BLOCKS, and a thread
+        parked in write(2) delivers no more edges: the same dead panel the
+        guard exists to prevent, only harder to see, because the thread is
+        still alive and `is_alive()` still says so. Before this PR nothing
+        wrote to stderr from this thread at all.
+
+        Two halves, in this order. First the control: with a reader, the
+        report really does travel down the dispatch thread into stderr --
+        without which the second half could pass against a `_report` that
+        never touches the journal. Then the same thing with the reader
+        withdrawn and the pipe full, where the only acceptable answer is
+        that the next press still arrives.
+        """
+        clock = use_clock(monkeypatch)
+        journal = JournalPipe()
+        attempts = []
+        real_report = buttons_mod._report
+
+        def watched(message):
+            attempts.append(message)
+            real_report(message)
+
+        monkeypatch.setattr(buttons_mod, "_report", watched)
+        saved, sys.stderr = sys.stderr, journal.stream
+        try:
+            panel._events.failures = 1
+            notifier.fire(buttons_mod.PIN_UP)
+            written = journal.take(timeout=2)
+
+            # Due again, so the loss below is one the reporter really does
+            # try to write rather than one the interval swallows.
+            clock.advance(buttons_mod.REPORT_SECONDS)
+            journal.wedge()
+
+            panel._events.failures = 1
+            notifier.fire(buttons_mod.PIN_UP)
+            notifier.fire(buttons_mod.PIN_DOWN)
+            arrived = panel.wait(timeout=3)
+            alive = notifier.alive()
+        finally:
+            sys.stderr = saved
+            journal.close()
+
+        assert "the UP press was LOST" in written, (
+            "the guard's report never reached stderr from the dispatch "
+            f"thread, so the wedge below tests nothing: {written!r}")
+        assert len(attempts) == 2, (
+            f"the second loss was never reported, so nothing tried to "
+            f"write to the wedged journal: {attempts}")
+        assert arrived is Press.DOWN, (
+            "no press arrived after a report was written to a journal "
+            "nobody was reading. The dispatch thread is parked inside "
+            f"write(2) -- alive={alive}, which is why is_alive() is not "
+            "the assertion here -- and every button on the unit is dead "
+            "until journald starts reading again.")
+        assert panel.dropped == 2
+
     def test_many_failures_in_a_row_still_leave_the_panel_answering(
             self, notifier, panel):
         """
         A supervisor is deliberately NOT part of this change, so the
         behaviour under repeated failure has to be stated somewhere: the
-        panel keeps taking edges and keeps losing them, and says so each
-        time. Nothing degrades, nothing recovers, nothing gives up.
+        panel keeps taking edges, keeps losing them, and keeps counting
+        them. Nothing degrades, nothing recovers, nothing gives up.
+
+        What it does NOT do is say so twenty times. The reporting is
+        bounded -- first loss in full, one line every REPORT_SECONDS after
+        that -- because twenty full reports is 14 KB into a journald that
+        `_report` must never wait on. That contract is
+        `TestALostPressIsSaidOutLoud`'s; the count asserted here is what
+        survives it.
         """
         panel._events.failures = 20
         for _ in range(20):
@@ -570,6 +730,15 @@ class TestALostPressIsSaidOutLoud:
     The operator sees nothing -- the panel is what just failed -- so the
     journal is the only record there is. A guard that swallows in silence
     turns a diagnosable fault into a unit that "sometimes misses presses".
+
+    Said out loud, but BOUNDED, which is the second half of the contract
+    and the reason most of these tests drive the clock. Each full report is
+    ~690 bytes and the faults that cause one cause them in bursts, so: the
+    first loss in full with its traceback, then at most one summary line
+    every REPORT_SECONDS. Nothing here may make the dispatch thread wait on
+    a journald that is not reading (`test_a_wedged_journal_...`), because a
+    thread parked in write(2) costs the panel exactly what an uncaught
+    exception costs it, while still looking alive.
     """
 
     @pytest.fixture
@@ -589,12 +758,21 @@ class TestALostPressIsSaidOutLoud:
         assert captured.out == "", "stdout is the simulator's panel"
 
     def test_it_names_the_press_that_was_lost(self, monkeypatch, reports):
+        """
+        Every line that gets out names its own press, the summary lines
+        included -- "an edge was lost" does not say which button the
+        operator is pressing to no effect.
+        """
+        clock = use_clock(monkeypatch)
         unit = build_panel(monkeypatch)
         unit._events = MemoryStarvedQueue()
         by_pin = {button.pin: button for button in unit._buttons}
 
         unit._events.failures = 1
         by_pin[buttons_mod.PIN_UP].when_pressed()
+        # Past the summary interval, so the second loss is a line of its
+        # own rather than a number folded into a later one.
+        clock.advance(buttons_mod.REPORT_SECONDS)
         unit._events.failures = 1
         by_pin[buttons_mod.PIN_DOWN].when_pressed()
 
@@ -619,6 +797,7 @@ class TestALostPressIsSaidOutLoud:
         assert "buttons.py" in said
 
     def test_it_says_how_many_have_gone(self, monkeypatch, reports):
+        clock = use_clock(monkeypatch)
         unit = build_panel(monkeypatch)
         unit._events = MemoryStarvedQueue()
         unit._events.failures = 3
@@ -626,9 +805,54 @@ class TestALostPressIsSaidOutLoud:
 
         for _ in range(3):
             by_pin[buttons_mod.PIN_UP].when_pressed()
+            clock.advance(buttons_mod.REPORT_SECONDS)
 
         assert unit.dropped == 3
         assert "3 edge(s) lost since this panel was built" in reports[-1]
+
+    def test_a_burst_says_the_first_in_full_and_then_counts(
+            self, monkeypatch, reports):
+        """
+        The bound, stated as a property: a panel losing every edge writes a
+        report, not a stream of them.
+
+        Measured before the bound existed: one lost edge is 11 lines and
+        690 bytes with flush=True, so a panel dropping presses as fast as
+        an operator can make them wrote unboundedly into the journal --
+        into journald, whose blocking is the hazard `_report` is built
+        around, at exactly the moment the panel was in trouble.
+        """
+        clock = use_clock(monkeypatch)
+        unit = build_panel(monkeypatch)
+        unit._events = MemoryStarvedQueue()
+        unit._events.failures = 50
+        by_pin = {button.pin: button for button in unit._buttons}
+
+        for _ in range(50):
+            by_pin[buttons_mod.PIN_UP].when_pressed()
+            clock.advance(0.01)                  # 0.5s of frantic pressing
+
+        assert unit.dropped == 50
+        assert len(reports) == 1, (
+            f"50 losses inside one {buttons_mod.REPORT_SECONDS:g}s window "
+            f"wrote {len(reports)} reports")
+        assert "Traceback (most recent call last)" in reports[0]
+        assert "at most one line every" in reports[0], (
+            "the first report must say that later ones are summarised, or "
+            "the gaps in the journal look like the losses stopped")
+
+        # And when the interval is up, one line -- not a second traceback
+        # -- carrying both totals.
+        clock.advance(buttons_mod.REPORT_SECONDS)
+        unit._events.failures = 1
+        by_pin[buttons_mod.PIN_DOWN].when_pressed()
+
+        assert len(reports) == 2, reports
+        summary = reports[1]
+        assert "51 edge(s) lost since this panel was built" in summary
+        assert "(50 since the last line)" in summary
+        assert "Traceback" not in summary
+        assert summary.count("\n") == 0, f"a summary is one line: {summary!r}"
 
     def test_a_lost_press_start_says_the_release_will_be_ignored(
             self, monkeypatch, reports):
@@ -637,25 +861,57 @@ class TestALostPressIsSaidOutLoud:
         ignores a release it saw no press for, so losing the press start
         silently costs the OK as well.
         """
+        clock = use_clock(monkeypatch,
+                          Clock(fails_with=OSError(9, "Bad file descriptor")))
         unit = build_panel(monkeypatch)
         by_pin = {button.pin: button for button in unit._buttons}
-        broken = [True]
 
-        def monotonic():
-            if broken[0]:
-                broken[0] = False
-                raise OSError(9, "Bad file descriptor")
-            return 1000.0
-
-        monkeypatch.setattr(buttons_mod.time, "monotonic", monotonic)
         by_pin[buttons_mod.PIN_OK].when_pressed()
 
+        assert not clock.armed, (
+            "the clock's one armed failure was never spent, so the press "
+            "start did not fail and this test proved nothing")
         assert reports, "a lost press start was not reported at all"
         assert "the start of an OK press" in reports[0]
         assert "the release after it is ignored" in reports[0]
         # And it really is ignored, rather than guessed at.
         by_pin[buttons_mod.PIN_OK].when_released()
         assert unit.wait(timeout=0) is None
+
+    def test_a_lost_press_start_leaves_no_press_time_behind(
+            self, monkeypatch, reports):
+        """
+        The same loss, with the worst state it could be left in.
+
+        If a failed `_on_press` left the PREVIOUS press's timestamp in
+        place, the next release would measure against it, find more than
+        HOLD_SECONDS, and emit BACK where the operator pressed OK -- which
+        while a job is printing are opposite things, and is the confusion
+        the whole tap-versus-hold design exists to prevent. The report
+        promises the release is ignored; this is that promise holding
+        whatever was there before.
+
+        The stale timestamp is planted by hand: gpiozero alternates
+        pressed/released and `_on_release` clears before it can fail, so
+        there is no route to it from outside today. The clearing costs one
+        line and does not depend on that staying true.
+        """
+        clock = use_clock(monkeypatch,
+                          Clock(fails_with=OSError(9, "Bad file descriptor")))
+        unit = build_panel(monkeypatch)
+        by_pin = {button.pin: button for button in unit._buttons}
+        unit._pressed_at = clock.now - 2 * buttons_mod.HOLD_SECONDS
+
+        by_pin[buttons_mod.PIN_OK].when_pressed()       # the clock fails
+        assert not clock.armed, "the press start did not fail"
+        assert unit._pressed_at is None, (
+            "a press start that failed left a timestamp behind; the next "
+            "release will be read as a hold")
+
+        by_pin[buttons_mod.PIN_OK].when_released()
+        assert unit.wait(timeout=0) is None, (
+            "the release after a lost press start became a press -- and at "
+            "that age, a BACK")
 
     def test_a_report_that_itself_fails_cannot_kill_the_panel(
             self, monkeypatch):

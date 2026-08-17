@@ -3378,5 +3378,5 @@ tests = [
 ]
 [[mutation.edit]]
 file = "otpunit/hw/buttons.py"
-find = "    print(message, file=sys.stderr, flush=True)"
-replace = "    pass"
+find = "    print(message, file=stream, flush=True)"
+replace = "    return"

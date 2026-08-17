@@ -30,6 +30,14 @@ PIN_DOWN = 6
 PIN_OK = 13
 HOLD_SECONDS = 1.0
 BOUNCE_SECONDS = 0.015
+#: After the first lost edge is reported in full, one line at most this
+#: often. See GpioButtons._note_lost for why a lost edge must not be free
+#: to write as often as it likes.
+REPORT_SECONDS = 5.0
+#: And no single report longer than this, in characters. Below PIPE_BUF
+#: (4096), which is the size of write that a pipe reporting itself writable
+#: promises to take without blocking -- see _report.
+REPORT_MAX_CHARS = 3500
 
 
 def _report(message: str) -> None:
@@ -42,8 +50,52 @@ def _report(message: str) -> None:
     nowhere to put a message that does not cost the screen someone is
     reading. A separate function so that there is one place to change if
     that ever stops being true, and so a test can watch it.
+
+    It must not BLOCK, and that does not come for free. On the unit stderr
+    is a stream socket to journald, and writing to a socket nobody is
+    draining does not fail -- it parks the caller inside write(2) until
+    someone reads. The caller here is lgpio's single dispatch thread (see
+    GpioButtons._guarded), so a journald that is restarting, wedged or
+    merely behind would cost every button on the device for as long as it
+    lasted: the same operator-visible outcome as the exception the guard
+    catches, and harder to diagnose, because the thread is still alive and
+    simply never comes back. Measured before this was here -- a pipe shrunk
+    to 4 KiB with F_SETPIPE_SZ, no reader, sys.stderr pointed at it, one
+    `_report` on a thread: the thread never returned. And the moment it
+    would happen is exactly the moment the panel is losing edges, which is
+    when the journal is being written to hardest.
+
+    So ask first, and drop the line if the answer is no: select() with a
+    zero timeout is a question, not a wait. A pipe reports itself writable
+    only with PIPE_BUF (4096) bytes of room, and a write of at most that
+    much is atomic; an AF_UNIX stream socket reports itself writable only
+    with more than half its send buffer free, which is tens of kilobytes.
+    A message capped below PIPE_BUF that passes the question therefore
+    cannot then park in the kernel. The hole left is another thread filling
+    the buffer between the question and the write, which would have to put
+    kilobytes into that window; closing it would mean holding a lock on the
+    dispatch thread, which is a worse trade than a log line lost during a
+    journald outage.
+
+    A stream with no file descriptor -- pytest's capture, a StringIO -- has
+    nothing to ask and cannot block, so it is simply written to.
     """
-    print(message, file=sys.stderr, flush=True)
+    stream = sys.stderr
+    if stream is None:
+        # print(file=None) writes to STDOUT, which on the simulator is the
+        # panel itself. Losing the line beats drawing on it.
+        return
+    if len(message) > REPORT_MAX_CHARS:
+        message = message[:REPORT_MAX_CHARS] + " [...truncated]"
+    try:
+        fd = stream.fileno()
+    except Exception:                           # noqa: BLE001
+        fd = None                               # in memory; cannot block
+    if fd is not None and not select.select((), (fd,), (), 0)[1]:
+        # Nothing is reading the journal socket. The count in the next
+        # line that does get out still includes whatever this one said.
+        return
+    print(message, file=stream, flush=True)
 
 
 class Buttons:
@@ -165,12 +217,29 @@ class KeyboardButtons(Buttons):
 class GpioButtons(Buttons):
     """The real front panel: three momentary switches to ground."""
 
-    # How many edges the guard below has eaten. A class attribute so that a
-    # unit built with __new__ -- which several tests do, to drive the timing
-    # logic without a gpiozero -- still has one to count with: an
-    # AttributeError raised INSIDE the guard would escape it and cost the
-    # panel the very thread the guard exists to keep.
-    dropped = 0
+    # How many edges the guard below has eaten, and when it last said so.
+    # Set per panel in __init__; these class-level values are only a
+    # fallback, so that a unit built with __new__ -- which several tests do,
+    # to drive the timing logic without a gpiozero -- still has something to
+    # count with. An AttributeError here would NOT escape the guard: the
+    # counting happens inside the inner try, so the cost of missing these
+    # would be the log line, not the thread. The fallback is so that panel
+    # still reports, not so that it survives.
+    #
+    # `_dropped` and not `dropped` because `self.dropped += 1` on a class
+    # attribute rebinds an INSTANCE one: the class attribute would then read
+    # 0 forever on a unit that had lost hundreds of edges, which is a trap
+    # for anything that later goes looking for the count. The count is per
+    # panel -- which is what the message says -- and is read through the
+    # `dropped` property below, off a panel and never off the class.
+    _dropped = 0
+    _said = 0                   # `_dropped` as of the last line printed
+    _said_at = None             # and when that was, on the monotonic clock
+
+    @property
+    def dropped(self) -> int:
+        """Edges this panel's guard has eaten since it was built."""
+        return self._dropped
 
     def __init__(self, up=PIN_UP, down=PIN_DOWN, ok=PIN_OK):
         from gpiozero import Button
@@ -178,6 +247,9 @@ class GpioButtons(Buttons):
         self._events: queue.Queue[Press] = queue.Queue()
         self._buttons = []
         self._pressed_at = None
+        self._dropped = 0
+        self._said = 0
+        self._said_at = None
 
         for pin, press in ((up, Press.UP), (down, Press.DOWN)):
             button = Button(pin, pull_up=True, bounce_time=BOUNCE_SECONDS)
@@ -244,9 +316,11 @@ class GpioButtons(Buttons):
         pad in progress and the key material with it.
 
         So the trade this makes is deliberate and one-directional: a lost
-        edge, said out loud, in exchange for a panel that is still there
-        for the next press. It does NOT retry, restart or escalate; see the
-        PR for why a supervisor is a separate conversation.
+        edge, said out loud -- at a bounded rate and never into a write
+        that could block, see `_note_lost` and `_report` -- in exchange for
+        a panel that is still there for the next press. It does NOT retry,
+        restart or escalate; see the PR for why a supervisor is a separate
+        conversation.
         """
         def guarded(_button=None):
             try:
@@ -260,26 +334,88 @@ class GpioButtons(Buttons):
                 # a KeyboardInterrupt or a SystemExit buys nothing here and
                 # costs three dead buttons. MemoryError, the one actually
                 # expected, is an ordinary Exception either way.
+                #
+                # A WARNING for whoever writes the next test, though:
+                # pytest.fail, pytest.skip and pytest's assertion-rewriting
+                # machinery all raise BaseException subclasses, so an
+                # assertion made INSIDE a callback wrapped here is caught,
+                # counted as a lost edge, and the test goes green having
+                # proved nothing. Assert on what the callback did -- what
+                # reached the queue, what `dropped` says -- from the test's
+                # own thread, which is what every test in
+                # tests/test_hardware.py does.
                 try:
-                    self.dropped += 1
-                    _report(
-                        f"otp: front panel: {lost} was LOST -- "
-                        f"{type(exc).__name__}: {exc}\n"
-                        f"otp: front panel: {self.dropped} edge(s) lost since "
-                        f"this panel was built; the buttons still work.\n"
-                        f"{traceback.format_exc().rstrip()}")
+                    self._note_lost(lost, exc)
                 except BaseException:           # noqa: BLE001
                     # The only swallow in here, and it is the last one
                     # available. Reporting allocates -- an f-string, a
                     # formatted traceback -- which is exactly what a
-                    # MemoryError breaks next, and stderr can be a closed
-                    # or full pipe. Losing the log entry is bad; losing
+                    # MemoryError breaks next, and the write can fail on a
+                    # closed stderr. Losing the log entry is bad; losing
                     # every button on the device because the log entry
                     # could not be written is worse.
                     pass
         return guarded
 
+    def _note_lost(self, lost, exc) -> None:
+        """
+        Count one lost edge and, if it is due, say so.
+
+        Bounded on purpose, and the bound is the point. A full report is
+        eleven lines and about 690 bytes, and the faults that produce one
+        produce them by the dozen: a panel dropping every edge would write
+        one per press, unthrottled, into the same journald whose blocking
+        is what `_report` is careful about. So the FIRST loss gets the
+        whole thing, traceback included, because that is the one that says
+        where the fault is; after it, one line at most every
+        REPORT_SECONDS, carrying the running total, which is enough to see
+        the shape of a burst without paying its volume.
+
+        What that costs, stated because the journal is the only diagnostic
+        this device has: the last few losses of a burst may appear only in
+        the count printed by whatever line comes next, and a later loss of
+        a DIFFERENT kind names its type and its message but not its
+        traceback.
+        """
+        self._dropped += 1
+        first = self._dropped == 1
+        due = (self._said_at is None
+               or (time.monotonic() - self._said_at) >= REPORT_SECONDS)
+        if not first and not due:
+            return                              # counted, said later
+        head = (f"otp: front panel: {lost} was LOST -- "
+                f"{type(exc).__name__}: {exc}")
+        if first:
+            _report(
+                f"{head}\n"
+                f"otp: front panel: {self._dropped} edge(s) lost since "
+                f"this panel was built; the buttons still work.\n"
+                f"otp: front panel: further losses are counted and "
+                f"summarised, at most one line every {REPORT_SECONDS:g}s.\n"
+                f"{traceback.format_exc().rstrip()}")
+        else:
+            _report(
+                f"{head}; {self._dropped} edge(s) lost since this panel "
+                f"was built ({self._dropped - self._said} since the last "
+                f"line); the buttons still work.")
+        # Stamped whether or not the line reached the journal. `_report`
+        # drops a line rather than wait for a wedged journald, and retrying
+        # every edge would only measure the wedge; the total in the next
+        # line that does get out is right either way.
+        self._said, self._said_at = self._dropped, time.monotonic()
+
     def _on_press(self, _button=None):
+        # Cleared first, then set. If the clock read below fails, the guard
+        # reports that "the release after it is ignored" -- and a timestamp
+        # left over from an earlier press would make that a lie in the
+        # expensive direction: `_on_release` would find a start time old
+        # enough to call the next release a hold and emit BACK where the
+        # operator pressed OK, which while a job is printing are opposite
+        # things. gpiozero alternates pressed/released and `_on_release`
+        # clears before it can fail, so there is no path here today; one
+        # line makes the report's promise true without needing there to
+        # not be one.
+        self._pressed_at = None
         self._pressed_at = time.monotonic()
 
     def _on_release(self, _button=None):
