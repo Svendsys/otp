@@ -2792,8 +2792,51 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/img-local-rig.sh"
-find = '''    for tool in qemu-system-aarch64 curl xz gzip cpio dpkg-deb fdtput od; do'''
-replace = '''    for tool in curl xz gzip cpio dpkg-deb fdtput od; do'''
+find = '''RIG_BOOT_TOOLS=(qemu-system-aarch64 curl xz gzip cpio dpkg-deb fdtput od)'''
+replace = '''RIG_BOOT_TOOLS=(curl xz gzip cpio dpkg-deb fdtput od)'''
+
+[[mutation]]
+name = "rig-plan-demands-the-emulator-before-it-will-print"
+tier = "fast"
+guard = """
+--plan starts no emulator, unpacks no deb and patches no device tree: it
+builds strings and prints them. Requiring 200MB of emulator before it will
+say what it would run is exactly backwards, because the person running
+--plan is deciding whether to install one. Measured: with the preflight on
+this path, `--plan rng` printed nothing and exited 1 on a host with no
+qemu-system-aarch64 and no fdtput -- which github's ubuntu-latest is, and
+which is how six tests in test_local_rig.py came to be red for a reason
+that had nothing to do with the rig."""
+tests = [
+  "tests/test_local_rig.py::test_the_plan_prints_on_a_host_with_no_emulator_at_all",
+  "tests/test_local_rig.py::test_the_plan_says_the_same_thing_with_the_tools_and_without",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    if [ "$plan" != "1" ]; then
+        rig_preflight "$probe"
+    fi'''
+replace = '''    rig_preflight "$probe"'''
+
+[[mutation]]
+name = "rig-boots-without-checking-any-of-its-preconditions"
+tier = "fast"
+guard = """
+The other direction of the same `if`, and the expensive one. A real run
+that does not check first discovers the missing emulator after the archive
+fetch and the 32MB deb, or -- worse -- reaches an emulator that boots and
+writes nothing, which is the symptom this whole section exists to stop
+people diagnosing. Moving the preflight off --plan must not move it off
+the run."""
+tests = [
+  "tests/test_local_rig.py::test_a_real_run_is_refused_before_it_costs_anything",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    if [ "$plan" != "1" ]; then
+        rig_preflight "$probe"
+    fi'''
+replace = '''    :'''
 
 [[mutation]]
 name = "rig-machine-check-piped-into-grep-q"

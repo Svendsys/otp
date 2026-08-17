@@ -25,6 +25,7 @@ already shipped one guard that could not pass.
 """
 import os
 import re
+import shutil
 import struct
 import subprocess
 from pathlib import Path
@@ -306,6 +307,22 @@ def test_naming_no_probe_at_all_is_refused(offline):
 
 
 # --- 4. the host it cannot run on, said out loud --------------------------
+#
+# WHICH PATH PAYS FOR THE TOOLS, which is the question these tests are
+# really about. A real run needs an emulator, a deb unpacker and a device
+# tree compiler; --plan needs none of them, because it builds strings and
+# prints them. Demanding all of it up front made `--plan rng` -- the
+# cheapest thing the rig can do, and the one somebody runs to decide whether
+# to install 200MB of emulator -- fail on any host without the emulator.
+# Measured on github's ubuntu-latest, which has neither qemu-system-aarch64
+# nor fdtput: six of these tests were red for that reason and nothing else.
+#
+# So the preconditions are exercised where they now live -- on the run --
+# and the plan is exercised for needing none of them. The refusals below go
+# through rig_preflight directly, because a run that gets PAST the preflight
+# on a stubbed host then fails four steps later for an unrelated reason, and
+# a positive control should assert the thing it is a control for. What keeps
+# main() actually calling it is the pair of CLI tests further down.
 
 TOOLS = ["bash", "sh", "curl", "xz", "gzip", "cpio", "dpkg-deb", "fdtput",
          "fdtget", "od", "depmod", "mkfs.ext4", "grep", "sed", "awk", "tr",
@@ -313,12 +330,28 @@ TOOLS = ["bash", "sh", "curl", "xz", "gzip", "cpio", "dpkg-deb", "fdtput",
          "cp", "mv", "chmod", "du", "truncate", "sleep", "kill", "timeout",
          "basename", "dirname", "ln", "mount", "printf", "uname", "stat"]
 
+#: Tools the rig only ever asks `command -v` about before the emulator
+#: starts; it RUNS none of them there. A host that has not got one -- the
+#: runner has no device-tree-compiler, so no fdtput -- gets a stub, so that
+#: a refusal test and its positive control still differ in exactly the
+#: omission rather than in what the runner happens to ship.
+#:
+#: qemu-system-aarch64 is deliberately NOT in here. The preflight executes
+#: it (`-M help`), so a stub would be a lie about what qemu says; tests that
+#: need one pass fake_qemu and control the lie themselves.
+PRESENCE_ONLY = {"curl", "xz", "cpio", "dpkg-deb", "fdtput", "fdtget",
+                 "depmod", "mkfs.ext4", "mount", "truncate"}
+
 
 def stub_path(tmp_path, *, omit=(), fake_qemu=None):
     """A PATH with every tool the rig needs except the omitted ones.
 
-    Symlinks rather than a copied PATH so the omission is the only
-    difference between a refusal test and its positive control.
+    Symlinks the host's own tool where there is one, so the omission is the
+    only difference between a refusal test and its positive control. Where
+    there is not one, a PRESENCE_ONLY tool gets a stub and anything else is
+    an error rather than a quiet gap -- a fixture that silently does not do
+    its job is a guard that cannot fail, which this file has already paid
+    for once (see BIG_RASPI_QEMU and `seq`).
     """
     d = tmp_path / ("bin-" + ("-".join(omit) or "all"))
     d.mkdir(parents=True, exist_ok=True)
@@ -328,11 +361,19 @@ def stub_path(tmp_path, *, omit=(), fake_qemu=None):
     for tool in wanted:
         if tool in omit:
             continue
-        for p in os.environ.get("PATH", "").split(os.pathsep):
-            cand = Path(p) / tool
-            if cand.exists():
-                (d / tool).symlink_to(cand)
-                break
+        host = shutil.which(tool)
+        if host is not None:
+            (d / tool).symlink_to(host)
+        elif tool in PRESENCE_ONLY:
+            stub = d / tool
+            stub.write_text("#!/bin/sh\nexit 0\n")
+            stub.chmod(0o755)
+        else:
+            raise AssertionError(
+                f"this host has no {tool}, and the rig runs that one rather "
+                f"than merely looking for it, so a stub would make the test "
+                f"below prove something else. Install it, or move {tool} to "
+                f"PRESENCE_ONLY if the rig stopped executing it.")
     if fake_qemu is not None:
         q = d / "qemu-system-aarch64"
         q.write_text(fake_qemu)
@@ -340,22 +381,70 @@ def stub_path(tmp_path, *, omit=(), fake_qemu=None):
     return str(d)
 
 
-def test_a_host_with_no_qemu_says_so(tmp_path, offline):
-    env = dict(offline)
-    env["PATH"] = stub_path(tmp_path, omit=("qemu-system-aarch64",))
-    proc = run_rig(["--plan", "rng"], env=env)
+def rig_tools(name) -> list:
+    """One of the rig's own tool lists, from the rig rather than restated."""
+    proc = rig_eval(f'printf "%s\\n" "${{{name}[@]}}"')
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.split()
+
+
+def preflight(probe, path, *, env=None):
+    """rig_preflight for one probe, on a PATH we control.
+
+    The function rather than the CLI: this is the check under test, and the
+    positive controls want to assert that it PASSED rather than that some
+    later step failed differently.
+    """
+    full = {"PATH": path}
+    full.update(env or {})
+    return rig_eval(f'rig_preflight {probe} && echo PREFLIGHT-OK', env=full)
+
+
+def test_the_stub_path_carries_every_tool_the_preflight_asks_for(tmp_path):
+    """The control on the fixture, without which every control below rots.
+
+    If the rig starts demanding a tool this file has never heard of, the
+    stub PATH quietly omits it, every positive control here refuses, and the
+    reason is a tool nobody was testing. Named here instead.
+    """
+    path = Path(stub_path(tmp_path, fake_qemu=RASPI_QEMU))
+    demanded = rig_tools("RIG_BOOT_TOOLS") + rig_tools("RIG_COLDPLUG_TOOLS") \
+        + rig_tools("RIG_RESOLVE_TOOLS")
+    assert demanded, "the rig no longer declares its tools in named lists"
+    missing = [t for t in demanded if not (path / t).exists()]
+    assert not missing, (
+        f"the rig demands {missing} and the stub PATH has not got them. Add "
+        f"them to TOOLS (and to PRESENCE_ONLY if the preflight only looks "
+        f"for them), or every positive control below refuses for a reason "
+        f"it is not about.")
+
+
+def test_a_host_with_no_qemu_says_so(tmp_path):
+    proc = preflight("rng", stub_path(tmp_path, omit=("qemu-system-aarch64",)))
     assert proc.returncode != 0
     assert "qemu-system-aarch64" in proc.stderr
     assert "missing host tools" in proc.stderr
 
 
-def test_the_same_host_with_qemu_gets_through(tmp_path, offline):
-    """Positive control: only the omission differs."""
-    env = dict(offline)
-    env["PATH"] = stub_path(tmp_path)
-    proc = run_rig(["--plan", "rng"], env=env)
-    assert proc.returncode == 0, proc.stderr + proc.stdout
-    assert "missing host tools" not in proc.stderr
+@pytest.mark.skipif(shutil.which("qemu-system-aarch64") is None,
+                    reason="no qemu-system-aarch64 on this host to hold the "
+                           "preflight against; the fake-qemu control below "
+                           "still runs, and so does everything else in this "
+                           "section. This one exists for the part a fake "
+                           "cannot prove -- that a REAL `-M help` listing "
+                           "matches the pattern rig_have_raspi_machine "
+                           "greps for. apt-get install qemu-system-arm")
+def test_the_hosts_own_qemu_satisfies_the_preflight(tmp_path):
+    """The one test here that wants the real emulator.
+
+    Everything else in this section runs against a shell script pretending
+    to be qemu, which proves the rig's logic and nothing about qemu. This
+    proves the two agree: the real binary is found, and its real `-M help`
+    output really does carry a line the machine check accepts.
+    """
+    proc = preflight("rng", stub_path(tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    assert "PREFLIGHT-OK" in proc.stdout
 
 
 NO_RASPI_QEMU = """#!/bin/bash
@@ -373,26 +462,27 @@ RASPI_QEMU = NO_RASPI_QEMU.replace(
     'echo "raspi3b              Raspberry Pi 3B (revision 1.2)"')
 
 
-def test_a_qemu_without_the_raspi_machine_says_so(tmp_path, offline):
+def test_a_qemu_without_the_raspi_machine_says_so(tmp_path):
     """A real configuration: some distributions build a reduced machine set.
 
     Without this the failure arrives from inside the emulator and reads like
     a typo in the rig.
     """
-    env = dict(offline)
-    env["PATH"] = stub_path(tmp_path, fake_qemu=NO_RASPI_QEMU)
-    proc = run_rig(["--plan", "rng"], env=env)
+    proc = preflight("rng", stub_path(tmp_path, fake_qemu=NO_RASPI_QEMU))
     assert proc.returncode != 0
     assert "raspi3b" in proc.stderr
     assert "no 'raspi3b' machine" in proc.stderr
 
 
-def test_a_qemu_with_the_raspi_machine_gets_through(tmp_path, offline):
-    """Positive control: the same stub, one machine line different."""
-    env = dict(offline)
-    env["PATH"] = stub_path(tmp_path, fake_qemu=RASPI_QEMU)
-    proc = run_rig(["--plan", "rng"], env=env)
-    assert proc.returncode == 0, proc.stderr + proc.stdout
+def test_a_qemu_with_the_raspi_machine_gets_through(tmp_path):
+    """Positive control: the same stub, one machine line different.
+
+    Also the control that runs everywhere for
+    test_a_host_with_no_qemu_says_so, whose omission this restores.
+    """
+    proc = preflight("rng", stub_path(tmp_path, fake_qemu=RASPI_QEMU))
+    assert proc.returncode == 0, proc.stderr
+    assert "PREFLIGHT-OK" in proc.stdout
 
 
 # A `-M help` far larger than a pipe buffer, with raspi3b on the FIRST
@@ -426,7 +516,7 @@ def test_the_big_listing_fixture_really_is_big(tmp_path):
     assert proc.stdout.splitlines()[1].startswith("raspi3b")
 
 
-def test_the_machine_check_survives_a_producer_that_keeps_writing(tmp_path, offline):
+def test_the_machine_check_survives_a_producer_that_keeps_writing(tmp_path):
     """`grep -q` here returns 141 under pipefail, not 0.
 
     device/install.sh carries a comment about exactly this shape and
@@ -436,32 +526,126 @@ def test_the_machine_check_survives_a_producer_that_keeps_writing(tmp_path, offl
     host that is perfectly capable. A `-M help` large enough to lose the
     race must still be read to the end.
     """
-    env = dict(offline)
-    env["PATH"] = stub_path(tmp_path, fake_qemu=BIG_RASPI_QEMU)
-    proc = run_rig(["--plan", "rng"], env=env)
+    proc = preflight("rng", stub_path(tmp_path, fake_qemu=BIG_RASPI_QEMU))
     assert proc.returncode == 0, (
         "the raspi3b check failed against a large -M help listing, which is "
         "the SIGPIPE/141 shape: " + proc.stderr)
 
 
-def test_coldplug_replay_demands_the_tools_only_it_needs(tmp_path, offline):
-    env = dict(offline)
-    env["PATH"] = stub_path(tmp_path, omit=("depmod",))
-    proc = run_rig(["--plan", "coldplug-replay"], env=env)
+def test_coldplug_replay_demands_the_tools_only_it_needs(tmp_path):
+    proc = preflight("coldplug-replay",
+                     stub_path(tmp_path, omit=("depmod",), fake_qemu=RASPI_QEMU))
     assert proc.returncode != 0
     assert "depmod" in proc.stderr
 
 
-def test_the_cheap_probes_do_not_pay_for_them(tmp_path, offline):
+def test_the_cheap_probes_do_not_pay_for_them(tmp_path):
     """Positive control, and a real property: no depmod is fine for rng.
 
     Demanding kmod from every probe would make a perfectly capable host
     refuse the probe it could have run.
     """
+    proc = preflight("rng",
+                     stub_path(tmp_path, omit=("depmod",), fake_qemu=RASPI_QEMU))
+    assert proc.returncode == 0, proc.stderr
+    assert "PREFLIGHT-OK" in proc.stdout
+
+
+# --- 4b. the plan pays for none of it, and the run pays for all of it -----
+#
+# The two CLI tests that keep the split above wired to the thing people
+# actually type. Everything in section 4 calls rig_preflight directly, so
+# without these main() could stop calling it, or start calling it on the
+# printing path again, and every one of them would still pass.
+
+#: A host that has never installed an emulator: no qemu, and no
+#: device-tree-compiler either. This is ubuntu-latest.
+NO_EMULATOR = ("qemu-system-aarch64", "fdtput", "fdtget")
+
+
+def test_the_plan_prints_on_a_host_with_no_emulator_at_all(tmp_path, offline):
+    """--plan is string construction, and must cost what string construction
+    costs.
+
+    The person running it is deciding whether to install 200MB of emulator;
+    requiring the emulator first is the wrong way round. This is also the
+    whole of why six tests in this file were red on the runner.
+    """
     env = dict(offline)
-    env["PATH"] = stub_path(tmp_path, omit=("depmod",))
+    env["PATH"] = stub_path(tmp_path, omit=NO_EMULATOR)
     proc = run_rig(["--plan", "rng"], env=env)
-    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert proc.returncode == 0, proc.stderr
+    assert "missing host tools" not in proc.stderr
+    # The argv, in full, not merely a clean exit: an emulator-less host must
+    # get the same thing to read as anybody else. Held against the rig's own
+    # argv function, minus the tokens that are work-dir paths.
+    printed = [line.strip() for line in proc.stdout.splitlines()]
+    reference = rig_eval('rig_qemu_argv /K /D /I /C0 /C1')
+    assert reference.returncode == 0, reference.stderr
+    for token in reference.stdout.splitlines():
+        if token.startswith(("/", "file:")):
+            continue
+        assert token in printed, f"the plan printed no {token!r}"
+    # And it did none of the work it was printing about: no deb, no kernel,
+    # no initramfs. A plan that downloads 32MB is not a plan.
+    work = Path(env["OTP_RIG_WORK"])
+    assert sorted(p.name for p in work.iterdir()) == []
+
+
+def test_the_plan_says_the_same_thing_with_the_tools_and_without(tmp_path,
+                                                                 offline):
+    """The output is not merely produced without them -- it is identical.
+
+    A plan that quietly says something else on a host with no emulator is
+    worse than one that refuses: the argv is what the reader takes away.
+    """
+    with_tools = dict(offline)
+    with_tools["PATH"] = stub_path(tmp_path, fake_qemu=RASPI_QEMU)
+    without = dict(offline)
+    without["PATH"] = stub_path(tmp_path, omit=NO_EMULATOR)
+    first = run_rig(["--plan", "rng"], env=with_tools)
+    second = run_rig(["--plan", "rng"], env=without)
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert first.stdout == second.stdout, (
+        "the plan differs depending on what the host has installed")
+
+
+def test_a_real_run_is_refused_before_it_costs_anything(tmp_path, offline):
+    """The other half: the run itself is still checked, and checked FIRST.
+
+    Every precondition unmet produces the same console -- nothing, or a stop
+    at "Run /init as init process" -- so a run that discovers the missing
+    emulator four steps later has already spent the download and lost the
+    diagnosis.
+    """
+    env = dict(offline)
+    env["PATH"] = stub_path(tmp_path, omit=("qemu-system-aarch64",))
+    proc = run_rig(["rng"], env=env)
+    assert proc.returncode != 0
+    assert "missing host tools" in proc.stderr
+    assert "qemu-system-aarch64" in proc.stderr
+    # From the preflight, not from a later stage that happened to trip over
+    # the same absence. See the positive control below for what "later"
+    # looks like on this fixture.
+    assert "no Filename for linux-image-" not in proc.stderr
+
+
+def test_a_real_run_with_the_tools_present_gets_past_the_preflight(tmp_path,
+                                                                   offline):
+    """Positive control: the same run, the same fixture, nothing omitted.
+
+    It cannot boot -- there is no archive index in a fresh work dir and the
+    kernel is pinned, so nothing knows which deb to fetch -- and that is the
+    point: the message it stops on comes from AFTER the preflight, which is
+    how we know the preflight passed rather than that the run never happened.
+    """
+    env = dict(offline)
+    env["PATH"] = stub_path(tmp_path, fake_qemu=RASPI_QEMU)
+    proc = run_rig(["rng"], env=env)
+    assert "missing host tools" not in proc.stderr
+    assert "no 'raspi3b' machine" not in proc.stderr
+    assert "no Filename for linux-image-" in proc.stderr, proc.stderr
 
 
 # --- 5. the kernel the image would run ------------------------------------

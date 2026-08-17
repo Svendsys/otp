@@ -80,6 +80,12 @@
 # fetched from deb.debian.org unless OTP_RIG_BUSYBOX names one. Everything
 # downloaded is cached in the work directory, so the second run of the day
 # does no network at all.
+#
+# THOSE ARE WHAT A RUN NEEDS. `--plan` needs none of them -- it prints the
+# argv and exits, so it works on a machine with no emulator, which is the
+# machine of the person deciding whether to install one. Only the archive
+# resolution behind the release name wants anything (curl and gzip), and
+# OTP_RIG_KERNEL removes even that.
 
 set -euo pipefail
 
@@ -150,7 +156,8 @@ probes:
   console-test     which consoles actually registered, and what the DTB says
   idle-survive     sit still for ${IDLE_SECONDS}s and see whether the machine resets
 
-  --plan           check preconditions and print the qemu argv; do not boot
+  --plan           print the qemu argv and exit; boots nothing, and needs
+                   no emulator installed to say what it would run
 
 environment:
   OTP_RIG_WORK      work dir (default \${TMPDIR:-/tmp}/otp-rig); downloads cached here
@@ -301,6 +308,44 @@ rig_resolve_kernel_version() {  # <packages-file>
 # a scratch script's response to a missing tool is a confusing error forty
 # lines later, or -- worse -- a boot that happens anyway and answers the
 # question wrongly.
+#
+# EARLY MEANS "BEFORE THE RUN THAT NEEDS THEM", NOT "BEFORE ANYTHING". The
+# first version of this demanded every tool from every invocation, --plan
+# included, and that was a check in the wrong place: --plan starts no
+# emulator, unpacks no deb and patches no device tree. It builds strings and
+# prints them. Requiring 200MB of emulator before the rig will tell you what
+# it would do with the emulator is exactly backwards -- the person running
+# --plan is deciding whether to install it. Measured: on a host with no
+# qemu-system-aarch64 and no fdtput (a github ubuntu-latest runner is one),
+# `--plan rng` printed nothing at all and exited 1.
+#
+# So the lists below are named for the path that RUNS them, and each is
+# demanded at the point where that path begins.
+
+#: Everything a real run shells out to: the emulator itself, the archive
+#: fetch, the deb unpack, the DTB patch, the initramfs build, and od(1) for
+#: the ELF and Image interrogation.
+RIG_BOOT_TOOLS=(qemu-system-aarch64 curl xz gzip cpio dpkg-deb fdtput od)
+#: Only coldplug-replay builds a module disk. See rig_preflight.
+RIG_COLDPLUG_TOOLS=(depmod mkfs.ext4)
+#: What resolving the kernel version out of the archive needs -- which both
+#: --plan and a real run do, because both report the release they mean.
+RIG_RESOLVE_TOOLS=(curl gzip)
+
+rig_require_tools() {  # <tool>...
+    local tool missing=""
+    for tool in "$@"; do
+        command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+    done
+    if [ -n "$missing" ]; then
+        rig_die "missing host tools:$missing" \
+                "Debian/Ubuntu: apt-get install qemu-system-arm curl xz-utils \\" \
+                "                   cpio dpkg device-tree-compiler kmod e2fsprogs" \
+                "The rig deliberately vendors nothing (issue #22); these are" \
+                "the tools it expects to find."
+    fi
+}
+
 rig_have_raspi_machine() {
     # grep -c, NOT grep -q, and this script runs under pipefail. `-q` closes
     # the pipe on its first match; the producer dies of SIGPIPE and the
@@ -314,26 +359,17 @@ rig_have_raspi_machine() {
     [ "${n:-0}" != "0" ]
 }
 
+# WHAT A REAL RUN OF <probe> NEEDS, checked before that run costs anything.
+# Not reached by --plan, which runs none of it.
 rig_preflight() {  # <probe>
-    local probe="$1" tool missing=""
-    for tool in qemu-system-aarch64 curl xz gzip cpio dpkg-deb fdtput od; do
-        command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
-    done
+    local probe="$1" tools=("${RIG_BOOT_TOOLS[@]}")
     # Only coldplug-replay builds a module disk, so only it pays for these.
     # Demanding them from every probe would make the cheap probes fail on a
     # host that could perfectly well run them.
     if [ "$probe" = "coldplug-replay" ]; then
-        for tool in depmod mkfs.ext4; do
-            command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
-        done
+        tools+=("${RIG_COLDPLUG_TOOLS[@]}")
     fi
-    if [ -n "$missing" ]; then
-        rig_die "missing host tools:$missing" \
-                "Debian/Ubuntu: apt-get install qemu-system-arm curl xz-utils \\" \
-                "                   cpio dpkg device-tree-compiler kmod e2fsprogs" \
-                "The rig deliberately vendors nothing (issue #22); these are" \
-                "the tools it expects to find."
-    fi
+    rig_require_tools "${tools[@]}"
     # A qemu-system-aarch64 that exists but has no raspi3b is a real
     # configuration -- some distributions build a reduced machine set -- and
     # it fails deep inside the emulator with a message about the machine
@@ -700,7 +736,15 @@ main() {
         rig_die "unknown probe: $probe" "Known probes: $(rig_probes | tr '\n' ' ')"
     fi
 
-    rig_preflight "$probe"
+    # THE PRECONDITIONS BELONG TO THE RUN, NOT TO THE PRINTOUT. A real run
+    # is checked here, before it fetches, unpacks or boots anything, because
+    # every one of those preconditions unmet produces the same unreadable
+    # console. --plan reaches none of that code and is therefore not checked:
+    # see the note above rig_preflight, and the two rows in
+    # tests/mutations.toml that keep this `if` from being flattened either way.
+    if [ "$plan" != "1" ]; then
+        rig_preflight "$probe"
+    fi
     mkdir -p "$WORK"
     WORK="$(cd "$WORK" && pwd)"
 
@@ -710,6 +754,10 @@ main() {
         rig_log "kernel pinned by OTP_RIG_KERNEL: $release"
     else
         local packages="$WORK/Packages.gz" plain="$WORK/Packages"
+        # Demanded HERE and not in rig_preflight, because this is the one
+        # piece of real work --plan does: it reports the release it would
+        # boot, and an unpinned release comes out of the archive.
+        rig_require_tools "${RIG_RESOLVE_TOOLS[@]}"
         rig_log "resolving $RIG_META from $RIG_ARCHIVE ($RIG_SUITE)"
         curl -fsSL --retry 3 -o "$packages" \
              "$RIG_ARCHIVE/dists/$RIG_SUITE/main/binary-arm64/Packages.gz" \
