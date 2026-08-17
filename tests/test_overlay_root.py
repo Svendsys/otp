@@ -1318,9 +1318,16 @@ def test_the_sheet_program_prints_what_the_probe_reads(tmp_path):
     assert "diagnostics.render_bytes" in program, program[:200]
     # /opt/otp-unit does not exist here; the repository root is on sys.path
     # already, so the shipped `sys.path.insert` is simply inert.
+    #
+    # CUPS_SERVER at a socket that cannot exist, so the submit half is
+    # hermetic: `lp` fails against nothing rather than reaching whatever
+    # daemon happens to be running on the machine the fast suite is on. The
+    # rig in tests/cupsrig.py is the hardware tier's job and carries a marker
+    # for it; this test must not touch a real queue by accident.
     proc = subprocess.run(
-        ["python3", "-c", program], capture_output=True, text=True, timeout=120,
-        cwd=REPO, env={**os.environ, "SHEET_QUEUE": "otpimgcheck"})
+        ["python3", "-c", program], capture_output=True, text=True, timeout=180,
+        cwd=REPO, env={**os.environ, "SHEET_QUEUE": "otpimgcheck",
+                       "CUPS_SERVER": "/nonexistent/otp-no-such-cupsd.sock"})
     assert proc.returncode == 0, proc.stderr
     said = proc.stdout
     assert re.search(r"^RENDER ok bytes=\d+ magic=%PDF-", said, re.M), said

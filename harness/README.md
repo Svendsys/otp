@@ -548,6 +548,16 @@ one speaker whose "Failed with result" is a verdict rather than a quotation.
 A phrase found only in a forwarded line is reported as an `IMG-NOTE` instead,
 so the scoping cannot swallow one in silence.
 
+**What it costs.** uart0 was 46848 and 45302 bytes in run 20 with the journal
+invisible; forwarding it will grow that, and the size is now a number worth
+reading rather than ignoring — the sampler's byte column prints it every 30
+seconds. There are five copies of each console in the work directory (the two
+ports, the concatenation, the ANSI-stripped copy and the speaker-filtered
+one), all of them matched by the `console*.log` glob the failure artifact
+uploads, and all of them well inside the 16 MB budget at these sizes. The
+early-stop grep still reads the whole file once per sample; if that ever
+shows up in the sampler's timing, `tail -c` a recent window instead.
+
 One more thing moved for the same reason and it is a guess rather than a
 measurement: `single-kernel-entry` counts `Booting Linux on physical CPU`,
 and journald imports `/dev/kmsg` from the start of the buffer. If it forwards
