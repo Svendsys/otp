@@ -180,8 +180,16 @@ rig_elf_u() {  # <file> <offset> <width-in-bytes>
 # program header table rather than by grepping for an interpreter path,
 # because a static binary may contain that string for other reasons.
 rig_require_arm64_static() {
-    local f="$1" magic machine phoff phentsize phnum i off ptype
+    local f="$1" magic machine phoff phentsize phnum i off ptype bytes
     [ -s "$f" ] || rig_die "$f is missing or empty"
+    # See rig_require_arm64_image: od refuses to skip past the end of its
+    # input, so a file shorter than the 64-byte ELF64 header would end this
+    # function with od's message rather than ours.
+    bytes=$(wc -c < "$f")
+    if [ "$bytes" -lt 64 ]; then
+        rig_die "$f is $bytes bytes, too short to be an ELF64 binary" \
+                "(the header alone is 64 bytes)"
+    fi
     magic=$(od -An -c -N4 "$f" | tr -d ' \n')
     if [ "$magic" != '177ELF' ]; then
         rig_die "$f is not an ELF binary" \
@@ -217,8 +225,21 @@ rig_require_arm64_static() {
 # kernel8.img, and QEMU is not it. See the header: the compressed file
 # reaches -kernel happily and produces a completely silent boot.
 rig_require_arm64_image() {
-    local f="$1" magic
+    local f="$1" magic bytes
     [ -s "$f" ] || rig_die "$f is missing or empty"
+    # SIZE FIRST, because od(1) refuses to skip past the end of its input
+    # and says "cannot skip past end of combined input" -- which under
+    # `set -e` ends the function with od's complaint instead of this
+    # function's. Measured against a gzipped 68-byte vmlinuz fixture: the
+    # caller saw an od error and no explanation of what was actually
+    # wrong, which is the whole failure this check exists to prevent.
+    bytes=$(wc -c < "$f")
+    if [ "$bytes" -lt 64 ]; then
+        rig_die "$f is $bytes bytes, too short to be an arm64 kernel Image" \
+                "(the boot-protocol header alone is 64 bytes)" \
+                "A gzipped vmlinuz out of the archive .deb lands here when it" \
+                "compresses small; see below for why that matters."
+    fi
     # The arm64 Linux boot protocol puts the 4-byte magic "ARM\x64" at
     # offset 56 of the image header. od -c renders \x64 as the letter d.
     magic=$(od -An -c -j56 -N4 "$f" | tr -d ' \n')

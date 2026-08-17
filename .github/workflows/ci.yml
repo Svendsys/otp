@@ -96,11 +96,15 @@ jobs:
             "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
             | tar -xJf - --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           ./shellcheck --version
+          # img-local-rig.sh is LINTED here and never run: it is a
+          # debugging tool with no CI wiring by design (issue #22), and
+          # running it would put a network fetch and an emulated boot on
+          # every push -- which is the cost it exists to remove.
           ./shellcheck device/install.sh device/persist-identity.sh \
                        image/build.sh image/render-manual.sh \
                        harness/kernel-sim.sh harness/vm-check.sh \
                        harness/vm-guest-check.sh harness/img-boot.sh \
-                       harness/img-guest-check.sh
+                       harness/img-guest-check.sh harness/img-local-rig.sh
 
   hardware:
     # Tier 1 of the harness: the real code against real kernel interfaces

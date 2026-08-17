@@ -898,6 +898,88 @@ refuses to make by masking, arriving through a different door. So the fix is
 boot pays two condition evaluations and a skip. The check was right; the image
 was wrong.
 
+## When CI evidence runs out — the local repro rig
+
+`./harness/img-local-rig.sh <probe>`. Not a tier and not a check: no CI
+wiring, deliberately (issue #22). It is what you reach for when the tiers
+above have told you everything they can and you still do not know why.
+
+**The problem it solves is the round trip.** Tier 3 cannot run without
+`image/deploy/*.img.xz`, and that artifact is the pi-gen arm64 job —
+16m16s for the whole thing on run 16, of which 6m58s is pi-gen on a cache
+miss and 7m59s is the pair of boots. So every hypothesis about the kernel,
+the console, the watchdog or coldplug cost a quarter of an hour *and a
+push*. Issue #17's fifteen-run narrative is largely a record of paying
+that, several times for theories that turned out to be wrong — which is
+exactly when the price is least affordable.
+
+The rig removes the image from the loop. The kernel and the DTB come out of
+the same `archive.raspberrypi.com` `.deb` pi-gen would install, resolved
+through the `linux-image-rpi-v8` metapackage so it stays current by itself;
+the root filesystem is a ~1MB busybox initramfs; the question is a shell
+heredoc in the one file. **Measured on the container it was written in
+(x86_64, QEMU 8.2.2, TCG): 27 seconds for the first `rng` run including a
+cold 32,739,088-byte kernel download, and 20 seconds a run afterwards
+against the cache.** Against 16m16s.
+
+| Probe | The question it was built to answer |
+|---|---|
+| `rng` | crng/entropy state, and a genuinely blocking read. Issue #17 spent two runs on an entropy stall that did not exist. |
+| `coldplug-replay` | `modprobe` every `/sys` modalias one at a time with START/DONE markers, against the kernel's own module tree on an ext4 disk, `depmod`'d host-side. A module that hangs is *named* instead of theorised about. |
+| `console-test` | Which consoles actually registered, what the DTB aliases say, and which port a write lands on. This is the one that ended six runs of misdiagnosed "freeze". |
+| `idle-survive` | Sit still and see whether the machine resets. The watchdog re-verification. |
+
+**The worked example, which is why the rig is in the repository at all.**
+Issue #17's boot "froze" at ~29.5–31.6s guest, always the moment journald
+started, and three theories died against it: dwc_otg wedging coldplug, TCG
+slowness, and an entropy stall. All three were argued from CI consoles. The
+rig answered all three in an afternoon:
+
+- **entropy** — `random: crng init done` at 2.4s, and a blocking read
+  returning immediately. The claim that the line was "absent in every
+  console" was an artifact of reading job-log *tails* that begin after 8s
+  guest, past where it prints. Re-measured with the rig as committed, over
+  two runs: crng init at **2.63s and 3.32s** — it moves run to run under
+  TCG, so the load-bearing fact is that it happens early and always, not
+  the digits — with `entropy_avail=256` (a full pool), hwrng
+  `3f104000.rng` registered, and sixteen *blocking* bytes of `/dev/random`
+  returning in 0.02s both times.
+- **coldplug** — all 41 modaliases probed, no hangs. Re-measured with the
+  rig as committed: `modules.dep` 1911 lines, **41 modaliases replayed, 4
+  returning non-zero, 19 modules loaded**, 41 START lines and 41 DONE lines.
+- **the console** — and this was the actual fault. `/proc/consoles` lists
+  `ttyAMA1` and nothing else; the device tree says `serial0 ->
+  /soc/serial@7e215040`, which is the *mini-UART*, and `stdout-path` points
+  at it; `serial1 -> /soc/serial@7e201000` is the PL011. So `console=ttyAMA0`
+  named a device that does not exist, no real console ever registered, and
+  the "wedge" was a blindfold. The rig prints that in twenty seconds.
+- **the watchdog** — `idle-survive` climbs from uptime 4.57 to 49.70 with
+  one kernel entry, well past the ~11.5s reset that runs 1–5 hit every time.
+
+**Findings only transfer if the machine matches**, so the five flags that
+decide what the guest *is* — `-M raspi3b`, `-m 1024`, `loglevel=7`,
+`console=ttyAMA1`, `initcall_blacklist=bcm2835_pm_driver_init` — plus the
+synthesised `0xa02082` board revision are held against `img-boot.sh` by
+`tests/test_local_rig.py`, which parses both scripts. It fails if the rig
+gains a kernel parameter tier 3 does not have, *and* if tier 3 gains one the
+rig does not consciously omit. A rig that boots a subtly different machine is
+worse than no rig: it produces confident answers about somewhere else.
+
+**What it will not do.** It boots no image, so it says nothing about the
+overlay, the unit, CUPS, the front panel or provisioning — all of that is
+tier 3's business and needs the real artifact. It answers kernel-level and
+early-userspace questions, which is the class that cost the most to ask
+through CI.
+
+**Host requirements**, documented rather than vendored: `qemu-system-aarch64`
+with the `raspi3b` machine, plus `curl xz-utils gzip cpio dpkg
+device-tree-compiler`, and for `coldplug-replay` only, `kmod` and
+`e2fsprogs`. Each is checked before the emulator starts and named if absent
+— because *every* one of these, missing, produces the same console: nothing
+at all, or a stop at `Run /init as init process`. That is the single most
+expensive symptom in this harness's history to misdiagnose. `--plan` prints
+the qemu argv and the preconditions without booting.
+
 ## Proving the guards can fail
 
 Every tier above is a check, and a check has one failure mode that nothing
