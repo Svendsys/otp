@@ -2110,3 +2110,302 @@ tests = [
 file = "otpunit/hmi.py"
 find = '            log(f"no OLED ({exc})")'
 replace = '            log(f"no display ({exc})")'
+
+
+# --- issue #21: the identity, the emulator's board revision, and the panel
+#
+# Two decisions landed together and they interact, which is why their rows
+# sit together. Persisting the machine-id stops systemd calling every boot a
+# first boot; supplying a board revision stops rpi-eeprom-update.service
+# failing -- and gpiozero reads the same property, so the emulated unit now
+# finds BUTTONS. The check named unit-detects-no-panel had to stop depending
+# on that, which is the first row here.
+
+[[mutation]]
+name = "guest-headless-check-ignores-the-display-it-found"
+tier = "fast"
+guard = """
+The clause that survives the board revision. With /system/linux,revision in
+the DTB, gpiozero's pin factory loads and `Button(5)` succeeds -- measured on
+a stock card under -M raspi3b -- so "printing unattended" is reached because
+the DISPLAY is None and nothing else. Without `display: none` the check is
+also satisfied by a unit that found an HDMI console and no buttons, which is
+a machine with a panel passing a check named for not having one."""
+tests = [
+  "tests/test_overlay_root.py::test_a_unit_that_found_a_screen_is_not_a_unit_with_no_panel",
+  "tests/test_overlay_root.py::test_a_unit_that_never_said_what_it_settled_on_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \'''
+replace = '''      "$(if [ "$NO_OLED" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "unit-stops-naming-the-display-it-settled-on"
+tier = "fast"
+guard = """
+`interface -- display: none,` is assembled at runtime out of two files and
+written down in neither: __main__ has the prefix and an f-string, hmi has the
+field names. A grep over either would pass while the probe matched nothing
+forever, so the test runs the real describe() instead."""
+tests = [
+  "tests/test_img_verdict.py::test_the_probe_looks_for_the_display_the_unit_actually_reports",
+]
+[[mutation.edit]]
+file = "otpunit/hmi.py"
+find = '        return f"display: {self.display_kind}, input: {self.input_kind}"'
+replace = '        return f"input: {self.input_kind}"'
+
+
+[[mutation]]
+name = "guest-identity-store-may-be-inside-the-overlay"
+tier = "fast"
+guard = """
+The clause that stops the machine-id check being self-satisfying. If
+/boot/firmware never mounted, the store is a directory on the overlay's
+tmpfs: the copy and the original agree perfectly on every boot while nothing
+survives any of them, and every other field reads green."""
+tests = [
+  "tests/test_overlay_root.py::test_a_store_inside_the_overlay_is_not_persistence",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ "$MACHINE_ID_KEPT" = yes ] && [ "$STORE_SRC" != "?" ] \
+            && [ "$STORE_SRC" != "$ROOT_SOURCE" ]; then echo yes; else echo no; fi)" \'''
+replace = '''      "$(if [ "$MACHINE_ID_KEPT" = yes ]; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "guest-machine-id-absence-counts-as-a-match"
+tier = "fast"
+guard = """
+Two absences are equal. An unreadable /etc/machine-id and an empty store
+compare the same as a kept identity, so "the machine-id persisted" would be
+certified of a machine that has no identity at all."""
+tests = [
+  "tests/test_overlay_root.py::test_a_machine_with_no_machine_id_at_all_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = 'if [ -n "$LIVE_MACHINE_ID" ] && [ "$LIVE_MACHINE_ID" = "$KEPT_MACHINE_ID" ]; then'
+replace = 'if [ "$LIVE_MACHINE_ID" = "$KEPT_MACHINE_ID" ]; then'
+
+
+[[mutation]]
+name = "guest-host-key-fingerprint-not-read-back"
+tier = "fast"
+guard = """
+Computing a fingerprint is not recording one. boot2 compares against a file
+on the boot partition, so boot1 has to say the file is THERE -- otherwise a
+write that never landed shows up two boots later as a mystery rather than as
+boot1's failure."""
+tests = [
+  "tests/test_overlay_root.py::test_a_fingerprint_that_never_reached_the_card_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''          "$(if [ -n "$HOSTKEYS_NOW" ] && [ "$HOSTKEYS_READBACK" = "$HOSTKEYS_NOW" ]; \
+             then echo yes; else echo no; fi)" \'''
+replace = '''          "$(if [ -n "$HOSTKEYS_NOW" ]; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "guest-host-key-fingerprint-recorded-with-no-keys"
+tier = "fast"
+guard = """
+The other half of the positive control. A machine with no host keys computes
+an empty fingerprint, writes an empty record and reads it back -- empty
+equals empty -- and boot2's "identical" then means nothing at all."""
+tests = [
+  "tests/test_overlay_root.py::test_a_machine_with_no_host_keys_records_nothing_and_says_so",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''          "$(if [ -n "$HOSTKEYS_NOW" ] && [ "$HOSTKEYS_READBACK" = "$HOSTKEYS_NOW" ]; \
+             then echo yes; else echo no; fi)" \'''
+replace = '''          "$(if [ "$HOSTKEYS_READBACK" = "$HOSTKEYS_NOW" ]; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "guest-host-keys-two-absences-accepted"
+tier = "fast"
+guard = """
+THE reading this check has to be unable to make. Nothing recorded by boot1
+and no keys in boot2 compare equal as strings, so a machine that lost its
+host keys entirely would certify that they survived the power cycle -- which
+is exactly the machine this check was added for."""
+# The both-empty case only. test_a_second_boot_with_keys_but_no_record_fails
+# is deliberately NOT here: with keys this boot and nothing recorded the two
+# strings differ, so the bare comparison still says FAIL and that test stays
+# green under this edit. Listing it would put a name in the table that the
+# runner never sees go red, which is the shape of claim this file exists to
+# refuse.
+tests = [
+  "tests/test_overlay_root.py::test_two_absences_are_not_identical_host_keys",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''          "$(if [ -n "$HOSTKEYS_NOW" ] && [ -n "$HOSTKEYS_BOOT1" ] \
+                && [ "$HOSTKEYS_NOW" = "$HOSTKEYS_BOOT1" ]; \
+             then echo yes; else echo no; fi)" \'''
+replace = '''          "$(if [ "$HOSTKEYS_NOW" = "$HOSTKEYS_BOOT1" ]; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "tier3-board-revision-not-handed-to-the-guest"
+tier = "fast"
+guard = """
+The quiet way to lose it: patch a copy of the DTB and boot the original.
+Everything before this line still succeeds, the log line still prints, and
+rpi-eeprom-update.service fails half an hour later on `(0x >> 23) & 1` as
+though the image were at fault."""
+tests = [
+  "tests/test_overlay_root.py::test_the_harness_supplies_the_board_revision_the_firmware_would_have",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = 'DTB="$DTB_PATCHED"'
+replace = 'DTB="$DTB"'
+
+
+[[mutation]]
+name = "tier3-board-revision-write-not-read-back"
+tier = "fast"
+guard = """
+An fdtput that did nothing looks exactly like one that worked. Without the
+read-back the harness boots a blob with no revision in it and reports the
+resulting unit failure as the image's."""
+tests = [
+  "tests/test_overlay_root.py::test_a_revision_that_did_not_reach_the_blob_stops_the_boot",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = 'if [ "${DTB_REVISION:-0}" != "$((BOARD_REVISION))" ]; then'
+replace = 'if false; then'
+
+
+[[mutation]]
+name = "install-ssh-socket-not-masked"
+tier = "fast"
+guard = """
+MASKED, not disabled. `enable` symlinks live in /etc/systemd/system, which is
+inside the overlay, so a disable lasts one boot and the next first-boot
+preset-all puts ssh.socket straight back -- and with the socket holding :22,
+cancel-rename's `systemctl reload ssh` leaves sshd unable to rebind and
+RestartPreventExitStatus=255 keeps it down for the rest of the boot."""
+tests = [
+  "tests/test_overlay_root.py::test_the_socket_that_kept_sshd_from_rebinding_is_masked",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = "systemctl mask ssh.socket"
+replace = "systemctl disable ssh.socket 2>/dev/null || true"
+
+
+[[mutation]]
+name = "overlay-machine-id-not-restored"
+tier = "fast"
+guard = """
+Without this call /etc/machine-id is whatever the card says, which is
+pi-gen's `uninitialized` -- so systemd calls every boot a first boot, runs
+preset-all every boot, and regenerates the host keys of a key printer every
+time the power is pulled. Nothing else in the boot can put the file there:
+PID 1 reads it before any unit exists."""
+tests = [
+  "tests/test_overlay_root.py::test_the_overlay_restores_the_machine_id_after_it_is_assembled",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = "\n\totp_restore_machine_id\n}"
+replace = "\n\t# the machine-id stays whatever the card says\n}"
+
+
+[[mutation]]
+name = "overlay-machine-id-not-validated"
+tier = "fast"
+guard = """
+systemd rejects a malformed machine-id and calls the boot a first boot --
+the state this exists to leave, reached by a longer route and with the
+image's own file overwritten on the way. Anything that is not 32 lower-case
+hex characters has to be dropped here."""
+tests = [
+  "tests/test_overlay_root.py::test_a_machine_id_that_is_not_32_hex_characters_is_not_written",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''		case "${id}" in
+		*[!0-9a-f]*|"") continue ;;
+		esac'''
+replace = '''		case "${id}" in
+		"") continue ;;
+		esac'''
+
+
+[[mutation]]
+name = "overlay-identity-partition-mounted-writable"
+tier = "fast"
+guard = """
+Reading a machine-id needs no write handle, and the whole mechanism this
+rides in exists so that a boot never holds one it does not need. The same
+`-r` argument the lower layer's mount carries, on the other partition."""
+tests = [
+  "tests/test_overlay_root.py::test_the_identity_partition_is_mounted_read_only",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '		mount -r -t vfat "${dev}" "${OTP_IDENTITY_MNT}" 2>/dev/null || continue'
+replace = '		mount -t vfat "${dev}" "${OTP_IDENTITY_MNT}" 2>/dev/null || continue'
+
+
+[[mutation]]
+name = "identity-store-not-checked-for-being-outside-the-overlay"
+tier = "fast"
+guard = """
+The same hole as guest-identity-store-may-be-inside-the-overlay, from the
+writing end. $BOOT_DIR falls back to /boot when /boot/firmware is not a
+directory, and /boot inside the overlay is a tmpfs: the script would copy
+this boot's identity into RAM, read it back happily, and lose it -- every
+boot, for the life of the unit, in silence."""
+tests = [
+  "tests/test_overlay_root.py::test_a_store_inside_the_overlay_is_refused_rather_than_written",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = 'if [ -z "$STORE_SRC" ] || [ "$STORE_SRC" = "$ROOT_SRC" ]; then'
+replace = 'if false; then'
+
+
+[[mutation]]
+name = "identity-restored-host-key-left-readable"
+tier = "fast"
+guard = """
+FAT carries no permission bits, so a key copied back from the store arrives
+with whatever the vfat mount options give it. sshd REFUSES a private key it
+can read from a group or from the world, and says so only in its own log --
+which on this appliance is volatile."""
+tests = [
+  "tests/test_overlay_root.py::test_a_later_boot_puts_the_kept_host_keys_back",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = '        install -m 0600 "$key" "$ETC_DIR/ssh/" || rc=1'
+replace = '        cp "$key" "$ETC_DIR/ssh/" || rc=1'
+
+
+[[mutation]]
+name = "identity-store-overwritten-by-a-boot-that-lost-it"
+tier = "fast"
+guard = """
+A stored machine-id that does not match the running one means the initramfs
+restore did not happen. The stored value is the one that still has a chance
+of being restored next time; replacing it with this boot's random id makes
+the store chase a value that changes every boot and never converge, while
+looking correct on every single one of them."""
+tests = [
+  "tests/test_overlay_root.py::test_a_kept_machine_id_is_not_overwritten_by_a_boot_that_lost_it",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = 'elif [ ! -s "$STORE/machine-id" ]; then'
+replace = 'elif true; then'
