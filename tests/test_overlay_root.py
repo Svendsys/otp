@@ -2962,7 +2962,7 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
                  executable=True, shadow=None, env=None,
                  credential="otp:$6$otpimgcheck$hashbytes",
                  boot1_digest="auto", store_src="/dev/mmcblk0p1",
-                 root_source="overlay"):
+                 root_source="overlay", sha256sum=True):
     """Run the shipped userconf block with a substituted systemd and shadow.
 
     Three absolute paths are rewritten rather than stubbed on the filesystem
@@ -2991,6 +2991,16 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
     (bin_dir / "systemctl").chmod(0o755)
     (bin_dir / "journalctl").write_text(JOURNALCTL_STUB)
     (bin_dir / "journalctl").chmod(0o755)
+    if not sha256sum:
+        # THE MISSING COMMAND, which is the question every guard here has to
+        # answer: what exit code, empty output or absent binary makes this
+        # pass silently? `cred_digest` pipes into sha256sum and takes what
+        # comes back, so one that is absent or broken answers the empty
+        # string -- in BOTH boots, which is how "the password survived the
+        # power cycle" turns into "there was never a password". Exits 0, like
+        # a command that is not there behind a `2>/dev/null`.
+        (bin_dir / "sha256sum").write_text("#!/bin/sh\ncat >/dev/null\nexit 0\n")
+        (bin_dir / "sha256sum").chmod(0o755)
 
     # The credential store the probe audits, and the record boot1 leaves for
     # boot2. Supplied here rather than left to the block, because both are
@@ -3444,6 +3454,29 @@ def test_a_first_boot_with_no_credential_at_all_records_nothing_and_says_so(tmp_
     assert written == "", written
 
 
+def test_a_record_that_never_reached_the_card_fails_boot1(tmp_path):
+    """
+    The read-back in the positive control, which is what makes it a control.
+
+    The record is the ONE thing boot2's claim rests on that the image did not
+    write, so boot1 has to say it landed rather than that it tried. A boot
+    partition that is full, read-only, or has something else at that path
+    leaves boot2 comparing against nothing -- and two nothings are equal.
+    """
+    bootdir = tmp_path / "firmware"
+    bootdir.mkdir(parents=True, exist_ok=True)
+    # Something at the path the record wants, which no `printf >` can write
+    # over. Cheaper than a full partition and the same failure from the
+    # probe's side.
+    (bootdir / "otp-imgcheck-credential").mkdir()
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           boot1_digest=None)
+    assert results(proc)["credential-recorded-for-the-next-boot"] == "FAIL", \
+        proc.stdout
+    # The apply itself is untouched: this is about the probe's own bookkeeping.
+    assert results(proc)["userconf-seed-applied"] == "PASS", proc.stdout
+
+
 def test_the_second_boot_accepts_the_password_that_outlived_the_power(tmp_path):
     """The healthy boot2 path, spelled out: the hash carries the seed's salt
     and digests to what boot1 recorded, with no seed on the card."""
@@ -3476,6 +3509,60 @@ def test_two_absences_are_not_a_credential_that_survived(tmp_path):
                            shadow="root:!:20000:0:99999:7:::\n",
                            boot1_digest=None)
     assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_digest_nothing_could_compute_is_not_a_match(tmp_path):
+    """
+    THE MISSING COMMAND, which is what the length clauses are actually for and
+    what the mutation gate caught this test's absence with.
+
+    Every other clause survives a broken `sha256sum`: the salt is still in
+    /etc/shadow, so attribution passes, and both digests come back as the
+    empty string, so the equality passes too -- a boot2 certifying that the
+    password survived on the strength of two things nothing computed. It is
+    not a hypothetical shape either: boot1 writes whatever `cred_digest`
+    returned into the record, so ONE broken sha256sum makes both sides empty
+    on the same machine.
+
+    The positive control is the same fixture with sha256sum working.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+                           boot1_digest="", sha256sum=False)
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+    proc, _ = run_userconf(tmp_path / "control", phase="boot2",
+                           env=HEALTHY_BOOT2)
+    assert results(proc)["credential-survives-the-power-cycle"] == "PASS", \
+        proc.stdout
+
+
+def test_the_same_password_in_both_boots_is_not_the_seeded_one(tmp_path):
+    """
+    ATTRIBUTION, which the digest comparison cannot supply.
+
+    A boot2 whose hash digests to exactly what boot1 recorded has proved that
+    the password did not CHANGE -- and pi-gen's build-time password does not
+    change either. It is the same on every boot of a unit whose credential was
+    never persisted at all, which is the image this check exists to fail. Only
+    the salt says the hash in force is the one the operator seeded.
+    """
+    build_time = "$6$RaNdOmSaLt$buildtimebytes"
+    proc, _ = run_userconf(
+        tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+        shadow=f"otp:{build_time}:20000:0:99999:7:::\n",
+        boot1_digest=sha256_of(build_time))
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+    # The positive control on the same fixture: swap in the seeded hash and
+    # its own digest, and the check passes. Without it this is satisfied by a
+    # clause that refuses everything.
+    seeded = "$6$otpimgcheck$hashbytes"
+    proc, _ = run_userconf(
+        tmp_path / "control", phase="boot2", env=HEALTHY_BOOT2,
+        shadow=f"otp:{seeded}:20000:0:99999:7:::\n",
+        boot1_digest=sha256_of(seeded))
+    assert results(proc)["credential-survives-the-power-cycle"] == "PASS", \
         proc.stdout
 
 

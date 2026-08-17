@@ -1106,9 +1106,16 @@ operator an account whose password is pi-gen's random FIRST_USER_PASS -- a
 value nobody has -- and the host, which can only watch the file disappear,
 would call that success. pi-gen salts its hash randomly, so the marker salt
 in the shadow entry can only have come from the seed."""
+#
+# ONE TEST, NOT TWO. `test_no_shadow_entry_at_all_fails` was listed here and
+# does not go red for this edit -- measured on origin/master's own copy of
+# the probe with this exact substitution, in a throwaway worktree: 1 failed,
+# 1 passed. Its fixture has no shadow entry for the account, so $UC_SHADOW is
+# empty and the mutated condition is false for the same reason the shipped
+# one is. The row was believed for a red nobody had observed, which is the
+# thing this table's own header says not to ship.
 tests = [
   "tests/test_overlay_root.py::test_a_seed_deleted_without_being_applied_fails",
-  "tests/test_overlay_root.py::test_no_shadow_entry_at_all_fails",
 ]
 [[mutation.edit]]
 # The assignment is part of the `find` because boot2's
@@ -3518,3 +3525,370 @@ tests = [
 file = "otpunit/hw/buttons.py"
 find = "    if len(message) > REPORT_MAX_CHARS:"
 replace = "    if False:      # mutation: no cap on the length of a report"
+
+
+# --- the operator's login, which used to last one boot --------------------
+#
+# The seed reached /etc/shadow and /etc is inside the overlay, so the
+# password worked for exactly one boot -- and userconf-service deletes the
+# only file that could reapply it as the last step of applying it. The
+# owner's decision out of {refuse the seed loudly, persist it, keep the seed
+# file} is "persist it", and everything below is a way for that to be
+# installed, enabled, green, and not true.
+#
+# THE EXPOSURE ROW IS THE FIRST ONE, deliberately. A password hash on the FAT
+# partition is offline-crackable by every uid on this machine and by anyone
+# with a card reader, and the one thing that keeps that bounded is that the
+# store is only ever written from the wizard's own ExecStartPost -- so the
+# only hash that reaches the card is one the operator's userconf.txt had
+# already put there. A mutation that records on every boot puts pi-gen's
+# build-time hash on the card of every unit ever made.
+
+[[mutation]]
+name = "identity-credential-recorded-on-every-boot"
+tier = "fast"
+guard = """
+The bound on the exposure this whole change adds. The default phase runs at
+sysinit on every boot of every unit; the recording phase runs only as an
+ExecStartPost on the wizard. Merge them and a machine whose operator never
+seeded anything gets a copy of pi-gen's random FIRST_USER_PASS hash written
+to a partition every local account can read -- a hash nobody has, for a
+password nobody wanted kept, on a device that prints one-time pads."""
+tests = [
+  "tests/test_overlay_root.py::test_an_unseeded_boot_puts_no_password_hash_on_the_boot_partition",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = "credential_restore || rc=1"
+replace = """credential_restore || rc=1
+credential_record || rc=1"""
+
+
+[[mutation]]
+name = "identity-credential-never-restored"
+tier = "fast"
+guard = """
+The whole point, deleted. The store still fills up, every check that reads it
+still passes, and the account still reverts to the build-time password on
+every power cycle -- which is the defect, with a persistence mechanism
+installed and reporting success on top of it."""
+tests = [
+  "tests/test_overlay_root.py::test_a_seeded_password_is_kept_and_comes_back_after_the_power_cycle",
+  "tests/test_overlay_root.py::test_a_fresh_seed_this_boot_beats_the_credential_that_was_restored",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = "credential_restore || rc=1"
+replace = ":"
+
+
+[[mutation]]
+name = "identity-credential-not-validated-as-a-crypt-string"
+tier = "fast"
+guard = """
+`chpasswd -e` writes its second field into /etc/shadow verbatim, so an EMPTY
+second field is an account that logs in with NO PASSWORD -- on an appliance
+that boots to a console with a keyboard and a screen attached. A card pulled
+mid-write is enough to produce one, and so is anyone with a card reader. `!`
+and `*` are the mirror: a store that can LOCK the only account takes away the
+recovery path this change exists to provide.
+
+TWO EDITS, because the property is defended twice and neither clause catches
+the empty string on its own: the crypt-shape case rejects it for having no
+`$`, and the length bound rejects it for being shorter than twenty
+characters. Stating the redundancy beats dropping the row."""
+tests = [
+  "tests/test_overlay_root.py::test_a_truncated_store_does_not_leave_the_account_passwordless",
+  "tests/test_overlay_root.py::test_a_store_that_is_not_a_crypt_string_is_refused[!]",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = """        '$'*'$'*'$'*) ;;
+        *) return 1 ;;"""
+replace = "        *) ;;"
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = '    [ "${#1}" -ge 20 ]'
+replace = "    return 0"
+
+
+[[mutation]]
+name = "identity-credential-may-name-any-account"
+tier = "fast"
+guard = """
+Whoever can write the store can already write userconf.txt, and this must
+hand them no account the documented path would not. userconf-pi refuses
+`root` outright and renames the UID-1000 user to whatever a seed names, so
+the only account /boot/firmware/userconf.txt can ever set a password on is
+the UID-1000 one. Without this clause a line an attacker drops on the card in
+a reader sets root's password on the next boot instead."""
+tests = [
+  "tests/test_overlay_root.py::test_the_store_may_only_name_the_uid_1000_account",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = 'if [ -z "$want" ] || [ "$user" != "$want" ]; then'
+replace = "if false; then"
+
+
+[[mutation]]
+name = "identity-credential-restore-not-read-back"
+tier = "fast"
+guard = """
+chpasswd's exit status says the command ran, not that /etc/shadow changed. A
+chpasswd missing from the image, replaced by a stub, or pointed at another
+tree gives a boot that reported a successful restore and an operator who
+cannot log in -- and on an air-gapped appliance nobody finds that out until
+they are standing in front of it with a keyboard."""
+tests = [
+  "tests/test_overlay_root.py::test_a_chpasswd_that_exits_zero_without_writing_is_caught",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = 'if [ "$live" != "$hash" ]; then'
+replace = "if false; then"
+
+
+[[mutation]]
+name = "identity-credential-store-may-set-two-accounts"
+tier = "fast"
+guard = """
+`chpasswd` reads EVERY line it is handed. A two-line store is a store that
+sets two accounts' passwords, on a partition anyone with a card reader can
+write -- and the first line being perfectly valid is exactly what would let
+the second one arrive unnoticed."""
+tests = [
+  "tests/test_overlay_root.py::test_a_second_line_in_the_store_is_refused_rather_than_applied",
+]
+# TWO EDITS, because the mutation gate proved the property is defended twice
+# and neither edit turns the suite red alone. Disabling only the explicit
+# newline case leaves the second line INSIDE $hash -- everything after the
+# first colon -- where is_crypt_hash's whitespace-and-colon clause refuses it
+# for a different reason. Stating the redundancy beats dropping the row: the
+# explicit case is what produces a message an operator can act on, and the
+# is_crypt_hash clause is what would still hold if the parse changed.
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = "        *$'\\n'*)"
+replace = "        *$'\\r\\r\\r'*)"
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = "        *[:[:space:]]*) return 1 ;;"
+replace = "        *) ;;"
+
+
+[[mutation]]
+name = "identity-credential-locked-account-recorded"
+tier = "fast"
+guard = """
+The recording phase's own refusal. An account whose shadow field is `!` has
+no password to keep, and writing that over the store replaces a working
+credential with one the restore must refuse -- costing the operator the login
+at the NEXT power cycle rather than this one, which is the hardest kind of
+failure to trace back to the boot that caused it."""
+tests = [
+  "tests/test_overlay_root.py::test_a_locked_account_is_not_recorded_over_a_good_credential",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = """    hash=$(live_hash "$user")
+    if ! is_crypt_hash "$hash"; then"""
+replace = """    hash=$(live_hash "$user")
+    if false; then"""
+
+
+[[mutation]]
+name = "install-credential-never-recorded"
+tier = "fast"
+guard = """
+The one line with no other trigger. The store is written by
+--record-credential and by nothing else, so without this ExecStartPost the
+restore has nothing to restore, forever: the image boots, applies an
+operator's seed, deletes it, and loses the password at the power cycle
+exactly as before -- with the persistence installed, enabled and reporting
+success every boot."""
+tests = [
+  "tests/test_overlay_root.py::test_the_wizard_records_the_credential_it_just_applied",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = "ExecStartPost=-/opt/otp-unit/persist-identity.sh --record-credential"
+replace = "# nothing records the credential"
+
+
+[[mutation]]
+name = "install-credential-record-can-loop-the-wizard"
+tier = "fast"
+guard = """
+The leading `-`. Stock userconfig.service carries Restart=on-failure, so
+without it a full boot partition -- or any other reason the record fails --
+turns into a restart loop printing `Failed with result` and `Scheduled
+restart job`, two of the strings harness/img-boot.sh fails a release on, on
+the one boot that was applying the operator's password successfully. Losing
+the record must not cost the operator the apply."""
+tests = [
+  "tests/test_overlay_root.py::test_a_record_that_fails_does_not_cost_the_operator_the_apply",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = "ExecStartPost=-/opt/otp-unit/persist-identity.sh"
+replace = "ExecStartPost=/opt/otp-unit/persist-identity.sh"
+
+
+[[mutation]]
+name = "guest-credential-store-may-be-inside-the-overlay"
+tier = "fast"
+guard = """
+The same hole #35 closed on the machine-id, on the credential. An unmounted
+/boot/firmware leaves the store a directory on the overlay's tmpfs: it agrees
+with /etc/shadow perfectly, on every boot, while nothing survives any of
+them, and every other clause of this check reads green."""
+tests = [
+  "tests/test_overlay_root.py::test_a_credential_store_inside_the_overlay_is_not_persistence",
+  "tests/test_overlay_root.py::test_a_root_nothing_could_describe_does_not_make_the_credential_kept",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = """                && [ "$STORE_SRC" != "?" ] && [ -n "$ROOT_SOURCE" ] \\
+                && [ "$STORE_SRC" != "$ROOT_SOURCE" ]; \\
+             then echo yes; else echo no; fi)" \\
+          "$CRED_STORE user="""
+replace = """                ; \\
+             then echo yes; else echo no; fi)" \\
+          "$CRED_STORE user="""
+
+
+[[mutation]]
+name = "guest-credential-recorded-with-nothing-applied"
+tier = "fast"
+guard = """
+The positive control boot2's whole claim rests on, and the clause that stops
+it certifying an absence. With no seeded hash in /etc/shadow the digest is
+the empty string, the record file holds the empty string, and the two match
+-- so boot1 would report that it recorded a credential for the next boot on a
+machine that has none. That is the two-absence hole the review caught on the
+machine-id side, arriving on this one."""
+tests = [
+  "tests/test_overlay_root.py::test_a_first_boot_with_no_credential_at_all_records_nothing_and_says_so",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = """          "$(if [ "$UC_APPLIED" = yes ] && [ "${#CRED_LIVE_DIGEST}" = 64 ] \\"""
+replace = """          "$(if [ "${#CRED_LIVE_DIGEST}" -ge 0 ] \\"""
+
+
+[[mutation]]
+name = "guest-credential-record-not-read-back"
+tier = "fast"
+guard = """
+The record is the one thing in boot2's comparison that the IMAGE did not
+write, so boot1 has to say it landed rather than that it tried. A boot
+partition that is full, read-only, or has something else at that path leaves
+boot2 holding this boot's hash against nothing at all."""
+tests = [
+  "tests/test_overlay_root.py::test_a_record_that_never_reached_the_card_fails_boot1",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '                && [ "$CRED_READBACK" = "$CRED_LIVE_DIGEST" ]; \'
+replace = "                ; \\"
+
+
+[[mutation]]
+name = "guest-credential-two-absences-accepted"
+tier = "fast"
+guard = """
+Two empty strings are equal. An unreadable /etc/shadow in boot2 and a record
+file boot1 never wrote compare the same as a password that survived the power
+cycle, so "the credential survived" would come to mean "there was never a
+credential" -- on the exact machine this change exists to stop shipping."""
+#
+# THE TEST HERE IS A BROKEN sha256sum, and it took the gate to find that out.
+# `test_two_absences_are_not_a_credential_that_survived` and
+# `test_a_second_boot_with_a_password_but_no_record_fails` were listed first
+# and NEITHER goes red for this edit -- measured, both green: an empty
+# /etc/shadow entry is caught by the salt clause and an absent record is
+# caught by the equality. The length clauses are load-bearing only when the
+# salt IS present and both digests are empty, which is one missing command
+# away: `cred_digest` pipes into sha256sum and returns what comes back, so a
+# broken one empties both sides on the same machine, and boot1 writes the
+# empty string into the record for boot2 to match.
+tests = [
+  "tests/test_overlay_root.py::test_a_digest_nothing_could_compute_is_not_a_match",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = """                && [ "${#CRED_LIVE_DIGEST}" = 64 ] \\
+                && [ "${#CRED_BOOT1}" = 64 ] \\"""
+replace = "                \\"
+
+
+[[mutation]]
+name = "guest-credential-may-have-come-from-a-seed-this-boot"
+tier = "fast"
+guard = """
+The clause that makes boot2's check a statement about a POWER CYCLE rather
+than about a wizard. A userconf.txt still on the card is a boot where the
+seed may have been applied a moment ago -- the delete failed, or it was never
+consumed -- and it is also the rejected "keep the seed file" option arriving
+by accident, with the operator's credential line readable in any card reader
+for the life of the device."""
+tests = [
+  "tests/test_overlay_root.py::test_a_password_that_could_have_come_from_a_seed_this_boot_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = """                && [ ! -e "$BOOTDIR/userconf.txt" ] \\
+                && [ ! -e "$BOOTDIR/userconf" ]; \\"""
+replace = "                ; \\"
+
+
+[[mutation]]
+name = "guest-credential-attribution-dropped"
+tier = "fast"
+guard = """
+The salt marker is what says the hash in force came from the SEED. pi-gen
+hashes FIRST_USER_PASS with a random salt, so a machine that reverted to the
+build-time password cannot carry it -- and without this clause the digest
+comparison alone would pass a boot2 whose record boot1 had written from that
+same reverted hash."""
+#
+# NOT `test_a_second_boot_back_on_the_build_time_password_fails`, which was
+# listed first and stays green for this edit: its record holds the digest of
+# the SEEDED hash, so the equality clause fails on its own. The salt is
+# load-bearing only when the digests agree -- and they agree perfectly on a
+# unit that never persisted anything, because pi-gen's build-time password
+# does not change from boot to boot either. That is the image this check
+# exists to fail.
+tests = [
+  "tests/test_overlay_root.py::test_the_same_password_in_both_boots_is_not_the_seeded_one",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '          "$(if [ "$CRED_FROM_SEED" = yes ] \'
+replace = '          "$(if [ -n "$CRED_FROM_SEED" ] \'
+
+
+[[mutation]]
+name = "tier3-credential-checks-not-required"
+tier = "fast"
+guard = """
+The named-check gate over the credential, and the release note that quotes
+it. Drop the names and both boots pass everything else -- the seed is
+applied, the wizard is quiet, the overlay discards, the identity survives --
+while the operator's password is gone at the power cycle and a note attached
+to a tag says it is not."""
+tests = [
+  "tests/test_img_verdict.py::test_the_harness_and_the_guest_agree_on_which_checks_exist",
+  "tests/test_image_workflow.py::test_the_release_notes_credential_claim_is_backed_by_the_harness",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = """ \\
+credential-recorded-outside-the-overlay credential-recorded-for-the-next-boot\""""
+replace = '"'
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = """ \\
+credential-survives-the-power-cycle\""""
+replace = '"'
