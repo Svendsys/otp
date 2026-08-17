@@ -36,6 +36,12 @@ INSTALL = REPO / "device" / "install.sh"
 IMG_BOOT = REPO / "harness" / "img-boot.sh"
 GUEST_CHECK = REPO / "harness" / "img-guest-check.sh"
 IMGCHECK_UNIT = REPO / "device" / "systemd" / "otp-unit-imgcheck.service"
+IDENTITY_SH = REPO / "device" / "persist-identity.sh"
+
+# What a machine-id looks like once systemd has generated one: 32 lower-case
+# hex characters. Both ends of the persistence -- the initramfs restore and
+# the guest check that reads it back -- are written around that shape.
+LIVE_ID = "0f9c2b4d6e8a1c3f5b7d9e0a2c4e6f81"
 
 
 def slice_between(text: str, first: str, last: str) -> str:
@@ -366,6 +372,271 @@ def test_install_sh_no_longer_tells_the_operator_to_run_raspi_config():
     assert not instructions, instructions
 
 
+# --- the one file the overlay lets through --------------------------------
+
+MACHINE_ID_FN = ("otp_restore_machine_id()\n{", "\treturn 0\n}")
+
+# The initrd has klibc's mount, which really mounts. Here it does not: the
+# test lays the fake card's contents at the mountpoint itself and this stands
+# in for the syscall, so what is exercised is the function's own logic --
+# which candidate it tries, what it accepts, and where it writes.
+MOUNT_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >> "$MOUNT_LOG"
+[ -z "${MOUNT_REFUSES-}" ] || exit 1
+exit 0
+"""
+UMOUNT_STUB = """#!/bin/sh
+printf 'umount %s\\n' "$*" >> "$MOUNT_LOG"
+exit 0
+"""
+
+
+def run_machine_id_restore(tmp_path, *, stored=LIVE_ID, mountable=True,
+                           make_store=True):
+    """Run the shipped initramfs function against a tree this test builds."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    mnt = tmp_path / "mnt"
+    (mnt / "otp-identity").mkdir(parents=True, exist_ok=True)
+    if make_store and stored is not None:
+        (mnt / "otp-identity" / "machine-id").write_text(stored + "\n")
+    rootmnt = tmp_path / "root"
+    (rootmnt / "etc").mkdir(parents=True, exist_ok=True)
+    # The device the first candidate resolves to. `${ROOT%p[0-9]}p1` turns
+    # .../mmcblk0p2 into .../mmcblk0p1, which is the derivation the shipped
+    # line makes on a Pi.
+    (tmp_path / "mmcblk0p1").write_text("")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name, body in (("mount", MOUNT_STUB), ("umount", UMOUNT_STUB)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+
+    runner = tmp_path / "restore.sh"
+    runner.write_text(
+        "set -u\n"
+        f'ROOT="{tmp_path}/mmcblk0p2"\n'
+        f'rootmnt="{rootmnt}"\n'
+        f'OTP_IDENTITY_MNT="{mnt}"\n'
+        + slice_between(INSTALL.read_text(), *MACHINE_ID_FN) + "\n"
+        "otp_restore_machine_id\n"
+        'printf "rc=%s\\n" "$?"\n')
+    env = {**os.environ, "MOUNT_LOG": str(tmp_path / "mount.log"),
+           "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    if not mountable:
+        env["MOUNT_REFUSES"] = "1"
+    proc = subprocess.run(["bash", str(runner)], capture_output=True,
+                          text=True, timeout=60, env=env)
+    restored = rootmnt / "etc" / "machine-id"
+    return proc, (restored.read_text().strip() if restored.exists() else None)
+
+
+def test_the_initramfs_puts_the_stored_machine_id_where_pid_1_will_read_it(tmp_path):
+    """
+    The positive control. PID 1 reads /etc/machine-id before it looks at a
+    single unit, so this is the last moment anything can put it there -- and
+    the file has to land inside the assembled overlay, not beside it.
+    """
+    proc, restored = run_machine_id_restore(tmp_path)
+    assert "rc=0" in proc.stdout, proc.stderr
+    assert restored == LIVE_ID, proc.stdout
+
+
+def test_the_identity_partition_is_mounted_read_only(tmp_path):
+    """
+    The whole point of the mechanism this rides in is that the boot never
+    holds a writable handle on storage it is not writing to. Reading a
+    machine-id needs none.
+    """
+    run_machine_id_restore(tmp_path)
+    calls = (tmp_path / "mount.log").read_text().splitlines()
+    mounts = [c for c in calls if not c.startswith("umount")]
+    assert mounts, "the function never tried to mount anything"
+    assert all(" -r " in f" {c} " for c in mounts), mounts
+
+
+def test_a_machine_id_that_is_not_32_hex_characters_is_not_written(tmp_path):
+    """
+    systemd rejects a malformed id and calls the boot a first boot -- which
+    is the state this exists to leave, arrived at by a longer route. Anything
+    that is not exactly the shape systemd accepts must be dropped here, where
+    the image's own file is still standing.
+    """
+    for bad in ("uninitialized", "", "deadbeef", LIVE_ID + "0", LIVE_ID[:-1] + "Z"):
+        proc, restored = run_machine_id_restore(tmp_path / f"bad-{len(bad)}-{bad[:4]}",
+                                                stored=bad)
+        assert "rc=0" in proc.stdout, proc.stderr
+        assert restored is None, f"{bad!r} was written as a machine-id"
+
+
+def test_a_card_with_no_stored_identity_leaves_the_boot_alone(tmp_path):
+    """Never fatal. The overlay panics when it fails because a unit that
+    booted writable is the one thing it exists to prevent; an identity is
+    not that, and a first boot is what this machine did before."""
+    proc, restored = run_machine_id_restore(tmp_path, make_store=False)
+    assert "rc=0" in proc.stdout, proc.stderr
+    assert restored is None
+
+
+def test_a_partition_that_will_not_mount_leaves_the_boot_alone(tmp_path):
+    proc, restored = run_machine_id_restore(tmp_path, mountable=False)
+    assert "rc=0" in proc.stdout, proc.stderr
+    assert restored is None
+
+
+def test_the_overlay_restores_the_machine_id_after_it_is_assembled(tmp_path):
+    """
+    Ordering, and it is not cosmetic: the write goes THROUGH the overlay into
+    its tmpfs upper layer, so a call placed before the mount would write to
+    the initrd's own root and vanish at pivot -- silently, with the boot
+    looking exactly the same.
+    """
+    script = overlay_script()
+    assert "otp_restore_machine_id" in script, \
+        "the overlay script no longer restores the machine-id, so every " \
+        "boot is a first boot again"
+    called = script.index("\n\totp_restore_machine_id")
+    assembled = script.index('panic "Failed to assemble the root overlay."')
+    assert called > assembled, \
+        "otp_restore_machine_id runs before the overlay is mounted, so it " \
+        "writes to the initrd's root and the write is lost at pivot"
+
+
+# --- the userspace half: recording it, and the host keys ------------------
+
+# persist-identity.sh asks findmnt the same question the guest probe does:
+# which filesystem contains the store. The stub answers out of the
+# environment, so a test can put the store inside the overlay without needing
+# two real filesystems -- which no CI runner reliably has under /tmp.
+IDENTITY_FINDMNT_STUB = """#!/bin/sh
+case "$*" in
+    *--target*) printf '%s\\n' "${FAKE_STORE_SRC-/dev/mmcblk0p1}" ;;
+    *" /") printf '%s\\n' "${FAKE_ROOT_SRC-overlay}" ;;
+    *) echo "stub: unexpected findmnt $*" >&2; exit 64 ;;
+esac
+"""
+
+
+def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
+                         etc_keys=("ed25519",), store_keys=(),
+                         store_src="/dev/mmcblk0p1"):
+    """Run the shipped script against a fake boot partition and a fake /etc."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    boot = tmp_path / "boot"
+    (boot / "otp-identity" / "ssh").mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "root"
+    (root / "etc" / "ssh").mkdir(parents=True, exist_ok=True)
+    if machine_id is not None:
+        (root / "etc" / "machine-id").write_text(machine_id + "\n")
+    if stored_id is not None:
+        (boot / "otp-identity" / "machine-id").write_text(stored_id + "\n")
+    for name in etc_keys:
+        (root / "etc" / "ssh" / f"ssh_host_{name}_key").write_text(f"live {name}\n")
+        (root / "etc" / "ssh" / f"ssh_host_{name}_key.pub").write_text(f"pub {name}\n")
+    for name in store_keys:
+        (boot / "otp-identity" / "ssh" / f"ssh_host_{name}_key").write_text(
+            f"stored {name}\n")
+        (boot / "otp-identity" / "ssh" / f"ssh_host_{name}_key.pub").write_text(
+            f"storedpub {name}\n")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "findmnt").write_text(IDENTITY_FINDMNT_STUB)
+    (bin_dir / "findmnt").chmod(0o755)
+    proc = subprocess.run(
+        ["bash", str(IDENTITY_SH), "--boot-dir", str(boot), "--root", str(root)],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "FAKE_STORE_SRC": store_src,
+             "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    return proc, boot, root
+
+
+def test_a_first_boot_records_what_it_has(tmp_path):
+    # The positive control: the store starts empty and comes out holding this
+    # machine's identity.
+    proc, boot, _ = run_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert (boot / "otp-identity" / "machine-id").read_text().strip() == LIVE_ID
+    assert (boot / "otp-identity" / "ssh" / "ssh_host_ed25519_key").read_text() \
+        == "live ed25519\n"
+
+
+def test_a_later_boot_puts_the_kept_host_keys_back(tmp_path):
+    proc, _, root = run_persist_identity(
+        tmp_path, stored_id=LIVE_ID, store_keys=("ed25519",), etc_keys=())
+    assert proc.returncode == 0, proc.stderr
+    restored = root / "etc" / "ssh" / "ssh_host_ed25519_key"
+    assert restored.read_text() == "stored ed25519\n"
+    # FAT cannot carry the mode, so it is re-applied here. sshd refuses a
+    # private key it can read from a group or from the world, and says so
+    # only in its own log.
+    assert oct(restored.stat().st_mode)[-3:] == "600", oct(restored.stat().st_mode)
+
+
+def test_a_store_inside_the_overlay_is_refused_rather_than_written(tmp_path):
+    """
+    The guard that stops the whole script being a no-op nobody notices.
+    If /boot/firmware never mounted, $BOOT_DIR is a directory on the
+    overlay's tmpfs: every copy agrees with its original, on every boot, and
+    nothing survives any of them.
+    """
+    proc, boot, _ = run_persist_identity(tmp_path, store_src="overlay")
+    assert proc.returncode != 0, proc.stdout
+    assert not (boot / "otp-identity" / "machine-id").exists(), \
+        "it wrote into the overlay anyway"
+
+
+def test_a_kept_machine_id_is_not_overwritten_by_a_boot_that_lost_it(tmp_path):
+    """
+    A stored id that does not match the running one means the initramfs
+    restore did not happen. The stored value is the one that still has a
+    chance of being restored, so replacing it with this boot's random id
+    would make the store chase a value that changes every boot.
+    """
+    other = "ffffffffffffffffffffffffffffffff"
+    proc, boot, _ = run_persist_identity(tmp_path, stored_id=other)
+    assert proc.returncode != 0, proc.stdout
+    assert (boot / "otp-identity" / "machine-id").read_text().strip() == other
+
+
+# --- ssh.socket, which turned a documented reload into a dead sshd --------
+
+SSH_SOCKET_BLOCK = ("# --- AND THE RELOAD AT THE END OF THAT SAME SCRIPT",
+                    "systemctl mask ssh.socket")
+
+
+def test_the_socket_that_kept_sshd_from_rebinding_is_masked(tmp_path):
+    """
+    cancel-rename ends a seeded first boot with `systemctl --quiet reload
+    ssh`. With ssh.socket holding :22, sshd runs on an inherited descriptor,
+    its SIGHUP re-exec has nothing left to adopt, and RestartPreventExitStatus
+    =255 keeps it down for the rest of the boot -- run 72, boot 1.
+
+    MASKED rather than disabled, and that is the half worth asserting: the
+    enable symlinks live in /etc/systemd/system, which is inside the overlay,
+    so a disable lasts one boot and the next first-boot preset-all puts the
+    socket straight back.
+    """
+    block = slice_between(INSTALL.read_text(), *SSH_SOCKET_BLOCK)
+    proc = run_block(block, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "mask ssh.socket" in systemctl_calls(tmp_path), \
+        systemctl_calls(tmp_path)
+
+
+def test_ssh_service_itself_is_left_alone(tmp_path):
+    """
+    Masking the SERVICE would be the other way to stop the reload -- the
+    guard in cancel-rename is `systemctl --quiet is-active ssh` -- and it is
+    refused. It leaves ssh.socket listening on :22 for a service that can
+    never start, and takes SSH off a machine as a side effect of a bug fix.
+    """
+    block = slice_between(INSTALL.read_text(), *SSH_SOCKET_BLOCK)
+    run_block(block, tmp_path)
+    for call in systemctl_calls(tmp_path):
+        assert call != "mask ssh.service", call
+        assert call != "mask ssh", call
+
+
 # --- the harness end ------------------------------------------------------
 
 def test_the_harness_copies_the_overlay_token_and_never_invents_one(tmp_path):
@@ -389,6 +660,142 @@ def test_the_harness_copies_the_overlay_token_and_never_invents_one(tmp_path):
                               text=True, timeout=30)
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout == expected, f"{cmdline!r} -> {proc.stdout!r}"
+
+
+REVISION_BLOCK = ("# --- the board revision the firmware would have supplied",
+                  'log "board revision $BOARD_REVISION synthesised into $DTB '
+                  '(the firmware\'s job)"')
+
+# fdtput/fdtget come from device-tree-compiler, which the image workflow
+# installs next to qemu and mtools and the fast suite does not have. Stubbed
+# so this runs anywhere: the "blob" is a text file and the property is a line
+# in it, which is enough for every branch under test.
+FDTPUT_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FDT_LOG"
+[ -z "${FDTPUT_DEAF-}" ] || exit 0
+# fdtput -c <blob> <node>, and fdtput -t x <blob> <node> <prop> <value>.
+case "$1" in
+    -c) exit 0 ;;
+    -t) printf '%s=%s\\n' "$5" "$6" >> "$3" ; exit 0 ;;
+esac
+exit 1
+"""
+# Shell builtins only: PATH below is cut down to the tools the block itself
+# uses, and reaching for sed here would make the stub depend on something the
+# code under test does not.
+FDTGET_STUB = """#!/bin/sh
+# fdtget <blob> <node> <prop>, printing the value as a decimal integer.
+value=""
+while IFS= read -r line; do
+    case "$line" in "$3="*) value="${line#*=}" ;; esac
+done < "$1"
+[ -n "$value" ] || exit 1
+printf '%d\\n' "$((value))"
+"""
+
+
+def run_revision_block(tmp_path, *, have_fdtput=True, fdtput_deaf=False):
+    """Run the shipped board-revision block over a stand-in for the DTB."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    work = tmp_path / "work"
+    (work / "boot").mkdir(parents=True, exist_ok=True)
+    dtb = work / "boot" / "bcm2710-rpi-3-b.dtb"
+    dtb.write_text("")
+    # A PATH with nothing on it but the tools the block uses, so
+    # `have_fdtput=False` really means absent -- on a developer's machine the
+    # real device-tree-compiler is usually installed, and inheriting PATH
+    # would make that test pass for the wrong reason there and fail in CI.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for tool in ("cp", "basename"):
+        real = shutil.which(tool)
+        assert real, f"{tool} is not on PATH, so this test cannot run"
+        (bin_dir / tool).symlink_to(real)
+    if have_fdtput:
+        for name, body in (("fdtput", FDTPUT_STUB), ("fdtget", FDTGET_STUB)):
+            (bin_dir / name).write_text(body)
+            (bin_dir / name).chmod(0o755)
+    runner = tmp_path / "revision.sh"
+    runner.write_text(
+        "set -euo pipefail\n"
+        "log() { printf 'LOG %s\\n' \"$*\"; }\n"
+        f'WORK="{work}"\nDTB="{dtb}"\n'
+        + slice_between(IMG_BOOT.read_text(), *REVISION_BLOCK) + "\n"
+        'printf "DTB=%s\\n" "$DTB"\n')
+    # PATH without the real device-tree-compiler even when the host has one,
+    # so `have_fdtput=False` really means absent.
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", str(runner)],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "FDT_LOG": str(tmp_path / "fdt.log"),
+             **({"FDTPUT_DEAF": "1"} if fdtput_deaf else {}),
+             "PATH": str(bin_dir)})
+    return proc, tmp_path / "fdt.log"
+
+
+def test_the_harness_supplies_the_board_revision_the_firmware_would_have(tmp_path):
+    """
+    QEMU is not the Pi firmware, so no /system/linux,revision reaches the
+    guest and rpi-eeprom-update.service dies on `(0x >> 23) & 1`. Measured on
+    a stock card under -M raspi3b: absent without this, 00a02082 with it, and
+    the service goes rc=2 to rc=0.
+    """
+    proc, log = run_revision_block(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text()
+    assert "linux,revision 0xa02082" in calls, calls
+    # The image's own DTB is left alone, so the evidence can still show what
+    # a device would have booted.
+    assert "otp-harness-" in proc.stdout, proc.stdout
+
+
+def test_a_revision_that_did_not_reach_the_blob_stops_the_boot(tmp_path):
+    """
+    A write that did nothing looks exactly like one that worked from here,
+    and the cost of not noticing is a red release gate blamed on the image
+    rather than on the emulator. So the property is read back.
+    """
+    proc, _ = run_revision_block(tmp_path, fdtput_deaf=True)
+    assert proc.returncode != 0
+    assert "linux,revision" in proc.stderr, proc.stderr
+
+
+def test_no_device_tree_compiler_stops_the_boot_rather_than_booting_without_it(tmp_path):
+    """
+    Booting without the property is booting the configuration this exists to
+    fix. A hard requirement, like mcopy: the failure has to name the missing
+    package rather than arrive half an hour later as a failed unit.
+    """
+    proc, _ = run_revision_block(tmp_path, have_fdtput=False)
+    assert proc.returncode != 0
+    assert "device-tree-compiler" in proc.stderr, proc.stderr
+
+
+def test_the_synthesised_revision_is_the_board_the_emulator_models():
+    """
+    A code for hardware `-M raspi3b` does not model is the run-1 DTB mistake
+    in a smaller font -- and gpiozero builds its whole board description from
+    these bits. Decoded against the scheme rpi-eeprom-update itself reads.
+    """
+    text = IMG_BOOT.read_text()
+    code = int(shell_assignment(text, "BOARD_REVISION"), 16)
+    assert (code >> 23) & 1, "new-style flag clear: rpi-eeprom-update would " \
+                             "call this a pre-2016 board and skip"
+    assert (code >> 12) & 0xF == 2, "processor is not BCM2837"
+    assert (code >> 4) & 0xFF == 0x08, "board type is not 3 Model B"
+    # 1GB, in the same units `-m 1024` gives the guest. A revision claiming
+    # more memory than the emulator provides is a description of a machine
+    # that is not there.
+    assert 256 * (2 ** ((code >> 20) & 7)) == 1024
+    assert "-M raspi3b -m 1024" in text, \
+        "the emulated machine moved; the revision above describes the old one"
+
+
+def shell_assignment(text: str, name: str) -> str:
+    """A plain NAME=value assignment, read out of a shipped script."""
+    match = re.search(rf"^{name}=(\S+)$", text, re.M)
+    assert match, f"{name} is gone"
+    return match.group(1)
 
 
 def test_the_harness_hands_the_initramfs_to_qemu():
@@ -1330,10 +1737,6 @@ case "$*" in
     *) echo "stub: unexpected findmnt $*" >&2; exit 64 ;;
 esac
 """
-
-# What the running machine's own machine-id looks like: 32 hex characters.
-LIVE_ID = "0f9c2b4d6e8a1c3f5b7d9e0a2c4e6f81"
-
 
 def run_identity(tmp_path, *, phase="boot1", live_id=LIVE_ID, stored_id=LIVE_ID,
                  host_keys=("ed25519-a", "rsa-a"), recorded=None,

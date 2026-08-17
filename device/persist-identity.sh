@@ -38,10 +38,36 @@
 # fix, and a script that shrugged at it would leave the fault in place with
 # nothing to read. The unit is WantedBy= rather than RequiredBy= sysinit,
 # so a failure here is loud without holding the boot open.
+#
+# TWO OPTIONS, AND THEY EXIST TO BE TESTED. otp-unit-identity.service passes
+# neither, so the shipped behaviour is the defaults; tests/test_overlay_root.py
+# passes both, because every path here is absolute and a script whose only
+# exercise is an emulated boot is one whose failure modes are found by an
+# emulated boot. Same shape as device/install.sh's own option loop.
+#
+#   --boot-dir DIR   where the persistent store lives
+#   --root DIR       a prefix for /etc and for `ssh-keygen -A`, which takes
+#                    one with -f. A prefix rather than a bare --etc so that
+#                    the generate branch really can be exercised: -A writes
+#                    to <prefix>/etc/ssh, so the two would otherwise disagree
+#                    about where the keys went.
 set -uo pipefail
 
-BOOT_DIR=/boot/firmware
-[ -d "$BOOT_DIR" ] || BOOT_DIR=/boot
+BOOT_DIR=""
+ROOT_DIR=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --boot-dir) BOOT_DIR="${2:-}"; shift ;;
+        --root) ROOT_DIR="${2:-}"; shift ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+ETC_DIR="$ROOT_DIR/etc"
+if [ -z "$BOOT_DIR" ]; then
+    BOOT_DIR=/boot/firmware
+    [ -d "$BOOT_DIR" ] || BOOT_DIR=/boot
+fi
 STORE="$BOOT_DIR/otp-identity"
 SSH_STORE="$STORE/ssh"
 
@@ -57,13 +83,17 @@ rc=0
 # from the value it had just lost. Every read-back would agree with itself
 # and nothing would ever look wrong.
 #
-# st_dev, because that is the question: is the store on the same filesystem
-# as /? An overlayfs root and a vfat partition have different device
-# numbers; a directory inside the root has the same one.
-if [ "$(stat -c %d "$BOOT_DIR" 2>/dev/null)" = "$(stat -c %d / 2>/dev/null)" ]; then
-    note "$BOOT_DIR is on the same filesystem as /, so it is INSIDE the"
-    note "  read-only overlay and nothing written there survives a power"
-    note "  cycle. Refusing to pretend this unit has a stable identity."
+# findmnt --target answers for the CONTAINING mount, so a store that is just
+# a directory inside the root reports the root's source rather than nothing.
+# Same call and same reasoning as harness/img-guest-check.sh's
+# boot-partition-separate, which is the check that reads this from outside.
+STORE_SRC=$(findmnt -no SOURCE --target "$BOOT_DIR" 2>/dev/null || true)
+ROOT_SRC=$(findmnt -no SOURCE / 2>/dev/null || true)
+if [ -z "$STORE_SRC" ] || [ "$STORE_SRC" = "$ROOT_SRC" ]; then
+    note "$BOOT_DIR is on the same filesystem as / (${STORE_SRC:-unknown}), so"
+    note "  it is INSIDE the read-only overlay and nothing written there"
+    note "  survives a power cycle. Refusing to pretend this unit has a"
+    note "  stable identity."
     exit 1
 fi
 
@@ -79,14 +109,14 @@ fi
 # this is the ID systemd generated a moment ago; on every boot after it, it
 # is the one the initramfs restored (see the overlay script in
 # device/install.sh).
-live=$(cat /etc/machine-id 2>/dev/null)
+live=$(cat "$ETC_DIR/machine-id" 2>/dev/null)
 case "$live" in
     ""|*[!0-9a-f]*) live="" ;;
 esac
 [ "${#live}" = 32 ] || live=""
 
 if [ -z "$live" ]; then
-    note "/etc/machine-id is not 32 hex characters, so there is no identity"
+    note "$ETC_DIR/machine-id is not 32 hex characters, so there is no identity"
     note "  to keep. systemd will call every boot a first boot."
     rc=1
 elif [ ! -s "$STORE/machine-id" ]; then
@@ -116,11 +146,7 @@ fi
 
 # --- the SSH host keys ----------------------------------------------------
 
-if ! command -v ssh-keygen >/dev/null 2>&1; then
-    note "no ssh-keygen here, so there are no host keys to look after"
-    exit "$rc"
-fi
-install -d -m 0755 /etc/ssh
+install -d -m 0755 "$ETC_DIR/ssh"
 
 shopt -s nullglob
 stored=("$SSH_STORE"/ssh_host_*_key)
@@ -130,8 +156,8 @@ if [ "${#stored[@]}" -gt 0 ]; then
     # because sshd refuses to load one that is group- or world-readable and
     # says so only in its own log.
     for key in "${stored[@]}"; do
-        install -m 0600 "$key" /etc/ssh/ || rc=1
-        [ -f "$key.pub" ] && { install -m 0644 "$key.pub" /etc/ssh/ || rc=1; }
+        install -m 0600 "$key" "$ETC_DIR/ssh/" || rc=1
+        [ -f "$key.pub" ] && { install -m 0644 "$key.pub" "$ETC_DIR/ssh/" || rc=1; }
     done
     note "restored ${#stored[@]} host key(s) from $SSH_STORE"
 else
@@ -142,15 +168,25 @@ else
     # Pi you already have" path there is no first boot, that unit does not
     # run, and adopting means the machine KEEPS the host key people already
     # know rather than having it silently replaced by a provisioning script.
-    live_keys=(/etc/ssh/ssh_host_*_key)
+    #
+    # ssh-keygen IS ONLY NEEDED BY THE GENERATE BRANCH, and the check sits
+    # here rather than at the top of this section for that reason. Restoring
+    # or adopting keys is file copying; refusing to do it on a machine that
+    # has no ssh-keygen yet would mean a unit that gains openssh later comes
+    # up with keys nothing kept.
+    live_keys=("$ETC_DIR"/ssh/ssh_host_*_key)
     if [ "${#live_keys[@]}" -eq 0 ]; then
-        note "no host keys anywhere yet; generating this unit's own"
-        ssh-keygen -A >/dev/null 2>&1 || rc=1
-        live_keys=(/etc/ssh/ssh_host_*_key)
+        if command -v ssh-keygen >/dev/null 2>&1; then
+            note "no host keys anywhere yet; generating this unit's own"
+            # shellcheck disable=SC2086  # the prefix is one word or none
+            ssh-keygen -A ${ROOT_DIR:+-f "$ROOT_DIR"} >/dev/null 2>&1 || rc=1
+            live_keys=("$ETC_DIR"/ssh/ssh_host_*_key)
+        else
+            note "no host keys and no ssh-keygen: there is nothing to keep"
+        fi
     fi
     if [ "${#live_keys[@]}" -eq 0 ]; then
-        note "still no host keys after ssh-keygen -A"
-        rc=1
+        note "no host keys to record in $SSH_STORE"
     fi
     for key in "${live_keys[@]}"; do
         # `cp`, NOT `install -m`. A chmod to a mode vfat cannot represent is

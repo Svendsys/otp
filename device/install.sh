@@ -843,11 +843,19 @@ else
 # characters all leave /etc/machine-id exactly as the image shipped it,
 # which is the behaviour this replaces rather than a new failure. What
 # notices is tier 3, not the boot.
+#
+# THE MOUNTPOINT IS A VARIABLE for the same reason $BOOTDIR is one in the
+# guest probe: tests/test_overlay_root.py runs this function against a tree
+# it can build, with stub mount/umount on PATH. A hardcoded path would leave
+# the only exercise of it an emulated boot of an image nobody can build
+# locally, which is the one place a mistake here is expensive to find.
+OTP_IDENTITY_MNT=/otp-identity
+
 otp_restore_machine_id()
 {
 	local dev id
 
-	mkdir -p /otp-identity
+	mkdir -p "${OTP_IDENTITY_MNT}"
 	# CANDIDATES, AND A MARKER, rather than a guess. On the Pi the FAT
 	# partition is always partition 1 of the card the root came off, so the
 	# first candidate is ${ROOT} with its partition number replaced; the
@@ -857,9 +865,9 @@ otp_restore_machine_id()
 	# persistence puts there, so mounting the wrong thing does nothing.
 	for dev in "${ROOT%p[0-9]}p1" /dev/mmcblk0p1; do
 		[ -e "${dev}" ] || continue
-		mount -r -t vfat "${dev}" /otp-identity 2>/dev/null || continue
-		id=$(cat /otp-identity/otp-identity/machine-id 2>/dev/null)
-		umount /otp-identity 2>/dev/null || true
+		mount -r -t vfat "${dev}" "${OTP_IDENTITY_MNT}" 2>/dev/null || continue
+		id=$(cat "${OTP_IDENTITY_MNT}/otp-identity/machine-id" 2>/dev/null)
+		umount "${OTP_IDENTITY_MNT}" 2>/dev/null || true
 		# 32 lower-case hex characters, which is the only thing systemd
 		# accepts. A short, empty or corrupt value is dropped rather than
 		# written: systemd would reject it and call the boot a first boot,
