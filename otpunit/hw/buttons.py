@@ -232,8 +232,8 @@ class GpioButtons(Buttons):
     # to drive the timing logic without a gpiozero -- still has something to
     # count with. An AttributeError here would NOT escape the guard: the
     # counting happens inside the inner try, so the cost of missing these
-    # would be the log line, not the thread. The fallback is so that panel
-    # still reports, not so that it survives.
+    # would be the log line, not the thread. The fallback is so that such a
+    # panel still reports, not so that it survives.
     #
     # `_dropped` and not `dropped` because `self.dropped += 1` on a class
     # attribute rebinds an INSTANCE one: the class attribute would then read
