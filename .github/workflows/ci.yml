@@ -42,7 +42,7 @@ jobs:
     # tests/mutations.toml.
     #
     # PER PR, not nightly, and that is measured rather than assumed: the fast
-    # tier is 159 mutations in 190 seconds ON THE DEVELOPMENT CONTAINER, not
+    # tier is 164 mutations in 196 seconds ON THE DEVELOPMENT CONTAINER, not
     # on this runner -- the number is a development-time figure and always has
     # been, and a reader meeting it inside this job's own comment block will
     # otherwise take it for this job's runtime, which is a different and
@@ -53,8 +53,8 @@ jobs:
     # `python3 tests/mutation_gate.py --tier fast` and read its last line
     # before touching this sentence. The seconds are noisier than the count:
     # three runs of the same 159 rows on the same container measured 232s,
-    # 190s and 192s, so treat the figure as an order of magnitude and the
-    # row count as exact.
+    # 190s and 192s, and two of the 164 rows measured 196s and 198s -- so
+    # treat the figure as an order of magnitude and the row count as exact.
     #
     # It stopped being cheaper than the suite it audits at that count. Twelve
     # of the rows added for the local rig (issue #22) are behavioural rather

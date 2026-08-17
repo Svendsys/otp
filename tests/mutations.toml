@@ -3488,3 +3488,27 @@ file = "otpunit/hw/buttons.py"
 find = """        self._pressed_at = None
         self._pressed_at = time.monotonic()"""
 replace = "        self._pressed_at = time.monotonic()"
+
+[[mutation]]
+name = "panel-report-longer-than-the-pipe-will-take"
+tier = "fast"
+guard = """
+The length half of the same promise. `select()` answering "writable" for a
+pipe promises PIPE_BUF (4096) bytes and no more -- a longer write puts the
+first 4096 in and parks in the kernel for the rest -- so asking the question
+only proves anything if the message is capped below it. The report is built
+from an exception's str() and a formatted traceback, neither of which this
+code chooses the length of: a deep stack or a chatty OSError is enough.
+
+A truncated line in the journal is a diagnostic. A parked dispatch thread is
+a dead panel with three buttons that do nothing.
+
+The mutation removes the cap. The named test writes 100 KB at a 4 KiB pipe
+that has room and requires `_report` to come back."""
+tests = [
+  "tests/test_hardware.py::TestALostPressIsSaidOutLoud::test_a_report_too_long_for_the_pipe_is_cut_rather_than_parked",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "    if len(message) > REPORT_MAX_CHARS:"
+replace = "    if False:      # mutation: no cap on the length of a report"

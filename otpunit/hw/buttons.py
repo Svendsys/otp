@@ -85,6 +85,15 @@ def _report(message: str) -> None:
         # print(file=None) writes to STDOUT, which on the simulator is the
         # panel itself. Losing the line beats drawing on it.
         return
+    if not message.isascii():
+        # PIPE_BUF counts BYTES and the cap below counts characters, which
+        # are the same number only for ASCII -- and an exception message
+        # can carry accents or a U+FFFD from a decode with
+        # errors="replace" (see ui.wrap, which has the same problem in the
+        # other direction). Escaping is cheaper than encoding twice to
+        # measure, and `isascii` is a flag lookup, so the common path pays
+        # nothing.
+        message = message.encode("ascii", "backslashreplace").decode("ascii")
     if len(message) > REPORT_MAX_CHARS:
         message = message[:REPORT_MAX_CHARS] + " [...truncated]"
     try:

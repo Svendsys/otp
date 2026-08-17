@@ -351,7 +351,10 @@ class JournalPipe:
             wait = 0 if got else max(0.0, deadline - time.monotonic())
             if not select.select([self._read], (), (), wait)[0]:
                 return got
-            got += os.read(self._read, 65536).decode("utf-8", "replace")
+            chunk = os.read(self._read, 65536)
+            if not chunk:
+                return got                       # the write end went away
+            got += chunk.decode("utf-8", "replace")
 
     def wedge(self):
         """Fill it to the brim. From here a write blocks rather than fails."""
@@ -364,11 +367,18 @@ class JournalPipe:
         finally:
             os.set_blocking(self._write, True)
 
-    def close(self):
-        # Drain first: anything parked in write(2) on this pipe has to be
-        # let go before the test can end, and a daemon thread left parked
-        # would take its fds with it into the next test.
-        self.take(timeout=0)
+    def close(self, timeout=5.0):
+        # Drain until nothing more comes, and only then close. Two reasons,
+        # both learned by hanging: a writer parked in write(2) has to be let
+        # go or the daemon thread holding it goes into the next test, and a
+        # writer with more to say parks again the moment the buffer refills,
+        # so one read is not enough. Closing underneath one of those blocks
+        # on the file object's own lock -- a teardown hang, in a test that
+        # has already decided it failed, which the mutation gate scores as
+        # BROKEN rather than caught.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self.take(timeout=0.2):
+            pass
         try:
             self.stream.close()
         except OSError:                          # pragma: no cover
@@ -756,6 +766,46 @@ class TestALostPressIsSaidOutLoud:
         captured = capsys.readouterr()
         assert "otp: front panel: hello" in captured.err
         assert captured.out == "", "stdout is the simulator's panel"
+
+    def test_a_report_too_long_for_the_pipe_is_cut_rather_than_parked(self):
+        """
+        The other half of not blocking, and the half that is easy to lose.
+
+        `select()` answering "writable" for a pipe promises PIPE_BUF (4096)
+        bytes and no more: a longer write puts the first 4096 in and parks
+        in the kernel for the rest. The report is built from an exception's
+        `str()` and a formatted traceback, neither of which this code gets
+        to choose the length of -- a deep stack or a chatty OSError is
+        enough -- so it is capped below PIPE_BUF before the question is
+        asked. A truncated line in the journal is a diagnostic; a parked
+        dispatch thread is a dead panel.
+        """
+        journal = JournalPipe()
+        done = threading.Event()
+
+        def report():
+            try:
+                buttons_mod._report("y" * 100_000)
+            finally:
+                done.set()
+
+        writer = threading.Thread(target=report, daemon=True)
+        saved, sys.stderr = sys.stderr, journal.stream
+        try:
+            writer.start()
+            finished = done.wait(5)
+            written = journal.take(timeout=1)
+        finally:
+            sys.stderr = saved
+            journal.close()
+
+        assert finished, (
+            "_report did not return: a message longer than the pipe would "
+            "take parked the caller inside write(2), and on the unit that "
+            "caller is the thread every button shares")
+        assert 0 < len(written) <= buttons_mod.REPORT_MAX_CHARS + 64
+        assert "truncated" in written, (
+            f"the line was cut without saying so: {written[-80:]!r}")
 
     def test_it_names_the_press_that_was_lost(self, monkeypatch, reports):
         """

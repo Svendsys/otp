@@ -1100,12 +1100,12 @@ stayed green.
 
 ```sh
 python3 tests/mutation_gate.py --list
-python3 tests/mutation_gate.py --tier fast       # 159 rows, 190s
+python3 tests/mutation_gate.py --tier fast       # 164 rows, 196s
 sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
 ```
 
 **Runtime decided the trigger.** The issue expected nightly or
-label-triggered; measured, the fast tier is about three minutes at 159 rows
+label-triggered; measured, the fast tier is about three minutes at 164 rows
 — still cheaper than the suite it audits — so it runs per pull
 request as its own `mutation` job, and the ordinary suite's wall clock does
 not move. The three CUPS-rig rows run in the existing `hardware` job, the
@@ -1115,7 +1115,8 @@ paragraph still said 38 rows and twenty-nine seconds long after both had
 moved, and the revision after that said 114 rows for a round in which there
 were 115, and it sat at 145 rows and 123s for two rounds after that. The row
 count is exact and the seconds are not: three runs of the same 159 rows on
-the same container measured 232s, 190s and 192s.
+the same container measured 232s, 190s and 192s, and two runs of the 164
+rows measured 196s and 198s.
 
 Every way this could rot into a no-op is a loud failure rather than a skip: a
 `find` string that no longer matches (the fast suite checks that much without
