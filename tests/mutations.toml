@@ -2647,3 +2647,361 @@ file = "harness/img-boot.sh"
 find = '''    awk '!/^\[[^]]*\] [^ ]+\[[0-9]+\]:/ || /^\[[^]]*\] systemd\[1\]:/' \
         "$1" 2>/dev/null || true'''
 replace = '''    awk '!/^\[[^]]*\] [^ ]+\[[0-9]+\]:/' "$1" 2>/dev/null || true'''
+
+
+# --- the local repro rig, harness/img-local-rig.sh ------------------------
+#
+# A DEBUGGING TOOL WITH NO CI WIRING (issue #22), which is exactly why it
+# needs rows. Nothing runs it per commit, so nothing else in this repository
+# would notice it rotting -- and its value is entirely "existing and being
+# CURRENT". A rig that boots a subtly different machine than tier 3 is worse
+# than no rig: it answers confidently about somewhere else, and the answer
+# gets believed precisely because it arrived in twenty seconds instead of
+# sixteen minutes.
+#
+# Two clusters. The first holds the rig's machine against img-boot.sh's, so
+# neither can drift alone. The second is the rig's own preconditions: every
+# one of them, unmet, produces the SAME console -- nothing at all, or a stop
+# at "Run /init as init process" -- and telling those apart is the most
+# expensive thing in this harness's history. Each is named before the
+# emulator starts, and these rows are what keeps them able to say so.
+
+[[mutation]]
+name = "rig-boots-a-different-machine-than-tier-3"
+tier = "fast"
+guard = """
+The rig's whole value is that a finding transfers to tier 3 without a
+build. It transfers only if the machine is the same one, and nothing but
+this comparison says so -- the two scripts are separate files with
+separate qemu invocations, and the rig's own header is where the claim
+would otherwise live."""
+tests = [
+  "tests/test_local_rig.py::test_the_rig_boots_the_machine_img_boot_boots",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''RIG_MACHINE=raspi3b'''
+replace = '''RIG_MACHINE=raspi2b'''
+
+[[mutation]]
+name = "rig-kernel-cmdline-drifts-from-tier-3"
+tier = "fast"
+guard = """
+The rig's kernel command line must be a SUBSET of img-boot.sh's. This is
+the ttyAMA1 discovery as a guard: console=ttyAMA0 named a device this DTB
+does not have, no real console registered, and six runs of issue #17 were
+spent diagnosing the resulting silence as a boot freeze. The same clause
+covers the watchdog blacklist -- dropping
+initcall_blacklist=bcm2835_pm_driver_init puts the ~11.5s reset back and
+every probe dies mid-answer for a reason that is not the one under test."""
+tests = [
+  "tests/test_local_rig.py::test_every_kernel_parameter_the_rig_passes_is_one_tier_3_passes",
+  "tests/test_local_rig.py::test_no_tier_3_parameter_is_dropped_without_a_stated_reason",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''RIG_CONSOLE=ttyAMA1'''
+replace = '''RIG_CONSOLE=ttyAMA0'''
+
+[[mutation]]
+name = "rig-synthesises-a-different-board-than-tier-3"
+tier = "fast"
+guard = """
+QEMU is not the firmware, so both scripts write linux,revision into the
+DTB themselves. 0xa02082 is the 1GB BCM2837 3 Model B that -M raspi3b
+claims to be; a different code is a different board, and it moves where
+gpiozero fails and whether rpi-eeprom-update survives."""
+tests = [
+  "tests/test_local_rig.py::test_the_rig_synthesises_the_board_revision_tier_3_synthesises",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''RIG_BOARD_REVISION=0xa02082'''
+replace = '''RIG_BOARD_REVISION=0xa22082'''
+
+[[mutation]]
+name = "rig-captures-the-two-uarts-in-the-other-order"
+tier = "fast"
+guard = """
+First -serial is the PL011 (ttyAMA1 under this DTB), second is the
+mini-UART where the earlycon bootconsole lives. Reversed, the probe's
+output lands in the file a reader treats as bootconsole noise and the
+console the rig tells them to read is the empty one -- which is precisely
+the stubborn 0 bytes that went unread for six runs."""
+tests = [
+  "tests/test_local_rig.py::test_the_rig_captures_both_uarts_in_tier_3s_order",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''        -serial "file:$c0" \
+        -serial "file:$c1" \'''
+replace = '''        -serial "file:$c1" \
+        -serial "file:$c0" \'''
+
+[[mutation]]
+name = "rig-advertises-probes-it-cannot-run"
+tier = "fast"
+guard = """
+One list drives --help, the dispatcher and the unknown-probe refusal. Let
+them disagree and the rig offers a name it then rejects, or hides one it
+implements. Someone reaching for this tool is mid-investigation and will
+conclude the rig is broken rather than that the menu is stale."""
+tests = [
+  "tests/test_local_rig.py::test_every_implemented_probe_is_advertised",
+  "tests/test_local_rig.py::test_the_issue_22_probes_are_all_there",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''rng
+coldplug-replay
+console-test
+idle-survive
+PROBES'''
+replace = '''rng
+console-test
+idle-survive
+PROBES'''
+
+[[mutation]]
+name = "rig-runs-something-else-when-the-name-is-typoed"
+tier = "fast"
+guard = """
+A typo must not fall through. The rig prints a completely plausible
+console either way, so running the wrong probe produces a confident
+answer to a question nobody asked -- the worst possible output from a
+tool whose entire purpose is being trusted in a hurry."""
+tests = [
+  "tests/test_local_rig.py::test_an_unknown_probe_is_refused",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    if ! rig_probes | grep -qxF "$probe"; then'''
+replace = '''    if false; then'''
+
+[[mutation]]
+name = "rig-does-not-say-when-the-emulator-is-absent"
+tier = "fast"
+guard = """
+Every missing precondition here produces the same console -- nothing at
+all, or a stop at "Run /init as init process" -- which is also what a
+gzipped kernel, a wrong DTB, a dead console and a watchdog reset look
+like. That ambiguity is the single most expensive thing in this harness's
+history to misdiagnose, so each cause is named BEFORE the emulator runs."""
+tests = [
+  "tests/test_local_rig.py::test_a_host_with_no_qemu_says_so",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    for tool in qemu-system-aarch64 curl xz gzip cpio dpkg-deb fdtput od; do'''
+replace = '''    for tool in curl xz gzip cpio dpkg-deb fdtput od; do'''
+
+[[mutation]]
+name = "rig-machine-check-piped-into-grep-q"
+tier = "fast"
+guard = """
+`grep -q` closes the pipe on its first match, the producer dies of
+SIGPIPE, and the pipeline returns 141 under pipefail -- so the check
+reports the machine ABSENT on a host that has it, and the rig refuses to
+run. Measured at 141 against a 20,000-line `-M help`. This is the third
+appearance of this exact shape in this repository: see the lsinitramfs
+note in device/install.sh and img-boot.sh's sampler."""
+tests = [
+  "tests/test_local_rig.py::test_the_machine_check_survives_a_producer_that_keeps_writing",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    n=$(qemu-system-aarch64 -M help 2>/dev/null | grep -cE "^${RIG_MACHINE} " || true)
+    [ "${n:-0}" != "0" ]'''
+replace = '''    qemu-system-aarch64 -M help 2>/dev/null | grep -qE "^${RIG_MACHINE} "'''
+
+[[mutation]]
+name = "rig-demands-kmod-from-probes-that-do-not-use-it"
+tier = "fast"
+guard = """
+Only coldplug-replay builds a module disk. Demanding depmod and mkfs.ext4
+from every probe makes a host that could have answered the rng question
+in twenty seconds refuse to try -- and the person then goes back to
+waiting on CI, which is the outcome this whole rig exists to prevent."""
+tests = [
+  "tests/test_local_rig.py::test_the_cheap_probes_do_not_pay_for_them",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    if [ "$probe" = "coldplug-replay" ]; then'''
+replace = '''    if true; then'''
+
+[[mutation]]
+name = "rig-accepts-a-metapackage-pointing-at-a-metapackage"
+tier = "fast"
+guard = """
+The indirection is the trick: linux-image-rpi-v8 never changes name, and
+what it depends on is the kernel pi-gen would install. The resolved name
+must be VERSIONED. Without the digit the pattern happily returns another
+metapackage, and the release string then becomes a modules directory that
+does not exist and a URL that 404s, four steps later, about something
+else."""
+tests = [
+  "tests/test_local_rig.py::test_a_moved_archive_fails_loudly_rather_than_resolving_to_nothing",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''                | grep -oE 'linux-image-[0-9][^ ,(]*' \'''
+replace = '''                | grep -oE 'linux-image-[^ ,(]*' \'''
+
+[[mutation]]
+name = "rig-reads-a-field-out-of-the-next-package"
+tier = "fast"
+guard = """
+Without the stanza terminator the reader keeps matching past the package
+it was asked about and returns the NEXT one's field. For Filename that
+means downloading a real file with a plausible name and booting a kernel
+nobody chose -- a wrong answer that looks exactly like a right one."""
+tests = [
+  "tests/test_local_rig.py::test_the_field_reader_does_not_bleed_between_stanzas",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''        /^Package: / { inpkg = 0 }
+'''
+replace = ''''''
+
+[[mutation]]
+name = "rig-hands-qemu-the-gzipped-vmlinuz"
+tier = "fast"
+guard = """
+The archive .deb ships boot/vmlinuz-* GZIPPED; on a real Pi the
+raspi-firmware postinst is what decompresses it into kernel8.img, and
+QEMU is not that postinst. Measured: the compressed file reaches -kernel
+without complaint and the guest writes NOTHING to either UART, which is
+run 1's symptom and an afternoon to diagnose. The magic at offset 56 is
+"ARMd" or the run does not start."""
+tests = [
+  "tests/test_local_rig.py::test_the_gzipped_vmlinuz_from_the_deb_is_refused",
+  "tests/test_local_rig.py::test_an_image_with_the_wrong_magic_is_refused",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    if [ "$magic" != "ARMd" ]; then'''
+replace = '''    if false; then'''
+
+[[mutation]]
+name = "rig-lets-od-report-the-error-instead-of-the-rig"
+tier = "fast"
+guard = """
+od(1) exits 1 with "cannot skip past end of combined input" when asked to
+skip past the end of a short file, so under set -e the checker ends with
+od's message and no explanation of what was actually wrong -- defeating
+the check whose entire job is explaining. Measured against a 68-byte
+gzip fixture while writing these tests."""
+tests = [
+  "tests/test_local_rig.py::test_a_short_file_is_refused_by_the_rig_not_by_od",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    if [ "$bytes" -lt 64 ]; then
+        rig_die "$f is $bytes bytes, too short to be an arm64 kernel Image"'''
+replace = '''    if false; then
+        rig_die "$f is $bytes bytes, too short to be an arm64 kernel Image"'''
+
+[[mutation]]
+name = "rig-accepts-a-busybox-for-the-wrong-architecture"
+tier = "fast"
+guard = """
+An x86-64 busybox in an arm64 initramfs gets as far as "Run /init as init
+process" and then the machine is silent forever -- the same console as a
+gzipped kernel, a wrong DTB, a dead console and a watchdog reset. Reading
+e_machine costs two lines and turns a day of bisection into a sentence."""
+tests = [
+  "tests/test_local_rig.py::test_a_busybox_for_the_wrong_architecture_is_refused",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    if [ "$machine" != "183" ]; then'''
+replace = '''    if false; then'''
+
+[[mutation]]
+name = "rig-accepts-a-dynamically-linked-busybox"
+tier = "fast"
+guard = """
+The initramfs carries no dynamic loader and no libc, so a PT_INTERP
+header means /init cannot execute at all -- and it fails with the same
+silence as the wrong architecture. busybox-static is a real package and
+busybox is a real package; picking up the wrong one is a plausible
+Tuesday."""
+tests = [
+  "tests/test_local_rig.py::test_a_dynamically_linked_busybox_is_refused",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''        if [ "$ptype" = "3" ]; then'''
+replace = '''        if false; then'''
+
+[[mutation]]
+name = "rig-sampler-piped-into-grep-q"
+tier = "fast"
+guard = """
+The sampler greps a file qemu is still writing, which is exactly the race
+that returns 141. With `grep -q` the early stop never fires, every probe
+pays the full backstop instead of stopping at its answer, and the rig
+stops being a seconds-scale tool -- which is the only reason it exists
+rather than tier 3."""
+tests = [
+  "tests/test_local_rig.py::test_every_probe_ends_with_the_marker_the_sampler_waits_for",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''        seen=$(grep -acF "OTP-RIG-DONE $probe" "$c0" 2>/dev/null || true)'''
+replace = '''        seen=$(grep -qF "OTP-RIG-DONE $probe" "$c0" 2>/dev/null && echo 1 || true)'''
+
+[[mutation]]
+name = "rig-probe-never-emits-the-marker-that-stops-it"
+tier = "fast"
+guard = """
+`poweroff -f` does not stop -M raspi3b: measured, a probe printed its own
+DONE marker at 4.15s guest and the machine then sat in rcu_preempt stalls
+until the 180s cap, exiting 124. The marker is what ends the run, and it
+is emitted by the init wrapper AFTER the probe body so that a probe which
+fails half way still ends the run instead of hanging it."""
+tests = [
+  "tests/test_local_rig.py::test_every_probe_ends_with_the_marker_the_sampler_waits_for",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''        printf 'echo "OTP-RIG-DONE %s"\n' "$probe"'''
+replace = '''        true'''
+
+[[mutation]]
+name = "rig-treats-a-probe-that-said-nothing-as-an-answer"
+tier = "fast"
+guard = """
+The interesting case. A run whose guest never reported is what a wedge
+looks like, and exiting 0 over an empty console tells the reader the
+probe answered. Silence has to be louder than a wrong answer here,
+because the person running this is already unsure what is happening."""
+tests = [
+  "tests/test_local_rig.py::test_a_probe_that_never_reports_is_a_failure_not_a_pass",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    if [ -z "$stopped" ]; then
+        # NOT silent'''
+replace = '''    if false; then
+        # NOT silent'''
+
+[[mutation]]
+name = "rig-is-not-findable-from-the-readme"
+tier = "fast"
+guard = """
+Issue #22's second clause, and not documentation tidiness: the rig's
+value is "existing and being current", and a debugging tool nobody can
+find when CI evidence runs out has neither. img-boot.sh cites "the local
+rig" twice as the evidence for two of its own load-bearing decisions, and
+those citations were unfalsifiable while the rig lived in a scratch
+directory."""
+tests = [
+  "tests/test_local_rig.py::test_the_readme_names_the_rig_and_its_probes",
+]
+[[mutation.edit]]
+file = "harness/README.md"
+find = '''`./harness/img-local-rig.sh <probe>`'''
+replace = '''`./harness/the-rig.sh <probe>`'''

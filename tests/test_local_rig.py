@@ -395,19 +395,49 @@ def test_a_qemu_with_the_raspi_machine_gets_through(tmp_path, offline):
     assert proc.returncode == 0, proc.stderr + proc.stdout
 
 
+# A `-M help` far larger than a pipe buffer, with raspi3b on the FIRST
+# machine line so a `grep -q` matches and closes the pipe while the producer
+# is still writing. That is the whole 141 shape.
+#
+# The loop is pure bash arithmetic and NOT `$(seq ...)`: the first version
+# of this fixture used seq, seq is not on the stubbed PATH the rig runs
+# with, the command substitution expanded to nothing, and the "20,000-line"
+# producer emitted two lines. The test passed, and it passed just as
+# happily with the `grep -q` mutation applied -- a fixture that silently
+# does not do its job is a guard that cannot fail.
+BIG_RASPI_QEMU = NO_RASPI_QEMU.replace(
+    'echo "virt                 QEMU 8.2 ARM Virtual Machine"',
+    'echo "raspi3b              Raspberry Pi 3B (revision 1.2)"\n'
+    '  i=0\n'
+    '  while [ "$i" -lt 20000 ]; do i=$((i+1)); echo "machine$i            filler"; done')
+
+
+def test_the_big_listing_fixture_really_is_big(tmp_path):
+    """The positive control on the fixture, without which the test below
+    cannot be trusted -- and, measured, could not fail."""
+    path = stub_path(tmp_path, fake_qemu=BIG_RASPI_QEMU)
+    proc = subprocess.run([str(Path(path) / "qemu-system-aarch64"), "-M", "help"],
+                          capture_output=True, text=True, timeout=120,
+                          env={"PATH": path})
+    assert proc.returncode == 0, proc.stderr
+    # Comfortably past a 64KiB pipe buffer, so grep -q closing early really
+    # does leave the producer writing into a closed pipe.
+    assert len(proc.stdout) > 200_000, len(proc.stdout)
+    assert proc.stdout.splitlines()[1].startswith("raspi3b")
+
+
 def test_the_machine_check_survives_a_producer_that_keeps_writing(tmp_path, offline):
-    """`grep -q` here would return 141 under pipefail, not 0.
+    """`grep -q` here returns 141 under pipefail, not 0.
 
     device/install.sh carries a comment about exactly this shape and
-    img-boot.sh's sampler was measured at 141 for it. A `-M help` that is
-    large enough to lose the race must still be read to the end.
+    img-boot.sh's sampler was measured at 141 for it. Measured again for
+    this check: with the `grep -q` form the pipeline returns 141, the
+    function reports the machine ABSENT, and the rig refuses to run on a
+    host that is perfectly capable. A `-M help` large enough to lose the
+    race must still be read to the end.
     """
-    big = NO_RASPI_QEMU.replace(
-        'echo "virt                 QEMU 8.2 ARM Virtual Machine"',
-        'echo "raspi3b              Raspberry Pi 3B (revision 1.2)"\n'
-        '  for i in $(seq 1 20000); do echo "machine$i            filler"; done')
     env = dict(offline)
-    env["PATH"] = stub_path(tmp_path, fake_qemu=big)
+    env["PATH"] = stub_path(tmp_path, fake_qemu=BIG_RASPI_QEMU)
     proc = run_rig(["--plan", "rng"], env=env)
     assert proc.returncode == 0, (
         "the raspi3b check failed against a large -M help listing, which is "
@@ -475,6 +505,22 @@ def test_a_moved_archive_fails_loudly_rather_than_resolving_to_nothing(tmp_path)
     An empty release would be concatenated into a URL and a modules path and
     fail four steps later, about something else.
     """
+    # The realistic rot is a metapackage pointing at ANOTHER metapackage,
+    # not at a versioned kernel -- so the fixture keeps the `linux-image-`
+    # prefix and removes only the version. An earlier fixture used
+    # `linux-headers-rpi-v8`, which the pattern rejects on the prefix alone:
+    # measured, loosening `linux-image-[0-9]` to `linux-image-` left that
+    # version of this test green, so it was testing the prefix and calling
+    # it the version check.
+    proc = resolve(tmp_path, PACKAGES.replace(
+        "Depends: linux-image-6.12.96+rpt-rpi-v8 (= 1:6.12.96-1+rpt1)",
+        "Depends: linux-image-rpi-v8-current"))
+    assert proc.returncode != 0
+    assert "no versioned linux-image" in proc.stderr
+
+
+def test_a_depends_on_something_unrelated_also_fails(tmp_path):
+    """The prefix half of the same pattern, kept as its own case."""
     proc = resolve(tmp_path, PACKAGES.replace(
         "Depends: linux-image-6.12.96+rpt-rpi-v8 (= 1:6.12.96-1+rpt1)",
         "Depends: linux-headers-rpi-v8"))

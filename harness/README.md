@@ -1017,13 +1017,13 @@ stayed green.
 
 ```sh
 python3 tests/mutation_gate.py --list
-python3 tests/mutation_gate.py --tier fast       # 124 rows, 103s
+python3 tests/mutation_gate.py --tier fast       # 143 rows, 145s
 sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
 ```
 
 **Runtime decided the trigger.** The issue expected nightly or
-label-triggered; measured, the fast tier is a hundred and three seconds at
-124 rows — still cheaper than the suite it audits — so it runs per pull
+label-triggered; measured, the fast tier is a hundred and forty-five seconds
+at 143 rows — still cheaper than the suite it audits — so it runs per pull
 request as its own `mutation` job, and the ordinary suite's wall clock does
 not move. The three CUPS-rig rows run in the existing `hardware` job, the
 only place with a real `cupsd`, for 36 seconds on top of about eight minutes.
@@ -1052,6 +1052,30 @@ Both were single-edit rows that survived:
   drain alone also survives, at MaxJobs 4, because generating a pad is slower
   than printing one. Together they are red in 3.8 seconds. The number stopped
   being what protects that sequence; the wait is.
+
+**The rig round produced a third kind of survivor, and it was the test's
+fault rather than the property's.** Both were fixed in
+`tests/test_local_rig.py`, not by adding a second edit:
+
+- the `grep -q`/SIGPIPE row survived because its fixture was inert. The fake
+  `qemu -M help` built its 20,000-line listing with `$(seq 1 20000)`, `seq`
+  is not on the stubbed `PATH` the rig runs with, the substitution expanded
+  to nothing, and the "large producer" emitted two lines — so the pipe never
+  filled, `grep -q` never closed it early, and the test was green with the
+  mutation applied. Confirmed separately that the bug is real: the `grep -q`
+  form returns **141** against a genuinely large producer and reports the
+  machine absent. The loop is pure bash arithmetic now, with a test that
+  asserts the fixture really emits more than 200,000 bytes.
+- the versioned-kernel row survived because the negative fixture used
+  `Depends: linux-headers-rpi-v8`, which the pattern rejects on the
+  `linux-image-` prefix alone. It was testing the prefix and calling it the
+  version check. The fixture is `linux-image-rpi-v8-current` now — a
+  metapackage pointing at another metapackage, which is the rot that would
+  actually happen — and the prefix case is kept as its own test.
+
+Both are the same lesson one level in from the usual one: a mutation row
+proves the *test* can fail, and a test can only fail as hard as its fixture
+is real.
 
 **What is not covered.** No row needs a booted guest, and the checks that
 only exist *inside* one — tier 2's spool redirect above, tty1 ownership, the
