@@ -161,6 +161,35 @@ jobs:
             || echo "no modules-extra for $(uname -r); some simulators will be absent"
           pip install -r requirements-dev.txt
           pip install smbus2 luma.oled gpiozero lgpio
+      - name: The panel tests that need gpiozero and lgpio
+        # tests/test_hardware.py is nobody's job otherwise. It carries no
+        # `hardware` marker, so the harness step below (`pytest -m
+        # hardware`) deselects the whole file; and the `test` job installs
+        # requirements-dev.txt, which deliberately has neither gpiozero nor
+        # lgpio. Measured by blocking both imports: the file goes to 9
+        # skipped -- the five [lgpio] parametrisations and all four
+        # TestRealGpiozero tests, seven of them added by the panel-guard
+        # change. Among them is the control that proves real gpiozero lets a
+        # callback exception straight out, which is the only thing keeping
+        # the stand-in dispatcher honest, and lgpio's own `run`. This step
+        # is the one place they run.
+        #
+        # Both libraries are installed above, so nothing in the file has a
+        # reason to skip -- and a skip is failed here rather than printed,
+        # because that is exactly how these tests came to run nowhere: a
+        # skipped test and a passing one look the same in a summary line.
+        run: |
+          set -o pipefail
+          timeout 300 python3 -m pytest -q -p no:randomly -rs \
+            tests/test_hardware.py 2>&1 | tee /tmp/panel.log
+          if grep -qE '[0-9]+ skipped' /tmp/panel.log; then
+            echo "tests/test_hardware.py skipped something. With gpiozero" >&2
+            echo "and lgpio both installed, nothing in it may skip -- a" >&2
+            echo "skip here means an install half-worked and the panel is" >&2
+            echo "back to being tested by the stand-ins only." >&2
+            grep -E '^SKIPPED' /tmp/panel.log >&2 || true
+            exit 1
+          fi
       - name: Stop the system CUPS and unconfine cupsd
         run: |
           # The rig runs its own cupsd on its own socket. The distro one is

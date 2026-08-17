@@ -192,6 +192,25 @@ of them assert the same property: a *later* press still arrives. "An
 exception was caught" is also true of a panel that has stopped delivering
 anything.
 
+Three places, and for a while only two of them ran anywhere. `pytest -m
+hardware` deselects `tests/test_hardware.py` wholesale — nothing in it is
+marked `hardware` — and the `test` job installs `requirements-dev.txt`,
+which has neither gpiozero nor lgpio, so with both absent that file goes to
+**9 skipped**: the five `[lgpio]` parametrisations and all four
+`TestRealGpiozero` tests, the control among them. This job therefore runs
+the file by name as well, in a step that treats a skip as a failure —
+`gpiozero` and `lgpio` are installed here, so nothing in it has a reason to
+skip, and a skipped test in a summary line looks exactly like a passing
+one.
+
+Nothing may **park** that thread either, which is a hazard the guard
+created: the report goes to stderr, and on the unit stderr is a stream
+socket to journald. A socket nobody is draining does not raise, it blocks,
+and a thread stuck in `write(2)` is as dead to the panel as one that ended
+— while still answering `is_alive()`. `_report` asks `select()` whether the
+write can complete before making it, and `_note_lost` bounds how often
+there is anything to write; both have tests and mutation rows of their own.
+
 Runs in CI as the `hardware` job.
 
 ## Tier 2 — a VM that actually boots the thing
