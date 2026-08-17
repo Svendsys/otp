@@ -195,9 +195,9 @@ anything.
 Three places, and for a while only two of them ran anywhere. `pytest -m
 hardware` deselects `tests/test_hardware.py` wholesale — nothing in it is
 marked `hardware` — and the `test` job installs `requirements-dev.txt`,
-which has neither gpiozero nor lgpio, so with both absent that file goes to
-**9 skipped**: the five `[lgpio]` parametrisations and all four
-`TestRealGpiozero` tests, the control among them. This job therefore runs
+which has neither gpiozero nor lgpio, so in a venv with only that in it the
+file measures **27 passed, 10 skipped**: the six `[lgpio]` parametrisations
+and all four `TestRealGpiozero` tests, the control among them. This job runs
 the file by name as well, in a step that treats a skip as a failure —
 `gpiozero` and `lgpio` are installed here, so nothing in it has a reason to
 skip, and a skipped test in a summary line looks exactly like a passing
