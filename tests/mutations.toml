@@ -3892,3 +3892,67 @@ file = "harness/img-boot.sh"
 find = """ \\
 credential-survives-the-power-cycle\""""
 replace = '"'
+
+
+[[mutation]]
+name = "tier3-credential-may-have-shipped-in-the-image"
+tier = "fast"
+guard = """
+The before-half of the one credential check that owes nothing to the guest
+probe. "the file is on the card after boot1" is equally true of an image
+BUILT with a credential in it -- and a hash baked into a public .img.xz is
+the same hash on every unit ever flashed from it, which is worse than the
+defect being fixed rather than better. The image ships none, so the file has
+to be absent before the boot and present after it."""
+tests = [
+  "tests/test_img_verdict.py::test_a_credential_the_image_shipped_is_not_one_this_boot_kept",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = """            if ! fat_lists "$before" otp-identity/credential \\
+               && fat_lists "$after" otp-identity/credential; then"""
+replace = """            if fat_lists "$after" otp-identity/credential; then"""
+
+
+[[mutation]]
+name = "tier3-credential-not-required-to-outlive-the-power-cycle"
+tier = "fast"
+guard = """
+boot2's half, and the property an operator is actually relying on: the file
+was on the card BEFORE the second boot. Without that clause a store written
+during boot2 satisfies the check -- and a boot with no seed that writes a
+credential is the exposure this design refuses, not the persistence it
+promises."""
+tests = [
+  "tests/test_img_verdict.py::test_a_credential_that_did_not_outlive_the_power_cycle_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = """            if fat_lists "$before" otp-identity/credential \\
+               && fat_lists "$after" otp-identity/credential; then"""
+replace = """            if fat_lists "$after" otp-identity/credential; then"""
+
+
+[[mutation]]
+name = "tier3-host-lists-only-the-fat-root"
+tier = "fast"
+guard = """
+`mdir -b` is NOT recursive. Measured with mtools on a FAT image built by
+hand: a directory appears as the single line `::/otp-identity/` and not one
+of its contents appears anywhere. The credential and the machine-id both live
+in that directory, so without the second `mdir` naming it the host-side check
+can never pass on ANY card -- red on a healthy image, which is the failure CI
+would blame on the image rather than on the harness.
+
+WHAT CATCHES IT IS A TEXT ASSERTION, and that is worth stating rather than
+leaving to be discovered: no test in the fast tier runs `fat_listing`,
+because the verdict tests inject their listings directly and mtools is not
+installed in the `test` job. The named test reads the command out of the
+shipped harness. It would not catch an mdir that ran and returned nothing."""
+tests = [
+  "tests/test_img_verdict.py::test_the_host_reads_the_store_a_level_below_the_root",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '    mdir -b -i "$IMG@@$BOOT_OFFSET" ::/otp-identity >> "$1" 2>/dev/null || true'
+replace = "    :"

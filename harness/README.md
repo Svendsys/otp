@@ -939,6 +939,24 @@ Three named guest checks read it back off the machine:
 from "written a moment ago". The probe's own record is what boot 2 is held
 against, and it predates boot 2 entirely.
 
+**And one check owes nothing to the guest at all.** `credential-kept-on-the-card`
+is a host-side `IMG-CHECK` in both boots: mtools lists the FAT partition
+either side of every boot, and the file either is on the card or is not. A
+guest that lied, a probe that never started, or a store written into the
+overlay's tmpfs instead of onto the partition all produce nothing here. Both
+ends are required in both boots — **absent** before boot 1 and present after
+(the image ships no credential, so it appeared *because of* that boot), and
+**present at both ends** of boot 2 (a power cycle did not take it, and
+nothing wrote one on a boot with no seed).
+
+That needed a change to the listing itself: `mdir -b` is **not recursive**.
+Measured with mtools on a FAT image built by hand — a card holding
+`otp-identity/{machine-id,credential}` lists as `::/kernel8.img` and
+`::/otp-identity/` and nothing else, so the store's contents were invisible
+to the host. `fat_listing` now makes a second call naming that directory and
+appends it; on a card with no store yet, mdir answers non-zero, prints
+nothing, and the listing is just the root.
+
 **The hash never travels and never prints.** This console is uploaded as a CI
 artifact, so what crosses the power cycle is a `sha256` of the hash, required
 to be 64 characters on **both** sides: two empty strings compare equal, and a
