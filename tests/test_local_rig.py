@@ -18,6 +18,13 @@ the point of the rig, and also why it has no CI wiring (issue #22):
      misdiagnose, and one issue #17 paid for repeatedly. So each is
      refused BEFORE the emulator starts, with a message naming the cause.
 
+  3. IT DOES NOT CHARGE FOR WHAT IT IS NOT DOING. The corollary of 2, and
+     the one that was wrong until this file was fixed: --plan boots
+     nothing, so it must not demand an emulator before it will say what it
+     would run. A refusal on the path that only prints is not a
+     precondition, it is an obstacle -- and it made six tests here fail on
+     a runner for a reason that was never about the rig.
+
 Every negative here has a positive control built from the same fixture: a
 test that only ever asserts a refusal cannot tell "refused for the right
 reason" from "refused for any reason at all", and this repository has
@@ -273,10 +280,13 @@ def run_rig(args, *, env=None, timeout=120):
 
 @pytest.fixture
 def offline(tmp_path):
-    """A --plan run that needs no network: the kernel version is pinned.
+    """A rig invocation that needs no network: the kernel version is pinned.
 
     Shared by the refusal tests and their positive controls, so the two
-    differ in exactly the thing under test.
+    differ in exactly the thing under test. Used by real-run tests as well
+    as --plan ones: pinning the release is what lets a run get past the
+    preflight and stop, immediately and offline, at the archive index it
+    has not got.
     """
     return {"OTP_RIG_KERNEL": "6.12.96+rpt-rpi-v8",
             "OTP_RIG_WORK": str(tmp_path / "work")}
