@@ -50,8 +50,15 @@ def run_block(block: str, tmp_path, *, env=None, preamble=""):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     # systemctl is stubbed rather than allowed through: the block disables a
-    # first-boot service, and a test must not touch the machine it runs on.
-    (bin_dir / "systemctl").write_text("#!/bin/sh\nexit 0\n")
+    # first-boot service and masks another, and a test must not touch the
+    # machine it runs on. It RECORDS what it was asked to do, because
+    # "install.sh masks systemd-growfs-root.service" is a claim about a
+    # command that was issued, and a stub that only exits 0 cannot tell a
+    # block that issued it from one that never did.
+    (bin_dir / "systemctl").write_text(
+        '#!/bin/sh\n'
+        'if [ -n "${SYSTEMCTL_LOG:-}" ]; then printf \'%s\\n\' "$*" >> "$SYSTEMCTL_LOG"; fi\n'
+        'exit 0\n')
     (bin_dir / "systemctl").chmod(0o755)
     runner = tmp_path / "run.sh"
     runner.write_text(
@@ -62,14 +69,21 @@ def run_block(block: str, tmp_path, *, env=None, preamble=""):
     return subprocess.run(
         ["bash", str(runner)], capture_output=True, text=True, timeout=60,
         env={**os.environ, **(env or {}),
+             "SYSTEMCTL_LOG": str(tmp_path / "systemctl-calls.log"),
              "PATH": f"{bin_dir}:{os.environ['PATH']}"},
     )
+
+
+def systemctl_calls(tmp_path) -> list:
+    """Every systemctl argument list the block under test issued."""
+    log = tmp_path / "systemctl-calls.log"
+    return log.read_text().splitlines() if log.exists() else []
 
 
 # --- the kernel command line ---------------------------------------------
 
 CMDLINE_BLOCK = ('    if ! grep -q "boot=overlay" "$CMDLINE_TXT"; then',
-                 '    systemctl disable rpi-resize.service 2>/dev/null || true')
+                 '    systemctl mask systemd-growfs-root.service')
 
 # pi-gen's own stage1 cmdline.txt, with export-image's PARTUUID substituted,
 # which is what install.sh actually finds in the chroot.
@@ -118,6 +132,33 @@ def test_the_first_boot_resize_token_is_removed(tmp_path):
     # neighbours here and a sloppier sed would have taken part of one.
     assert "fsck.repair=yes" in after
     assert "rootwait" in after
+
+
+def test_systemds_own_grower_is_masked_as_well_as_pi_gens(tmp_path):
+    """
+    Two units grow the root filesystem on a Pi OS image, and disabling one
+    of them is what shipped.
+
+    rpi-resize.service is the pi-gen one and it is disabled above.
+    systemd-growfs-root.service is systemd's, and nothing enables it: it is
+    hooked onto the root mount by systemd-fstab-generator on every boot, so
+    there is no symlink for `disable` to remove and it ran on every boot of
+    every image this project has built. On an overlay root it cannot
+    succeed -- `/` is an overlayfs, systemd-growfs wants a block device --
+    and run 72's tier-3 console carries the result in both boots:
+
+        systemd-growfs[293]: File system "/" not backed by block device.
+        systemd[1]: systemd-growfs-root.service: Failed with result 'exit-code'.
+
+    It was invisible until issue #21 put the journal on the console. The
+    verb has to be `mask`: `disable` is a no-op against a generator.
+    """
+    cmdline_after(tmp_path, PI_GEN_CMDLINE)
+    calls = systemctl_calls(tmp_path)
+    assert "mask systemd-growfs-root.service" in calls, calls
+    # The pi-gen half is still done -- this is an addition to that decision,
+    # not a replacement for it.
+    assert any(c.startswith("disable rpi-resize.service") for c in calls), calls
 
 
 # --- building the initramfs the overlay lives in --------------------------

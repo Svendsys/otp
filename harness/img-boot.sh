@@ -725,12 +725,20 @@ per_boot_verdict() {
     # early boot arrives a second time and a healthy boot counts TWO kernel
     # entries and is failed as a reboot loop.
     #
-    # Whether journald does that is NOT measured: there is no systemd on the
-    # machine this was written on, and no console in this repository has been
-    # captured with forwarding on yet. The exclusion costs nothing if it does
-    # not, and it cannot hide a real loop -- a second kernel entry prints its
-    # own "Booting Linux on physical CPU" with a timestamp and no identifier,
-    # which is what is still counted.
+    # MEASURED NOW, and the answer is no. Run 72 is the first console this
+    # repository has captured with forwarding actually on, and it carries
+    # ZERO lines matching `kernel: ` in either boot: journald does not
+    # re-forward the kmsg entries it imported. "Booting Linux on physical
+    # CPU" appears exactly once in a 1070-line console and both boots report
+    # `kernel entered 1 time(s)`, so the doubling this exclusion was written
+    # against does not happen and never did.
+    #
+    # KEPT ANYWAY. It costs one grep, it is the documented behaviour of a
+    # setting that could change with a systemd release, and it cannot hide a
+    # real loop -- a second kernel entry prints its own "Booting Linux on
+    # physical CPU" with a timestamp and no identifier, which is what is
+    # still counted. What has changed is that this is now a guard against a
+    # regression rather than a guess about an unknown.
     KERNEL_ENTRIES=$(grep -vE '^\[[^]]*\] kernel: ' "$CONSOLE_TXT" 2>/dev/null \
                      | grep -c "Booting Linux on physical CPU" || true)
     printf 'qemu exit: %s\n' "$QEMU_RC"
@@ -811,6 +819,24 @@ per_boot_verdict() {
                "Kernel panic" "Unable to mount root"; do
         if grep -qF -- "$bad" "$SPOKEN" 2>/dev/null; then
             printf 'IMG-CHECK %s no-%s FAIL\n' "$phase" "$(printf '%s' "$bad" | tr ' =' '--')"
+            # WHICH LINES, indented under the red, the way guest-no-fail-lines
+            # already dumps its matches. Without this the verdict said only
+            # that a phrase occurred somewhere in a 1000-line console, and
+            # answering "which unit?" meant downloading the evidence artifact
+            # and grepping it by hand -- which is exactly what run 72 cost.
+            # The three units it would have named are the whole finding.
+            #
+            # Bounded at 10 lines and 200 columns because a reboot loop
+            # repeats its phrase for as long as it loops, and a verdict file
+            # that scrolls the real checks off the top of the job log is a
+            # worse report than one that says nothing.
+            #
+            # Quoting into the verdict can trip the `grep -q FAIL` over
+            # verdict.txt at the bottom of this file, and here that costs
+            # nothing that is not already spent: this branch has JUST written
+            # FAIL on the line above it, so the phase is red either way.
+            grep -F -- "$bad" "$SPOKEN" 2>/dev/null \
+                | head -10 | cut -c1-200 | sed 's/^/    /' || true
         elif grep -qF -- "$bad" "$CONSOLE_TXT" 2>/dev/null; then
             printf 'IMG-NOTE %s quoted-%s: %s\n' "$phase" \
                    "$(printf '%s' "$bad" | tr ' =' '--')" \

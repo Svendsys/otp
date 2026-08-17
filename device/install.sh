@@ -830,6 +830,33 @@ OVERLAY
     # never written after provisioning.
     sed -i -E 's/(^| )resize( |$)/\1/g' "$CMDLINE_TXT"
     systemctl disable rpi-resize.service 2>/dev/null || true
+    # AND systemd's own grower, which is the same decision and was missing
+    # from it. rpi-resize.service pulls systemd-growfs-root.service in with a
+    # Wants=, so disabling rpi-resize LOOKS like it settles the matter -- but
+    # systemd-fstab-generator hooks that unit onto the root mount as well,
+    # every boot, with no symlink anywhere to disable. It therefore ran on
+    # every boot of every image this project has built, and on an overlay
+    # root it cannot do anything but fail:
+    #
+    #   systemd-growfs[293]: File system "/" not backed by block device.
+    #   systemd[1]: systemd-growfs-root.service: Failed with result 'exit-code'.
+    #   [FAILED] Failed to start systemd-growfs-root.service - Grow Root File System.
+    #
+    # quoted from run 72's tier-3 console, both boots. `/` is an overlayfs
+    # here by construction, so there is no block device to grow and never
+    # will be. A red line on the console of an appliance that prints key
+    # material teaches its operator to read past red, which is the cost even
+    # though the unit harms nothing else.
+    #
+    # MASKED, not disabled: `disable` removes symlinks, and there are none to
+    # remove -- the generator re-creates the dependency on the next boot
+    # regardless. A mask is a link to /dev/null in /etc/systemd/system, it
+    # lives in the image rather than in the overlay's tmpfs, and systemd
+    # refuses to start the unit whatever asks for it. Bare, with no
+    # `|| true`, for the reason the networkd-wait-online mask above is bare:
+    # this runs in the pi-gen chroot where that mask demonstrably lands, and
+    # a mask that silently failed to apply is the defect it exists to stop.
+    systemctl mask systemd-growfs-root.service
 
     # PROVE it rather than trust the sequence above, because every way this
     # can go wrong is silent. config.txt asking the firmware for an initramfs

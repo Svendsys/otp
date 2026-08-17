@@ -1010,6 +1010,58 @@ def test_systemds_own_verdict_on_a_unit_still_fails_the_release(tmp_path):
     assert proc.returncode == 1
 
 
+def test_the_forbidden_phrase_says_which_lines_it_found(tmp_path):
+    """
+    The red has to name the unit, and until run 72 it did not.
+
+    That run failed on `no-Failed-with-result` with no detail at all, and
+    the verdict was the same four words whether one unit had failed or
+    three. Answering "which unit?" meant downloading the evidence artifact
+    and grepping a thousand-line console by hand -- for a fact the harness
+    had already found and then thrown away.
+
+    Three units were failing on every boot of the shipped image. The gate
+    was right; only its report was useless.
+    """
+    growfs = ("[   38.453838] systemd[1]: systemd-growfs-root.service: "
+              "Failed with result 'exit-code'.")
+    ssh = ("[  172.770348] systemd[1]: ssh.service: "
+           "Failed with result 'exit-code'.")
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1") + [growfs, ssh]})
+    assert "IMG-CHECK boot1 no-Failed-with-result FAIL" in verdict, verdict
+    assert "systemd-growfs-root.service" in verdict, verdict
+    # BOTH of them. A report that stops at the first match would have named
+    # growfs and hidden ssh, and hiding the second of three is most of the
+    # cost of hiding all three.
+    assert "ssh.service" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_a_quoted_phrase_is_not_dumped_as_if_the_system_had_said_it(tmp_path):
+    """
+    The dump is scoped exactly as the gate is.
+
+    IMG-NOTE already quotes one line for the reported case. If the FAIL
+    branch's dump read the whole console instead of the filtered copy, a
+    boot where PID 1 failed one unit and the probe quoted the phrase would
+    print the probe's own output under the red as though systemd had said
+    it -- and the reader would go looking for a unit that never failed.
+    """
+    real = ("[   50.000000] systemd[1]: otp-unit.service: "
+            "Failed with result 'exit-code'.")
+    echoed = forwarded(
+        "Aug 16 22:05:01 otp-unit systemd[1]: nosuch.service: "
+        "Failed with result 'exit-code'.",
+        ident="img-guest-check.sh", pid=900)
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1") + [real, echoed]})
+    assert "IMG-CHECK boot1 no-Failed-with-result FAIL" in verdict, verdict
+    assert "otp-unit.service" in verdict, verdict
+    assert "nosuch.service" not in verdict, verdict
+    assert proc.returncode == 1
+
+
 def test_a_journald_copy_of_a_kernel_line_is_not_a_second_boot(tmp_path):
     """
     The count that says "reboot loop", protected from the forwarding.
