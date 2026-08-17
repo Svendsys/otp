@@ -843,9 +843,17 @@ rig_boot() {  # <probe> <kernel> <dtb> <initrd> <drive>
     while kill -0 "$pid" 2>/dev/null; do
         sleep 2
         elapsed=$((elapsed + 2))
-        # grep -c, not grep -q: see rig_have_raspi_machine. The producer here
-        # is a file qemu is still writing, which is precisely the race that
-        # returned 141 in img-boot.sh's sampler.
+        # grep -c and not grep -q, to match rig_have_raspi_machine and
+        # img-boot.sh's sampler -- but NOT for their reason, and the
+        # comment that used to be here claimed otherwise. Both of those
+        # read a PIPE (`qemu -M help |`, `sed |`) and `-q` closing it
+        # early is what returns 141 under pipefail. This one hands grep a
+        # FILE, so there is no producer to kill and `-q` here would behave
+        # identically: measured, swapping it changed nothing at all, which
+        # is why the mutation row for this samples the early stop itself
+        # rather than the spelling of the grep. The `-a` is the load-
+        # bearing letter -- a UART file with a stray byte in it is
+        # "binary", and grep says so instead of counting.
         seen=$(grep -acF "OTP-RIG-DONE $probe" "$c0" 2>/dev/null || true)
         if [ -z "$stopped" ] && [ "${seen:-0}" != "0" ]; then
             stopped=$elapsed
@@ -884,9 +892,7 @@ rig_boot() {  # <probe> <kernel> <dtb> <initrd> <drive>
         rig_log "  $c1"
         return 1
     fi
-    # grep -c and not grep -q, for the third time in this file: see
-    # rig_have_raspi_machine. The file is one qemu was writing until a
-    # moment ago and this runs under pipefail.
+    # -a for the same reason as the sampler's: this file came off a UART.
     local ok
     ok=$(grep -acF "OTP-RIG-DONE $probe status=ok" "$c0" 2>/dev/null || true)
     if [ "${ok:-0}" = "0" ]; then

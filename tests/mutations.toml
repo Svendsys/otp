@@ -2738,6 +2738,54 @@ find = '''        -serial "file:$c0" \
 replace = '''        -serial "file:$c1" \
         -serial "file:$c0" \'''
 
+# THE OTHER HALF OF EVERY COMPARISON ABOVE, and the half that was unguarded.
+# tests/test_local_rig.py holds the rig against img-boot.sh, and until now
+# it held it against img-boot.sh's PROSE: `-M` matched the log() line
+# "Booting $phase under -M raspi3b ...", `-m` matched a comment, and
+# -display/-no-reboot matched any of a dozen mentions in 1375 lines that are
+# mostly argument about the invocation. Measured, with the whole suite green
+# each time: deleting -no-reboot from the real command line left 863 passed,
+# and so did reversing its two -serial lines. These two rows mutate the
+# invocation and nothing else, so a comparison that reads the file rather
+# than the argv cannot pass them.
+
+[[mutation]]
+name = "tier-3-stops-passing-no-reboot"
+tier = "fast"
+guard = """
+Without -no-reboot a guest that resets loops instead of stopping, and
+runs 3 and 4 of issue #17 were both misread reboot loops -- the header of
+img-boot.sh opens with that story. It is also one of the five flags the
+rig copies so that a finding transfers; if tier 3 drops it the rig is
+booting a machine tier 3 no longer boots, and nobody is told."""
+tests = [
+  "tests/test_local_rig.py::test_the_rig_boots_the_machine_img_boot_boots",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        -display none -no-reboot &'''
+replace = '''        -display none &'''
+
+[[mutation]]
+name = "tier-3-captures-the-two-uarts-in-the-other-order"
+tier = "fast"
+guard = """
+FIRST -serial is the PL011 (ttyAMA1 under this DTB), SECOND is the
+mini-UART where the earlycon bootconsole lives. Reversed, console.log --
+the file every message in this harness points a reader at -- holds
+bootconsole noise, and the PL011's stubborn zero bytes, which was itself
+the clue nobody read for six runs, lands in the file nobody is told to
+open. The rig's own order is guarded; tier 3's was not."""
+tests = [
+  "tests/test_local_rig.py::test_tier_3_captures_the_pl011_into_console_log",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        -serial "file:$console" \
+        -serial "file:$console2" \'''
+replace = '''        -serial "file:$console2" \
+        -serial "file:$console" \'''
+
 [[mutation]]
 name = "rig-advertises-probes-it-cannot-run"
 tier = "fast"
@@ -2792,8 +2840,31 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/img-local-rig.sh"
-find = '''RIG_BOOT_TOOLS=(qemu-system-aarch64 curl xz gzip cpio dpkg-deb fdtput od)'''
-replace = '''RIG_BOOT_TOOLS=(curl xz gzip cpio dpkg-deb fdtput od)'''
+find = '''RIG_BOOT_TOOLS=(qemu-system-aarch64 curl xz gzip cpio dpkg-deb fdtput fdtget'''
+replace = '''RIG_BOOT_TOOLS=(curl xz gzip cpio dpkg-deb fdtput fdtget'''
+
+[[mutation]]
+name = "rig-uses-a-tool-it-never-asked-the-host-for"
+tier = "fast"
+guard = """
+USED IS DECLARED, which is the direction nothing checked. fdtget was used
+and undeclared for the whole of this PR: the rig writes the board revision
+with fdtput and reads it back with fdtget, so on a host with no
+device-tree-compiler the readback returned nothing and the rig announced
+"$dtb does not carry linux,revision after the patch" -- the patch blamed
+for a tool that was never installed, which is exactly the misdirection the
+preflight exists to prevent. timeout and truncate had the same shape. The
+older test checks that everything DECLARED is on the stub PATH, and a tool
+the rig runs without declaring sails straight past it."""
+tests = [
+  "tests/test_local_rig.py::test_every_host_tool_the_rig_runs_is_one_it_asked_for",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''RIG_BOOT_TOOLS=(qemu-system-aarch64 curl xz gzip cpio dpkg-deb fdtput fdtget
+                od timeout)'''
+replace = '''RIG_BOOT_TOOLS=(qemu-system-aarch64 curl xz gzip cpio dpkg-deb fdtput
+                od timeout)'''
 
 [[mutation]]
 name = "rig-plan-demands-the-emulator-before-it-will-print"
@@ -2980,38 +3051,48 @@ find = '''        if [ "$ptype" = "3" ]; then'''
 replace = '''        if false; then'''
 
 [[mutation]]
-name = "rig-sampler-piped-into-grep-q"
+name = "rig-sampler-never-stops-on-the-marker"
 tier = "fast"
 guard = """
-The sampler greps a file qemu is still writing, which is exactly the race
-that returns 141. With `grep -q` the early stop never fires, every probe
-pays the full backstop instead of stopping at its answer, and the rig
-stops being a seconds-scale tool -- which is the only reason it exists
-rather than tier 3."""
+`poweroff -f` does not stop -M raspi3b: measured, a probe printed its own
+DONE marker at 4.15s guest and the machine then sat in rcu_preempt stalls
+until the 180s cap, exiting 124. So the sampler watching for the marker
+and killing qemu is the entire reason this rig answers in seconds rather
+than in the backstop, and a rig that does not answer in seconds has no
+reason to exist rather than tier 3.
+
+REPLACES `rig-sampler-piped-into-grep-q`, which did not mutate anything.
+That row swapped `grep -acF ... "$c0"` for `grep -qF ... "$c0" && echo 1`
+on the theory that -q closes the pipe and returns 141 -- but this grep is
+handed a FILE, not a pipe, so there is no producer to kill and the two
+forms behave identically. Measured: with the swap applied the suite was
+green because the code was unchanged, and the row read as caught only
+because its test asserted the literal string `grep -acF`. The 141 shape
+is real in rig_have_raspi_machine and in img-boot.sh's sampler, both of
+which do pipe."""
 tests = [
-  "tests/test_local_rig.py::test_every_probe_ends_with_the_marker_the_sampler_waits_for",
+  "tests/test_local_rig.py::test_the_marker_stops_the_emulator_instead_of_waiting_out_the_backstop",
 ]
 [[mutation.edit]]
 file = "harness/img-local-rig.sh"
-find = '''        seen=$(grep -acF "OTP-RIG-DONE $probe" "$c0" 2>/dev/null || true)'''
-replace = '''        seen=$(grep -qF "OTP-RIG-DONE $probe" "$c0" 2>/dev/null && echo 1 || true)'''
+find = '''        if [ -z "$stopped" ] && [ "${seen:-0}" != "0" ]; then'''
+replace = '''        if false; then'''
 
 [[mutation]]
 name = "rig-probe-never-emits-the-marker-that-stops-it"
 tier = "fast"
 guard = """
-`poweroff -f` does not stop -M raspi3b: measured, a probe printed its own
-DONE marker at 4.15s guest and the machine then sat in rcu_preempt stalls
-until the 180s cap, exiting 124. The marker is what ends the run, and it
-is emitted by the init wrapper AFTER the probe body so that a probe which
-fails half way still ends the run instead of hanging it."""
+The marker is what ends the run, and it is emitted by the init wrapper
+AFTER the probe body so that a probe which fails half way still ends the
+run instead of hanging it. Without it every probe pays the full backstop
+and reports as a wedge."""
 tests = [
-  "tests/test_local_rig.py::test_every_probe_ends_with_the_marker_the_sampler_waits_for",
+  "tests/test_local_rig.py::test_every_probes_init_ends_with_a_marker_carrying_a_status",
 ]
 [[mutation.edit]]
 file = "harness/img-local-rig.sh"
-find = '''        printf 'echo "OTP-RIG-DONE %s"\n' "$probe"'''
-replace = '''        true'''
+find = '''    printf 'echo "OTP-RIG-DONE %s status=$rig_status"\n' "$probe"'''
+replace = '''    true'''
 
 [[mutation]]
 name = "rig-treats-a-probe-that-said-nothing-as-an-answer"
@@ -3019,10 +3100,12 @@ tier = "fast"
 guard = """
 The interesting case. A run whose guest never reported is what a wedge
 looks like, and exiting 0 over an empty console tells the reader the
-probe answered. Silence has to be louder than a wrong answer here,
-because the person running this is already unsure what is happening."""
+probe answered. It also has to be its OWN exit code and not merely
+non-zero: "the machine never got there" and "the probe ran and found
+something wrong" are different problems, and telling those two apart is
+most of what this rig is for."""
 tests = [
-  "tests/test_local_rig.py::test_a_probe_that_never_reports_is_a_failure_not_a_pass",
+  "tests/test_local_rig.py::test_a_probe_that_never_reports_pays_the_backstop_and_says_so",
 ]
 [[mutation.edit]]
 file = "harness/img-local-rig.sh"
@@ -3030,6 +3113,187 @@ find = '''    if [ -z "$stopped" ]; then
         # NOT silent'''
 replace = '''    if false; then
         # NOT silent'''
+
+[[mutation]]
+name = "rig-exits-zero-for-a-probe-that-did-nothing"
+tier = "fast"
+guard = """
+The rig's exit code used to mean "something printed a marker", which is
+not the same statement as "the probe did its work". Measured: coldplug's
+body with no module disk printed "FAIL: could not mount the module disk
+at /dev/mmcblk0" and the rig exited 0, so
+`./harness/img-local-rig.sh coldplug-replay && echo clean` printed clean
+for a replay that mounted nothing; a probe body of `:` printed BEGIN and
+DONE and did the same. Anyone scripting this rig, or reading its exit
+code in a hurry mid-investigation, is told the question was answered."""
+# One test named and not two, deliberately: each of these costs a fake
+# emulator's six seconds, and test_a_marker_with_no_status_at_all_is_not_a_
+# pass goes red on exactly the same edit. It stays in the suite; it does
+# not need to be paid for twice per mutation round.
+tests = [
+  "tests/test_local_rig.py::test_the_rig_will_not_call_a_failed_probe_an_answer",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    if [ "${ok:-0}" = "0" ]; then'''
+replace = '''    if false; then'''
+
+[[mutation]]
+name = "rig-probe-body-is-never-parsed-by-anything"
+tier = "fast"
+guard = """
+The probe bodies live in `<<'PROBE'` quoted heredocs, which shellcheck
+reads as data. Measured: an unbalanced `if [ "$broken" ; then` inside the
+rng heredoc left shellcheck v0.9.0 at rc 0, all 48 tests in
+test_local_rig.py green and the whole suite at 863 passed. In real use
+that typo kills /init before the marker, so the sampler waits out the
+full 300s and the rig prints "NEVER REPORTED ... hung, reset, or never
+reached /init" -- the exact wedge signature this rig exists to
+disambiguate, produced by the rig."""
+tests = [
+  "tests/test_local_rig.py::test_every_probes_init_parses_as_shell",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''before=$(cut -d' ' -f1 /proc/uptime)'''
+replace = '''if [ "$broken" ; then
+before=$(cut -d' ' -f1 /proc/uptime)'''
+
+[[mutation]]
+name = "rig-rng-reports-a-blocking-read-that-never-happened"
+tier = "fast"
+guard = """
+THE HEADLINE ONE. dd's exit code was never examined and its stderr went to
+/dev/null, so "16 blocking bytes: uptime 3.05 -> 3.08" printed
+unconditionally with a plausible sub-second delta. Measured on the
+emulator: booting the verbatim probe with /dev/random deleted printed
+"16 blocking bytes: uptime 3.29 -> 3.31" and the rig exited 0.
+
+Structurally identical to the `modprobe -d` defect this same file carries
+a paragraph about, twelve lines below -- an unexamined exit status
+reported as an answer -- and worse, because the number does not stay in
+the rig. img-boot.sh cites this measurement as the evidence for a hard
+gate on crng seeding and harness/README.md repeats the figures, so the
+failure mode is a one-time-pad printer being told its entropy is fine by
+a probe that never read a byte."""
+tests = [
+  "tests/test_local_rig.py::test_the_rng_probe_will_not_report_a_read_that_did_not_happen",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''err=$(dd if=/dev/random of=/dev/null bs=1 count=16 2>&1)
+rc=$?'''
+replace = '''dd if=/dev/random of=/dev/null bs=1 count=16 2>/dev/null
+rc=0'''
+
+[[mutation]]
+name = "rig-idle-probe-reports-time-it-did-not-spend"
+tier = "fast"
+guard = """
+"survived 45 seconds with no reset" was printed for completing 45
+iterations of a loop, which is a different statement. A sleep that
+returns immediately finishes the loop in milliseconds and the probe
+reports surviving a minute it never spent -- and this is the probe that
+re-verifies the bcm2835_pm_driver_init blacklist, so the claim it makes
+is the one img-boot.sh's kernel command line rests on. The uptime clock
+is the witness a reset cannot fake, because a reset restarts it."""
+tests = [
+  "tests/test_local_rig.py::test_the_idle_probe_will_not_report_time_it_did_not_spend",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''if [ "$elapsed" -ge $(( OTP_RIG_IDLE_SECONDS - 1 )) ]; then'''
+replace = '''if true; then'''
+
+[[mutation]]
+name = "rig-coldplug-calls-replaying-nothing-a-clean-replay"
+tier = "fast"
+guard = """
+"coldplug replayed 0 modaliases, 0 of them non-zero" read as a pass, and
+the old guard excluded zero on purpose with `[ "$total" -gt 0 ] &&` -- so
+the one case where the loop did no work at all was the one case it could
+not report. A count that agrees with itself while measuring nothing is
+the same defect as the rng probe's dd, and this probe already carries a
+paragraph about the last time it had it: 41 modprobes that all died on
+"invalid option -- 'd'" and reported 41/41 clean."""
+tests = [
+  "tests/test_local_rig.py::test_a_coldplug_that_replayed_nothing_is_not_a_clean_replay",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''        if [ "$total" = "0" ]; then'''
+replace = '''        if false; then'''
+
+[[mutation]]
+name = "rig-coldplug-failures-do-not-reach-the-exit-code"
+tier = "fast"
+guard = """
+Printing a FAIL line is not the same as failing. Every failure path in a
+probe has to go through rig_fail, which is what puts status=fail on the
+marker and turns rig_boot's exit code non-zero; an `echo` that says FAIL
+and leaves the status at ok is exactly the state this rig was in when a
+replay that mounted nothing exited 0."""
+tests = [
+  "tests/test_local_rig.py::test_a_coldplug_that_mounted_nothing_says_so",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    rig_fail "could not mount the module disk at /dev/mmcblk0" \'''
+replace = '''    echo "   FAIL: could not mount the module disk at /dev/mmcblk0" \'''
+
+[[mutation]]
+name = "rig-init-swallows-a-mount-that-did-not-happen"
+tier = "fast"
+guard = """
+All three of the init's mounts ended in `2>/dev/null` with their exit
+status unread, so a /proc, /sys or /dev that never arrived was invisible.
+A guest with no /dev is the concrete path by which the rng probe reports
+on entropy it never asked for, and a guest with no /sys is a coldplug
+replay of nothing. EBUSY stays tolerated -- a kernel with
+CONFIG_DEVTMPFS_MOUNT mounts /dev before /init and mounting it again is
+harmless -- and nothing else does."""
+tests = [
+  "tests/test_local_rig.py::test_a_mount_that_failed_is_not_swallowed",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    rig_fail "could not mount $1 on $2 (rc=$rc)" \'''
+replace = '''    echo "   could not mount $1 on $2 (rc=$rc)" \'''
+
+[[mutation]]
+name = "rig-init-refuses-a-dev-the-kernel-already-mounted"
+tier = "fast"
+guard = """
+The other direction of the same guard, and the one that would make the
+rig useless on a perfectly good host. A kernel built with
+CONFIG_DEVTMPFS_MOUNT mounts /dev before /init runs; mounting it again
+over itself returns EBUSY and is not a problem. Refusing that would fail
+every probe on that kernel for a reason that is not about the probe --
+the same class of false refusal as demanding kmod from the rng probe."""
+tests = [
+  "tests/test_local_rig.py::test_a_mount_that_was_already_done_is_tolerated",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    *"resource busy"*|*"Resource busy"*|*"esource or device busy"*)'''
+replace = '''    *"this string appears in no mount error"*)'''
+
+[[mutation]]
+name = "rig-console-probe-calls-a-missing-proc-a-finding"
+tier = "fast"
+guard = """
+`cat /proc/consoles || echo "   (none)"` printed "(none)", which reads as
+a finding about consoles when it is /proc failing to mount. This is the
+probe that settled the ttyAMA1 question after six runs of misdiagnosed
+"freeze"; an answer it cannot actually support is the most expensive
+thing it could print."""
+tests = [
+  "tests/test_local_rig.py::test_a_console_probe_that_cannot_read_proc_says_so",
+]
+[[mutation.edit]]
+file = "harness/img-local-rig.sh"
+find = '''    || rig_fail "/proc/consoles is unreadable, so nothing below can say which" \'''
+replace = '''    || echo "   (none)" "" \'''
 
 [[mutation]]
 name = "rig-is-not-findable-from-the-readme"

@@ -32,9 +32,11 @@ already shipped one guard that could not pass.
 """
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -70,6 +72,17 @@ def rig_eval(snippet, *, env=None, timeout=60):
 
 
 # --- 1. the machine the rig boots is tier 3's machine ---------------------
+#
+# AGAINST TIER 3'S ARGV, NOT AGAINST TIER 3'S PROSE. img-boot.sh is 1375
+# lines and most of them are argument about the invocation rather than the
+# invocation, so a substring search over the file agrees just as happily
+# with the flag the script no longer passes. Measured, with the checks
+# below in their previous form: `-M` matched the log() line "Booting $phase
+# under -M raspi3b ...", `-m` matched a comment, `-display` and
+# `-no-reboot` matched any of a dozen mentions -- and deleting `-no-reboot`
+# from the real command line left the whole suite at 863 passed, as did
+# reversing its two -serial lines. So the one block the shell actually runs
+# is parsed, the way img_boot_append() already reads the one -append.
 
 def img_boot_append() -> str:
     """The kernel command line img-boot.sh hands the emulator, as written."""
@@ -77,6 +90,56 @@ def img_boot_append() -> str:
     m = re.search(r'^\s*-append "([^"]*)"', text, re.M)
     assert m, f"{IMG_BOOT} no longer passes a quoted -append"
     return m.group(1)
+
+
+def img_boot_qemu_block() -> str:
+    """The ONE backgrounded qemu invocation img-boot.sh runs, as written.
+
+    Exactly one, for the reason tests/mutation_gate.py refuses a `find`
+    that matches twice: which of two blocks got read would otherwise
+    depend on the file's history rather than on anybody's decision.
+    """
+    blocks = re.findall(
+        r'^[ \t]*timeout\b[^\n]*\bqemu-system-aarch64[ \t]*\\\n'
+        r'(?:[^\n]*\\\n)*'
+        r'[^\n]*&[ \t]*$',
+        IMG_BOOT.read_text(), re.M)
+    assert len(blocks) == 1, (
+        f"{IMG_BOOT} has {len(blocks)} backgrounded qemu-system-aarch64 "
+        f"invocations continued over several lines, and this file compares "
+        f"the rig against exactly one. It cannot choose between two.")
+    return blocks[0]
+
+
+def img_boot_argv() -> list:
+    """That block as tokens, split the way the shell would split it.
+
+    shlex rather than a regex per flag, because the point is to read the
+    ARGUMENTS -- including the ones whose value is a quoted string with
+    spaces in it. `${INITRD:+-initrd "$INITRD"}` survives as two
+    odd-looking tokens, which is harmless: nothing here asks about -initrd.
+    """
+    return shlex.split(img_boot_qemu_block().replace("\\\n", " "), posix=True)
+
+
+def test_the_parsed_block_really_is_the_command_line_tier_3_runs():
+    """The positive control on the parser, without which everything in
+    this section rots into agreement with a string nobody runs.
+
+    Three independent anchors: the block is the one the shell backgrounds,
+    it starts with the bounded `timeout` wrapper, and the -append inside it
+    is the same one img_boot_append() finds by a completely different
+    route. A regex that drifted onto some other line fails all three.
+    """
+    block = img_boot_qemu_block()
+    assert block.rstrip().endswith("&"), block
+    argv = img_boot_argv()
+    assert argv[0] == "timeout", argv[:3]
+    assert "qemu-system-aarch64" in argv, argv
+    assert argv_value(argv, "-append") == img_boot_append(), (
+        "the -append inside the parsed block is not the one "
+        "img_boot_append() reads out of the file, so one of the two is "
+        "looking at the wrong line")
 
 
 def rig_argv() -> list:
@@ -115,26 +178,31 @@ DELIBERATELY_NOT_IN_THE_RIG = {
 
 
 def test_the_rig_boots_the_machine_img_boot_boots():
-    """-M, -m, and the display/reboot flags, held against tier 3."""
+    """-M, -m, and the display/reboot flags, held against tier 3's argv."""
     argv = rig_argv()
-    img = IMG_BOOT.read_text()
+    img = img_boot_argv()
     assert argv[0] == "qemu-system-aarch64"
     for flag, why in (("-M", "the emulated board"), ("-m", "the memory size")):
+        assert flag in img, (
+            f"{IMG_BOOT}'s qemu invocation no longer passes {flag} ({why})")
         rig_value = argv_value(argv, flag)
-        # Not anchored to the line start: img-boot.sh writes
-        # `-M raspi3b -m 1024 \` on a single line.
-        m = re.search(rf'(?:^|\s){re.escape(flag)} (\S+)', img, re.M)
-        assert m, f"{IMG_BOOT} no longer passes {flag} ({why})"
-        assert rig_value == m.group(1), (
+        img_value = argv_value(img, flag)
+        assert rig_value == img_value, (
             f"the rig passes {flag} {rig_value} and img-boot.sh passes "
-            f"{flag} {m.group(1)}. Findings do not transfer between "
+            f"{flag} {img_value}. Findings do not transfer between "
             f"different machines."
         )
     # -no-reboot in particular: without it a guest that resets loops, and
-    # runs 3 and 4 of issue #17 were both misread reboot loops.
+    # runs 3 and 4 of issue #17 were both misread reboot loops. In the
+    # ARGV on both sides -- the word appears a dozen times in img-boot.sh's
+    # prose, and asking the file whether it contains it is how deleting it
+    # from the real command line left this test green.
     for flag in ("-display", "-no-reboot"):
         assert flag in argv, f"the rig no longer passes {flag}"
-        assert flag in img, f"{IMG_BOOT} no longer passes {flag}"
+        assert flag in img, (
+            f"{IMG_BOOT}'s qemu invocation no longer passes {flag}. The "
+            f"word may well still be in the file; that is what made this "
+            f"check unable to fail.")
 
 
 def test_every_kernel_parameter_the_rig_passes_is_one_tier_3_passes():
@@ -197,16 +265,59 @@ def test_the_rig_synthesises_the_board_revision_tier_3_synthesises():
     )
 
 
-def test_the_rig_captures_both_uarts_in_tier_3s_order():
-    """First -serial is the PL011, second is the mini-UART.
+#: The mapping six runs of issue #17 turned on, recorded where a reader
+#: meets it: in the FILE NAMES. Whatever lands in console.log came out of
+#: the PL011 (ttyAMA1 under this DTB, where the probe and the real console
+#: talk) and whatever lands in console-uart1.log came out of the mini-UART,
+#: where the earlycon bootconsole lives and nothing else does. Both scripts
+#: must capture them in that order or the file each script points its
+#: reader at is the other one -- which is precisely the stubborn 0 bytes
+#: that went unread for six runs.
+UART_ORDER = ["console.log", "console-uart1.log"]
 
-    Six runs of issue #17 turned on this mapping. Reversing it here would
-    put the rig's probe output in the file the reader treats as bootconsole
-    noise.
+
+def serial_files(argv, resolve=lambda v: v) -> list:
+    """The basenames each -serial writes to, in the order they are passed."""
+    out = []
+    for flag, value in zip(argv, argv[1:]):
+        if flag != "-serial":
+            continue
+        assert value.startswith("file:"), value
+        out.append(os.path.basename(resolve(value[len("file:"):])))
+    return out
+
+
+def img_boot_console_vars() -> dict:
+    """img-boot.sh's `local console=` / `local console2=`, as paths.
+
+    The variable names carry no meaning and the file names carry all of
+    it, so the -serial values have to be resolved through the assignments
+    before the order means anything.
     """
-    argv = rig_argv()
-    serials = [argv[i + 1] for i, a in enumerate(argv) if a == "-serial"]
-    assert serials == ["file:/C0", "file:/C1"], serials
+    found = dict(re.findall(r'^\s*local (console2?)="(\$dir/[^"]+)"',
+                            IMG_BOOT.read_text(), re.M))
+    assert set(found) == {"console", "console2"}, (
+        f"{IMG_BOOT} no longer names its two console files in the shape "
+        f"this test resolves: found {found}")
+    return found
+
+
+def test_tier_3_captures_the_pl011_into_console_log():
+    """img-boot.sh's half of the mapping, read from its qemu invocation.
+
+    This used to be checked nowhere at all: the test below asserted the
+    arguments it had just passed in and never opened img-boot.sh.
+    Measured -- swapping img-boot.sh's two -serial lines left the whole
+    suite at 863 passed.
+    """
+    cvars = img_boot_console_vars()
+    got = serial_files(img_boot_argv(), lambda v: cvars[v.lstrip("$")])
+    assert got == UART_ORDER, (
+        f"img-boot.sh captures {got}. The first -serial is the PL011 and "
+        f"the second is the mini-UART; reversed, every reader sent to "
+        f"console.log for the real console gets bootconsole noise, and the "
+        f"PL011's silence -- the actual clue -- lands in the file nobody "
+        f"is told to read.")
 
 
 # --- 2. the probe menu cannot disagree with the kitchen -------------------
@@ -429,6 +540,79 @@ def test_the_stub_path_carries_every_tool_the_preflight_asks_for(tmp_path):
         f"it is not about.")
 
 
+#: Tools a Debian host may genuinely not have, which is why the rig has to
+#: ASK for them rather than assume them. Not coreutils in general: `cat`
+#: and `mv` are not going to be missing, and a list that included them
+#: would be noise around the entries that matter. Every one of these,
+#: absent, is a real configuration -- a runner with no
+#: device-tree-compiler, a container with no kmod, a qemu built without
+#: the Pi machines.
+NOT_GUARANTEED = {
+    "qemu-system-aarch64", "curl", "xz", "gzip", "cpio", "dpkg-deb",
+    "fdtput", "fdtget", "od", "depmod", "mkfs.ext4", "truncate", "timeout",
+}
+
+
+def rig_host_code() -> str:
+    """The rig's own shell, with the guest's and the prose removed.
+
+    The `<<'PROBE'` heredocs run in the initramfs against busybox applets
+    and say nothing at all about what the HOST needs -- a `dd` in there is
+    not a host tool. Comments go too: this file argues with itself at
+    length and names tools while doing it.
+    """
+    text = re.sub(r"cat <<'PROBE'\n.*?\nPROBE\n", "", RIG.read_text(),
+                  flags=re.S)
+    return re.sub(r'^[ \t]*#.*$', '', text, flags=re.M)
+
+
+def test_every_host_tool_the_rig_runs_is_one_it_asked_for():
+    """USED IS DECLARED, which is the direction that catches the real bug.
+
+    The test above checks the other one -- that everything DECLARED is on
+    the stub PATH -- and a tool the rig runs without declaring sails past
+    it. fdtget did exactly that. The rig writes the board revision with
+    fdtput and reads it back with fdtget, so on a host with no
+    device-tree-compiler the readback returned nothing and the rig
+    announced "$dtb does not carry linux,revision after the patch": the
+    patch blamed for a tool that was never installed, which is precisely
+    the misdirection the whole preflight exists to prevent. timeout and
+    truncate had the same shape.
+    """
+    declared = set(rig_tools("RIG_BOOT_TOOLS") + rig_tools("RIG_COLDPLUG_TOOLS")
+                   + rig_tools("RIG_RESOLVE_TOOLS"))
+    code = rig_host_code()
+    used = {t for t in NOT_GUARANTEED
+            if re.search(rf'(?:^|[\t (|;&]|\$\()[ \t]*{re.escape(t)}[ \t]',
+                         code, re.M)}
+    assert used, "the tool scan matched nothing at all, so it proves nothing"
+    undeclared = used - declared
+    assert not undeclared, (
+        f"the rig runs {sorted(undeclared)} and no RIG_*_TOOLS list asks "
+        f"for them, so a host without them fails somewhere downstream with "
+        f"a message about something else. Add each to the list belonging to "
+        f"the path that runs it.")
+
+
+def test_the_tool_scan_would_notice_an_undeclared_one():
+    """Positive control for the scan, which is a regex and can rot silently.
+
+    An undeclared tool is planted by removing one from the declaration
+    rather than by adding one to the code, so this exercises the same
+    comparison the test above makes on the same text.
+    """
+    declared = set(rig_tools("RIG_BOOT_TOOLS") + rig_tools("RIG_COLDPLUG_TOOLS")
+                   + rig_tools("RIG_RESOLVE_TOOLS")) - {"fdtget"}
+    code = rig_host_code()
+    used = {t for t in NOT_GUARANTEED
+            if re.search(rf'(?:^|[\t (|;&]|\$\()[ \t]*{re.escape(t)}[ \t]',
+                         code, re.M)}
+    assert "fdtget" in used, (
+        "the scan cannot see fdtget in the rig's host code, so the test "
+        "above could not have caught it going undeclared")
+    assert used - declared == {"fdtget"}
+
+
 def test_a_host_with_no_qemu_says_so(tmp_path):
     proc = preflight("rng", stub_path(tmp_path, omit=("qemu-system-aarch64",)))
     assert proc.returncode != 0
@@ -437,15 +621,26 @@ def test_a_host_with_no_qemu_says_so(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("qemu-system-aarch64") is None,
-                    reason="no qemu-system-aarch64 on this host to hold the "
-                           "preflight against; the fake-qemu control below "
-                           "still runs, and so does everything else in this "
-                           "section. This one exists for the part a fake "
-                           "cannot prove -- that a REAL `-M help` listing "
-                           "matches the pattern rig_have_raspi_machine "
-                           "greps for. apt-get install qemu-system-arm")
+                    reason="THIS ONE NEVER RUNS IN CI, and that is a "
+                           "standing fact rather than an accident of some "
+                           "host: ci.yml installs qemu-system-x86 and only "
+                           "that, in the `vm` job, which runs no pytest -- "
+                           "so no job that collects this file has an "
+                           "aarch64 emulator and this is skipped on every "
+                           "push, permanently. Deliberate: putting qemu in "
+                           "the fast tier is a 200MB install per commit for "
+                           "a debugging tool with no CI wiring by design "
+                           "(issue #22). It runs LOCALLY, which is where "
+                           "the rig is used, and it is the only thing here "
+                           "that can prove a REAL `-M help` listing matches "
+                           "the pattern rig_have_raspi_machine greps for. "
+                           "Everything else in this section runs everywhere "
+                           "against a fake, including this one's positive "
+                           "control test_a_qemu_with_the_raspi_machine_gets_"
+                           "through. apt-get install qemu-system-arm")
 def test_the_hosts_own_qemu_satisfies_the_preflight(tmp_path):
-    """The one test here that wants the real emulator.
+    """The one test here that wants the real emulator, and the one test
+    here that CI never runs. See the skip reason.
 
     Everything else in this section runs against a shell script pretending
     to be qemu, which proves the rig's logic and nothing about qemu. This
@@ -944,38 +1139,523 @@ def test_a_busybox_too_short_to_have_a_header_is_refused_clearly(tmp_path):
     assert "cannot skip past end" not in proc.stderr
 
 
-# --- 8. the probes report, and the rig waits for the report ---------------
+# --- 8. the marker contract, run rather than quoted -----------------------
+#
+# ONE HANDSHAKE IS WHAT MAKES THIS RIG SECONDS-SCALE: the guest prints
+# OTP-RIG-DONE, the sampler sees it and kills the emulator. `poweroff -f`
+# does not stop -M raspi3b -- measured, a probe printed its own DONE marker
+# at 4.15s guest and the machine then sat in rcu_preempt stalls until the
+# 180s cap, exiting 124 -- so without the handshake the rig is a 300s tool
+# and has no reason to exist rather than tier 3.
+#
+# Both halves of it used to be guarded by "the source contains this
+# string", which proves the string is present and nothing whatever about
+# the handshake. These run rig_boot against a script pretending to be qemu
+# and time it, the way test_the_machine_check_survives_a_producer_that_
+# keeps_writing runs the real check against a real 200KB listing.
 
-def test_every_probe_ends_with_the_marker_the_sampler_waits_for():
-    """`poweroff -f` does not stop -M raspi3b: measured, the guest printed
-    its DONE marker at 4.15s and then sat in rcu stalls to the 180s cap.
+FAKE_QEMU = r"""#!/bin/bash
+# A stand-in for the emulator. Writes to the file named by the FIRST
+# -serial -- which is what a guest whose console is the PL011 does -- and
+# then sits still for far longer than any backstop these tests set, so
+# that "the run ended" is always the sampler's doing and never the fake's.
+first=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-serial" ] && [ -z "$first" ]; then first="${a#file:}"; fi
+  prev="$a"
+done
+printf 'fake qemu speaking on %s\n' "$first" >> "$first"
+__MARKER__
+sleep 600
+"""
 
-    So the sampler kills the emulator on the marker, and a probe that never
-    prints one costs the full backstop. The marker is emitted by the init
-    wrapper after the probe body, which is what makes that true for every
-    probe including one that fails half way.
+
+def fake_qemu(marker):
+    """FAKE_QEMU with one line: what the guest says, or nothing at all."""
+    say = (f'printf "%s\\n" {shlex.quote(marker)} >> "$first"'
+           if marker else '# this guest says nothing')
+    return FAKE_QEMU.replace("__MARKER__", say)
+
+
+def boot(tmp_path, probe, marker, *, backstop=25, wait=120):
+    """Run the rig's own rig_boot against the fake emulator.
+
+    rig_boot is the function under test and the only one: it builds the
+    argv, samples the console, stops the emulator on the marker and turns
+    all of that into an exit code. Everything before it -- the archive,
+    the deb, the DTB, the initramfs -- is a different half of the rig and
+    is tested elsewhere in this file.
+
+    Returns the process, the wall clock it took, and the work dir, because
+    two of the three properties here are about time. The process is None
+    if `wait` ran out: a rig_boot that has not returned is a rig_boot that
+    is waiting out its backstop, which is the failure some of these tests
+    are looking for, and giving up on it early is what keeps the mutation
+    gate's bill for that row down to the deadline rather than up to the
+    backstop.
     """
-    text = RIG.read_text()
-    assert 'printf \'echo "OTP-RIG-DONE %s"\\n\' "$probe"' in text, (
-        "the init wrapper no longer emits the DONE marker unconditionally "
-        "after the probe body")
-    assert 'grep -acF "OTP-RIG-DONE $probe"' in text, (
-        "the sampler no longer looks for the marker with grep -c; `grep -q` "
-        "here returns 141 under pipefail against a file qemu is still writing")
+    work = tmp_path / "work"
+    work.mkdir()
+    binned = tmp_path / "bin"
+    binned.mkdir()
+    q = binned / "qemu-system-aarch64"
+    q.write_text(fake_qemu(marker))
+    q.chmod(0o755)
+    env = {"PATH": f"{binned}:{os.environ['PATH']}",
+           "OTP_RIG_WORK": str(work),
+           "OTP_RIG_TIMEOUT": str(backstop)}
+    # `|| rc=$?`, not `;`: the rig runs under set -e and rig_boot restores
+    # it before returning, so a bare call would take the sourcing shell
+    # down with it and print nothing.
+    started = time.monotonic()
+    try:
+        proc = rig_eval(f'rc=0; rig_boot {probe} /K /D /I "" || rc=$?; '
+                        f'echo "RIG-BOOT-RC=$rc"', env=env, timeout=wait)
+    except subprocess.TimeoutExpired:
+        proc = None
+    return proc, time.monotonic() - started, work
 
 
-def test_a_probe_that_never_reports_is_a_failure_not_a_pass():
-    """The silent-pass question: what does the rig do with no evidence?
+@pytest.fixture(scope="module")
+def clean_boot(tmp_path_factory):
+    """One successful fake boot, shared by the tests that need one.
 
-    A rig that exits 0 having captured an empty console is worse than one
-    that crashes, because the reader concludes the probe answered.
+    Module-scoped because it costs real seconds: the sampler's cadence is
+    two seconds and it drains for two more, so a boot that stops on its
+    marker cannot take less than about six however fast the fake is. The
+    failure cases below each need their own, and pay for it.
+
+    The backstop is 25s and the deadline 12s, which is what makes the
+    failure cheap to observe: a sampler that has stopped stopping runs to
+    the backstop, and there is no reason to watch it do so.
     """
-    text = RIG.read_text()
-    boot = text[text.index("rig_boot() {"):]
-    assert "NEVER REPORTED" in boot
-    assert re.search(r'if \[ -z "\$stopped" \]; then', boot), (
-        "rig_boot no longer distinguishes a run that reported from one that "
-        "did not")
+    return boot(tmp_path_factory.mktemp("clean"), "rng",
+                "OTP-RIG-DONE rng status=ok", backstop=25, wait=12)
+
+
+def test_the_marker_stops_the_emulator_instead_of_waiting_out_the_backstop(
+        clean_boot):
+    """The handshake, timed.
+
+    The fake sits still for 600s and the backstop is 25s, so finishing at
+    all is the property and finishing quickly is the measurement. A
+    sampler that has stopped watching for the marker pays the whole 25 --
+    and then reports as a run that never reported, which is the second
+    assertion here from the same evidence.
+    """
+    proc, seconds, _ = clean_boot
+    assert proc is not None, (
+        f"the marker was on the console and rig_boot had still not "
+        f"returned {seconds:.0f}s later, with a 25s backstop under it. The "
+        f"sampler is not stopping the emulator, which is the whole reason "
+        f"this rig answers faster than tier 3.")
+    assert "RIG-BOOT-RC=0" in proc.stdout, proc.stderr
+    assert "reported after" in proc.stderr
+
+
+def test_a_probe_that_never_reports_pays_the_backstop_and_says_so(tmp_path):
+    """The other side, and the interesting case.
+
+    A run whose guest never printed a marker is what a wedge looks like.
+    It has to cost the backstop -- there is nothing else to wait for --
+    and it has to be its OWN exit code, because "the machine never got
+    there" and "the probe ran and found something wrong" are different
+    problems and telling them apart is most of what this rig is for.
+    """
+    proc, seconds, _ = boot(tmp_path, "rng", "", backstop=6)
+    assert "RIG-BOOT-RC=1" in proc.stdout, proc.stderr
+    assert "NEVER REPORTED" in proc.stderr
+    assert seconds >= 6, (
+        f"rig_boot gave up after {seconds:.0f}s of a 6s backstop, so it "
+        f"stopped on something other than the marker it never saw")
+
+
+def test_the_rig_will_not_call_a_failed_probe_an_answer(tmp_path):
+    """status=fail is a non-zero exit, and a different one.
+
+    Measured before the marker carried a status: coldplug's body with no
+    module disk printed "FAIL: could not mount the module disk at
+    /dev/mmcblk0" and the rig exited 0, so `./harness/img-local-rig.sh
+    coldplug-replay && echo clean` printed clean for a replay that mounted
+    nothing. A probe body of `:` printed BEGIN and DONE and did the same.
+    """
+    proc, _, _ = boot(tmp_path, "rng", "OTP-RIG-DONE rng status=fail")
+    assert "RIG-BOOT-RC=2" in proc.stdout, proc.stderr
+    assert "REPORTED FAILURE" in proc.stderr
+    # Not the wedge code: the guest reported, it just reported badly.
+    assert "NEVER REPORTED" not in proc.stderr
+
+
+def test_a_marker_with_no_status_at_all_is_not_a_pass(tmp_path):
+    """Fail closed. A marker the rig cannot read a status out of stops the
+    run -- it has to, or the run costs the backstop -- but it does not get
+    to mean the probe did its work."""
+    proc, _, _ = boot(tmp_path, "rng", "OTP-RIG-DONE rng")
+    assert "RIG-BOOT-RC=2" in proc.stdout, proc.stderr
+
+
+def test_the_rig_captures_both_uarts_in_tier_3s_order(tmp_path):
+    """The rig's half of the mapping, from a run rather than from a call.
+
+    rig_qemu_argv is not the whole story -- rig_boot decides which file it
+    hands to which -serial, and which one it then samples and points the
+    reader at. So this reads the argv rig_boot actually wrote, and checks
+    that the line the fake spoke on the FIRST port landed in the file the
+    rig points its reader at. It used to assert the arguments the test
+    itself had just passed in.
+
+    Its own short backstop, not the shared clean boot: this does not need
+    the run to SUCCEED, only to have launched, and reversing the order is
+    exactly the mutation that stops the sampler ever seeing a marker. Four
+    seconds of fake emulator rather than a backstop spent proving a point
+    the argv file already settles.
+    """
+    _, _, work = boot(tmp_path, "rng", "OTP-RIG-DONE rng status=ok",
+                      backstop=4)
+    argv = (work / "rng" / "qemu-argv.txt").read_text().splitlines()
+    assert serial_files(argv) == UART_ORDER, serial_files(argv)
+    first = (work / "rng" / "console.log").read_text()
+    second = (work / "rng" / "console-uart1.log").read_text()
+    assert "OTP-RIG-DONE" in first, first
+    assert "OTP-RIG-DONE" not in second, second
+
+
+# --- 9. the init the guest runs -------------------------------------------
+#
+# UNTIL NOW THIS WAS THE ONLY SHELL IN THE REPOSITORY NOTHING LOOKED AT.
+# The probe bodies live in `<<'PROBE'` quoted heredocs, which shellcheck
+# reads as data: measured, an unbalanced `if [ "$broken" ; then` inside the
+# rng heredoc left shellcheck v0.9.0 at rc 0, this file's 48 tests green
+# and the whole suite at 863 passed. What that typo does in real use is
+# kill /init before the marker, so the sampler waits out the full 300s and
+# the rig prints "NEVER REPORTED ... hung, reset, or never reached /init"
+# -- the exact wedge signature the rig exists to DISAMBIGUATE, produced by
+# a typo in the rig.
+#
+# So: `sh -n` over every probe's init, and then the init RUN, because
+# parsing is not the interesting half. The marker's status is what the
+# rig's exit code now means, and the only way to know a probe sets it when
+# its work did not happen is to stop the work happening and look.
+
+def init_script(probe, *, idle_seconds="3") -> str:
+    """The init the rig writes into the initramfs, from the rig itself."""
+    proc = rig_eval(f'rig_init_script {probe}',
+                    env={"OTP_RIG_IDLE_SECONDS": idle_seconds})
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def sh_n(text):
+    return subprocess.run(["sh", "-n"], input=text, capture_output=True,
+                          text=True, timeout=30)
+
+
+def test_every_probes_init_parses_as_shell():
+    """The cheap check that was missing entirely."""
+    for probe in declared_probes():
+        proc = sh_n(init_script(probe))
+        assert proc.returncode == 0, (
+            f"the {probe} init does not parse, so /init dies before the "
+            f"marker and the run reads as a wedge: {proc.stderr}")
+
+
+def test_the_syntax_check_would_notice(tmp_path):
+    """Positive control, and the whole of the evidence for the section.
+
+    A `sh -n` that accepts anything is not a check. This is the exact
+    breakage that was measured passing everything: shellcheck rc 0, 48
+    tests green, 863 passed.
+    """
+    broken = init_script("rng").replace('echo "-- hwrng:"',
+                                        'if [ "$broken" ; then')
+    assert 'if [ "$broken" ; then' in broken, "the fixture patched nothing"
+    assert sh_n(broken).returncode != 0
+
+
+#: Commands the init runs that must not be allowed to touch the host these
+#: tests run on. `mount` above all: the init mounts /proc, /sys and /dev,
+#: and this is not the rig's guest. The rest either write outside the temp
+#: dir -- `mkdir -p /lib`, `ln -sf ... /lib/modules` -- or load kernel
+#: modules. Everything else is the host's own tool, which is what lets the
+#: rng body genuinely run: /proc/sys/kernel/random and /dev/random are
+#: Linux, not Raspberry Pi.
+NEUTERED = ("mount", "mkdir", "ln", "modprobe", "depmod")
+
+#: The idle loop at the bottom of every init is `while true; do sleep 5;
+#: done`, and it is deliberate -- PID 1 exiting is a kernel panic that
+#: scrolls the evidence off the console. On a host there is no PID 1 to
+#: protect and something has to end the run, so the five-second sleep, and
+#: only the five-second sleep, stops the shell. Every other sleep in the
+#: probes asks for one second and is answered honestly.
+SLEEP_STUB = """#!/bin/sh
+if [ "$1" = "5" ]; then kill -TERM "$PPID"; exit 0; fi
+__ONE__
+"""
+
+
+def run_init(tmp_path, probe, *, rc=None, stubs=None, real_sleep=True,
+             moddir=None, idle_seconds="3", timeout=60):
+    """Run the init the rig builds, under a host shell.
+
+    The emulator is not what is under test here; the SCRIPT is, and it is
+    the same script either way. `rc` overrides the exit status of named
+    commands, which is the whole mechanism -- {"dd": 1} is a /dev/random
+    that cannot be read, and {"mount": 1} is a guest with no /proc.
+    `stubs` replaces a command outright, for the cases where WHAT it says
+    is the thing under test.
+
+    dash buffers its output, so this reads a file rather than a pipe:
+    measured, a shell killed mid-loop still flushes everything it echoed.
+    """
+    rc = dict(rc or {})
+    binned = tmp_path / "bin"
+    binned.mkdir(parents=True)
+    for name in NEUTERED:
+        rc.setdefault(name, 0)
+    for name, code in rc.items():
+        stub = binned / name
+        stub.write_text(f'#!/bin/sh\n[ {code} = 0 ] || '
+                        f'echo "{name}: stubbed failure" >&2\nexit {code}\n')
+        stub.chmod(0o755)
+    for name, text in (stubs or {}).items():
+        stub = binned / name
+        stub.write_text(text)
+        stub.chmod(0o755)
+    sleeper = binned / "sleep"
+    sleeper.write_text(SLEEP_STUB.replace(
+        "__ONE__", 'exec /bin/sleep "$@"' if real_sleep else "exit 0"))
+    sleeper.chmod(0o755)
+
+    script = tmp_path / "init"
+    script.write_text(init_script(probe, idle_seconds=idle_seconds))
+    out = tmp_path / "init.out"
+    env = dict(os.environ)
+    env["PATH"] = f"{binned}:{env['PATH']}"
+    # Both documented in the rig: the guest writes these two paths and a
+    # host has neither to spare.
+    env["RIG_FAILED"] = str(tmp_path / "rig-failed")
+    env["RIG_MODDIR"] = str(moddir or (tmp_path / "moddir"))
+    with out.open("w") as fh:
+        proc = subprocess.Popen(["sh", str(script)], stdout=fh,
+                                stderr=subprocess.STDOUT, env=env,
+                                cwd=str(tmp_path))
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise
+    return out.read_text(errors="replace")
+
+
+def marker_status(text, probe):
+    """The status on the DONE marker, or None if there is no marker."""
+    m = re.search(rf'^OTP-RIG-DONE {re.escape(probe)}(?: status=(\S+))?$',
+                  text, re.M)
+    return None if m is None else (m.group(1) or "")
+
+
+def test_every_probes_init_ends_with_a_marker_carrying_a_status(tmp_path):
+    """Run, for every probe, with everything that could fail stubbed out.
+
+    The wrapper's contract in one test: BEGIN, then the body, then the
+    marker -- unconditionally, so a probe that dies half way still ends
+    the run instead of hanging it -- and the marker says which of the two
+    it was. Whether a given probe passes on a host is not the point and is
+    not asserted; coldplug's answer depends on what the host has in
+    /sys/devices.
+    """
+    for probe in declared_probes():
+        text = run_init(tmp_path / probe, probe, real_sleep=False)
+        assert f"OTP-RIG-BEGIN {probe}" in text, text
+        status = marker_status(text, probe)
+        assert status in ("ok", "fail"), (
+            f"the {probe} init ended with {status!r}, not a marker the "
+            f"sampler can read a verdict out of:\n{text}")
+
+
+def test_a_probe_whose_work_happened_says_ok(tmp_path):
+    """Positive control for every negative below, on the probe whose body
+    runs honestly on a host: /proc/sys/kernel/random and /dev/random are
+    Linux, and dd reading sixteen bytes is the real thing."""
+    text = run_init(tmp_path, "rng")
+    assert marker_status(text, "rng") == "ok", text
+    assert "16 blocking bytes" in text, text
+
+
+def test_the_rng_probe_will_not_report_a_read_that_did_not_happen(tmp_path):
+    """THE ONE THIS SECTION EXISTS FOR.
+
+    dd's exit code was never examined and its stderr went to /dev/null, so
+    "16 blocking bytes: uptime ... -> ..." printed unconditionally with a
+    plausible sub-second delta. Measured on the emulator: booting the
+    verbatim probe with /dev/random deleted printed "16 blocking bytes:
+    uptime 3.29 -> 3.31" and the rig exited 0.
+
+    It does not stay in the rig either. img-boot.sh cites this measurement
+    as the evidence for a hard gate on crng seeding and harness/README.md
+    repeats the figures, so a probe that cannot tell a blocking read from
+    a missing device is a pad printer being told its entropy is fine.
+    """
+    text = run_init(tmp_path, "rng", rc={"dd": 1})
+    assert marker_status(text, "rng") == "fail", text
+    assert "the blocking read did not happen" in text, text
+    assert "16 blocking bytes" not in text, (
+        "the probe still reported sixteen bytes it never read:\n" + text)
+
+
+def test_a_mount_that_failed_is_not_swallowed(tmp_path):
+    """All three mounts ended in `2>/dev/null` with their status unread.
+
+    A guest with no /dev is the concrete path by which the rng probe above
+    reports on entropy it never asked for, so the mounts have to be able
+    to say they did not happen.
+    """
+    text = run_init(tmp_path, "rng", rc={"mount": 1})
+    assert marker_status(text, "rng") == "fail", text
+    assert "could not mount" in text, text
+
+
+#: busybox's own wording, from a real guest: mounting devtmpfs over a /dev
+#: the kernel already mounted returns 255 and says this.
+EBUSY_MOUNT = ('#!/bin/sh\n'
+               'echo "mount: mounting $2 on $3 failed: '
+               'Device or resource busy" >&2\nexit 255\n')
+
+
+def test_a_mount_that_was_already_done_is_tolerated(tmp_path):
+    """The one failure the mounts may swallow, and only this one.
+
+    A kernel built with CONFIG_DEVTMPFS_MOUNT mounts /dev before /init
+    runs, and mounting it again over itself is EBUSY and no problem.
+    Measured on this rig's kernel that does NOT happen -- /dev holds one
+    node, `console`, and all three mounts return 0 -- which is exactly why
+    the tolerance has to be this narrow. The control is the test above:
+    the same non-zero exit with any other message is a failure.
+    """
+    text = run_init(tmp_path, "rng", stubs={"mount": EBUSY_MOUNT})
+    assert marker_status(text, "rng") == "ok", text
+    assert "already mounted" in text, text
+    assert "could not mount" not in text, text
+
+
+def test_the_idle_probe_will_not_report_time_it_did_not_spend(tmp_path):
+    """"survived 45 seconds" was printed for completing 45 iterations of a
+    loop, which is a different statement.
+
+    A sleep that returns immediately finishes the loop in milliseconds and
+    the probe reports surviving a minute it never spent -- and this is the
+    probe that decides whether the watchdog fix from issue #17 is
+    believed. Same shape as the rng probe's unexamined dd.
+    """
+    fast = run_init(tmp_path / "fast", "idle-survive", real_sleep=False)
+    assert marker_status(fast, "idle-survive") == "fail", fast
+    assert "Nothing waited, so" in fast, fast
+    assert "survived 3 seconds with no reset" not in fast, fast
+
+
+def test_the_idle_probe_reports_time_it_did_spend(tmp_path):
+    """Positive control, same fixture, three real seconds."""
+    slow = run_init(tmp_path / "slow", "idle-survive", real_sleep=True)
+    assert marker_status(slow, "idle-survive") == "ok", slow
+    assert "survived 3 seconds with no reset" in slow, slow
+
+
+#: Fails the module disk and nothing else. A blanket `mount` failure would
+#: also take out the init's own /proc, /sys and /dev -- which set the
+#: status by themselves -- and the test below would then pass with the
+#: probe's own failure path deleted. Measured: it did.
+EXT4_MOUNT_FAILS = ('#!/bin/sh\n'
+                    'case " $* " in *" ext4 "*)\n'
+                    '  echo "mount: mounting /dev/mmcblk0 failed" >&2\n'
+                    '  exit 1 ;;\nesac\nexit 0\n')
+
+
+def test_a_coldplug_that_mounted_nothing_says_so(tmp_path):
+    """The measured one. With no module disk the probe printed "FAIL:
+    could not mount the module disk at /dev/mmcblk0" and the rig exited 0,
+    so `./harness/img-local-rig.sh coldplug-replay && echo clean` printed
+    clean for a replay that mounted nothing."""
+    text = run_init(tmp_path, "coldplug-replay",
+                    stubs={"mount": EXT4_MOUNT_FAILS}, real_sleep=False)
+    assert "could not mount" in text and "on /proc" not in text, (
+        "the init's own mounts failed too, so the status below could have "
+        "come from anywhere:\n" + text)
+    assert marker_status(text, "coldplug-replay") == "fail", text
+    assert "could not mount the module disk" in text, text
+
+
+def moddisk(tmp_path, release, *, lines=3):
+    """A module tree with a modules.dep in it, where the guest looks."""
+    d = tmp_path / "moddir" / "lib" / "modules" / release
+    d.mkdir(parents=True)
+    (d / "modules.dep").write_text("x:\n" * lines)
+    return tmp_path / "moddir"
+
+
+def test_a_coldplug_with_no_modules_dep_says_so(tmp_path):
+    """depmod runs on the HOST, in rig_build_module_disk, because the deb
+    ships no modules.dep at all. Without it modprobe resolves nothing and
+    every probe below 'succeeds' without doing anything."""
+    text = run_init(tmp_path, "coldplug-replay", real_sleep=False)
+    assert marker_status(text, "coldplug-replay") == "fail", text
+    assert "no modules.dep for" in text, text
+
+
+def test_a_coldplug_that_replayed_nothing_is_not_a_clean_replay(tmp_path):
+    """"coldplug replayed 0 modaliases, 0 of them non-zero" read as a pass.
+
+    The old guard excluded zero on purpose -- `[ "$total" -gt 0 ] &&` --
+    so the one case where the loop did no work at all was the one case it
+    could not report. A count that agrees with itself while measuring
+    nothing is the same defect as the rng probe's, and this probe already
+    carries a paragraph about the last time it had it.
+    """
+    release = subprocess.run(["uname", "-r"], capture_output=True,
+                             text=True).stdout.strip()
+    text = run_init(tmp_path, "coldplug-replay", real_sleep=False,
+                    moddir=moddisk(tmp_path, release),
+                    rc={"find": 0})
+    assert "replayed 0 modaliases" in text, (
+        "the fixture did not reach the replay loop, so this test is about "
+        "something else:\n" + text)
+    assert marker_status(text, "coldplug-replay") == "fail", text
+    assert "replayed NOTHING" in text, text
+
+
+def test_a_coldplug_that_replayed_something_is(tmp_path):
+    """Positive control for the two above: same fixture, a real find.
+
+    Whether individual modprobes succeed is not the question -- "No such
+    module" is a legitimate answer for an alias with no driver -- so the
+    stub returns 0 and the probe should be satisfied.
+    """
+    release = subprocess.run(["uname", "-r"], capture_output=True,
+                             text=True).stdout.strip()
+    text = run_init(tmp_path, "coldplug-replay", real_sleep=False,
+                    moddir=moddisk(tmp_path, release))
+    assert re.search(r'replayed [1-9]\d* modaliases', text), text
+    assert marker_status(text, "coldplug-replay") == "ok", text
+
+
+def test_a_console_probe_that_cannot_read_proc_says_so(tmp_path):
+    """"(none)" for /proc/consoles reads as a finding about consoles when
+    it is /proc failing to mount, and this probe exists to answer exactly
+    the question it then cannot answer."""
+    text = run_init(tmp_path, "console-test", rc={"cat": 1})
+    assert marker_status(text, "console-test") == "fail", text
+    assert "/proc/consoles is unreadable" in text, text
+
+
+def test_the_console_probe_is_happy_when_it_can_read_proc(tmp_path):
+    """Positive control. Note what is NOT a failure here: "no serial tty
+    nodes at all". Measured on a healthy guest -- devtmpfs mounts and
+    populates /dev with 130-odd nodes and there is still no /dev/ttyAMA1,
+    while /proc/consoles registers ttyAMA1 at 204:65. "Registered as a
+    console, no character device" is the finding this probe exists to
+    bring back, not a fault in the probe."""
+    text = run_init(tmp_path, "console-test")
+    assert marker_status(text, "console-test") == "ok", text
 
 
 def test_the_rig_has_no_ci_wiring():
