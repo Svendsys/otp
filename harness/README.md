@@ -156,6 +156,61 @@ a version string on the status sheet, so the thread is already running by
 the end of the CUPS tests. Measured: `[Errno 22] setns back: Invalid
 argument`, in the teardown of the first button test.
 
+### The one thread every button in the process shares
+
+That same singleton is why `GpioButtons` wraps every callback it hands to
+gpiozero. `_callback_thread.run` dispatches with no guard around the call
+(lgpio 0.2.2.0, lgpio.py:531‑559):
+
+    for cb in self.callbacks:
+        if cb.chip == chip and cb.gpio == gpio:
+            cb.func(chip, gpio, level, tick)
+
+so an exception out of `cb.func` ends the thread — and because the thread
+is process-wide and never restarted, **no button anywhere in the process
+fires again**, including a panel built afterwards. gpiozero adds nothing on
+the way in: `LGPIOPin._call_when_changed` → `PiPin._call_when_changed` →
+`Button._pin_changed` → `_fire_events` → `_fire_activated` contains no
+`try` at all. The only report is a `PytestUnhandledThreadExceptionWarning`
+under pytest, or an ignored-exception line otherwise. Observed while
+fixing issue #12: `lgpio: notify thread alive=False go=True`, with the
+gpio-sim line moving perfectly.
+
+On the unit the trigger to expect is not #12's dead weakref — a real panel
+is built once — but a `MemoryError`: 512 MiB, no swap, pads of up to 1000
+pages. A dead panel there costs a power cycle, which discards the pad in
+progress.
+
+`GpioButtons._guarded` catches, names what was lost on stderr (the
+journal), and carries on. It is checked in three places, deliberately:
+`tests/test_hardware.py` drives the shipped callbacks through a stand-in
+dispatcher with lgpio's fatal shape **and** through lgpio's own `run` fed
+forged edges down a pipe — neither needs a kernel — and
+`TestTheRealButtonPath::test_a_raising_callback_does_not_kill_the_panel`
+here does it with a real gpiochip and the real gpiozero → lgpio chain. All
+of them assert the same property: a *later* press still arrives. "An
+exception was caught" is also true of a panel that has stopped delivering
+anything.
+
+Three places, and for a while only two of them ran anywhere. `pytest -m
+hardware` deselects `tests/test_hardware.py` wholesale — nothing in it is
+marked `hardware` — and the `test` job installs `requirements-dev.txt`,
+which has neither gpiozero nor lgpio, so in a venv with only that in it the
+file measures **27 passed, 10 skipped**: the six `[lgpio]` parametrisations
+and all four `TestRealGpiozero` tests, the control among them. This job runs
+the file by name as well, in a step that treats a skip as a failure —
+`gpiozero` and `lgpio` are installed here, so nothing in it has a reason to
+skip, and a skipped test in a summary line looks exactly like a passing
+one.
+
+Nothing may **park** that thread either, which is a hazard the guard
+created: the report goes to stderr, and on the unit stderr is a stream
+socket to journald. A socket nobody is draining does not raise, it blocks,
+and a thread stuck in `write(2)` is as dead to the panel as one that ended
+— while still answering `is_alive()`. `_report` asks `select()` whether the
+write can complete before making it, and `_note_lost` bounds how often
+there is anything to write; both have tests and mutation rows of their own.
+
 Runs in CI as the `hardware` job.
 
 ## Tier 2 — a VM that actually boots the thing
@@ -1045,20 +1100,23 @@ stayed green.
 
 ```sh
 python3 tests/mutation_gate.py --list
-python3 tests/mutation_gate.py --tier fast       # 145 rows, 123s
+python3 tests/mutation_gate.py --tier fast       # 164 rows, 196s
 sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
 ```
 
 **Runtime decided the trigger.** The issue expected nightly or
-label-triggered; measured, the fast tier is a hundred and twenty-three
-seconds at 145 rows — still cheaper than the suite it audits — so it runs per pull
+label-triggered; measured, the fast tier is about three minutes at 164 rows
+— still cheaper than the suite it audits — so it runs per pull
 request as its own `mutation` job, and the ordinary suite's wall clock does
 not move. The three CUPS-rig rows run in the existing `hardware` job, the
 only place with a real `cupsd`, for 36 seconds on top of about eight minutes.
 Those numbers are counted, not carried forward: an earlier revision of this
 paragraph still said 38 rows and twenty-nine seconds long after both had
 moved, and the revision after that said 114 rows for a round in which there
-were 115.
+were 115, and it sat at 145 rows and 123s for two rounds after that. The row
+count is exact and the seconds are not: three runs of the same 159 rows on
+the same container measured 232s, 190s and 192s, and two runs of the 164
+rows measured 196s and 198s.
 
 Every way this could rot into a no-op is a loud failure rather than a skip: a
 `find` string that no longer matches (the fast suite checks that much without

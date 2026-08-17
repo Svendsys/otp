@@ -42,7 +42,7 @@ jobs:
     # tests/mutations.toml.
     #
     # PER PR, not nightly, and that is measured rather than assumed: the fast
-    # tier is 157 mutations in 172 seconds ON THE DEVELOPMENT CONTAINER, not
+    # tier is 164 mutations in 196 seconds ON THE DEVELOPMENT CONTAINER, not
     # on this runner -- the number is a development-time figure and always has
     # been, and a reader meeting it inside this job's own comment block will
     # otherwise take it for this job's runtime, which is a different and
@@ -51,7 +51,10 @@ jobs:
     # long time after both had moved, 114 for one round after it was 115, and
     # 124 for several rounds after it was 143. Re-run
     # `python3 tests/mutation_gate.py --tier fast` and read its last line
-    # before touching this sentence.
+    # before touching this sentence. The seconds are noisier than the count:
+    # three runs of the same 159 rows on the same container measured 232s,
+    # 190s and 192s, and two of the 164 rows measured 196s and 198s -- so
+    # treat the figure as an order of magnitude and the row count as exact.
     #
     # It stopped being cheaper than the suite it audits at that count. Twelve
     # of the rows added for the local rig (issue #22) are behavioural rather
@@ -158,6 +161,35 @@ jobs:
             || echo "no modules-extra for $(uname -r); some simulators will be absent"
           pip install -r requirements-dev.txt
           pip install smbus2 luma.oled gpiozero lgpio
+      - name: The panel tests that need gpiozero and lgpio
+        # tests/test_hardware.py is nobody's job otherwise. It carries no
+        # `hardware` marker, so the harness step below (`pytest -m
+        # hardware`) deselects the whole file; and the `test` job installs
+        # requirements-dev.txt, which deliberately has neither gpiozero nor
+        # lgpio. Measured in a venv with only requirements-dev.txt in it:
+        # 27 passed, 10 skipped -- the six [lgpio] parametrisations and all
+        # four TestRealGpiozero tests, eight of them added by the panel-guard
+        # change. Among them is the control that proves real gpiozero lets a
+        # callback exception straight out, which is the only thing keeping
+        # the stand-in dispatcher honest, and lgpio's own `run`. This step is
+        # the one place they run.
+        #
+        # Both libraries are installed above, so nothing in the file has a
+        # reason to skip -- and a skip is failed here rather than printed,
+        # because that is exactly how these tests came to run nowhere: a
+        # skipped test and a passing one look the same in a summary line.
+        run: |
+          set -o pipefail
+          timeout 300 python3 -m pytest -q -p no:randomly -rs \
+            tests/test_hardware.py 2>&1 | tee /tmp/panel.log
+          if grep -qE '[0-9]+ skipped' /tmp/panel.log; then
+            echo "tests/test_hardware.py skipped something. With gpiozero" >&2
+            echo "and lgpio both installed, nothing in it may skip -- a" >&2
+            echo "skip here means an install half-worked and the panel is" >&2
+            echo "back to being tested by the stand-ins only." >&2
+            grep -E '^SKIPPED' /tmp/panel.log >&2 || true
+            exit 1
+          fi
       - name: Stop the system CUPS and unconfine cupsd
         run: |
           # The rig runs its own cupsd on its own socket. The distro one is
@@ -274,19 +306,19 @@ jobs:
           # not to police the exact count, which every new test changes.
           PASSED=$(grep -oE '[0-9]+ passed' /tmp/harness.log | tail -1 | cut -d' ' -f1)
           echo "harness tests passed: ${PASSED:-0}"
-          # 54, and derived from a count rather than from the tail of an
+          # 55, and derived from a count rather than from the tail of an
           # old run -- the last three numbers here were all wrong, in
           # both directions, because they were carried forward by hand
           # while the harness kept growing. `pytest -m hardware
-          # --collect-only` on this tree collects 60.
+          # --collect-only` on this tree collects 61.
           #
           # Measured on a kernel with NO simulators at all (this
           # container: CONFIG_GPIOLIB and CONFIG_CONFIGFS_FS unset):
-          # 50 passed, 10 skipped -- the 6 gpio-sim tests, 2 i2c-stub,
-          # 1 vkms, 1 uinput. A runner with modules-extra runs all ten,
-          # so 60 is what this job should see.
+          # 50 passed, 11 skipped -- the 7 gpio-sim tests, 2 i2c-stub,
+          # 1 vkms, 1 uinput. A runner with modules-extra runs all
+          # eleven, so 61 is what this job should see.
           #
-          # 54 leaves six free to skip for a reason already seen and
+          # 55 leaves six free to skip for a reason already seen and
           # accepted, and no more: the debounce test on a box too slow
           # to bounce a line inside the window, the unaided-chip-number
           # test when gpio-sim does not land on gpiochip0, luma refusing
@@ -296,8 +328,8 @@ jobs:
           # If this number needs changing again, COUNT -- do not adjust
           # it to match whatever the last run happened to print, which
           # is how it came to claim the CUPS rig was 37 tests.
-          if [ "${PASSED:-0}" -lt 54 ]; then
-            echo "expected at least 54 passing harness tests (the CUPS rig" >&2
+          if [ "${PASSED:-0}" -lt 55 ]; then
+            echo "expected at least 55 passing harness tests (the CUPS rig" >&2
             echo "alone is 13); got ${PASSED:-0}. Something skipped silently." >&2
             grep -E "^SKIPPED" /tmp/harness.log >&2 || true
             exit 1
@@ -309,10 +341,24 @@ jobs:
           # entire input surface of the device quietly stops being tested.
           # If a future runner kernel loses gpio-sim this goes red on
           # purpose; the reason will be in the lines it prints.
+          #
+          # The last of them is the guard against lgpio's dispatch
+          # thread, which is a module-level singleton with no try around
+          # its callback call: one exception out of a button callback
+          # ends every button in the process for the life of the
+          # process, and on a 512 MiB board with no swap making
+          # 1000-page pads that exception is a MemoryError waiting to
+          # happen. The fast tier proves the same property against a
+          # stand-in dispatcher and against lgpio's own `run` fed
+          # through a pipe; this is the only place it runs with a
+          # kernel, a real gpiochip and the real gpiozero -> lgpio chain
+          # all at once, so it is named here rather than left to the
+          # count.
           for named in test_a_tap_on_up_arrives_as_up \
                        test_a_tap_on_down_arrives_as_down \
                        test_a_tap_on_ok_arrives_as_ok_not_back \
-                       test_a_hold_on_ok_arrives_as_back_exactly_once; do
+                       test_a_hold_on_ok_arrives_as_back_exactly_once \
+                       test_a_raising_callback_does_not_kill_the_panel; do
             if ! grep -q "TestTheRealButtonPath::${named} PASSED" \
                  /tmp/harness.log; then
               echo "${named} did not pass. A real press on a simulated" >&2

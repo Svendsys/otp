@@ -3319,3 +3319,196 @@ tests = [
 file = "harness/README.md"
 find = '''`./harness/img-local-rig.sh <probe>`'''
 replace = '''`./harness/the-rig.sh <probe>`'''
+
+
+# --- the front panel's callbacks, and lgpio's one dispatch thread ---------
+#
+# These two are product-code rows rather than harness rows, which most of
+# this table is not. They earn it the same way: the failure they defend
+# against is SILENT. A panel whose buttons have stopped working looks
+# exactly like a panel nobody is pressing, and the only report is a warning
+# in a volatile journal.
+
+[[mutation]]
+name = "panel-callback-exceptions-reach-lgpios-dispatch-thread"
+tier = "fast"
+guard = """
+The wrap, and the whole of what it buys. lgpio dispatches every GPIO edge
+in the process from ONE thread and puts no guard around the call
+(lgpio 0.2.2.0, lgpio.py:531-559); that thread is a module-level singleton
+started at import (lgpio.py:562) and nothing restarts it, and gpiozero adds
+no guard on the way in either. So one exception out of a button callback
+ends every button in the process, permanently, and says so only as a
+PytestUnhandledThreadExceptionWarning or an ignored-exception line.
+
+Observed during issue #12: `lgpio: notify thread alive=False go=True`, with
+the gpio-sim line moving perfectly. On the unit the trigger to expect is a
+MemoryError -- 512 MiB, no swap, 1000-page pads -- and the remedy for a
+dead panel is a power cycle, which discards the pad in progress.
+
+The mutation is the guard removed and nothing else: same signature, same
+call, no try. Only the [stand-in] parametrisation is named here because
+[lgpio] skips where lgpio is not installed, which is every CI run of the
+fast tier, and a skipped test cannot go red."""
+tests = [
+  "tests/test_hardware.py::TestNoCallbackExceptionReachesTheDispatchThread::test_a_press_on_another_button_survives_one_that_raises[stand-in]",
+  "tests/test_hardware.py::TestNoCallbackExceptionReachesTheDispatchThread::test_a_raising_release_does_not_cost_the_next_ok[stand-in]",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "        return guarded"
+replace = "        return lambda _button=None: action()"
+
+[[mutation]]
+name = "panel-loses-a-press-without-saying-so"
+tier = "fast"
+guard = """
+The other half of the decision: catching is only half of it. The operator
+cannot be told -- the panel is the thing that just failed, and this device
+has no other output -- so the journal is the only record that an edge was
+ever lost, and a guard that swallows in silence turns a diagnosable fault
+into a unit that "sometimes misses presses".
+
+The named test is the one that watches the DEFAULT reporter rather than a
+monkeypatched one. Every other test in that class replaces `_report` to
+read what it said, so all of them stay green against a `_report` that
+writes nowhere at all -- which is exactly this mutation."""
+tests = [
+  "tests/test_hardware.py::TestALostPressIsSaidOutLoud::test_the_default_report_goes_to_stderr",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "    print(message, file=stream, flush=True)"
+replace = "    return"
+
+
+[[mutation]]
+name = "panel-report-parks-the-thread-on-a-journal-nobody-reads"
+tier = "fast"
+guard = """
+The guard's own report, on the guard's own thread. Catching the exception
+bought a panel that survives a lost edge and then handed lgpio's single
+dispatch thread a write to stderr -- which on the unit is a stream socket
+to journald. A socket nobody is draining does not raise, it BLOCKS, and a
+thread parked in write(2) delivers no further edges: the same dead panel
+the guard exists to prevent, and harder to see, because the thread is still
+alive and every is_alive() assertion in this file still passes for it.
+`except BaseException: pass` cannot help with a call that never returns.
+
+Measured before the check existed: a pipe shrunk to 4 KiB with F_SETPIPE_SZ
+and no reader, sys.stderr pointed at it, one `_report` on a thread -- the
+thread never came back. And the moment it would happen is the moment the
+panel is losing edges, because that is when this writes.
+
+The mutation removes the question and writes regardless. The named test
+wedges a real pipe and requires a later press to arrive anyway; it goes red
+by timing out on that press, not by hanging.
+
+[stand-in] only, for the reason the row above gives: [lgpio] skips wherever
+lgpio is not installed, which is every CI run of the fast tier."""
+tests = [
+  "tests/test_hardware.py::TestNoCallbackExceptionReachesTheDispatchThread::test_a_journal_nobody_is_reading_does_not_park_the_thread[stand-in]",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "    if fd is not None and not select.select((), (fd,), (), 0)[1]:"
+replace = "    if False:      # mutation: write whether or not it would block"
+
+[[mutation]]
+name = "panel-reports-every-lost-edge-without-a-bound"
+tier = "fast"
+guard = """
+The volume half of the same hazard. One full report is 11 lines and about
+690 bytes with flush=True, and the faults that produce one produce them in
+bursts -- a panel dropping every edge writes one per press, unbounded and
+un-rate-limited, into the same journald that `_report` must never wait on.
+Bounded output is what keeps the diagnostic affordable at the only moment
+it is ever emitted.
+
+The mutation makes every loss due, so the first report's traceback is
+followed by one line per lost edge. The named test loses fifty edges inside
+one interval and requires exactly one report."""
+tests = [
+  "tests/test_hardware.py::TestALostPressIsSaidOutLoud::test_a_burst_says_the_first_in_full_and_then_counts",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """        due = (self._said_at is None
+               or (time.monotonic() - self._said_at) >= REPORT_SECONDS)"""
+replace = "        due = True      # mutation: every loss writes its own line"
+
+[[mutation]]
+name = "panel-report-failing-is-not-caught"
+tier = "fast"
+guard = """
+The last swallow in the callback, and the only place in this file where a
+programming error can hide forever -- so it is also the one most in need of
+a row saying it is load-bearing rather than decorative.
+
+Reporting is the riskiest thing the guard does: it allocates an f-string
+and formats a traceback, which is exactly what a MemoryError breaks next,
+and the write can fail on a closed stderr. Without this catch, a report
+that fails takes the dispatch thread with it -- the guard would then have
+converted "one lost edge" into "every button on the device, permanently",
+which is worse than not guarding at all.
+
+The mutation narrows the catch to a type that cannot occur there. The named
+test makes `_report` raise MemoryError and requires the callback to return
+anyway."""
+tests = [
+  "tests/test_hardware.py::TestALostPressIsSaidOutLoud::test_a_report_that_itself_fails_cannot_kill_the_panel",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "                except BaseException:           # noqa: BLE001"
+replace = "                except ValueError:              # mutation: no swallow"
+
+[[mutation]]
+name = "panel-keeps-a-press-time-a-failed-press-start-left-behind"
+tier = "fast"
+guard = """
+What the report for a lost press start promises: "the release after it is
+ignored". If a failed `_on_press` leaves the previous press's timestamp in
+place, the next release measures against it, finds more than HOLD_SECONDS,
+and emits BACK where the operator pressed OK. While a job is printing those
+mean opposite things -- BACK can purge the spool and destroy a pad pair --
+which is the confusion the whole tap-versus-hold design exists to prevent.
+
+Defensive rather than reachable: gpiozero alternates pressed/released and
+`_on_release` clears before it can fail, so nothing constructs the stale
+state from outside today. The row exists because one line is what makes the
+report's promise true without depending on that staying so.
+
+The mutation removes the clearing line."""
+tests = [
+  "tests/test_hardware.py::TestALostPressIsSaidOutLoud::test_a_lost_press_start_leaves_no_press_time_behind",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """        self._pressed_at = None
+        self._pressed_at = time.monotonic()"""
+replace = "        self._pressed_at = time.monotonic()"
+
+[[mutation]]
+name = "panel-report-longer-than-the-pipe-will-take"
+tier = "fast"
+guard = """
+The length half of the same promise. `select()` answering "writable" for a
+pipe promises PIPE_BUF (4096) bytes and no more -- a longer write puts the
+first 4096 in and parks in the kernel for the rest -- so asking the question
+only proves anything if the message is capped below it. The report is built
+from an exception's str() and a formatted traceback, neither of which this
+code chooses the length of: a deep stack or a chatty OSError is enough.
+
+A truncated line in the journal is a diagnostic. A parked dispatch thread is
+a dead panel with three buttons that do nothing.
+
+The mutation removes the cap. The named test writes 100 KB at a 4 KiB pipe
+that has room and requires `_report` to come back."""
+tests = [
+  "tests/test_hardware.py::TestALostPressIsSaidOutLoud::test_a_report_too_long_for_the_pipe_is_cut_rather_than_parked",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "    if len(message) > REPORT_MAX_CHARS:"
+replace = "    if False:      # mutation: no cap on the length of a report"
