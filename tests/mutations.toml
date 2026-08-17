@@ -1627,9 +1627,10 @@ tests = [
 file = "harness/img-boot.sh"
 find = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
 front-panel-survives-the-credential-apply diagnostic-sheet-renders \
-diagnostic-sheet-reaches-cups"'''
+diagnostic-sheet-reaches-cups ssh-host-key-fingerprint-recorded"'''
 replace = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
-diagnostic-sheet-renders diagnostic-sheet-reaches-cups"'''
+diagnostic-sheet-renders diagnostic-sheet-reaches-cups \
+ssh-host-key-fingerprint-recorded"'''
 
 
 [[mutation]]
@@ -2017,8 +2018,8 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/img-guest-check.sh"
-find = '''      "$(if [ "$NO_OLED" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \'''
-replace = '''      "$(if [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \'''
+find = '''      "$(if [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \'''
+replace = '''      "$(if [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \'''
 
 
 [[mutation]]
@@ -2035,8 +2036,8 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/img-guest-check.sh"
-find = '''      "$(if [ "$NO_OLED" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \'''
-replace = '''      "$(if [ "$NO_OLED" = yes ]; then echo yes; else echo no; fi)" \'''
+find = '''      "$(if [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \'''
+replace = '''      "$(if [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ]; then echo yes; else echo no; fi)" \'''
 
 
 [[mutation]]

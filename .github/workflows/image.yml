@@ -356,8 +356,13 @@ jobs:
           # on the way past -- and making that step skip on arm64 took the
           # update with it.
           sudo apt-get update
+          # device-tree-compiler is for fdtput: QEMU is not the Pi firmware
+          # and supplies no board revision, so harness/img-boot.sh writes
+          # /system/linux,revision into a copy of the image's own DTB. Without
+          # it rpi-eeprom-update.service dies on `(0x >> 23) & 1` in both
+          # boots -- the emulator's fault, reported as the image's.
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-arm mtools xz-utils
+            qemu-system-arm mtools xz-utils device-tree-compiler
           OTP_IMG_WORK=${{ runner.temp }}/otp-img \
             ./harness/img-boot.sh image/deploy/*.img.xz
       - name: Boot verdict

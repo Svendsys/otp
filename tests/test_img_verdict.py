@@ -411,6 +411,48 @@ def test_the_probe_looks_for_the_words_the_unit_actually_logs():
             f"unit-detects-no-panel check matches nothing"
 
 
+def test_the_probe_looks_for_the_display_the_unit_actually_reports():
+    """
+    The third clause, and the only one that is assembled at runtime rather
+    than written out anywhere -- which makes it the easiest of the three to
+    break by accident.
+
+    `interface -- display: none,` is otpunit/__main__ logging
+    hmi.Interface.describe(), and neither file contains that string: __main__
+    has the prefix and an f-string, hmi has the two field names. A grep over
+    either would pass while the probe matched nothing, so this RUNS the real
+    describe() on the real dataclass instead, with the interface a unit that
+    found nothing to draw on ends up holding.
+
+    It matters more than the other two now. The harness supplies a board
+    revision so rpi-eeprom-update.service stops failing; gpiozero reads the
+    same property, its pin factory loads, and `Button(5)` succeeds -- so on
+    the emulated Pi the INPUT half is present and this is the clause that
+    still says the panel is not.
+    """
+    import sys
+    sys.path.insert(0, str(REPO))
+    from otpunit import hmi
+
+    needle = "interface -- display: none,"
+    assert f'*"{needle}"*' in GUEST_CHECK.read_text(), \
+        f"the probe no longer looks for {needle!r}"
+    # The interface hmi.detect() builds on a machine with no OLED, no HDMI
+    # connector and buttons that constructed -- which is the emulated Pi,
+    # measured.
+    described = hmi.Interface(display=None, buttons=object(),
+                              display_kind="none",
+                              input_kind="GPIO buttons").describe()
+    assert needle == f"interface -- {described.split(' input:')[0]}", \
+        f"Interface.describe() now says {described!r}, so the probe's " \
+        f"unit-detects-no-panel check matches nothing"
+    # And the line __main__ wraps it in. Read as text, because importing
+    # __main__ runs it.
+    assert 'log(f"interface -- {interface.describe()}")' in \
+        (REPO / "otpunit" / "__main__.py").read_text(), \
+        "otpunit/__main__ no longer logs the interface it detected"
+
+
 # --- the seed itself, which three files have to agree about ---------------
 
 BUILD_SH = REPO / "image" / "build.sh"

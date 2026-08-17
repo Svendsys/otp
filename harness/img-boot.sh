@@ -396,6 +396,108 @@ if [ ! -f "$KERNEL" ] || [ -z "$DTB" ]; then
     exit 1
 fi
 log "kernel=$KERNEL dtb=$DTB"
+
+# --- the board revision the firmware would have supplied -----------------
+#
+# THE FIRMWARE IS WHAT WRITES THIS, and QEMU is not the firmware. On a real
+# Pi, start.elf adds a /system node to the device tree carrying
+# linux,revision -- the 24-bit board code. The static DTB does not have one:
+# measured with `fdtget` against bcm2710-rpi-3-b.dtb out of
+# linux-image-6.12.47+rpt-rpi-v8, there is no /system node at all.
+#
+# WHAT IT COST, in run 72's console, both boots:
+#
+#   /usr/bin/rpi-eeprom-update: 512: arithmetic expression: expecting ')':
+#   "(0x >> 23) & 1"
+#   systemd[1]: rpi-eeprom-update.service: Failed with result 'exit-code'.
+#
+# rpi-eeprom-update reads /sys/firmware/devicetree/base/system/linux,revision,
+# then /proc/cpuinfo, then vcgencmd; with none of them BOARD_INFO is empty
+# and `0x` is a shell syntax error. On real hardware it reaches
+# chipNotSupported() and exits 0, so the unit succeeds on every board
+# docs/HARDWARE.md lists. It is the emulator that is wrong, and this is the
+# same kind of thing the harness already does for the command line and the
+# initramfs: supply what the firmware would have.
+#
+# MEASURED BEFORE IT WAS BUILT ON, by booting a stock Raspberry Pi OS Lite
+# arm64 card under this same `-M raspi3b` with QEMU 8.2.2, twice:
+#
+#   without the property   linux,revision ABSENT, /proc/cpuinfo has no
+#                          Revision line, rpi-eeprom-update rc=2 with the
+#                          `(0x >> 23) & 1` message above
+#   with it                dt-rev=00a02082, /proc/cpuinfo Revision a02082,
+#                          rpi-eeprom-update rc=0: "Device does not a have
+#                          a Raspberry Pi bootloader EEPROM (e.g. Pi 4 or
+#                          Pi 5). Skipping bootloader update."
+#
+# 0xa02082 IS THE MACHINE QEMU IS PRETENDING TO BE, decoded field by field
+# against the scheme rpi-eeprom-update itself reads: new-style flag set
+# (bit 23), memory 1GB (bits 20-22 = 2, and -m 1024 below agrees), Sony UK,
+# BCM2837, type 0x08 = 3 Model B, revision 1.2. Handing the guest a code for
+# a board `-M raspi3b` does not model would be the DTB mistake from run 1 in
+# a smaller font.
+#
+# THE SAME PROPERTY IS READ BY GPIOZERO, and that is not a side effect to be
+# discovered later -- it is measured, in the same pair of boots:
+#
+#   without   Button(5) raised BadPinFactory: Unable to load any default
+#             pin factory
+#   with      Button(5) CONSTRUCTED factory='LGPIOFactory' pin=GPIO5
+#
+# (QEMU does provide /dev/gpiochip0 and /dev/gpiochip1, which is what lgpio
+# opens.) So from now on the emulated unit finds BUTTONS -- exactly as every
+# real Pi does, which is the whole reason hmi.Interface.prove exists. What it
+# still does not find is a SCREEN: there is no /dev/i2c-* and /sys/class/drm
+# is empty in both boots, so hmi.open_display raises and returns none. That
+# is the half unit-detects-no-panel now keys on; see the comment on that
+# check in harness/img-guest-check.sh.
+#
+# fdtput, NOT a dtc round trip. `dtc -I dtb -O dts` and back rewrites the
+# whole blob -- phandles, __symbols__, the overlay fixups -- to change one
+# property; fdtput patches the blob in place and resizes it by the 47 bytes
+# the node costs. The patched copy is a COPY: the image's own DTB is left
+# alone, so what a device would boot and what this booted stay comparable in
+# the evidence.
+#
+# A HARD REQUIREMENT, like mcopy. Booting without the property is booting
+# the configuration this exists to fix, and a boot that quietly did that
+# would fail on rpi-eeprom-update.service half an hour later and read as a
+# regression in the image.
+if ! command -v fdtput >/dev/null; then
+    echo "ERROR: fdtput (device-tree-compiler) is needed to give the guest" >&2
+    echo "       a board revision. Without it rpi-eeprom-update.service" >&2
+    echo "       fails on an empty BOARD_INFO and the boot is red for a" >&2
+    echo "       fault in the emulator rather than in the image." >&2
+    exit 1
+fi
+BOARD_REVISION=0xa02082
+# Beside $WORK/boot rather than in it: that directory is what the *.dtb glob
+# above picks the guest's device tree out of, and dropping a second .dtb into
+# it is precisely the "next person adds a file to that directory" the comment
+# on the glob warns about.
+DTB_PATCHED="$WORK/otp-harness-$(basename "$DTB")"
+cp "$DTB" "$DTB_PATCHED"
+# `-c` on a node that already exists is FDT_ERR_EXISTS and rc 1, not a
+# no-op -- measured against fdtput 1.7.0. A firmware DTB that one day ships
+# its own empty /system must not fail the run for that, so the create is
+# allowed to fail and only the property write is required. The read-back
+# below is the gate in both cases.
+fdtput -c "$DTB_PATCHED" /system 2>/dev/null || true
+if ! fdtput -t x "$DTB_PATCHED" /system linux,revision "$BOARD_REVISION"; then
+    echo "ERROR: could not write linux,revision into $DTB_PATCHED" >&2
+    exit 1
+fi
+# READ BACK, because a write that did nothing looks exactly like one that
+# worked from here, and the cost of not noticing is a red release gate
+# blamed on the image. fdtget prints the property as a decimal integer.
+DTB_REVISION=$(fdtget "$DTB_PATCHED" /system linux,revision 2>/dev/null || true)
+if [ "${DTB_REVISION:-0}" != "$((BOARD_REVISION))" ]; then
+    echo "ERROR: $DTB_PATCHED does not carry linux,revision after the patch" >&2
+    echo "       (read back: '${DTB_REVISION:-nothing}', wanted $((BOARD_REVISION)))" >&2
+    exit 1
+fi
+DTB="$DTB_PATCHED"
+log "board revision $BOARD_REVISION synthesised into $DTB (the firmware's job)"
 IMG_CMDLINE=""
 if [ -s "$WORK/boot/cmdline.txt" ]; then
     IMG_CMDLINE=$(tr -d '\r\n' < "$WORK/boot/cmdline.txt")
@@ -954,13 +1056,15 @@ GUEST_CHECKS_COMMON="root-is-overlay root-write-lands-and-is-readable \
 unit-active unit-not-restart-looping journal-marker-accepted \
 unit-detects-no-panel etc-cups-is-its-own-tmpfs cups-running \
 cupsd-config-valid boot-partition-separate setting-saved-to-the-boot-partition \
-network-wait-cannot-hold-the-boot-open"
+network-wait-cannot-hold-the-boot-open \
+machine-id-persisted-outside-the-overlay"
 GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
 front-panel-survives-the-credential-apply diagnostic-sheet-renders \
-diagnostic-sheet-reaches-cups"
+diagnostic-sheet-reaches-cups ssh-host-key-fingerprint-recorded"
 GUEST_CHECKS_BOOT2="root-writes-discarded-by-the-power-cycle \
 settings-survive-the-power-cycle userconf-unseeded-boot-skips-the-wizard \
-userconf-wizard-cannot-prompt userconf-malformed-seed-fails-fast"
+userconf-wizard-cannot-prompt userconf-malformed-seed-fails-fast \
+ssh-host-keys-identical-across-the-power-cycle"
 
 guest_gate() {
     local phase="$1" count counts passed total missing want name

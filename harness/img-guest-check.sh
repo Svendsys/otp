@@ -53,6 +53,14 @@
 set -uo pipefail
 
 BOOTDIR=/boot/firmware
+# The two halves of this machine's identity, named rather than spelled inline
+# where they are read. Same reason $BOOTDIR is a variable: the checks over
+# them are sliced out and run against a tree tests/test_overlay_root.py
+# builds, and a hardcoded /etc would leave them exercised only by a real
+# emulated boot -- which is the one place a check that has stopped checking
+# cannot be noticed cheaply.
+ETC_MACHINE_ID=/etc/machine-id
+ETC_SSH=/etc/ssh
 
 # THE PHASE, and every write in this file hangs off it.
 #
@@ -94,11 +102,12 @@ case "$PHASE" in
     *)
         echo "OTP-GUEST refusing to run: the kernel command line carries no" >&2
         echo "  otp.imgcheck=boot1 or otp.imgcheck=boot2 token (phase read:" >&2
-        echo "  '${PHASE:-none}'). This probe writes a sentinel to / and a" >&2
-        echo "  marker page count into $BOOTDIR/otp-unit.conf, which is" >&2
-        echo "  outside the read-only overlay and would overwrite the" >&2
-        echo "  operator's settings for good. It runs only inside the" >&2
-        echo "  emulated boot harness/img-boot.sh sets up." >&2
+        echo "  '${PHASE:-none}'). This probe writes a sentinel to /, a" >&2
+        echo "  marker page count into $BOOTDIR/otp-unit.conf and an SSH" >&2
+        echo "  host key fingerprint into $BOOTDIR/otp-imgcheck-hostkeys --" >&2
+        echo "  the last two outside the read-only overlay, where the first" >&2
+        echo "  would overwrite the operator's settings for good. It runs" >&2
+        echo "  only inside the emulated boot harness/img-boot.sh sets up." >&2
         exit 1
         ;;
 esac
@@ -251,15 +260,48 @@ check journal-marker-accepted \
 # Storage=volatile is the only thing that makes an unscoped read safe today,
 # and a probe must not depend for its correctness on a line in another file.
 #
-# BOTH HALVES, because either alone describes a different machine. "no OLED ("
-# is otpunit/hmi.open_display reporting that the display probe raised, with
-# the exception in the brackets; "no usable interface; printing unattended" is
-# otpunit/__main__ choosing the headless route off the back of it. The first
-# without the second is a unit that saw the missing panel and walked into the
-# menu anyway -- the hang otpunit/hmi.Interface.prove was written to stop; the
-# second without the first is a unit that never looked. Both strings are held
-# against the modules that print them by tests/test_img_verdict.py, so a
-# rewording there cannot leave this check quietly matching nothing.
+# THREE CLAUSES, because each one is a different claim and the middle one is
+# the only one that stays true now that the harness supplies a board revision.
+#
+#   "no OLED ("                          otpunit/hmi.open_display reporting
+#                                        that the display probe RAISED, with
+#                                        the exception in the brackets. This
+#                                        says the unit LOOKED.
+#   "interface -- display: none,"        otpunit/hmi.Interface.describe by way
+#                                        of otpunit/__main__: the display it
+#                                        settled on, after the OLED and the
+#                                        HDMI console were both ruled out.
+#                                        This says it found NOTHING TO DRAW ON.
+#   "no usable interface; printing       otpunit/__main__ choosing the
+#    unattended"                         headless route off the back of that.
+#                                        This says what it DECIDED.
+#
+# WHY THE MIDDLE ONE HAD TO BE ADDED, and it is the whole reason this check
+# survived the emulator fix. harness/img-boot.sh now writes
+# /system/linux,revision into the DTB so rpi-eeprom-update.service stops
+# failing -- and gpiozero reads the same property. Measured, booting a stock
+# card under `-M raspi3b` with and without it: `Button(5) raised BadPinFactory`
+# becomes `Button(5) CONSTRUCTED factory='LGPIOFactory'`. So hmi.open_buttons
+# now succeeds here, exactly as it does on every real Pi -- gpiozero reserves
+# a pin and there is no presence detection, which is why Interface.prove
+# exists at all.
+#
+# With buttons present, "printing unattended" is reached only because the
+# DISPLAY is None: Interface.interactive is `display is not None and buttons
+# is not None`. That makes the third clause a consequence of the display side
+# and nothing else, and it leaves a hole the first two clauses cannot see --
+# a machine that DID find a screen (an HDMI console) but no buttons logs
+# "no OLED (" and "printing unattended" too, and would have passed a check
+# whose name says the unit detected no panel. Requiring `display: none` closes
+# it and keys the check on the one thing the emulator genuinely cannot
+# provide: there is no /dev/i2c-* and /sys/class/drm is empty in every boot
+# measured, with the revision and without it.
+#
+# The three strings are written in otpunit/ and matched here, which is how a
+# check stops checking with nothing going red -- so tests/test_img_verdict.py
+# holds each of them against the module that prints it, and holds
+# `display: none` against Interface.describe() by RUNNING it.
+#
 # POLLED, and it has to be. otp-unit.service is Type=simple, so systemd calls
 # it active the instant the process is SPAWNED -- `unit-active` above breaks
 # out of its poll before the interpreter has imported luma, gpiozero or
@@ -268,22 +310,25 @@ check journal-marker-accepted \
 # yet, and reads "it never looked for a panel". Bounded, because a unit that
 # is never going to say it must still produce a report.
 NO_OLED=no
+NO_DISPLAY=no
 HEADLESS=no
 UNIT_LOG=""
 for _ in $(seq 1 30); do
     UNIT_LOG=$(journalctl -b -u otp-unit.service --no-pager 2>/dev/null | tr '\n' ' ')
     case "$UNIT_LOG" in *"no OLED ("*) NO_OLED=yes ;; esac
+    case "$UNIT_LOG" in *"interface -- display: none,"*) NO_DISPLAY=yes ;; esac
     case "$UNIT_LOG" in *"no usable interface; printing unattended"*) HEADLESS=yes ;; esac
-    [ "$NO_OLED" = yes ] && [ "$HEADLESS" = yes ] && break
+    [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ] && break
     sleep 2
 done
 # What it decided it had, quoted back. Display and input are chosen
-# independently, so WHICH of them was missing is the half worth reading: a
-# QEMU Pi may well offer a gpiochip and no screen.
+# independently, so WHICH of them was missing is the half worth reading --
+# and since the board revision arrived, the input half is expected to say
+# "GPIO buttons" on a machine with no buttons wired to anything.
 UNIT_IFACE=$(printf '%s' "$UNIT_LOG" | grep -m1 -oE 'interface -- .{0,60}' || true)
 check unit-detects-no-panel \
-      "$(if [ "$NO_OLED" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \
-      "no-oled=$NO_OLED headless=$HEADLESS ${UNIT_IFACE:-no 'interface --' line in the unit journal}"
+      "$(if [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \
+      "no-oled=$NO_OLED no-display=$NO_DISPLAY headless=$HEADLESS ${UNIT_IFACE:-no 'interface --' line in the unit journal}"
 
 # --- CUPS, which is the half of the design the overlay could break --------
 
@@ -316,6 +361,96 @@ BOOT_FS=$(findmnt -no FSTYPE --target "$BOOTDIR" 2>/dev/null || echo "?")
 check boot-partition-separate \
       "$(if [ "$BOOT_SRC" != "?" ] && [ "$BOOT_SRC" != "$ROOT_SOURCE" ]; then echo yes; else echo no; fi)" \
       "$BOOTDIR src=$BOOT_SRC fstype=$BOOT_FS"
+
+# --- the identity, which is the one thing allowed to survive --------------
+
+# WHAT THIS IS ABOUT. /etc is inside the overlay, so /etc/machine-id reverted
+# to pi-gen's `uninitialized` on every power cycle -- and systemd reads that
+# word as "first boot": preset-all again, ssh.socket enabled again,
+# regenerate_ssh_host_keys.service deleting and remaking the host keys again.
+# Run 72's console carries all of it, in both boots. device/install.sh answers
+# it with a machine-id restored by the initramfs and an
+# otp-unit-identity.service that keeps both that and the SSH host keys on the
+# boot partition; these are the checks that say whether any of that happened
+# on the machine rather than in a comment.
+IDENTITY_STORE="$BOOTDIR/otp-identity"
+LIVE_MACHINE_ID=$(tr -d '\n\r' < "$ETC_MACHINE_ID" 2>/dev/null)
+KEPT_MACHINE_ID=$(tr -d '\n\r' < "$IDENTITY_STORE/machine-id" 2>/dev/null)
+# OUTSIDE THE OVERLAY, ASKED OF THE DIRECTORY THAT IS ACTUALLY WRITTEN.
+# Without this clause the check is satisfied by a store that is a plain
+# directory on the overlay's tmpfs -- /boot/firmware failing to mount is all
+# it takes. The copy and the original then agree with each other perfectly,
+# on every boot, while nothing survives any of them, and every field below
+# reads green. `boot-partition-separate` above says $BOOTDIR is its own
+# mount; this says the store is not on the same filesystem as /.
+#
+# findmnt --target, which answers for the CONTAINING mount, so a store that
+# is a directory inside the root reports the root's source rather than
+# nothing. That is the same call and the same reasoning as $BOOT_SRC above.
+STORE_SRC=$(findmnt -no SOURCE --target "$IDENTITY_STORE" 2>/dev/null || echo "?")
+MACHINE_ID_KEPT=no
+if [ -n "$LIVE_MACHINE_ID" ] && [ "$LIVE_MACHINE_ID" = "$KEPT_MACHINE_ID" ]; then
+    MACHINE_ID_KEPT=yes
+fi
+# The first eight characters only. A machine-id is this machine's identifier
+# and this console is uploaded as a CI artifact; eight is enough to compare
+# two boots by eye and not enough to be the value.
+check machine-id-persisted-outside-the-overlay \
+      "$(if [ "$MACHINE_ID_KEPT" = yes ] && [ "$STORE_SRC" != "?" ] \
+            && [ "$STORE_SRC" != "$ROOT_SOURCE" ]; then echo yes; else echo no; fi)" \
+      "$ETC_MACHINE_ID=${LIVE_MACHINE_ID:0:8}... stored=${KEPT_MACHINE_ID:0:8}... match=$MACHINE_ID_KEPT store=$IDENTITY_STORE src=$STORE_SRC root-src=${ROOT_SOURCE:-?}"
+
+# THE FINGERPRINTS, sorted, so the same set of keys cannot read as two
+# different sets because ssh-keygen was handed them in a different order.
+# Public by construction -- a fingerprint is what an SSH client prints at
+# you -- so unlike the machine-id these go into the detail in full, and the
+# two boots can be compared from the verdict alone.
+host_key_fingerprints() {
+    local pub
+    for pub in "$ETC_SSH"/ssh_host_*_key.pub; do
+        [ -f "$pub" ] || continue
+        ssh-keygen -lf "$pub" 2>/dev/null | awk '{print $2}'
+    done | sort | tr '\n' ' '
+}
+HOSTKEY_RECORD="$BOOTDIR/otp-imgcheck-hostkeys"
+HOSTKEYS_NOW=$(host_key_fingerprints)
+HOSTKEYS_NOW=${HOSTKEYS_NOW% }
+
+if [ "$PHASE" = "boot1" ]; then
+    # THE POSITIVE CONTROL, and it is the reason boot2's check can mean
+    # anything. "the fingerprints are identical" is satisfied perfectly by a
+    # machine with no host keys at all in either boot, by an ssh-keygen that
+    # is not installed, and by a record file that was never written -- three
+    # ways for the property to read green while nothing is being kept. So
+    # boot1 states, out of the same function and the same file boot2 will
+    # read: there WERE keys, a fingerprint was computed from them, and it
+    # came back off the boot partition byte for byte.
+    printf '%s\n' "$HOSTKEYS_NOW" > "$HOSTKEY_RECORD" 2>/dev/null || true
+    HOSTKEYS_READBACK=$(tr -d '\n\r' < "$HOSTKEY_RECORD" 2>/dev/null)
+    check ssh-host-key-fingerprint-recorded \
+          "$(if [ -n "$HOSTKEYS_NOW" ] && [ "$HOSTKEYS_READBACK" = "$HOSTKEYS_NOW" ]; \
+             then echo yes; else echo no; fi)" \
+          "this boot: ${HOSTKEYS_NOW:-NO HOST KEYS AT ALL} | read back from $HOSTKEY_RECORD: ${HOSTKEYS_READBACK:-nothing}"
+fi
+
+if [ "$PHASE" = "boot2" ]; then
+    # THE PROPERTY: the same card, powered off and on, still answers with the
+    # same host keys. Before the machine-id was persisted this was false by
+    # construction -- every boot was a first boot, and
+    # regenerate_ssh_host_keys.service starts with
+    # `rm -f /etc/ssh/ssh_host_*_key*`.
+    #
+    # BOTH SIDES ARE REQUIRED TO BE NON-EMPTY, which is the clause that makes
+    # this a statement rather than a tautology: two absences are equal, and
+    # `ssh-host-key-fingerprint-recorded` in boot1 is what rules the recorded
+    # side of that out with the same fixture and the same function.
+    HOSTKEYS_BOOT1=$(tr -d '\n\r' < "$HOSTKEY_RECORD" 2>/dev/null)
+    check ssh-host-keys-identical-across-the-power-cycle \
+          "$(if [ -n "$HOSTKEYS_NOW" ] && [ -n "$HOSTKEYS_BOOT1" ] \
+                && [ "$HOSTKEYS_NOW" = "$HOSTKEYS_BOOT1" ]; \
+             then echo yes; else echo no; fi)" \
+          "boot1: ${HOSTKEYS_BOOT1:-nothing recorded} | boot2: ${HOSTKEYS_NOW:-NO HOST KEYS AT ALL}"
+fi
 
 if [ "$PHASE" = "boot2" ]; then
     # BEFORE the write below, and read back through config.load() rather

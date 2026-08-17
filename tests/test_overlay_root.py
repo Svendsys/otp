@@ -1057,15 +1057,50 @@ esac
 
 # What a unit with no panel logs on the way to printing unattended, in the
 # order otpunit/hmi.detect and otpunit/__main__ produce it.
+#
+# THE BUTTONS CONSTRUCT HERE, and that is the emulated machine as it is now
+# rather than as it was. harness/img-boot.sh writes /system/linux,revision
+# into the DTB so rpi-eeprom-update.service stops failing on an empty
+# BOARD_INFO; gpiozero reads the same property, so its pin factory loads and
+# `Button(5)` succeeds. Measured by booting a stock Raspberry Pi OS Lite arm64
+# card under `-M raspi3b` with QEMU 8.2.2, with the property and without it:
+#
+#   without   Button(5) raised BadPinFactory: Unable to load any default
+#             pin factory
+#   with      Button(5) CONSTRUCTED factory='LGPIOFactory' pin=GPIO5
+#
+# There is no `no GPIO buttons (` line in this fixture for that reason, and
+# the interface line says what the unit now reports. What did NOT change in
+# either boot: no /dev/i2c-*, and /sys/class/drm empty -- so the display side
+# is still none, which is what unit-detects-no-panel keys on.
 HEADLESS_JOURNAL = (
     "Aug 17 00:04:02 otp-unit systemd[1]: Started otp-unit.service.\n"
     "Aug 17 00:04:09 otp-unit python3[412]: no OLED (FileNotFoundError: "
     "[Errno 2] No such file or directory: '/dev/i2c-1')\n"
-    "Aug 17 00:04:09 otp-unit python3[412]: no GPIO buttons (BadPinFactory)\n"
     "Aug 17 00:04:09 otp-unit python3[412]: interface -- display: none, "
-    "input: none\n"
+    "input: GPIO buttons\n"
     "Aug 17 00:04:09 otp-unit python3[412]: no usable interface; printing "
     "unattended\n")
+
+# The same machine before the board revision was supplied: gpiozero could not
+# build a pin factory, so open_buttons reported and fell through to none. Kept
+# as a fixture of its own because a unit really can have neither -- a Pi with
+# lgpio uninstalled, or a future emulator that stops providing a gpiochip --
+# and the check must go on passing for it.
+NO_BUTTONS_JOURNAL = HEADLESS_JOURNAL.replace(
+    "interface -- display: none, input: GPIO buttons",
+    "no GPIO buttons (BadPinFactory: Unable to load any default pin "
+    "factory!)\nAug 17 00:04:09 otp-unit python3[412]: interface -- "
+    "display: none, input: none")
+
+# And a machine that DID find something to draw on. An HDMI monitor with no
+# buttons: hmi.open_display still logs "no OLED (" because the SSD1306 probe
+# raised, and __main__ still logs the headless line because
+# Interface.interactive needs both halves -- so the two strings this check
+# used to be made of are both there on a unit that has a screen.
+SCREEN_JOURNAL = HEADLESS_JOURNAL.replace(
+    "interface -- display: none, input: GPIO buttons",
+    "interface -- display: HDMI console, input: none")
 
 
 def journal_block() -> str:
@@ -1186,6 +1221,69 @@ def test_a_unit_that_saw_no_panel_and_went_on_anyway_fails(tmp_path):
     assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
 
 
+def test_a_unit_that_found_a_screen_is_not_a_unit_with_no_panel(tmp_path):
+    """
+    The clause the board revision made necessary, and the hole it closes.
+
+    An HDMI monitor with no buttons logs BOTH of the strings this check used
+    to be made of: hmi.open_display reports "no OLED (" because the SSD1306
+    probe raised, and __main__ reports "printing unattended" because
+    Interface.interactive wants a display AND buttons. So a machine with a
+    screen passed a check called unit-detects-no-panel.
+
+    That was survivable while nothing could construct a Button here, because
+    the input half was reliably missing too. It is not survivable now: with
+    /system/linux,revision in the DTB, gpiozero's factory loads and the
+    headless decision rests on the display side alone. What the check keys on
+    has to be the display side, said out loud.
+    """
+    proc, _ = run_journal(tmp_path, unit_journal=SCREEN_JOURNAL)
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
+def test_a_unit_whose_buttons_constructed_still_reports_no_panel(tmp_path):
+    """
+    The other direction, and the proof the emulator fix did not quietly
+    change what this check says.
+
+    Once the harness supplies a board revision, `Button(5)` succeeds under
+    QEMU exactly as it does on every real Pi -- gpiozero reserves a pin and
+    has no presence detection at all. A unit reporting `input: GPIO buttons`
+    on a machine with nothing wired to those pins is therefore the normal
+    case, not a fault, and this check must still pass for it. If it did not,
+    the fix to rpi-eeprom-update.service would have turned a green check red
+    for a reason that has nothing to do with the image.
+    """
+    proc, _ = run_journal(tmp_path)
+    assert "GPIO buttons" in HEADLESS_JOURNAL, \
+        "this fixture is supposed to be the machine whose buttons constructed"
+    assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
+
+
+def test_a_unit_with_neither_buttons_nor_a_screen_still_reports_no_panel(tmp_path):
+    """
+    And the machine as it was before the revision arrived, which is also a
+    machine that can really exist -- a Pi with lgpio uninstalled reports
+    exactly this. Neither shape may be the only one the check accepts.
+    """
+    proc, _ = run_journal(tmp_path, unit_journal=NO_BUTTONS_JOURNAL)
+    assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
+
+
+def test_a_unit_that_never_said_what_it_settled_on_fails(tmp_path):
+    """
+    The interface line is the one that carries the display kind, so a unit
+    that never printed it leaves the new clause with nothing to read. An
+    absence must be a FAIL rather than a shrug: the alternative is a check
+    that goes green on a boot where the unit died between probing the display
+    and deciding what to do about it.
+    """
+    journal = "\n".join(line for line in HEADLESS_JOURNAL.splitlines()
+                        if "interface --" not in line) + "\n"
+    proc, _ = run_journal(tmp_path, unit_journal=journal)
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
 def test_a_previous_boots_headless_decision_does_not_answer_for_this_one(tmp_path):
     """
     `-b`, and why it is load bearing three hundred lines from the file that
@@ -1201,6 +1299,228 @@ def test_a_previous_boots_headless_decision_does_not_answer_for_this_one(tmp_pat
         tmp_path, unit_journal="",
         env={"UNIT_JOURNAL_LAST_BOOT": HEADLESS_JOURNAL})
     assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
+# --- the identity that has to outlive the power cycle ---------------------
+
+IDENTITY_BLOCK = (
+    "# --- the identity, which is the one thing allowed to survive",
+    # Through the closing `fi` of the boot2 branch, or the slice is a shell
+    # fragment that will not parse -- which is a syntax error rather than a
+    # test, and would have been one either way.
+    '"boot1: ${HOSTKEYS_BOOT1:-nothing recorded} | '
+    'boot2: ${HOSTKEYS_NOW:-NO HOST KEYS AT ALL}"\nfi')
+
+# Fingerprints by CONTENT. The checks under test depend on exactly one
+# property of ssh-keygen -lf: the same bytes give the same fingerprint and
+# different bytes give a different one. A stub that answered a constant would
+# make "the keys are identical" true of two different keys, which is the
+# claim being tested.
+SSH_KEYGEN_STUB = """#!/bin/sh
+[ "$1" = "-lf" ] || { echo "stub: unexpected ssh-keygen $*" >&2; exit 64; }
+printf '256 SHA256:%s root@otp-unit (ED25519)\\n' "$(cksum < "$2" | cut -d' ' -f1)"
+"""
+
+# The probe asks findmnt exactly one thing here: which filesystem contains the
+# identity store. Anything else is a stub being asked a question nobody wrote
+# an answer for, and it says so rather than returning "".
+FINDMNT_STUB = """#!/bin/sh
+case "$*" in
+    *--target*) printf '%s\\n' "${FAKE_STORE_SRC-/dev/mmcblk0p1}" ;;
+    *) echo "stub: unexpected findmnt $*" >&2; exit 64 ;;
+esac
+"""
+
+# What the running machine's own machine-id looks like: 32 hex characters.
+LIVE_ID = "0f9c2b4d6e8a1c3f5b7d9e0a2c4e6f81"
+
+
+def run_identity(tmp_path, *, phase="boot1", live_id=LIVE_ID, stored_id=LIVE_ID,
+                 host_keys=("ed25519-a", "rsa-a"), recorded=None,
+                 store_src="/dev/mmcblk0p1", boot_dir="boot",
+                 make_boot=True):
+    """Run the shipped identity checks against a tree this test builds.
+
+    Everything the block reads is a path it takes from a variable -- $BOOTDIR,
+    $ETC_MACHINE_ID, $ETC_SSH -- so the SHIPPED lines run here rather than a
+    copy of them.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    boot = tmp_path / boot_dir
+    etc_ssh = tmp_path / "etc-ssh"
+    etc_ssh.mkdir(exist_ok=True)
+    machine_id = tmp_path / "machine-id"
+    machine_id.write_text(live_id + "\n") if live_id is not None else None
+    if make_boot:
+        boot.mkdir(exist_ok=True)
+        (boot / "otp-identity").mkdir(exist_ok=True)
+        if stored_id is not None:
+            (boot / "otp-identity" / "machine-id").write_text(stored_id + "\n")
+        if recorded is not None:
+            (boot / "otp-imgcheck-hostkeys").write_text(recorded + "\n")
+    for name in host_keys:
+        (etc_ssh / f"ssh_host_{name}_key.pub").write_text(f"ssh-{name} AAAA\n")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name, body in (("ssh-keygen", SSH_KEYGEN_STUB),
+                       ("findmnt", FINDMNT_STUB)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+
+    runner = tmp_path / "identity.sh"
+    runner.write_text(
+        "set -uo pipefail\n"
+        f'PHASE="{phase}"\nPASS=0\nTOTAL=0\n'
+        f'BOOTDIR="{boot}"\n'
+        f'ETC_MACHINE_ID="{machine_id}"\n'
+        f'ETC_SSH="{etc_ssh}"\n'
+        'ROOT_SOURCE="overlay"\n'
+        + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
+        + slice_between(GUEST_CHECK.read_text(), *IDENTITY_BLOCK) + "\n")
+    proc = subprocess.run(
+        ["bash", str(runner)], capture_output=True, text=True, timeout=60,
+        env={**os.environ, "FAKE_STORE_SRC": store_src,
+             "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    return proc, boot
+
+
+def fingerprints_of(*names) -> str:
+    """What the stub above answers for a set of host keys, in the probe's
+    order -- sorted, space separated. Computed by running the same `cksum`
+    the stub runs, rather than pasted, so a fixture cannot drift away from
+    the stub and quietly turn a comparison into a mismatch nobody meant."""
+    out = []
+    for name in names:
+        proc = subprocess.run(["cksum"], input=f"ssh-{name} AAAA\n",
+                              capture_output=True, text=True)
+        out.append("SHA256:" + proc.stdout.split()[0])
+    return " ".join(sorted(out))
+
+
+def test_a_boot_that_kept_its_identity_says_so(tmp_path):
+    # The positive control for everything below: every other test here
+    # asserts a FAIL, and a block that failed unconditionally would satisfy
+    # all of them.
+    proc, _ = run_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert results(proc) == {
+        "machine-id-persisted-outside-the-overlay": "PASS",
+        "ssh-host-key-fingerprint-recorded": "PASS"}, proc.stdout
+
+
+def test_the_first_boot_writes_the_fingerprint_where_the_second_can_read_it(tmp_path):
+    """The record is the whole mechanism boot2's check rests on, so boot1 has
+    to leave it on the boot partition rather than merely compute it."""
+    proc, boot = run_identity(tmp_path)
+    written = (boot / "otp-imgcheck-hostkeys").read_text().strip()
+    assert written == fingerprints_of("ed25519-a", "rsa-a"), written
+    assert results(proc)["ssh-host-key-fingerprint-recorded"] == "PASS"
+
+
+def test_a_machine_with_no_host_keys_records_nothing_and_says_so(tmp_path):
+    """
+    The positive control has to be able to fail, or boot2's "identical"
+    means nothing. A machine with no host keys at all computes an empty
+    fingerprint, writes an empty record, and reads it back -- empty equals
+    empty, which is exactly the shape of agreement this check exists to
+    refuse.
+    """
+    proc, _ = run_identity(tmp_path, host_keys=())
+    assert results(proc)["ssh-host-key-fingerprint-recorded"] == "FAIL", proc.stdout
+
+
+def test_a_fingerprint_that_never_reached_the_card_fails(tmp_path):
+    """
+    Computing it is not recording it. With no writable boot directory the
+    record never lands, and boot2 would have nothing to compare against --
+    which must be boot1's failure rather than boot2's mystery.
+    """
+    proc, _ = run_identity(tmp_path, make_boot=False)
+    assert results(proc)["ssh-host-key-fingerprint-recorded"] == "FAIL", proc.stdout
+
+
+def test_the_second_boot_accepts_the_same_keys(tmp_path):
+    proc, _ = run_identity(
+        tmp_path, phase="boot2",
+        recorded=fingerprints_of("ed25519-a", "rsa-a"))
+    assert results(proc)["ssh-host-keys-identical-across-the-power-cycle"] \
+        == "PASS", proc.stdout
+
+
+def test_host_keys_regenerated_by_the_power_cycle_fail_the_second_boot(tmp_path):
+    """
+    The property, stated as its own negation. Before the machine-id was
+    persisted this was the machine: every boot was a first boot, and
+    regenerate_ssh_host_keys.service opens with
+    `rm -f /etc/ssh/ssh_host_*_key*`.
+    """
+    proc, _ = run_identity(
+        tmp_path, phase="boot2", host_keys=("ed25519-b", "rsa-b"),
+        recorded=fingerprints_of("ed25519-a", "rsa-a"))
+    assert results(proc)["ssh-host-keys-identical-across-the-power-cycle"] \
+        == "FAIL", proc.stdout
+
+
+def test_two_absences_are_not_identical_host_keys(tmp_path):
+    """
+    THE reading this check has to be unable to make. No keys in boot2 and
+    nothing recorded by boot1 compare equal as strings, and a machine that
+    lost its host keys entirely would then certify that they survived the
+    power cycle.
+    """
+    proc, _ = run_identity(tmp_path, phase="boot2", host_keys=(), recorded=None)
+    assert results(proc)["ssh-host-keys-identical-across-the-power-cycle"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_second_boot_with_keys_but_no_record_fails(tmp_path):
+    """Half of that absence on its own: boot1 never recorded anything, so
+    there is nothing this boot's keys can be identical TO."""
+    proc, _ = run_identity(tmp_path, phase="boot2", recorded=None)
+    assert results(proc)["ssh-host-keys-identical-across-the-power-cycle"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_machine_id_that_was_never_kept_fails(tmp_path):
+    proc, _ = run_identity(tmp_path, stored_id=None)
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_kept_machine_id_that_is_not_the_one_in_use_fails(tmp_path):
+    """
+    Which is what a failed initramfs restore looks like from userspace: the
+    store holds an id, systemd generated a different one because it never saw
+    it, and the boot was a first boot all over again.
+    """
+    proc, _ = run_identity(tmp_path, stored_id="ffffffffffffffffffffffffffffffff")
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_machine_with_no_machine_id_at_all_fails(tmp_path):
+    """
+    Two absences again, in the other half. An unreadable /etc/machine-id and
+    an empty store compare equal, and "the identity persisted" would be
+    certified of a machine that has no identity.
+    """
+    proc, _ = run_identity(tmp_path, live_id=None, stored_id="")
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_store_inside_the_overlay_is_not_persistence(tmp_path):
+    """
+    The clause that stops the whole check being self-satisfying. If
+    /boot/firmware never mounted, the store is a directory on the overlay's
+    tmpfs: the copy and the original agree on every boot and nothing survives
+    any of them. findmnt then reports the ROOT's source for the store, which
+    is the state named here.
+    """
+    proc, _ = run_identity(tmp_path, store_src="overlay")
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "FAIL", proc.stdout
 
 
 # --- the diagnostic sheet -------------------------------------------------
