@@ -323,11 +323,23 @@ rig_resolve_kernel_version() {  # <packages-file>
 # demanded at the point where that path begins.
 
 #: Everything a real run shells out to: the emulator itself, the archive
-#: fetch, the deb unpack, the DTB patch, the initramfs build, and od(1) for
-#: the ELF and Image interrogation.
-RIG_BOOT_TOOLS=(qemu-system-aarch64 curl xz gzip cpio dpkg-deb fdtput od)
-#: Only coldplug-replay builds a module disk. See rig_preflight.
-RIG_COLDPLUG_TOOLS=(depmod mkfs.ext4)
+#: fetch, the deb unpack, the DTB patch AND ITS READBACK, the initramfs
+#: build, od(1) for the ELF and Image interrogation, and timeout(1) for the
+#: backstop the whole run is bounded by.
+#:
+#: fdtget WAS MISSING FROM THIS LIST while the rig used it, and the way
+#: that surfaced is the misdirection the preflight exists to prevent: the
+#: patch is written with fdtput and read back with fdtget, so on a host
+#: with neither the readback returns nothing and the rig says "$dtb does
+#: not carry linux,revision after the patch" -- blaming the patch for a
+#: tool that was never there. timeout and truncate had the same shape.
+#: tests/test_local_rig.py now checks USED-IS-DECLARED, not just
+#: declared-is-stubbable, which is the direction that catches this.
+RIG_BOOT_TOOLS=(qemu-system-aarch64 curl xz gzip cpio dpkg-deb fdtput fdtget
+                od timeout)
+#: Only coldplug-replay builds a module disk, which is what depmod fills,
+#: truncate sizes and mkfs.ext4 formats. See rig_preflight.
+RIG_COLDPLUG_TOOLS=(depmod mkfs.ext4 truncate)
 #: What resolving the kernel version out of the archive needs -- which both
 #: --plan and a real run do, because both report the release they mean.
 RIG_RESOLVE_TOOLS=(curl gzip)
@@ -412,9 +424,36 @@ dmesg | grep -i 'crng\|random:' || echo "   (nothing)"
 # seconds printed after it are the answer.
 echo "-- blocking read of /dev/random (this is the entropy question):"
 before=$(cut -d' ' -f1 /proc/uptime)
-dd if=/dev/random of=/dev/null bs=1 count=16 2>/dev/null
+# RC CAPTURED AND STDERR KEPT, and this is the whole of the probe's
+# honesty. Both were thrown away -- `2>/dev/null`, exit status unread --
+# so the line below printed "16 blocking bytes" with a plausible
+# sub-second delta for a read that never happened. Measured: with
+# /dev/random deleted this probe still said "16 blocking bytes: uptime
+# 3.29 -> 3.31" and the rig still exited 0.
+#
+# That is structurally the same defect as the `modprobe -d` one the
+# coldplug probe below carries a paragraph about: an unexamined exit
+# status reported as an answer. It is worse here, because this
+# measurement does not stay in the rig -- img-boot.sh cites it as the
+# evidence for a hard gate on crng seeding, and harness/README.md
+# repeats the figures. A pad printer that cannot get entropy must not
+# learn that from a probe that never read a byte.
+#
+# Substitution rather than a pipe into anything: the guest shell is
+# busybox ash, which has no PIPESTATUS, so `dd | cat` would leave $?
+# holding cat's status -- always 0. Same trap, one level in, as the
+# coldplug probe's.
+err=$(dd if=/dev/random of=/dev/null bs=1 count=16 2>&1)
+rc=$?
 after=$(cut -d' ' -f1 /proc/uptime)
-echo "   16 blocking bytes: uptime $before -> $after"
+if [ "$rc" = "0" ]; then
+    echo "   16 blocking bytes: uptime $before -> $after"
+else
+    rig_fail "the blocking read did not happen (dd rc=$rc)." \
+             "uptime $before -> $after is the cost of failing, not an" \
+             "entropy figure, and must not be quoted as one." \
+             "$err"
+fi
 PROBE
         ;;
     coldplug-replay)
@@ -424,16 +463,21 @@ PROBE
 # this probe is not that it usually passes -- it is that a module which
 # hangs is named by the START line with no matching DONE, so the wedge has
 # an address instead of a theory.
-mkdir -p /mnt/modules
+# Named once instead of spelled out five times, and overridable for the
+# same reason RIG_FAILED above is: the tests run this exact body on a host,
+# and a host has no /mnt it may mount things under. In the guest it is
+# /mnt/modules and nothing sets it.
+MODDIR="${RIG_MODDIR:-/mnt/modules}"
+mkdir -p "$MODDIR"
 # The module tree rides on the SD card, which is free here because this rig
 # boots no image. mmcblk0 is the whole disk: one ext4 filesystem, no table.
 for try in 1 2 3 4 5 6 7 8 9 10; do
     [ -b /dev/mmcblk0 ] && break
     sleep 1
 done
-if ! mount -t ext4 -o ro /dev/mmcblk0 /mnt/modules 2>/dev/null; then
-    echo "   FAIL: could not mount the module disk at /dev/mmcblk0"
-    echo "   (block devices: $(ls /dev/mmcblk* 2>/dev/null || echo none))"
+if ! mount -t ext4 -o ro /dev/mmcblk0 "$MODDIR" 2>/dev/null; then
+    rig_fail "could not mount the module disk at /dev/mmcblk0" \
+             "(block devices: $(ls /dev/mmcblk* 2>/dev/null || echo none))"
 else
     # /lib/modules, NOT `modprobe -d`. busybox's modprobe has no -d option
     # -- that is kmod's -- and the first version of this probe used it.
@@ -443,15 +487,15 @@ else
     # convincing possible way to be wrong. A coldplug replay in which no
     # modprobe can run is not a clean coldplug replay.
     mkdir -p /lib
-    ln -sf /mnt/modules/lib/modules /lib/modules
+    ln -sf "$MODDIR/lib/modules" /lib/modules
     release=$(uname -r)
-    echo "   modules: $(ls /mnt/modules/lib/modules 2>/dev/null)"
-    if [ ! -f "/lib/modules/$release/modules.dep" ]; then
-        echo "   FAIL: no modules.dep for $release -- modprobe can resolve nothing,"
-        echo "   so every probe below would 'succeed' without doing anything."
-        echo "   (the host-side depmod in rig_build_module_disk is what makes it)"
+    echo "   modules: $(ls "$MODDIR/lib/modules" 2>/dev/null)"
+    if [ ! -f "$MODDIR/lib/modules/$release/modules.dep" ]; then
+        rig_fail "no modules.dep for $release -- modprobe can resolve nothing," \
+                 "so every probe below would 'succeed' without doing anything." \
+                 "(the host-side depmod in rig_build_module_disk is what makes it)"
     else
-        echo "   modules.dep: $(wc -l < "/lib/modules/$release/modules.dep") lines"
+        echo "   modules.dep: $(wc -l < "$MODDIR/lib/modules/$release/modules.dep") lines"
         total=0; failed=0
         for m in $(find /sys/devices -name modalias -print 2>/dev/null | sort); do
             alias=$(cat "$m" 2>/dev/null) || continue
@@ -477,10 +521,20 @@ else
         done
         echo "   coldplug replayed $total modaliases, $failed of them non-zero"
         echo "   loaded: $(wc -l < /proc/modules) modules now in /proc/modules"
-        if [ "$total" -gt 0 ] && [ "$failed" = "$total" ]; then
-            echo "   FAIL: EVERY probe returned non-zero. That is a broken"
-            echo "   invocation, not a clean coldplug -- read the lines above"
-            echo "   before believing the count."
+        if [ "$total" = "0" ]; then
+            # THE ZERO CASE, which the old guard explicitly excluded with
+            # `[ "$total" -gt 0 ] &&`. "coldplug replayed 0 modaliases, 0 of
+            # them non-zero" is not a clean replay; it is /sys not mounted,
+            # or a find that matched nothing, and the question was never
+            # asked. Same shape as the rng probe's unexamined dd: a count
+            # that agrees with itself while measuring nothing.
+            rig_fail "no modalias files under /sys/devices at all, so this" \
+                     "replayed NOTHING. Zero probes and zero failures is not" \
+                     "a clean coldplug -- check that /sys mounted."
+        elif [ "$failed" = "$total" ]; then
+            rig_fail "EVERY probe returned non-zero. That is a broken" \
+                     "invocation, not a clean coldplug -- read the lines above" \
+                     "before believing the count."
         fi
     fi
 fi
@@ -495,9 +549,16 @@ PROBE
 # changes which port is live changes that answer, so it is worth asking
 # directly rather than inferring it from silence.
 echo "-- /proc/consoles (the registered ones, C = preferred):"
-cat /proc/consoles 2>/dev/null || echo "   (none)"
+# `|| echo "   (none)"` was the whole answer here, and "(none)" reads like
+# a finding about consoles when it is really /proc failing to mount. This
+# probe exists to say which console is live; without /proc it cannot, and
+# saying so is the honest output.
+cat /proc/consoles 2>/dev/null \
+    || rig_fail "/proc/consoles is unreadable, so nothing below can say which" \
+                "console registered. /proc did not mount; this is not a" \
+                "finding about consoles."
 echo "-- kernel cmdline:"
-cat /proc/cmdline
+cat /proc/cmdline || rig_fail "/proc/cmdline is unreadable (see above)"
 echo "-- tty device nodes devtmpfs actually made:"
 # `ls /dev/ttyAMA*` was the first form and it lied: with no match busybox ls
 # still lists the paths that DO exist, then exits nonzero, so the `|| echo
@@ -509,6 +570,14 @@ for t in /dev/tty[A-Z]*[0-9] /dev/ttyS[0-9]; do
     found_tty="yes"
     echo "   $(ls -l "$t")"
 done
+# A FINDING, NOT A FAULT, and deliberately not rig_fail. Measured on this
+# rig's healthy guest: devtmpfs mounts and populates /dev with 130-odd
+# nodes -- tty0..tty63, random, urandom, hwrng -- and there is no
+# /dev/ttyAMA1 among them, while /proc/consoles registers ttyAMA1 at
+# 204:65. "Registered as a console, no character device" is exactly the
+# kind of answer this probe exists to bring back, so it must not be the
+# thing that makes the probe report failure. An empty /dev is a different
+# statement and rig_mount above is what makes it.
 [ -n "$found_tty" ] || echo "   (no serial tty nodes at all)"
 echo "   /dev/console: $(ls -l /dev/console 2>/dev/null || echo absent)"
 echo "-- what the device tree calls them:"
@@ -543,19 +612,135 @@ PROBE
 # point is the re-verification, and a heartbeat is what makes a reset
 # visible: the count restarts from 1 instead of continuing.
 i=0
+start=$(cut -d' ' -f1 /proc/uptime)
 while [ "$i" -lt "$OTP_RIG_IDLE_SECONDS" ]; do
     i=$((i + 1))
     echo "   heartbeat $i/$OTP_RIG_IDLE_SECONDS uptime=$(cut -d' ' -f1 /proc/uptime)"
     sleep 1
 done
-echo "   survived $OTP_RIG_IDLE_SECONDS seconds with no reset"
-echo "   (a reset would have restarted this count at 1)"
+end=$(cut -d' ' -f1 /proc/uptime)
+# THE CLAIM IS MEASURED, NOT COUNTED. "survived N seconds" was printed for
+# completing N iterations of a loop, which is a different statement: a
+# sleep that returns immediately finishes the loop in milliseconds and the
+# probe reports surviving a minute it never spent. Same shape as the rng
+# probe's unexamined dd -- a success line for work whose success was never
+# checked -- and this one decides whether the watchdog fix is believed.
+#
+# Whole seconds either side, so each truncation can lose just under one and
+# the honest bound is N-1. Ash has no floating point and the point here is
+# telling 45 from 0, not 45 from 44.
+elapsed=$(( ${end%%.*} - ${start%%.*} ))
+if [ "$elapsed" -ge $(( OTP_RIG_IDLE_SECONDS - 1 )) ]; then
+    echo "   survived $OTP_RIG_IDLE_SECONDS seconds with no reset"
+    echo "   (uptime $start -> $end; a reset would have restarted this count at 1)"
+else
+    rig_fail "the loop ran to $OTP_RIG_IDLE_SECONDS but only ${elapsed}s of" \
+             "uptime passed (uptime $start -> $end). Nothing waited, so" \
+             "nothing survived: this is a sleep that is not sleeping, not a" \
+             "machine that stayed up."
+fi
 PROBE
         ;;
     *)
         return 1
         ;;
     esac
+}
+
+# --- the init the guest runs ---------------------------------------------
+#
+# A FUNCTION THAT PRINTS THE SCRIPT, not one that writes the file, and the
+# reason is coverage rather than tidiness. The probe bodies above live in
+# `<<'PROBE'` quoted heredocs, which shellcheck reads as data: measured, an
+# unbalanced `if [ "$broken" ; then` inside the rng heredoc left shellcheck
+# at rc 0, all of tests/test_local_rig.py green and the whole suite green.
+# What that typo does in real use is kill /init before the marker, so the
+# sampler waits out the full 300s backstop and the rig prints "NEVER
+# REPORTED ... hung, reset, or never reached /init" -- which is the exact
+# wedge signature this rig exists to DISAMBIGUATE, produced by a typo in
+# the rig. Printing the script instead of writing it lets the tests `sh -n`
+# every probe's init, and run it, without an emulator anywhere near them.
+rig_init_script() {  # <probe>
+    local probe="$1"
+    # Not `set -e`: a probe that fails half way through should print
+    # everything up to the failure and then its DONE marker. An init that
+    # dies leaves the sampler waiting for a marker that will never come,
+    # and the run pays the full backstop for no evidence.
+    cat <<'INIT_HEAD'
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+
+# WHETHER THE PROBE DID ITS WORK, recorded in a file rather than a shell
+# variable so that a probe reporting from inside a subshell still counts.
+# The DONE marker at the bottom carries the answer and rig_boot's exit
+# code is that answer. Overridable only so the tests can run this exact
+# script on a host without writing to its root; in the guest it is the
+# initramfs and there is nothing else here.
+RIG_FAILED="${RIG_FAILED:-/rig-failed}"
+rm -f "$RIG_FAILED"
+
+# THE ONE WAY A PROBE SAYS "THIS DID NOT WORK", and printing a FAIL line
+# is not it. Measured: coldplug's body with no module disk printed
+# "FAIL: could not mount the module disk at /dev/mmcblk0" and the rig
+# exited 0, so `./harness/img-local-rig.sh coldplug-replay && echo clean`
+# printed clean for a replay that mounted nothing.
+rig_fail() {
+    echo "   FAIL: $1"
+    shift
+    for l in "$@"; do echo "   $l"; done
+    echo failed > "$RIG_FAILED"
+}
+
+# MOUNT ERRORS ARE NOT SUPPRESSED. All three of these ended in
+# `2>/dev/null` and their exit status went unread, so a /proc, /sys or
+# /dev that never arrived was invisible -- and a guest with no /dev is
+# exactly the path by which the rng probe reported a blocking read of
+# /dev/random that never happened. EBUSY is the one tolerable answer, for
+# a kernel built with CONFIG_DEVTMPFS_MOUNT that mounted /dev before
+# /init ran. Measured on this rig's kernel that does NOT happen -- /dev
+# holds one node, `console`, and all three mounts return 0 -- which is
+# precisely why nothing else may be swallowed alongside it.
+rig_mount() {  # <type> <dir>
+    out=$(mount -t "$1" "$1" "$2" 2>&1)
+    rc=$?
+    if [ "$rc" = "0" ]; then
+        return 0
+    fi
+    case "$out" in
+    *"resource busy"*|*"Resource busy"*|*"esource or device busy"*)
+        echo "   ($2 was already mounted; continuing)"
+        return 0
+        ;;
+    esac
+    rig_fail "could not mount $1 on $2 (rc=$rc)" \
+             "$out" \
+             "Everything below reads $2, so the probe's answers would be" \
+             "about a filesystem that is not there."
+    return 1
+}
+
+rig_mount proc /proc
+rig_mount sysfs /sys
+rig_mount devtmpfs /dev
+INIT_HEAD
+    printf 'export OTP_RIG_IDLE_SECONDS=%s\n' "$IDLE_SECONDS"
+    printf 'echo "OTP-RIG-BEGIN %s"\n' "$probe"
+    # shellcheck disable=SC2016  # $(uname -r) is the GUEST's job, not ours
+    printf 'echo "kernel: $(uname -r)"\n'
+    rig_probe_body "$probe"
+    # THE MARKER THE SAMPLER WAITS FOR, printed unconditionally after
+    # whatever the probe did or failed to do -- and now carrying WHICH of
+    # those it was. Unconditional, so a probe that fails half way still
+    # ends the run instead of hanging it; with a status, so that ending
+    # the run stops being the same thing as answering the question.
+    # shellcheck disable=SC2016  # $RIG_FAILED is the GUEST's variable
+    printf 'if [ -f "$RIG_FAILED" ]; then rig_status=fail; else rig_status=ok; fi\n'
+    # shellcheck disable=SC2016  # $rig_status is the GUEST's variable
+    printf 'echo "OTP-RIG-DONE %s status=$rig_status"\n' "$probe"
+    # An idle loop rather than an exit: PID 1 exiting is a kernel panic,
+    # which scrolls the evidence off the top of the console. The sampler
+    # stops the emulator on the marker above.
+    printf 'while true; do sleep 5; done\n'
 }
 
 # --- building the initramfs ----------------------------------------------
@@ -566,29 +751,7 @@ rig_build_initramfs() {  # <busybox> <probe> <out>
     mkdir -p "$root/bin" "$root/proc" "$root/sys" "$root/dev" "$root/mnt"
     cp "$busybox" "$root/bin/busybox"
     chmod 755 "$root/bin/busybox"
-    {
-        printf '#!/bin/busybox sh\n'
-        # Not `set -e`: a probe that fails half way through should print
-        # everything up to the failure and then its DONE marker. An init
-        # that dies leaves the sampler waiting for a marker that will never
-        # come, and the run pays the full backstop for no evidence.
-        printf '/bin/busybox --install -s /bin\n'
-        printf 'mount -t proc proc /proc 2>/dev/null\n'
-        printf 'mount -t sysfs sysfs /sys 2>/dev/null\n'
-        printf 'mount -t devtmpfs devtmpfs /dev 2>/dev/null\n'
-        printf 'export OTP_RIG_IDLE_SECONDS=%s\n' "$IDLE_SECONDS"
-        printf 'echo "OTP-RIG-BEGIN %s"\n' "$probe"
-        # shellcheck disable=SC2016  # $(uname -r) is the GUEST's job, not ours
-        printf 'echo "kernel: $(uname -r)"\n'
-        rig_probe_body "$probe"
-        # The marker the sampler waits for. Printed unconditionally, after
-        # whatever the probe did or failed to do.
-        printf 'echo "OTP-RIG-DONE %s"\n' "$probe"
-        # An idle loop rather than an exit: PID 1 exiting is a kernel panic,
-        # which scrolls the evidence off the top of the console. The sampler
-        # stops the emulator on the marker above.
-        printf 'while true; do sleep 5; done\n'
-    } > "$root/init"
+    rig_init_script "$probe" > "$root/init"
     chmod 755 "$root/init"
     ( cd "$root" && find . | cpio -o -H newc --quiet ) | gzip -9 > "$out"
 }
@@ -697,15 +860,41 @@ rig_boot() {  # <probe> <kernel> <dtb> <initrd> <drive>
     set -e
     printf '%s\n' "$rc" > "$dir/qemu-rc"
     rig_log "$probe: uart0=$(wc -c < "$c0") bytes uart1=$(wc -c < "$c1") bytes rc=$rc"
+    # WHAT THE EXIT CODE MEANS, in three states a caller can tell apart.
+    # It used to mean "something printed a marker", which is not the same
+    # thing as "the probe did its work": measured, coldplug's body with no
+    # module disk printed "FAIL: could not mount the module disk" and the
+    # rig exited 0, and a probe body of `:` printed BEGIN and DONE and
+    # exited 0. `./harness/img-local-rig.sh coldplug-replay && echo clean`
+    # printed clean for a replay that mounted nothing.
+    #
+    #   1  no marker at all: the guest hung, reset, or never reached
+    #      /init. Its own code, because that is a different problem from a
+    #      probe that ran and found something wrong -- and telling those
+    #      two apart is most of what this rig is for.
+    #   2  the probe reported, and reported failure.
+    #   0  the probe reported, and did its work.
     if [ -z "$stopped" ]; then
-        # NOT silent, and not a hard failure either. A probe that never
-        # reported is the interesting case -- it is what a wedge looks like
-        # -- but the consoles are the evidence and they are on disk.
+        # NOT silent. A probe that never reported is the interesting case
+        # -- it is what a wedge looks like -- and the consoles are the
+        # evidence and they are on disk.
         rig_log "$probe NEVER REPORTED: no 'OTP-RIG-DONE $probe' on uart0."
         rig_log "The machine hung, reset, or never reached /init. Read:"
         rig_log "  $c0"
         rig_log "  $c1"
         return 1
+    fi
+    # grep -c and not grep -q, for the third time in this file: see
+    # rig_have_raspi_machine. The file is one qemu was writing until a
+    # moment ago and this runs under pipefail.
+    local ok
+    ok=$(grep -acF "OTP-RIG-DONE $probe status=ok" "$c0" 2>/dev/null || true)
+    if [ "${ok:-0}" = "0" ]; then
+        rig_log "$probe REPORTED FAILURE after ${stopped}s wall."
+        rig_log "The probe ran and said its work did not happen, so nothing"
+        rig_log "else it printed is an answer. Read the FAIL lines on uart0:"
+        printf '   %s\n   %s\n' "$c0" "$c1" >&2
+        return 2
     fi
     rig_log "$probe reported after ${stopped}s wall. Consoles:"
     printf '   %s\n   %s\n' "$c0" "$c1" >&2
