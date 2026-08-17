@@ -821,6 +821,19 @@ systemctl mask ssh.socket
 # whatever is at / with the options fstab gives for /. That is untested here
 # and it is the first thing to look at if a tier-3 console ever shows
 # systemd-remount-fs failing.
+#
+# THE /boot/firmware LINE IS NOT TOUCHED EITHER, and that is a decision with
+# a cost worth naming. pi-gen mounts it `vfat ... defaults`, and vfat carries
+# no permission bits, so every file on the boot partition is 0755 root:root
+# -- readable by EVERY local account, the `otp` user the print unit runs as
+# included, not merely by someone who takes the card out. `fmask=0077,
+# dmask=0077` would fix that and was considered. It is not applied because
+# otp-unit.service carries ReadWritePaths=-/boot/firmware precisely so that
+# otpunit/config.py can save the operator's settings there, and a partition
+# only root could write would break settings persistence to protect a
+# machine-id and a page count -- neither of which is a secret. No pad byte
+# and no password is written to this partition; if that ever changes, this
+# is the line that has to change with it.
 CMDLINE_TXT="$BOOT_DIR/cmdline.txt"
 if [ ! -f "$CMDLINE_TXT" ]; then
     # The overlay is configured through the Raspberry Pi boot firmware, so
@@ -875,10 +888,12 @@ else
 # so the exception rides with the mechanism it is an exception to, rather
 # than in some other file that has to be kept in step with it.
 #
-# NARROW ON PURPOSE: one file, 33 bytes, named. Not /etc, not a list, and
-# the SSH host keys are deliberately NOT done here -- they need modes a
-# FAT partition cannot express, and sshd starts late enough that ordinary
-# userspace can place them (see otp-unit-identity.service).
+# NARROW ON PURPOSE: one file, 33 bytes, named. Not /etc, and not a list.
+# The SSH host keys are not done here or anywhere else: this appliance ships
+# with ssh.service disabled (image/build.sh sets ENABLE_SSH=0) and does not
+# run sshd, so there is no fingerprint anybody could be shown and no reason
+# to put a private key on a partition every local account can read. See
+# device/persist-identity.sh.
 #
 # WHERE IT COMES FROM: the FAT boot partition, the same partition
 # otpunit/config.py already persists settings to and the only writable

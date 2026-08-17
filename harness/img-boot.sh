@@ -1093,7 +1093,7 @@ per_boot_verdict() {
     # was never written, by a boot that died in the initrd, and by a grep
     # looking for a string systemd no longer prints. Boot1 requires the same
     # string, from the same grep over the same kind of file, to be THERE --
-    # and boot1 genuinely is a first boot every run, because harness gets a
+    # and boot1 genuinely is a first boot every run, because the harness takes a
     # fresh `xz -dc` of the image before it starts.
     #
     # REPORTED FIRST, GATED NOW: run 32020772161 printed both halves in the
