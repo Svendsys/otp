@@ -453,9 +453,20 @@ jobs:
           # in the act of applying it. The repository owner's decision is to
           # persist it, so the sentence has changed, and it now says the
           # STRONGER thing: the password is still there after the power
-          # cycle. That claim is backed by three named guest checks the gate
+          # cycle. That claim is backed by four named guest checks the gate
           # requires, and tests/test_image_workflow.py holds this body
           # against those names.
+          #
+          # AND IT NAMES THE ONE THING THAT DOES NOT SURVIVE, because leaving
+          # it out is how a reader gets locked out. `userconf-pi` RENAMES the
+          # UID-1000 account whenever a seed names another user, and that
+          # rename touches only /etc and /home -- inside the overlay -- so
+          # the next boot is `otp` again with the new password on it. A note
+          # that promised the credential without saying which username it
+          # belongs to would send an operator to a tty2 prompt to type a name
+          # this machine does not have, with no network and no sshd behind
+          # it. credential-recovers-a-store-naming-another-account is the
+          # check that makes the sentence true.
           #
           # AND IT SAYS WHAT THAT COSTS IN THE SAME BREATH. The hash is on a
           # world-readable partition and can be attacked offline; a reader
@@ -477,7 +488,16 @@ jobs:
             the RAM overlay and the wizard deletes the seed as the last step
             of applying it, so before this the credential lasted exactly one
             boot and the account reverted to the random build-time password,
-            which nobody has. It is kept in
+            which nobody has. **The USERNAME does not survive, and only the
+            password does.** If your `userconf.txt` names anything other than
+            `otp`, `userconf-pi` renames the `otp` account to it -- and that
+            rename lives entirely in `/etc` and `/home`, inside the overlay,
+            so the next boot is back to `otp` with the password you chose.
+            Log in as `otp`. The second boot of this gate proved that
+            directly: a store naming an account this unit no longer had was
+            applied to the account holding UID 1000 and the store was
+            rewritten to match, so a seed naming another user costs you the
+            name and never the login. The credential is kept in
             `/boot/firmware/otp-identity/credential`, written only on a boot
             where you seeded a `userconf.txt` yourself -- **so it is a
             password hash on the same world-readable FAT partition your own

@@ -513,10 +513,22 @@ def test_the_seed_names_the_account_the_image_actually_ships(tmp_path):
     would be running by accident. Naming the image's own first user keeps the
     rename branch out of it -- so if image/build.sh ever changes
     FIRST_USER_NAME, this seed silently starts testing something else.
+
+    WHAT THAT NARROWING NO LONGER HIDES. The rename is exactly what an
+    operator gets for writing any other username, it lives entirely inside
+    the overlay, and the store outlives it -- so the next boot met a
+    credential naming an account that was gone, and refusing it took the
+    unit's only login away. The state that leaves is synthesised in boot2 and
+    handed to the real shipped script instead of being seeded here, so this
+    agreement stays a narrowing rather than a blind spot: see
+    credential-recovers-a-store-naming-another-account.
     """
     first_user = shell_value(BUILD_SH, "FIRST_USER_NAME")
     assert shell_value(IMG_BOOT, "USERCONF_USER") == first_user
     assert shell_value(GUEST_CHECK, "USERCONF_USER") == first_user
+    assert "credential-recovers-a-store-naming-another-account" \
+        in GUEST_CHECK.read_text(), \
+        "nothing in tier 3 exercises the rename branch this seed avoids"
 
 
 def test_the_guest_looks_for_the_salt_the_harness_actually_planted():

@@ -17,7 +17,13 @@
 #                   regenerate_ssh_host_keys.service on every boot.
 #
 #   the UID-1000 account's password hash, and ONLY once an operator has
-#                   seeded one themselves. userconf-service applies
+#                   seeded one themselves -- the ACCOUNT, not the name it
+#                   had. userconf-pi renames UID 1000 to whatever a seed
+#                   names before setting the password on it, and that
+#                   rename lives in /etc and /home, so it dies with the
+#                   overlay while this store does not. The name in the
+#                   store is therefore a label; see credential_restore.
+#                   userconf-service applies
 #                   /boot/firmware/userconf.txt with `chpasswd -e` into
 #                   /etc/shadow and then DELETES the seed. /etc is inside the
 #                   overlay and the FAT partition is not, so the credential
@@ -115,6 +121,12 @@
 # malformed seed reaches neither -- userconf-service fails before
 # ExecStartPost runs, the store is untouched, and the password the restore
 # put back at sysinit is still the one that works.
+#
+# AND THE STORE'S PASSWORD ALWAYS LANDS ON THE UID-1000 ACCOUNT, whatever
+# name the store carries. That is the same rule stated in one more place,
+# because the rename above means the two can legitimately disagree after any
+# power cycle. docs/IMAGE.md's precedence table says so where an operator
+# reads it.
 #
 # EXITS NON-ZERO WHEN IT CANNOT DO ITS JOB, in both phases, and see
 # device/install.sh for why the ExecStartPost that runs the second one is
@@ -214,6 +226,13 @@ refuse() {
 # re-transcribing the regex says exactly that: whoever can write this store
 # can already write userconf.txt, and this must hand them no account the
 # documented path would not.
+#
+# IT IS ALSO WHAT THE STORE'S USER FIELD IS *NOT*. That field is a label
+# written down at record time; this function is the authorisation. Reading
+# the label as the authorisation -- refusing when the two disagree -- is what
+# bricked a unit whose operator seeded any name but the image's own, because
+# the rename that made them disagree does not survive the overlay and the
+# store does. See credential_restore.
 first_user() {
     awk -F: '$3 == 1000 { print $1; exit }' "$ETC_DIR/passwd" 2>/dev/null
 }

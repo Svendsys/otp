@@ -566,6 +566,17 @@ fi
 # leaves exactly the part under test: the decision not to prompt, the
 # `chpasswd -e`, and the delete. tests/test_img_verdict.py holds this name
 # against image/build.sh so the two cannot drift.
+#
+# WHAT THAT NARROWING USED TO HIDE, and where it is covered now. The rename
+# is not a curiosity: it is what an operator gets for writing any username
+# but `otp`, it lives entirely inside the overlay, and the store on this
+# partition outlives it -- so the next boot met a credential naming an
+# account that no longer existed, and refusing it took the unit's only login
+# away. Seeding a different name here would exercise that and would cost this
+# tier its only end-to-end look at the plain apply, so the state that power
+# cycle leaves is synthesised in boot2 instead and handed to the real shipped
+# script: see credential-recovers-a-store-naming-another-account in
+# harness/img-guest-check.sh.
 USERCONF_USER="otp"
 # sha512-crypt, generated with
 #
@@ -1177,7 +1188,8 @@ GUEST_CHECKS_BOOT2="root-writes-discarded-by-the-power-cycle \
 settings-survive-the-power-cycle userconf-unseeded-boot-skips-the-wizard \
 userconf-wizard-cannot-prompt userconf-malformed-seed-fails-fast \
 machine-id-identical-across-the-power-cycle \
-credential-survives-the-power-cycle"
+credential-survives-the-power-cycle \
+credential-recovers-a-store-naming-another-account"
 
 guest_gate() {
     local phase="$1" count counts passed total missing want name

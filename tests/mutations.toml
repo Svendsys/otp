@@ -1360,6 +1360,47 @@ replace = ''':'''
 
 
 [[mutation]]
+name = "operator-doc-promises-the-kept-credential-unconditionally"
+tier = "fast"
+guard = """
+docs/IMAGE.md is where this change reaches somebody who cannot read the code,
+and its precedence table said "a kept credential only -> the kept one wins"
+with no mention of which account -- next to a paragraph telling an operator
+to write `username:hash` and nothing about which username. Follow both and
+userconf-pi renames the UID-1000 account, the rename dies with the overlay,
+and the operator is at a tty2 prompt typing a name the machine does not have,
+on a unit with no network and no sshd."""
+tests = [
+  "tests/test_overlay_root.py::test_the_operator_documentation_says_which_account_the_login_comes_back_on",
+]
+[[mutation.edit]]
+file = "docs/IMAGE.md"
+find = "| a kept credential only | the kept one, on the UID-1000 account |"
+replace = "| a kept credential only | the kept one |"
+
+
+[[mutation]]
+name = "release-note-promises-a-login-without-its-username"
+tier = "fast"
+guard = """
+The half of the credential claim that decides whether the reader can act on
+it. `userconf-pi` RENAMES the UID-1000 account to whatever a seed names, and
+that rename touches only /etc and /home -- inside the overlay -- so the next
+boot is `otp` again carrying the password the operator chose. A note that
+promises "the password was still in force" and does not say which account it
+belongs to sends them to a tty2 prompt to type a username this machine does
+not have, on a unit with no network and no sshd behind it. A release note is
+the one place this project's claims reach someone who cannot check them."""
+tests = [
+  "tests/test_image_workflow.py::test_the_release_notes_credential_claim_is_backed_by_the_harness",
+]
+[[mutation.edit]]
+file = ".github/workflows/image.yml"
+find = "**The USERNAME does not survive, and only the"
+replace = "**The username survives too, and so does the"
+
+
+[[mutation]]
 name = "image-cache-key-ignores-the-probe"
 tier = "fast"
 guard = """
@@ -3669,6 +3710,7 @@ and equally destructive to a WORKING persisted login the moment an operator
 seeded a new name."""
 tests = [
   "tests/test_overlay_root.py::test_a_store_naming_the_pre_rename_account_still_logs_the_operator_in",
+  "tests/test_overlay_root.py::test_an_unseeded_second_boot_is_quiet_and_leaves_evidence",
 ]
 [[mutation.edit]]
 file = "device/persist-identity.sh"
@@ -3676,6 +3718,43 @@ find = """    if [ "$user" != "$want" ]; then
         relabel=yes"""
 replace = """    if [ "$user" != "$want" ]; then
         return 1"""
+
+
+[[mutation]]
+name = "tier3-relabel-experiment-plants-a-name-the-machine-has"
+tier = "fast"
+guard = """
+The fixture clause under boot2's relabel experiment. Its subject is a store
+naming an account that does NOT exist -- that is what a power cycle leaves
+after userconf-pi's rename. Aimed at a name the machine really has it becomes
+a different experiment entirely: a credential applied over an account
+somebody could be using, which is the thing the UID rule exists to stop."""
+tests = [
+  "tests/test_overlay_root.py::test_the_relabel_experiment_is_refused_a_name_this_machine_really_has",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '                && [ -z "$CRED_OTHER_EXISTS" ] \'
+replace = '                && [ -n "${CRED_OTHER_EXISTS:-x}" ] \'
+
+
+[[mutation]]
+name = "tier3-relabel-experiment-satisfied-by-two-absences"
+tier = "fast"
+guard = """
+"the live hash is the kept one afterwards" is satisfied perfectly by an
+experiment that never disturbed it: the mangle silently fails, the shipped
+script finds the password already right, takes its early exit, relabels the
+store and exits 0 -- and every other clause is true of a boot that proved
+nothing about the apply. Same hole, same shape, as the length clauses on the
+digests either side of the power cycle."""
+tests = [
+  "tests/test_overlay_root.py::test_a_relabel_experiment_that_never_changed_the_password_proves_nothing",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '                && [ -n "$CRED_BEFORE" ] && [ "$CRED_BEFORE" != "$UC_SHADOW" ] \'
+replace = '                && [ -n "${CRED_BEFORE:-x}" ] \'
 
 
 [[mutation]]
@@ -4075,7 +4154,8 @@ replace = '"'
 [[mutation.edit]]
 file = "harness/img-boot.sh"
 find = """ \\
-credential-survives-the-power-cycle\""""
+credential-survives-the-power-cycle \\
+credential-recovers-a-store-naming-another-account\""""
 replace = '"'
 
 
@@ -4157,7 +4237,7 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/README.md"
-find = "**21 guest checks in boot 1 and 20 in boot 2**"
+find = "**21 guest checks in boot 1 and 21 in boot 2**"
 replace = "**19 guest checks in boot 1 and 19 in boot 2**"
 
 

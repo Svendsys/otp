@@ -1003,6 +1003,91 @@ if [ "$PHASE" = "boot2" ]; then
              then echo yes; else echo no; fi)" \
           "${USERCONF_USER}'s hash (${#UC_SHADOW} chars) begins $USERCONF_SALT: $CRED_FROM_SEED | boot1: $(cred_short "$CRED_BOOT1") | boot2: $(cred_short "$CRED_LIVE_DIGEST") | seed on the card: $(yesno test -e "$BOOTDIR/userconf.txt")"
 
+    # --- and a store that names the account the seed RENAMED ---------------
+    #
+    # THE ONE ARRANGEMENT THE SEEDED PATH ABOVE CANNOT PRODUCE, run as an
+    # experiment for exactly that reason.
+    #
+    # img-boot.sh seeds `otp`, which is image/build.sh's own FIRST_USER_NAME,
+    # and that is deliberate: it keeps userconf-pi's rename branch out of a
+    # boot whose subject is the apply. But an operator is told to write
+    # `username:hash` and is told nothing about which username, and
+    # /usr/lib/userconf-pi/userconf takes `getent passwd 1000`, RENAMES that
+    # account when the seed names another, and only then runs `chpasswd -e`.
+    # `rename_user` touches /etc/{passwd,shadow,group,gshadow,subuid,subgid,
+    # sudoers.d} and /home -- every one of them inside the read-only overlay
+    # -- so the rename dies with the power while the store on the FAT
+    # partition does not, and the next boot meets a store naming an account
+    # that no longer exists. Refusing it took the unit's only login away.
+    #
+    # WHAT IS SYNTHESISED AND WHAT IS NOT. The state after that power cycle
+    # is synthesised here -- the store is relabelled by hand -- because the
+    # alternative is seeding a different name in boot1, which would take the
+    # only end-to-end observation of the plain documented apply out of this
+    # tier to get it. Everything the state is then handed to is real: the
+    # shipped script this unit boots with, the real `chpasswd`, the real
+    # /etc/shadow, and the real store on the real FAT partition.
+    #
+    # NO HASH IS INVENTED AND NONE IS PRINTED. The "before" password is this
+    # unit's own hash with its last character changed, so the probe carries no
+    # credential of its own and the account is never given a password anyone
+    # holds; the mangled string is never printed, because it is the kept hash
+    # to within one byte. What travels to the console is sha256 digests, the
+    # way every other check in this block reports.
+    #
+    # AND THE EXPERIMENT PUTS THE CARD BACK BY ITSELF. Only the NAME in the
+    # store is changed, so a working restore rewrites it to the live account
+    # and re-applies the kept hash: both files end byte-for-byte as they were
+    # found. Nothing here needs undoing, and boot2's host-side
+    # credential-kept-on-the-card is looking at the same file afterwards.
+    # /etc/passwd read directly, and by UID, for the two reasons
+    # device/persist-identity.sh reads it that way: this appliance has no
+    # network and no NSS source but the file, and the account under discussion
+    # is the one holding UID 1000 whatever it is called.
+    CRED_LIVE_USER=$(awk -F: '$3 == 1000 { print $1; exit }' /etc/passwd 2>/dev/null)
+    # The name an operator following the Raspberry Pi documentation reaches
+    # for. This image is built with FIRST_USER_NAME='otp', so it is not an
+    # account here -- asserted below rather than assumed, because a fixture
+    # that names a real account is testing something else entirely.
+    CRED_OTHER_USER=pi
+    CRED_OTHER_EXISTS=$(awk -F: -v u="$CRED_OTHER_USER" \
+                        '$1 == u { print "yes"; exit }' /etc/passwd 2>/dev/null)
+    case "$UC_SHADOW" in
+        *Z) CRED_MANGLED="${UC_SHADOW%?}Y" ;;
+        *)  CRED_MANGLED="${UC_SHADOW%?}Z" ;;
+    esac
+    printf '%s:%s\n' "$CRED_LIVE_USER" "$CRED_MANGLED" | chpasswd -e 2>/dev/null || true
+    CRED_BEFORE=$(awk -F: -v u="$CRED_LIVE_USER" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
+    printf '%s:%s\n' "$CRED_OTHER_USER" "$UC_SHADOW" > "$CRED_STORE" 2>/dev/null || true
+    /opt/otp-unit/persist-identity.sh; CRED_RELABEL_RC=$?
+    CRED_AFTER=$(awk -F: -v u="$CRED_LIVE_USER" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
+    CRED_STORE_USER=$(cut -d: -f1 < "$CRED_STORE" 2>/dev/null | tr -d '\n\r')
+    #
+    # SIX CLAUSES, and the first three are about the fixture rather than the
+    # property -- without them "the password is the kept one" is satisfied by
+    # an experiment that never disturbed it:
+    #
+    #   - the name planted in the store is NOT an account on this machine, and
+    #     is not the UID-1000 account either, so this really is the mismatch;
+    #   - the password was DIFFERENT before the script ran, so the script is
+    #     what put it back and not the state it started in;
+    #   - the script exited 0, which is the half the refusal used to fail;
+    #   - the live UID-1000 account carries the kept hash, digest for digest
+    #     and 64 characters of it, which is the WORKING LOGIN;
+    #   - the store now names the live account, so the stale label does not
+    #     come back on every boot for the rest of the unit's life.
+    check credential-recovers-a-store-naming-another-account \
+          "$(if [ -n "$CRED_LIVE_USER" ] \
+                && [ -z "$CRED_OTHER_EXISTS" ] \
+                && [ "$CRED_OTHER_USER" != "$CRED_LIVE_USER" ] \
+                && [ -n "$CRED_BEFORE" ] && [ "$CRED_BEFORE" != "$UC_SHADOW" ] \
+                && [ "$CRED_RELABEL_RC" = 0 ] \
+                && [ "${#CRED_LIVE_DIGEST}" = 64 ] \
+                && [ "$(cred_digest "$CRED_AFTER")" = "$CRED_LIVE_DIGEST" ] \
+                && [ "$CRED_STORE_USER" = "$CRED_LIVE_USER" ]; \
+             then echo yes; else echo no; fi)" \
+          "store named $CRED_OTHER_USER (an account here: ${CRED_OTHER_EXISTS:-no}), uid-1000 is ${CRED_LIVE_USER:-none} | before: $(cred_short "$(cred_digest "$CRED_BEFORE")") | after: $(cred_short "$(cred_digest "$CRED_AFTER")") | kept: $(cred_short "$CRED_LIVE_DIGEST") | rc=$CRED_RELABEL_RC | store now names ${CRED_STORE_USER:-none}"
+
     # THE MALFORMED SEED, run by hand and not left on the card for the unit
     # to find at boot. Stock userconfig.service carries Restart=on-failure,
     # so a boot that met one prints "Failed with result" and "Scheduled

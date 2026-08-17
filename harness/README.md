@@ -976,8 +976,29 @@ still works. It is written **only** from the wizard's own `ExecStartPost`, so
 the only hash that reaches a card is one the operator put on that card
 themselves.
 
-The counts move with it: **21 guest checks in boot 1 and 20 in boot 2**, up
-from 19 and 19. The run recorded below predates all three.
+**A store may name an account this unit no longer has, and that has to end in
+a working login rather than a refusal.** `/usr/lib/userconf-pi/userconf` takes
+`getent passwd 1000` and *renames* that account whenever the seed names
+another one, then sets the password on the new name — and `rename_user`
+touches only `/etc/{passwd,shadow,group,gshadow,subuid,subgid,sudoers.d}` and
+`/home`, all inside the overlay. So the rename dies with the power and the
+store does not: a seed naming anything but `otp` left the next boot holding a
+credential for an account that no longer existed. Refusing it took away the
+only login on a unit with no network and no `sshd`.
+
+The seed this tier plants is still `otp` — naming another one would take the
+plain documented apply out of the only boot that observes it — so boot 2 runs
+`credential-recovers-a-store-naming-another-account` as an experiment instead:
+the store's *name* field is relabelled by hand, the live password is put one
+byte off the kept one, and the shipped `persist-identity.sh` is run for real
+against the real `chpasswd`, the real `/etc/shadow` and the real store. A
+working restore rewrites the label back and re-applies the kept hash, so both
+files end byte-for-byte as they were found and nothing needs undoing. No hash
+is invented and none is printed: the "before" password is this unit's own,
+one character changed, and only digests reach the console.
+
+The counts move with it: **21 guest checks in boot 1 and 21 in boot 2**, up
+from 19 and 19. The run recorded below predates all of it.
 
 ### Run 32020772161: what stopping the first-boot loop uncovered
 

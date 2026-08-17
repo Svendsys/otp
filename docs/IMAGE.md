@@ -106,6 +106,17 @@ or let Raspberry Pi Imager do it. `userconfig.service` applies it on the next
 boot and deletes the file. The account is `otp`; the login prompt is on tty2
 (**Alt+F2**), because tty1 is the front panel.
 
+**Put `otp` in that file.** Naming anyone else works for one boot and then
+undoes itself: `userconf-pi` *renames* the UID-1000 account to whatever your
+seed says — `usermod -l`, a home directory move, and edits to `/etc/group`,
+`/etc/subuid`, `/etc/subgid` and the sudoers drop-in — and every one of those
+lives in `/etc` or `/home`, which are inside the RAM overlay. The rename is
+gone at the next power-cycle. **Your password is not**: the unit notices that
+the kept credential names an account it no longer has, applies it to whoever
+holds UID 1000, and rewrites the store to match, saying so in the journal.
+So a seed naming `pi` costs you the name and never the login — from the
+second boot on, **log in as `otp`**.
+
 **Until recently that password worked for exactly one boot.** The apply is
 `chpasswd -e` into `/etc/shadow`, `/etc` is inside the RAM overlay, and the
 seed file that could have reapplied it is deleted by the boot that consumes
@@ -119,14 +130,33 @@ ever write a new `userconf.txt` onto a unit that already has a kept password:
 
 | what is there | what wins this boot | what the next boot uses |
 |---|---|---|
-| a kept credential only | the kept one | the kept one |
+| a kept credential only | the kept one, on the UID-1000 account | the kept one |
 | a kept credential **and** a fresh `userconf.txt` | the fresh one | the fresh one |
 | a fresh `userconf.txt` only | the fresh one | the fresh one |
 | a malformed `userconf.txt` | the kept one | the kept one |
+| an empty or half-written `credential` | nothing — the unit fails and says so | nothing |
 
 so writing a new `userconf.txt` is always how you change the password, and a
 seed the wizard rejects costs you nothing — it is renamed `failed_userconf.txt`
 and the password you already had still works.
+
+**Row 1 says *on the UID-1000 account* rather than *on the account the file
+names*, and that is the whole of the caveat above.** The kept credential is
+stored as `username:hash`, but the username in it is a label: the password is
+put on whichever account holds UID 1000 this boot, which is the only account
+a `userconf.txt` could ever have set a password on in the first place. If the
+two disagree — because your seed renamed the account and the rename did not
+survive — the unit applies the hash to the live account, rewrites the store,
+and notes all of it. It refuses only if there is no UID-1000 account at all.
+
+**The last row is a failure, not a fallback.** The store is written beside
+itself and renamed into place, and vfat has no atomic rename, so a power cut
+mid-write or a full boot partition can leave a zero-length `credential` or a
+leftover `credential.new`. That is *not* the same as a card nobody has
+seeded, and the unit does not treat it as one: `otp-unit-identity.service`
+fails, the reason is on the screen during the boot, and a copy of it is left
+in `/boot/firmware/otp-identity/credential-not-restored.txt` where you can
+read it with the card in another machine. Write a fresh `userconf.txt`.
 
 **THE COST, which you should decide about rather than discover.** That file is
 a password hash on a vfat partition mounted with `defaults` — `0755
@@ -141,6 +171,15 @@ bytes your own `userconf.txt` put on that same partition — persisting them
 adds no exposure that seeding them did not — and nothing is written there at
 all unless you seeded a credential yourself, so a unit whose owner never set a
 password has no hash on its card.
+
+**If the login does not come back, the unit says why in two places.** The
+notes go to the screen while the boot is happening — `otp-unit-identity.service`
+writes them to the console before any login prompt exists — and every refusal
+is also left in `/boot/firmware/otp-identity/credential-not-restored.txt`,
+which is there for the case where you cannot log in to read a journal that
+lives in RAM anyway. Take the card out and read that file; it names the
+reason and never contains a hash. It is removed by the first boot that
+restores the login successfully.
 
 **Deleting `userconf.txt` no longer takes it off the card.** This does:
 

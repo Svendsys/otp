@@ -294,10 +294,24 @@ def test_the_release_notes_credential_claim_is_backed_by_the_harness():
                  # the old wording at least understated.
                  "credential-recorded-outside-the-overlay",
                  "credential-recorded-for-the-next-boot",
-                 "credential-survives-the-power-cycle"):
+                 "credential-survives-the-power-cycle",
+                 # And the one the note's USERNAME sentence rests on. A note
+                 # that promises the credential without saying the rename
+                 # does not survive sends an operator to a tty2 prompt to
+                 # type a name this machine does not have -- with no network
+                 # and no sshd behind it, which is the whole recovery path.
+                 "credential-recovers-a-store-naming-another-account"):
         assert name in harness, (
             f"the release note claims the credential path was checked, but "
             f"img-boot.sh no longer requires {name}")
+    # THE CAVEAT ITSELF, in the body. The check above says the harness proves
+    # it; this says the reader is told. `userconf-pi` renames the UID-1000
+    # account to whatever a seed names and the rename dies with the overlay,
+    # so the account is `otp` on every boot after the one that applied it.
+    assert "USERNAME does not survive" in body, (
+        "the release note promises a persistent login without saying the "
+        "username reverts: an operator would type a name that is not there")
+    assert "Log in as `otp`" in body, body
     # AND IT SAYS WHAT KEEPING IT COSTS. A note that tells a reader their
     # password now persists, without telling them it persists as an
     # offline-crackable hash on a partition any card reader can mount, has
