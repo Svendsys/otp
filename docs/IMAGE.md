@@ -85,6 +85,21 @@ session touches survives a power-cycle, and pulling the plug cannot corrupt
 the card, because nothing writes to it. Settings still persist — they live on
 the boot partition, which is outside the overlay.
 
+**Two other things live there, and they are the only exception to the
+sentence above.** `/boot/firmware/otp-identity` holds this unit's
+`machine-id` and a copy of its SSH host keys. Without them `/etc/machine-id`
+reverted to `uninitialized` on every power-cycle, systemd read every boot as a
+*first* boot — re-running `preset-all` and regenerating the host keys each
+time — and the fingerprint of a machine that prints one-time pads changed
+whenever somebody switched it off. The machine-id is put back by the
+initramfs, because systemd reads that file before any service exists.
+
+FAT has no permission bits, so the private host keys in that directory are
+readable by anyone who can mount the card. That is the same set of people who
+can already read them off the root filesystem, which is not encrypted either
+— the card *is* the device — but it is worth knowing before you hand one to
+somebody.
+
 This used to be a manual step, printed as advice at the end of `install.sh`.
 It was a manual step nowhere else in this project: the image did not do it,
 the pi-gen stage did not do it, and no tier of the harness had ever booted a
