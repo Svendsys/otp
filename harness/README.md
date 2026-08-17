@@ -898,6 +898,116 @@ refuses to make by masking, arriving through a different door. So the fix is
 boot pays two condition evaluations and a skip. The check was right; the image
 was wrong.
 
+## When CI evidence runs out — the local repro rig
+
+`./harness/img-local-rig.sh <probe>`. Not a tier and not a check: no CI
+wiring, deliberately (issue #22). It is what you reach for when the tiers
+above have told you everything they can and you still do not know why.
+
+**The problem it solves is the round trip.** Tier 3 cannot run without
+`image/deploy/*.img.xz`, and that artifact is the pi-gen arm64 job —
+16m16s for the whole thing on run 16, of which 6m58s is pi-gen on a cache
+miss and 7m59s is the pair of boots. So every hypothesis about the kernel,
+the console, the watchdog or coldplug cost a quarter of an hour *and a
+push*. Issue #17's fifteen-run narrative is largely a record of paying
+that, several times for theories that turned out to be wrong — which is
+exactly when the price is least affordable.
+
+The rig removes the image from the loop. The kernel and the DTB come out of
+the same `archive.raspberrypi.com` `.deb` pi-gen would install, resolved
+through the `linux-image-rpi-v8` metapackage so it stays current by itself;
+the root filesystem is a ~1MB busybox initramfs; the question is a shell
+heredoc in the one file. **Measured on the container it was written in
+(x86_64, QEMU 8.2.2, TCG): 24–27 seconds for the first `rng` run including
+a cold 32,739,088-byte kernel download, then against the warm cache 20s for
+`console-test`, 35s for `coldplug-replay` (which builds and `depmod`s a
+module disk on its first run) and 67s for `idle-survive`, which is 45s of
+deliberate waiting.** Against 16m16s.
+
+| Probe | The question it was built to answer |
+|---|---|
+| `rng` | crng/entropy state, and a genuinely blocking read. Issue #17 spent two runs on an entropy stall that did not exist. |
+| `coldplug-replay` | `modprobe` every `/sys` modalias one at a time with START/DONE markers, against the kernel's own module tree on an ext4 disk, `depmod`'d host-side. A module that hangs is *named* instead of theorised about. |
+| `console-test` | Which consoles actually registered, what the DTB aliases say, and which port a write lands on. This is the one that ended six runs of misdiagnosed "freeze". |
+| `idle-survive` | Sit still and see whether the machine resets. The watchdog re-verification. |
+
+**The exit code means "the probe did its work", in three states, and it is
+safe to script on.** `0` the probe reported and did its work; `2` the probe
+reported and said its work did not happen — a module disk that would not
+mount, a `/dev/random` that could not be read, a `/proc` that never
+appeared, so read the `FAIL:` lines on uart0 before believing anything else
+it printed; `1` no marker at all, meaning the guest hung, reset or never
+reached `/init`, which is a different problem and stays a different code.
+Until QA on PR #36 the code meant only "something printed a marker":
+`./harness/img-local-rig.sh coldplug-replay && echo clean` printed *clean*
+for a replay that mounted nothing.
+
+**The worked example, which is why the rig is in the repository at all.**
+Issue #17's boot "froze" at ~29.5–31.6s guest, always the moment journald
+started, and three theories died against it: dwc_otg wedging coldplug, TCG
+slowness, and an entropy stall. All three were argued from CI consoles. The
+rig answered all three in an afternoon:
+
+- **entropy** — `random: crng init done` at 2.4s, and a blocking read
+  returning immediately. The claim that the line was "absent in every
+  console" was an artifact of reading job-log *tails* that begin after 8s
+  guest, past where it prints. Re-measured with the rig as committed, over
+  three runs: crng init at **2.62s, 2.63s and 3.32s** — it moves run to run
+  under TCG, so the load-bearing fact is that it happens early and always,
+  not the digits — with `entropy_avail=256` (a full pool), hwrng
+  `3f104000.rng` registered, and sixteen *blocking* bytes of `/dev/random`
+  returning in 0.02s every time. **That last figure was unfalsifiable until
+  QA on PR #36.** The probe threw away `dd`'s exit status and its stderr, so
+  the "16 blocking bytes" line printed whatever happened: booting the
+  verbatim probe with `/dev/random` deleted still reported `uptime 3.29 ->
+  3.31` and the rig still exited 0. The status is read now and the run fails
+  loudly, which is what makes the sentence above worth quoting.
+- **coldplug** — all 41 modaliases probed, no hangs. Re-measured with the
+  rig as committed: `modules.dep` 1911 lines, **41 modaliases replayed, 4
+  returning non-zero, 19 modules loaded**, 41 START lines and 41 DONE lines.
+- **the console** — and this was the actual fault. `/proc/consoles` lists
+  `ttyAMA1` and nothing else; the device tree says `serial0 ->
+  /soc/serial@7e215040`, which is the *mini-UART*, and `stdout-path` points
+  at it; `serial1 -> /soc/serial@7e201000` is the PL011. So `console=ttyAMA0`
+  named a device that does not exist, no real console ever registered, and
+  the "wedge" was a blindfold. The rig prints that in twenty seconds.
+- **the watchdog** — `idle-survive` climbs from uptime 4.57 to 49.70 with
+  one kernel entry, well past the ~11.5s reset that runs 1–5 hit every time.
+
+**Findings only transfer if the machine matches**, so the five flags that
+decide what the guest *is* — `-M raspi3b`, `-m 1024`, `loglevel=7`,
+`console=ttyAMA1`, `initcall_blacklist=bcm2835_pm_driver_init` — plus the
+synthesised `0xa02082` board revision are held against `img-boot.sh` by
+`tests/test_local_rig.py`, which parses both scripts. It fails if the rig
+gains a kernel parameter tier 3 does not have, *and* if tier 3 gains one the
+rig does not consciously omit. A rig that boots a subtly different machine is
+worse than no rig: it produces confident answers about somewhere else.
+
+**What it will not do.** It boots no image, so it says nothing about the
+overlay, the unit, CUPS, the front panel or provisioning — all of that is
+tier 3's business and needs the real artifact. It answers kernel-level and
+early-userspace questions, which is the class that cost the most to ask
+through CI.
+
+**Host requirements**, documented rather than vendored: `qemu-system-aarch64`
+with the `raspi3b` machine, plus `curl xz-utils gzip cpio dpkg
+device-tree-compiler`, and for `coldplug-replay` only, `kmod` and
+`e2fsprogs`. Each is checked before the emulator starts and named if absent
+— because *every* one of these, missing, produces the same console: nothing
+at all, or a stop at `Run /init as init process`. That is the single most
+expensive symptom in this harness's history to misdiagnose.
+
+**`--plan` needs none of them.** It prints the qemu argv and exits, so it
+works on a machine with no emulator installed — which is the machine of the
+person deciding whether to install one. It used to demand the whole list
+before it would print, and that was the check in the wrong place: printing a
+plan is string construction. (It was also six red tests on `ubuntu-latest`,
+which has neither `qemu-system-aarch64` nor `fdtput`.) The only thing behind
+the plan that wants anything is resolving the release name out of the
+archive, which asks for `curl` and `gzip` at the point it uses them, and
+`OTP_RIG_KERNEL=<release>` removes even that. A *run* is still refused up
+front, before it fetches or unpacks anything.
+
 ## Proving the guards can fail
 
 Every tier above is a check, and a check has one failure mode that nothing
@@ -935,13 +1045,13 @@ stayed green.
 
 ```sh
 python3 tests/mutation_gate.py --list
-python3 tests/mutation_gate.py --tier fast       # 124 rows, 103s
+python3 tests/mutation_gate.py --tier fast       # 145 rows, 123s
 sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
 ```
 
 **Runtime decided the trigger.** The issue expected nightly or
-label-triggered; measured, the fast tier is a hundred and three seconds at
-124 rows — still cheaper than the suite it audits — so it runs per pull
+label-triggered; measured, the fast tier is a hundred and twenty-three
+seconds at 145 rows — still cheaper than the suite it audits — so it runs per pull
 request as its own `mutation` job, and the ordinary suite's wall clock does
 not move. The three CUPS-rig rows run in the existing `hardware` job, the
 only place with a real `cupsd`, for 36 seconds on top of about eight minutes.
@@ -970,6 +1080,30 @@ Both were single-edit rows that survived:
   drain alone also survives, at MaxJobs 4, because generating a pad is slower
   than printing one. Together they are red in 3.8 seconds. The number stopped
   being what protects that sequence; the wait is.
+
+**The rig round produced a third kind of survivor, and it was the test's
+fault rather than the property's.** Both were fixed in
+`tests/test_local_rig.py`, not by adding a second edit:
+
+- the `grep -q`/SIGPIPE row survived because its fixture was inert. The fake
+  `qemu -M help` built its 20,000-line listing with `$(seq 1 20000)`, `seq`
+  is not on the stubbed `PATH` the rig runs with, the substitution expanded
+  to nothing, and the "large producer" emitted two lines — so the pipe never
+  filled, `grep -q` never closed it early, and the test was green with the
+  mutation applied. Confirmed separately that the bug is real: the `grep -q`
+  form returns **141** against a genuinely large producer and reports the
+  machine absent. The loop is pure bash arithmetic now, with a test that
+  asserts the fixture really emits more than 200,000 bytes.
+- the versioned-kernel row survived because the negative fixture used
+  `Depends: linux-headers-rpi-v8`, which the pattern rejects on the
+  `linux-image-` prefix alone. It was testing the prefix and calling it the
+  version check. The fixture is `linux-image-rpi-v8-current` now — a
+  metapackage pointing at another metapackage, which is the rot that would
+  actually happen — and the prefix case is kept as its own test.
+
+Both are the same lesson one level in from the usual one: a mutation row
+proves the *test* can fail, and a test can only fail as hard as its fixture
+is real.
 
 **What is not covered.** No row needs a booted guest, and the checks that
 only exist *inside* one — tier 2's spool redirect above, tty1 ownership, the

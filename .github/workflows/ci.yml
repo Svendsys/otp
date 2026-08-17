@@ -42,11 +42,26 @@ jobs:
     # tests/mutations.toml.
     #
     # PER PR, not nightly, and that is measured rather than assumed: the fast
-    # tier is 124 mutations in 103 seconds, which is cheaper than the suite it
-    # audits. Counted, not carried forward -- this line said 19 in 11 seconds
-    # for a long time after both had moved, and 114 for one round after it
-    # was 115. Re-run `python3 tests/mutation_gate.py --tier fast` and read
-    # its last line before touching this sentence.
+    # tier is 157 mutations in 172 seconds ON THE DEVELOPMENT CONTAINER, not
+    # on this runner -- the number is a development-time figure and always has
+    # been, and a reader meeting it inside this job's own comment block will
+    # otherwise take it for this job's runtime, which is a different and
+    # usually smaller number (115s for the 145-row version of this line).
+    # Counted, not carried forward -- this line said 19 in 11 seconds for a
+    # long time after both had moved, 114 for one round after it was 115, and
+    # 124 for several rounds after it was 143. Re-run
+    # `python3 tests/mutation_gate.py --tier fast` and read its last line
+    # before touching this sentence.
+    #
+    # It stopped being cheaper than the suite it audits at that count. Twelve
+    # of the rows added for the local rig (issue #22) are behavioural rather
+    # than textual: they run rig_boot against a fake emulator and TIME it,
+    # because the property under test -- the guest's marker stops the run in
+    # seconds instead of at the backstop -- is a clock, and the rows that
+    # replaced were caught by "the source contains this string" and could not
+    # fail. Four of them cost between four and twelve seconds each. That is
+    # the price of the gate being able to fail, which is the only thing it is
+    # for.
     #
     # The issue expected nightly or label-triggered; at this price
     # that would be the wrong call, because a gate that reports on the commit
@@ -96,11 +111,15 @@ jobs:
             "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
             | tar -xJf - --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           ./shellcheck --version
+          # img-local-rig.sh is LINTED here and never run: it is a
+          # debugging tool with no CI wiring by design (issue #22), and
+          # running it would put a network fetch and an emulated boot on
+          # every push -- which is the cost it exists to remove.
           ./shellcheck device/install.sh device/persist-identity.sh \
                        image/build.sh image/render-manual.sh \
                        harness/kernel-sim.sh harness/vm-check.sh \
                        harness/vm-guest-check.sh harness/img-boot.sh \
-                       harness/img-guest-check.sh
+                       harness/img-guest-check.sh harness/img-local-rig.sh
 
   hardware:
     # Tier 1 of the harness: the real code against real kernel interfaces
