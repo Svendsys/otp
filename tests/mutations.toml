@@ -1869,6 +1869,7 @@ REPEATED "Failed with result" is row 2 of issue #14 in a new place: the
 harness matching text it wrote itself."""
 tests = [
   "tests/test_img_verdict.py::test_a_unit_quoting_a_systemd_phrase_does_not_fail_the_release",
+  "tests/test_img_verdict.py::test_no_forbidden_phrase_is_gated_when_only_a_unit_said_it",
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
@@ -2623,3 +2624,26 @@ find = '''  * systemd-growfs-root.service is MASKED. systemd-fstab-generator hoo
     this machine can grow the root filesystem any more. Undo with
     `sudo systemctl unmask systemd-growfs-root.service`.'''
 replace = '''  * nothing else on this machine was touched.'''
+
+
+[[mutation]]
+name = "tier3-forbidden-phrases-drop-pid-1"
+tier = "fast"
+guard = """
+The half of the scoping that decides WHICH phrases can be gated at all.
+system_lines() keeps kernel output and PID 1; drop the PID 1 clause and the
+kernel's phrases still fire while systemd's own verdict on a failed unit --
+`Failed with result`, `Scheduled restart job`, `status=` -- is filtered out
+of the file the gate reads. Three of the five phrases become unfireable and
+nothing says so. This is also the constraint the list is written under: only
+what PID 1 or the kernel utters can be enforced here, which is why
+`sshd[744]: fatal: Cannot bind any address.` is not on it."""
+tests = [
+  "tests/test_img_verdict.py::test_every_forbidden_phrase_is_one_the_scoping_can_actually_enforce",
+  "tests/test_img_verdict.py::test_systemds_own_verdict_on_a_unit_still_fails_the_release",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    awk '!/^\[[^]]*\] [^ ]+\[[0-9]+\]:/ || /^\[[^]]*\] systemd\[1\]:/' \
+        "$1" 2>/dev/null || true'''
+replace = '''    awk '!/^\[[^]]*\] [^ ]+\[[0-9]+\]:/' "$1" 2>/dev/null || true'''

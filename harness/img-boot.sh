@@ -919,6 +919,23 @@ per_boot_verdict() {
     # anything else; a phrase found only in one of those is reported instead
     # of gated, so the scoping can never swallow one in silence.
     #
+    # WHICH CONSTRAINS WHAT MAY BE ADDED TO THIS LIST, and that is worth
+    # stating rather than rediscovering. Only a phrase that PID 1 or the
+    # KERNEL utters can be enforced here. Every one of the five below is such
+    # a phrase today -- `status=`, `Failed with result` and `Scheduled
+    # restart job` are systemd[1]'s verdicts on a unit, and the other two are
+    # the kernel's -- and run 74 confirms none of them appears anywhere in
+    # either console, filtered or not. But the single line that diagnosed the
+    # bug this harness was extended for is
+    #
+    #     sshd[744]: fatal: Cannot bind any address.
+    #
+    # which system_lines() drops: it is a forwarded line from a unit, not
+    # from PID 1. A phrase of that shape added here would be a gate that can
+    # never fire. Put those in a NOTE over $CONSOLE_TXT instead, or give the
+    # guest a check that reads the unit's own journal -- which is what
+    # harness/img-guest-check.sh does for everything it judges about a unit.
+    #
     # The note quotes the line, and the quote can itself trip the `grep -q
     # FAIL` over verdict.txt at the bottom of this file if what it repeats
     # contains that word. That is the safe direction -- a run that stops to be

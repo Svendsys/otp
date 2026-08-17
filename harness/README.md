@@ -935,18 +935,20 @@ stayed green.
 
 ```sh
 python3 tests/mutation_gate.py --list
-python3 tests/mutation_gate.py --tier fast       # 114 rows, 96s
+python3 tests/mutation_gate.py --tier fast       # 124 rows, 103s
 sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
 ```
 
 **Runtime decided the trigger.** The issue expected nightly or
-label-triggered; measured, the fast tier is ninety-six seconds at 114 rows —
-still cheaper than the suite it audits — so it runs per pull request as its
-own `mutation` job, and the ordinary suite's wall clock does not move. The three CUPS-rig rows run in
-the existing `hardware` job, the only place with a real `cupsd`, for 36
-seconds on top of about eight minutes. Those numbers are counted, not carried
-forward: an earlier revision of this paragraph still said 38 rows and
-twenty-nine seconds long after both had moved.
+label-triggered; measured, the fast tier is a hundred and three seconds at
+124 rows — still cheaper than the suite it audits — so it runs per pull
+request as its own `mutation` job, and the ordinary suite's wall clock does
+not move. The three CUPS-rig rows run in the existing `hardware` job, the
+only place with a real `cupsd`, for 36 seconds on top of about eight minutes.
+Those numbers are counted, not carried forward: an earlier revision of this
+paragraph still said 38 rows and twenty-nine seconds long after both had
+moved, and the revision after that said 114 rows for a round in which there
+were 115.
 
 Every way this could rot into a no-op is a loud failure rather than a skip: a
 `find` string that no longer matches (the fast suite checks that much without

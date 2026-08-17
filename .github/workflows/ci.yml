@@ -42,9 +42,11 @@ jobs:
     # tests/mutations.toml.
     #
     # PER PR, not nightly, and that is measured rather than assumed: the fast
-    # tier is 114 mutations in 96 seconds, which is cheaper than the suite it
+    # tier is 124 mutations in 103 seconds, which is cheaper than the suite it
     # audits. Counted, not carried forward -- this line said 19 in 11 seconds
-    # for a long time after both had moved.
+    # for a long time after both had moved, and 114 for one round after it
+    # was 115. Re-run `python3 tests/mutation_gate.py --tier fast` and read
+    # its last line before touching this sentence.
     #
     # The issue expected nightly or label-triggered; at this price
     # that would be the wrong call, because a gate that reports on the commit

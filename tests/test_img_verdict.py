@@ -1148,6 +1148,64 @@ def test_systemds_own_verdict_on_a_unit_still_fails_the_release(tmp_path):
     assert proc.returncode == 1
 
 
+def forbidden_phrases() -> list:
+    """The phrase list, read out of img-boot.sh rather than restated here."""
+    text = IMG_BOOT.read_text()
+    match = re.search(r"for bad in (.*?); do", text, re.S)
+    assert match, "the forbidden-phrase loop is gone from " + str(IMG_BOOT)
+    return re.findall(r'"([^"]+)"', match.group(1).replace("\\\n", " "))
+
+
+def check_name(phrase: str) -> str:
+    """The name the loop derives from a phrase: `tr ' =' '--'`."""
+    return "no-" + phrase.replace(" ", "-").replace("=", "-")
+
+
+def test_every_forbidden_phrase_is_one_the_scoping_can_actually_enforce(tmp_path):
+    """
+    THE CONSTRAINT ON THIS LIST, made executable instead of remembered.
+
+    system_lines() keeps kernel output and PID 1 and drops journald's
+    forwarded lines from anything else, so ONLY a phrase that PID 1 or the
+    kernel utters can be gated here. All five phrases are such a phrase
+    today. The line that diagnosed the bug this harness was extended for --
+    `sshd[744]: fatal: Cannot bind any address.` -- is not: it is a unit's
+    own output, and a phrase of that shape added to the list would be a gate
+    that can never fire, green forever, on the exact fault it was added for.
+
+    Each phrase is put on a PID 1 line and required to fail the phase. A
+    phrase the filter cannot see fails this test on the day it is added
+    rather than on the day it was needed.
+    """
+    phrases = forbidden_phrases()
+    assert len(phrases) >= 5, phrases
+    for phrase in phrases:
+        spoken = f"[   50.000000] systemd[1]: otp-unit.service: {phrase} here."
+        proc, verdict = run_verdict(
+            tmp_path / check_name(phrase),
+            {"boot1": healthy("boot1") + [spoken]})
+        assert f"IMG-CHECK boot1 {check_name(phrase)} FAIL" in verdict, verdict
+        assert proc.returncode == 1, verdict
+
+
+def test_no_forbidden_phrase_is_gated_when_only_a_unit_said_it(tmp_path):
+    """
+    The other half of the same rule, over the whole list rather than the one
+    phrase the probe happens to quote. A unit REPEATING one of these is row 2
+    of issue #14 in a new place, and it must be a note.
+    """
+    for phrase in forbidden_phrases():
+        quoted = forwarded(f"Aug 16 22:05:01 otp-unit systemd[1]: {phrase} here.",
+                           ident="img-guest-check.sh", pid=900)
+        proc, verdict = run_verdict(
+            tmp_path / check_name(phrase),
+            {"boot1": healthy("boot1") + [quoted]})
+        assert f"{check_name(phrase)} FAIL" not in verdict, verdict
+        assert f"IMG-NOTE boot1 quoted-{check_name(phrase)[3:]}:" in verdict, \
+            verdict
+        assert proc.returncode == 0, proc.stderr + verdict
+
+
 def test_the_forbidden_phrase_says_which_lines_it_found(tmp_path):
     """
     The red has to name the unit, and until run 72 it did not.
