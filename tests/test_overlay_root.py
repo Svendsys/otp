@@ -1691,6 +1691,81 @@ def test_a_unit_that_never_said_what_it_settled_on_fails(tmp_path):
     assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
 
 
+def journal_from_the_real_hmi(monkeypatch, *, oled_present):
+    """
+    The lines otpunit's own detection writes, on the machine tier 3 boots.
+
+    Not a fixture of what it is believed to log -- the real
+    hmi.detect/open_display/open_buttons, with only the two pieces of
+    hardware stubbed, so the strings come from the code that ships. The
+    conditions are the measured ones: no /dev/i2c-* (the SSD1306 probe
+    raises), /sys/class/drm empty, and a Button that CONSTRUCTS, which is
+    what the board revision in the DTB buys.
+    """
+    import sys
+    sys.path.insert(0, str(REPO))
+    from otpunit import hmi
+
+    class Dummy:
+        def close(self):
+            pass
+
+    def oled(**_kwargs):
+        if oled_present:
+            return Dummy()
+        raise FileNotFoundError(
+            2, "No such file or directory", "/dev/i2c-1")
+
+    monkeypatch.setattr(hmi, "Ssd1306Display", oled)
+    monkeypatch.setattr(hmi, "GpioButtons", lambda *a, **k: Dummy())
+    monkeypatch.setattr(hmi, "screen_connected", lambda: False)
+    monkeypatch.setattr(hmi, "keyboard_connected", lambda: False)
+
+    lines = []
+    interface = hmi.detect(log=lines.append)
+    # The one line __main__ adds around describe(). Held against __main__'s
+    # own source by tests/test_img_verdict.py.
+    lines.append(f"interface -- {interface.describe()}")
+    # And the decision. Given to the mutant as well, deliberately: a check
+    # that only failed because the headless line went missing would be
+    # proving something weaker than "the detection is what it reads".
+    lines.append("no usable interface; printing unattended")
+    return "".join(
+        f"Aug 17 00:04:09 otp-unit python3[412]: {line}\n" for line in lines)
+
+
+def test_the_check_reads_what_the_shipped_detection_actually_logs(tmp_path,
+                                                                  monkeypatch):
+    """
+    End to end, with no fixture in the middle: the real hmi produces the
+    lines, the shipped probe judges them.
+    """
+    journal = journal_from_the_real_hmi(monkeypatch, oled_present=False)
+    assert "input: GPIO buttons" in journal, journal
+    proc, _ = run_journal(tmp_path, unit_journal=journal)
+    assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
+
+
+def test_breaking_the_panel_absence_detection_still_turns_the_check_red(
+        tmp_path, monkeypatch):
+    """
+    THE PROOF the emulator fix is allowed to ship. `unit-detects-no-panel`
+    had to stop being able to pass for the wrong reason, and the way to show
+    that is to break the thing it watches and see it go red.
+
+    The break is the panel-absence detection itself: the SSD1306 probe
+    succeeds, so the unit has a display where the emulated machine has none.
+    Everything else is identical to the test above -- same function, same
+    stubs, same headless line handed over for free -- and the only difference
+    in the journal is what the shipped code said about the panel.
+    """
+    healthy = journal_from_the_real_hmi(monkeypatch, oled_present=False)
+    broken = journal_from_the_real_hmi(monkeypatch, oled_present=True)
+    assert healthy != broken, "the mutation changed nothing the unit logs"
+    proc, _ = run_journal(tmp_path, unit_journal=broken)
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
 def test_a_previous_boots_headless_decision_does_not_answer_for_this_one(tmp_path):
     """
     `-b`, and why it is load bearing three hundred lines from the file that

@@ -317,6 +317,33 @@ def test_the_release_notes_boot_completion_claim_is_backed_by_the_harness():
             f"intact, but img-boot.sh no longer requires {name}")
 
 
+def test_the_release_notes_identity_claim_is_backed_by_the_harness():
+    """
+    The newest sentence in the note, and the one most easily left standing
+    after the thing behind it stops being checked.
+
+    It says the second boot came up as the same machine as the first. Three
+    named checks make that true -- the machine-id in use matches the copy
+    kept OUTSIDE the overlay, boot1 really recorded a host key fingerprint,
+    and boot2's keys are identical to it -- and without all three the
+    sentence is a claim about nothing on a device that prints key material.
+    """
+    body = step_named(build_steps(), ATTACH)["with"]["body"]
+    assert "machine-id" in body, body
+    assert "host keys" in body, body
+    # The exposure is part of the claim, not a footnote: FAT has no
+    # permission bits and the note is the only place a person who flashes
+    # this image is told so.
+    assert "otp-identity" in body, body
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    for name in ("machine-id-persisted-outside-the-overlay",
+                 "ssh-host-key-fingerprint-recorded",
+                 "ssh-host-keys-identical-across-the-power-cycle"):
+        assert name in harness, (
+            f"the release note claims this unit keeps its identity across a "
+            f"power cycle, but img-boot.sh no longer requires {name}")
+
+
 # --- what counts as a change to the image --------------------------------
 #
 # The probe runs INSIDE the image. install.sh installs

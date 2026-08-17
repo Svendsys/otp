@@ -474,9 +474,18 @@ jobs:
             `failed_userconf.txt` rather than holding the boot open. The
             first boot still had its front panel on tty1 afterwards, and
             neither boot was left waiting on a network this appliance does
-            not have. That gate does not exercise the OLED, the buttons or a
-            printer -- see the header of `harness/img-boot.sh` for exactly
-            what it does and does not prove.
+            not have. The unit's IDENTITY survived the power-cycle as well:
+            the second boot was using the same machine-id as the first, and
+            its SSH host keys had the same fingerprints. That is a change --
+            `/etc` is inside the RAM overlay, so before this the machine-id
+            reverted to `uninitialized` every time, systemd read every boot
+            as a first boot, and the host keys were regenerated on each one.
+            The machine-id and a copy of the host keys are kept in
+            `/boot/firmware/otp-identity`, on the FAT partition, where
+            anyone who can mount the card can read them. That gate does not
+            exercise the OLED, the buttons or a printer -- see the header of
+            `harness/img-boot.sh` for exactly what it does and does not
+            prove.
 
       # The bar, stated where it can be seen. Ten minutes is the budget for
       # a run that did not have to rebuild the image; a run that did is

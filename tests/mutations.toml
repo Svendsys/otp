@@ -2409,3 +2409,23 @@ tests = [
 file = "device/persist-identity.sh"
 find = 'elif [ ! -s "$STORE/machine-id" ]; then'
 replace = 'elif true; then'
+
+
+[[mutation]]
+name = "tier3-identity-checks-not-required"
+tier = "fast"
+guard = """
+The named-check gate over the identity, and the release note that quotes it.
+Drop the name and both boots still pass everything else -- the overlay
+discards, the settings survive, the panel is detected -- while the machine
+comes up as a different machine every time and the note attached to a tag
+says it did not."""
+tests = [
+  "tests/test_img_verdict.py::test_the_harness_and_the_guest_agree_on_which_checks_exist",
+  "tests/test_image_workflow.py::test_the_release_notes_identity_claim_is_backed_by_the_harness",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''network-wait-cannot-hold-the-boot-open \
+machine-id-persisted-outside-the-overlay"'''
+replace = '''network-wait-cannot-hold-the-boot-open"'''

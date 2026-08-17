@@ -42,8 +42,11 @@ jobs:
     # tests/mutations.toml.
     #
     # PER PR, not nightly, and that is measured rather than assumed: the fast
-    # tier is 19 mutations in 11 seconds, which is cheaper than the suite it
-    # audits. The issue expected nightly or label-triggered; at this price
+    # tier is 114 mutations in 96 seconds, which is cheaper than the suite it
+    # audits. Counted, not carried forward -- this line said 19 in 11 seconds
+    # for a long time after both had moved.
+    #
+    # The issue expected nightly or label-triggered; at this price
     # that would be the wrong call, because a gate that reports on the commit
     # which broke the guard is worth several that report the next morning. A
     # separate job rather than a step in `test`, so the ordinary suite's wall
