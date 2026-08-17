@@ -550,7 +550,8 @@ SEEDED_HASH = "$6$otpimgcheck$" + "A" * 86
 
 def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
                          etc_keys=("ed25519",), store_src="/dev/mmcblk0p1",
-                         credential=None, live_hash=BUILD_TIME_HASH,
+                         credential=None, partial=None,
+                         live_hash=BUILD_TIME_HASH,
                          first_user="otp", mode=None, chpasswd_env=None):
     """Run the shipped script against a fake boot partition and a fake /etc.
 
@@ -562,6 +563,12 @@ def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
     /etc/shadow holds for the UID-1000 account this boot. The default pair is
     the interesting one: a card with nothing on it and an account carrying the
     random build-time password.
+
+    `partial` is a `credential.new` left on the card -- the fragment
+    `credential_record` writes beside the store before renaming it into place.
+    A card that still has one is a card whose record lost the power or the
+    room mid-write, and it is the one tell that tells that state apart from a
+    card nobody ever seeded.
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     boot = tmp_path / "boot"
@@ -574,6 +581,8 @@ def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
         (boot / "otp-identity" / "machine-id").write_text(stored_id + "\n")
     if credential is not None:
         (boot / "otp-identity" / "credential").write_text(credential)
+    if partial is not None:
+        (boot / "otp-identity" / "credential.new").write_text(partial)
     for name in etc_keys:
         (root / "etc" / "ssh" / f"ssh_host_{name}_key").write_text(f"live {name}\n")
         (root / "etc" / "ssh" / f"ssh_host_{name}_key.pub").write_text(f"pub {name}\n")
@@ -648,6 +657,32 @@ def shadow_hash(root, user="otp") -> str:
 def chpasswd_argv(tmp_path) -> list:
     log = tmp_path / "chpasswd-argv.log"
     return log.read_text().splitlines() if log.exists() else []
+
+
+def power_cycle(root, *, user="otp", live_hash=BUILD_TIME_HASH):
+    """WHAT THE OVERLAY HANDS THE NEXT BOOT: /etc back out of the image.
+
+    Not `set_shadow_hash`, which edits the tree in place. Everything under
+    /etc is inside the read-only overlay, so a power cycle throws away the
+    WHOLE of it -- the shadow entry the wizard wrote AND any rename
+    userconf-pi performed -- and the account comes back with the name and the
+    random FIRST_USER_PASS image/build.sh built in. Only the FAT partition
+    survives, which is the entire reason this store exists.
+    """
+    (root / "etc" / "passwd").write_text(
+        "root:x:0:0:root:/root:/bin/bash\n"
+        "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+        f"{user}:x:1000:1000:,,,:/home/{user}:/bin/bash\n")
+    (root / "etc" / "shadow").write_text(
+        "root:!:20088:0:99999:7:::\n"
+        "daemon:*:20088:0:99999:7:::\n"
+        f"{user}:{live_hash}:20088:0:99999:7:::\n")
+
+
+def card_note(boot) -> str:
+    """The refusal persist-identity.sh leaves where the card can carry it."""
+    note = boot / "otp-identity" / "credential-not-restored.txt"
+    return note.read_text() if note.exists() else ""
 
 
 def test_a_first_boot_records_what_it_has(tmp_path):
@@ -888,7 +923,150 @@ def test_a_store_that_is_not_a_crypt_string_is_refused(tmp_path, kept):
     assert kept not in proc.stderr or kept == "", proc.stderr
 
 
-def test_the_store_may_only_name_the_uid_1000_account(tmp_path):
+def test_a_zero_length_store_is_not_read_as_a_card_that_was_never_seeded(tmp_path):
+    """
+    THE ONE MALFORMED SHAPE THAT USED TO EXIT 0.
+
+    Every other bad store below fails the unit loudly. A zero-length one
+    returned 0 with a note that reads exactly like a fresh card -- and it is
+    not one. `credential_record` writes `credential.new` and renames it over
+    `credential`; vfat has no atomic rename, so a power cut mid-record or a
+    partition with no room left can leave a zero-length `credential` where a
+    working credential used to be. The operator then loses the login they had,
+    with nothing on the machine having failed and nothing in the journal to
+    read.
+
+    THE TELL IS THAT THE FILE IS THERE AT ALL. A card nobody has seeded has no
+    `credential` and no `credential.new`; this one has a `credential`. That
+    costs one `-e` and it is the difference between a failed unit somebody can
+    diagnose and a silent revert.
+    """
+    proc, boot, root = run_persist_identity(tmp_path, credential="")
+    assert proc.returncode != 0, proc.stdout
+    assert shadow_hash(root) == BUILD_TIME_HASH
+    assert chpasswd_argv(tmp_path) == [], chpasswd_argv(tmp_path)
+    # And it does NOT tell the operator their card was never seeded, which is
+    # the specific wrong answer this is about.
+    assert "no credential kept" not in proc.stderr, proc.stderr
+
+    # THE POSITIVE CONTROL, and it is the whole point: a card that really was
+    # never seeded still comes out quiet and green on the identical fixture.
+    # Without it this passes on a script that fails every unseeded unit ever
+    # built.
+    proc, boot, _ = run_persist_identity(tmp_path / "fresh")
+    assert proc.returncode == 0, proc.stderr
+    assert "no credential kept" in proc.stderr, proc.stderr
+    assert card_note(boot) == ""
+
+
+def test_a_record_fragment_with_no_store_beside_it_is_not_a_fresh_card(tmp_path):
+    """
+    The other half of the same interrupted write, and the half that leaves no
+    `credential` at all: the power went off between the redirect that creates
+    `credential.new` and the `mv` that puts it in place, on the very first
+    record a unit ever did. `credential` is absent -- which is exactly what a
+    fresh card looks like -- and `credential.new` is the only thing that says
+    otherwise.
+    """
+    proc, boot, root = run_persist_identity(
+        tmp_path, partial=f"otp:{SEEDED_HASH}\n")
+    assert proc.returncode != 0, proc.stdout
+    assert "no credential kept" not in proc.stderr, proc.stderr
+    # NOT applied out of the fragment, either. A file the record never
+    # committed is a file nothing checked, and the whole reason for writing
+    # beside and renaming is that its contents may be half a line.
+    assert chpasswd_argv(tmp_path) == [], chpasswd_argv(tmp_path)
+    assert shadow_hash(root) == BUILD_TIME_HASH
+
+
+def test_a_record_fragment_beside_a_good_store_is_cleared_and_the_store_wins(tmp_path):
+    """
+    The third arrangement the interrupted write can leave: the previous
+    credential intact and a fragment beside it. That is the outcome
+    write-beside-and-rename is FOR, so the restore has to be an ordinary one
+    -- and the fragment has to go, or every boot for the rest of the unit's
+    life reports an interruption that has already been dealt with.
+    """
+    proc, boot, root = run_persist_identity(
+        tmp_path, credential=f"otp:{SEEDED_HASH}\n",
+        partial="otp:$6$halfwritten$")
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == SEEDED_HASH, \
+        "the fragment cost the operator the credential that was committed"
+    assert not (boot / "otp-identity" / "credential.new").exists()
+    assert "credential.new" in proc.stderr, proc.stderr
+
+
+def test_every_refusal_is_left_on_the_card_a_locked_out_operator_can_read(tmp_path):
+    """
+    WHERE A REFUSAL GOES ON A MACHINE NOBODY CAN LOG IN TO.
+
+    Each note above goes to stderr, otp-unit-identity.service sends stderr to
+    the journal, device/install.sh sets `Storage=volatile`, and
+    `systemd.journald.forward_to_console=1` is on the tier-3 harness's
+    command line and NOT in the image's cmdline.txt. So on a shipped unit
+    every one of these reasons died with the power -- on the machine whose
+    operator is locked out of the only shell that could have read it. The unit
+    file now carries `StandardError=journal+console` so the notes reach the
+    screen while the boot is happening; this is the copy that is still there
+    afterwards.
+
+    THE CARD IS THE RIGHT PLACE because it is the only thing the locked-out
+    operator can still do: take it out and put it in another machine, which
+    they have to do anyway to write a new userconf.txt. The note carries no
+    hash -- nothing here ever prints one -- so it adds no exposure to a
+    partition that already holds the hash in full.
+    """
+    proc, boot, _ = run_persist_identity(tmp_path, credential="otp:!\n")
+    assert proc.returncode != 0, proc.stdout
+    note = card_note(boot)
+    assert "userconf.txt" in note, note
+    assert "crypt(3) string" in note, note
+    # The reason is the journal's own words rather than a summary that can
+    # drift away from them: a second channel saying something different from
+    # the first is one nobody can act on. The header above it is the part an
+    # operator holding a card in another machine needs and the journal does
+    # not.
+    header, _, reason = note.partition("\n\n")
+    assert len(header.splitlines()) == 3, note
+    assert reason.strip(), note
+    for line in reason.splitlines():
+        assert f"otp-identity: {line}" in proc.stderr, (line, proc.stderr)
+    # NEVER THE HASH, on a partition every local account can read and anyone
+    # with a card reader can mount.
+    assert SEEDED_HASH not in note and BUILD_TIME_HASH not in note
+
+    # AND IT IS CLEARED BY A RESTORE THAT WORKS. A stale "your login could not
+    # be restored" on the card of a unit that is fine is a fault report for a
+    # fault that is over, and this appliance has no clock to date it with.
+    (boot / "otp-identity" / "credential").write_text(f"otp:{SEEDED_HASH}\n")
+    proc = invoke_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert card_note(boot) == "", "the refusal outlived the fault"
+
+
+def test_the_identity_units_notes_reach_the_console_and_not_only_the_journal():
+    """
+    The systemd half of the finding above, which no fake tree can show.
+
+    `StandardError=journal` plus `Storage=volatile` plus no forwarding in the
+    image's cmdline.txt is three settings in three files that add up to
+    "nothing this script says is readable on a shipped unit". `journal+console`
+    is the one of the three that can be changed for THIS UNIT ALONE: it puts
+    these notes on /dev/console at sysinit, before any getty exists, without
+    making the rest of the machine narrate itself to whoever is watching the
+    serial header.
+    """
+    unit = IDENTITY_UNIT.read_text()
+    assert "StandardError=journal+console" in unit, unit
+    # And it stays scoped to this unit: journald's machine-wide forwarding is
+    # a harness-only lever, and turning it on in the image would put every
+    # unit's output on the console of a device that prints key material.
+    for shipped in (REPO / "device" / "install.sh", REPO / "image" / "build.sh"):
+        assert "forward_to_console" not in shipped.read_text(), shipped
+
+
+def test_the_store_may_only_ever_set_the_uid_1000_accounts_password(tmp_path):
     """
     Whoever can write this store can already write userconf.txt, and this must
     hand them no account the documented path would not. userconf-pi refuses
@@ -896,22 +1074,35 @@ def test_the_store_may_only_name_the_uid_1000_account(tmp_path):
     the only account /boot/firmware/userconf.txt can ever set a password on is
     the UID-1000 one. Keying on the uid says exactly that, and says it without
     re-transcribing three validation rules that could drift.
+
+    WHICH ACCOUNT THE RULE NAMES IS THE UID, NOT THE STRING IN THE STORE. A
+    card that says `root:` is a card whose LABEL is wrong; the hash still goes
+    to UID 1000 and nowhere else, so `root` here must come out of this
+    untouched while the operator's own account is set. Refusing instead was
+    the shape the lockout in the test below came in.
     """
-    proc, _, root = run_persist_identity(
+    proc, boot, root = run_persist_identity(
         tmp_path, credential=f"root:{SEEDED_HASH}\n")
-    assert proc.returncode != 0, proc.stdout
+    assert proc.returncode == 0, proc.stderr
     assert shadow_hash(root, "root") == "!", "root's password was set"
-    assert chpasswd_argv(tmp_path) == [], chpasswd_argv(tmp_path)
+    assert shadow_hash(root) == SEEDED_HASH, \
+        "the kept hash did not reach the UID-1000 account"
+    # chpasswd was handed the UID-1000 account and only it: the store's own
+    # user field never reaches the command, which is what makes the line
+    # above a property of the script rather than of the stub.
+    assert chpasswd_argv(tmp_path), "chpasswd never ran"
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"otp:{SEEDED_HASH}\n", "the store kept the label it could not use"
 
     # AND THE NAME IT QUOTES BACK IS STRIPPED FIRST. That field comes off a
     # partition anyone with a card reader can write, and this script's stderr
     # is the journal -- forwarded to the serial console under the tier-3
-    # harness, which uploads it. An escape sequence there is one `tr` to
-    # refuse.
+    # harness, which uploads it, and now written to the console of the unit
+    # itself. An escape sequence there is one `tr` to refuse.
     proc, _, _ = run_persist_identity(
         tmp_path / "escape",
         credential="ro\x1b[2Jot:" + SEEDED_HASH + "\n")
-    assert proc.returncode != 0, proc.stdout
+    assert proc.returncode == 0, proc.stderr
     for gone in ("\x1b", "["):
         assert gone not in proc.stderr, repr(proc.stderr)
     # The positive control for the stripping: what is left of the name IS
@@ -921,13 +1112,159 @@ def test_the_store_may_only_name_the_uid_1000_account(tmp_path):
     # made them a clear-screen sequence are what had to go.
     assert "'ro2Jot'" in proc.stderr, proc.stderr
 
-    # The positive control, same fixture: the UID-1000 account is `otp` here,
-    # and a store naming it is applied. Without this the test above passes on
-    # a script that refuses every store there is.
-    proc, _, root = run_persist_identity(tmp_path / "control",
-                                         credential=f"otp:{SEEDED_HASH}\n")
+    # The negative control the rule actually rests on: with no UID-1000 line
+    # in /etc/passwd there is no account this store may be applied to, and
+    # `root` is still sitting there to be picked instead. Refused, and
+    # chpasswd never runs.
+    proc, _, root = run_persist_identity(tmp_path / "nobody", first_user=None,
+                                         credential=f"root:{SEEDED_HASH}\n")
+    assert proc.returncode != 0, proc.stdout
+    assert shadow_hash(root, "root") == "!", "root's password was set"
+    assert chpasswd_argv(tmp_path / "nobody") == [], \
+        chpasswd_argv(tmp_path / "nobody")
+
+
+def test_a_store_naming_the_pre_rename_account_still_logs_the_operator_in(tmp_path):
+    """
+    THE LOCKOUT, DRIVEN AS THE DOCUMENTED HAPPY PATH THAT PRODUCES IT.
+
+    docs/IMAGE.md tells an operator to write `username:hash` to the boot
+    partition. Nothing tells them the username has to be `otp`, and
+    /usr/lib/userconf-pi/userconf does not require it either -- read out of
+    the real userconf-pi_0.19_all.deb:
+
+        FIRSTUSER="$(getent passwd 1000 | cut -d: -f1)"
+        ...
+        if [ "$FIRSTUSER" != "$NEWNAME" ]; then rename_user; fi
+        ...
+        echo "$NEWNAME:$NEWPASS" | chpasswd -e
+
+    so a seed naming `pi` RENAMES the UID-1000 account and then sets the
+    password on the new name. `rename_user` touches /etc/{passwd,shadow,group,
+    gshadow,subuid,subgid,sudoers.d} and /home -- every one of them inside the
+    read-only overlay. The rename therefore dies with the power. The store, on
+    the FAT partition, does not.
+
+    So the next boot found a store naming an account that no longer exists,
+    and the script REFUSED it: no network, no sshd, tty1 held by the front
+    panel, and a tty2 prompt that took neither the operator's chosen username
+    nor `otp`. A unit with one-time-pad key material on it, bricked by the
+    documented path, recoverable only by pulling the card. The same sequence
+    destroyed a WORKING persisted login if an operator later seeded
+    `alice:...` to rename themselves.
+
+    THE FIX IS THE FILE'S OWN RULE, APPLIED. Only the UID-1000 account may
+    ever be touched -- so the name in the store is a LABEL, not an
+    authorisation, and the hash belongs on whatever account holds UID 1000
+    this boot. That grants the store no account `userconf.txt` could not
+    already reach, which is the whole test above.
+    """
+    # Boot 1. The image ships FIRST_USER_NAME='otp'; the operator's seed names
+    # `pi`, so userconf-pi renames the account and applies the hash to it, and
+    # the wizard's own ExecStartPost records what it finds live.
+    proc, boot, root = run_persist_identity(tmp_path, first_user="pi",
+                                            live_hash=SEEDED_HASH)
+    assert proc.returncode == 0, proc.stderr
+    proc = invoke_persist_identity(tmp_path, mode="--record-credential")
+    assert proc.returncode == 0, proc.stderr
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"pi:{SEEDED_HASH}\n", "the record did not keep the renamed account"
+
+    # The power cycle. /etc comes back out of the image: the rename is gone,
+    # UID 1000 is `otp` again, and the password is the build-time one nobody
+    # has. The card still holds `pi:<hash>`.
+    power_cycle(root)
+    assert "pi:" not in (root / "etc" / "passwd").read_text()
+
+    proc = invoke_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    # THE PROPERTY, and it is a WORKING LOGIN rather than a tidy exit status:
+    # the operator's own hash is what /etc/shadow holds for the account they
+    # can actually type at the tty2 prompt.
+    assert shadow_hash(root) == SEEDED_HASH, \
+        "the operator is locked out: the kept password did not reach otp"
+    # Through chpasswd, and named for the LIVE account -- not the store's.
+    assert any(f"-e --root {tmp_path}/root" in line
+               for line in chpasswd_argv(tmp_path)), chpasswd_argv(tmp_path)
+    # And it SAYS so, because a unit that silently re-points a credential at
+    # another account is one nobody can audit afterwards.
+    assert "'pi'" in proc.stderr, proc.stderr
+
+    # THE STORE IS REWRITTEN, so the stale name does not persist: without this
+    # every boot for the rest of the unit's life repeats the mismatch, and the
+    # tier-3 check that the store names the live account could never be true.
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"otp:{SEEDED_HASH}\n"
+    assert not (boot / "otp-identity" / "credential.new").exists()
+    assert card_note(boot) == "", "a working restore left a refusal on the card"
+
+    # The boot after that is an ordinary one: the store now matches, so there
+    # is nothing to say and nothing to rewrite.
+    power_cycle(root)
+    proc = invoke_persist_identity(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert shadow_hash(root) == SEEDED_HASH
+    assert "'otp'" not in proc.stderr, proc.stderr
+
+
+def test_a_stale_label_is_rewritten_even_when_the_password_already_matches(tmp_path):
+    """
+    The other way into the rewrite, and the reason it is not enough to do it
+    only after a `chpasswd`.
+
+    This is the boot AFTER a rewrite that could not be written -- the card was
+    full, or an operator had it in a reader read-only. The hash is already on
+    the UID-1000 account, so there is nothing for chpasswd to do and the
+    restore takes its early exit; the label is still wrong. Skip the rewrite
+    here and a unit that once failed to relabel never gets another chance,
+    because from now on every boot lands on this branch.
+    """
+    proc, boot, root = run_persist_identity(
+        tmp_path, credential=f"pi:{SEEDED_HASH}\n", live_hash=SEEDED_HASH)
+    assert proc.returncode == 0, proc.stderr
+    assert chpasswd_argv(tmp_path) == [], "chpasswd ran for a password that was already right"
+    assert shadow_hash(root) == SEEDED_HASH
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"otp:{SEEDED_HASH}\n", "the stale label survived the boot"
+
+
+def test_a_rewrite_the_card_will_not_take_does_not_cost_the_login(tmp_path):
+    """
+    The rewrite above is a convenience; the login is the job.
+
+    A card that has gone read-only, or filled up, can take the `chpasswd` --
+    that lands in /etc/shadow, inside the overlay -- and refuse the store. If
+    that failed the restore, an operator whose password DID come back would be
+    handed a failed unit and, worse, a script that had already decided the
+    boot was lost. So the write is attempted, its failure is said out loud,
+    and the exit status still describes the login.
+
+    Driven by putting a DIRECTORY where the fragment goes, because this suite
+    runs as root and `chmod` on a directory root owns stops nothing. What the
+    script sees is what a full or read-only vfat gives it: the redirect into
+    `credential.new` fails, so the rename never happens and the store keeps
+    the bytes it had.
+    """
+    proc, boot, root = run_persist_identity(
+        tmp_path, credential=f"pi:{SEEDED_HASH}\n")
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == SEEDED_HASH
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"otp:{SEEDED_HASH}\n"
+
+    # Same tree, same mismatched store, with nothing able to write the store.
+    (boot / "otp-identity" / "credential").write_text(f"pi:{SEEDED_HASH}\n")
+    (boot / "otp-identity" / "credential.new").mkdir()
+    power_cycle(root)
+    proc = invoke_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == SEEDED_HASH, \
+        "a store that could not be rewritten cost the operator the login"
+    assert "could not rewrite" in proc.stderr, proc.stderr
+    # And the store still holds what it held: a rewrite that cannot finish
+    # must not be a rewrite that half-finished.
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"pi:{SEEDED_HASH}\n"
 
 
 def test_the_uid_1000_account_is_found_by_uid_and_not_by_name(tmp_path):

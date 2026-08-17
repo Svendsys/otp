@@ -153,6 +153,26 @@ fi
 STORE="$BOOT_DIR/otp-identity"
 CRED_STORE="$STORE/credential"
 
+# WHERE A REFUSAL GOES ON A MACHINE NOBODY CAN LOG IN TO. Every note below
+# goes to stderr; otp-unit-identity.service sends stderr to the journal;
+# device/install.sh sets Storage=volatile so the journal dies with the power;
+# and systemd.journald.forward_to_console=1 is on the tier-3 harness's kernel
+# command line and NOT in the image's cmdline.txt. Three settings in three
+# files that add up to "nothing this script says survives the boot it says it
+# on" -- on the one machine whose operator may be locked out of the only shell
+# that could read it.
+#
+# Two answers, because neither is enough alone. The unit file now carries
+# StandardError=journal+console, so the notes are on the screen while the boot
+# is happening; and every REFUSAL is left here, on the card, because taking
+# the card out is the one thing a locked-out operator can still do -- and the
+# thing they have to do anyway to write a new userconf.txt.
+#
+# NO HASH IS EVER WRITTEN HERE. Nothing in this script prints one; the notes
+# carry lengths. The file adds no exposure to a partition that already holds
+# the hash in full, and it is removed the moment a restore works.
+CRED_NOTE="$STORE/credential-not-restored.txt"
+
 # --root is a test affordance, so it has to reach the one command here that
 # does not take a path. Unset on a real unit, where a bare `chpasswd` is
 # wanted: `chpasswd --root /` chroots, and asking a boot-critical account
@@ -163,6 +183,24 @@ if [ -n "$ROOT_DIR" ]; then
 fi
 
 note() { printf 'otp-identity: %s\n' "$*" >&2; }
+
+# A reason credential_restore declined, said in the journal AND left on the
+# card. One argument per line, same wording in both places: a second channel
+# that says something different from the first is one nobody can act on.
+#
+# The header is the part an operator holding this card in another machine
+# needs and the journal does not -- what the state of the unit now is, and
+# what to do about it.
+refuse() {
+    local line
+    for line in "$@"; do note "$line"; done
+    {
+        printf 'This unit refused to restore the kept login at its last boot.\n'
+        printf 'The account is back on the random password the image was built\n'
+        printf 'with, which nobody has. Write a fresh userconf.txt here.\n\n'
+        printf '%s\n' "$@"
+    } > "$CRED_NOTE" 2>/dev/null || true
+}
 
 # --- the credential, and the three things that read or write it -----------
 
@@ -226,13 +264,66 @@ safe_name() {
 # and that console is uploaded as a CI artifact. A length is enough to tell
 # "empty" from "locked" from "a real hash" while reading a boot log.
 credential_restore() {
-    local stored user hash want live
+    local rc
+    credential_restore_inner
+    rc=$?
+    # THE NOTE ON THE CARD EXISTS EXACTLY WHEN THE LAST RESTORE REFUSED, and
+    # that invariant is kept here rather than at each `return 0` below so that
+    # a path added later cannot forget it. A stale "your login could not be
+    # restored" on the card of a unit that is now fine is a fault report for a
+    # fault that is over, and this appliance has no clock to date it with.
+    [ "$rc" = 0 ] && rm -f "$CRED_NOTE" 2>/dev/null
+    return "$rc"
+}
 
-    if [ ! -s "$CRED_STORE" ]; then
+credential_restore_inner() {
+    local stored user hash want live have_store=no have_fragment=no relabel=no
+
+    [ -e "$CRED_STORE" ] && have_store=yes
+    [ -e "$CRED_STORE.new" ] && have_fragment=yes
+
+    if [ "$have_store" = no ] && [ "$have_fragment" = no ]; then
         note "no credential kept in $CRED_STORE, so this unit's login is the"
         note "  random one image/build.sh generated. Write a userconf.txt to"
         note "  the boot partition to set one; it will be kept from then on."
         return 0
+    fi
+
+    # A ZERO-LENGTH STORE IS NOT A CARD THAT WAS NEVER SEEDED, and telling
+    # those two apart is the whole of this block.
+    #
+    # credential_record writes `credential.new` and renames it over
+    # `credential`; vfat has no atomic rename, so a power cut mid-record -- or
+    # a partition with no room left -- can leave a zero-length `credential`, a
+    # `credential.new` with no `credential` beside it, or both. Every other
+    # malformed shape here exits non-zero and fails the unit loudly. This one
+    # used to return 0 with the note above, which reads exactly like a fresh
+    # card: the operator lost the login they had, nothing on the machine
+    # failed, and there was nothing anywhere to read.
+    #
+    # THE TELL IS THAT THE FILE IS THERE AT ALL. A card nobody has seeded has
+    # NEITHER of these names on it.
+    if [ ! -s "$CRED_STORE" ]; then
+        refuse "there is no usable credential in $CRED_STORE, and this is not" \
+               "  a card that was never seeded: credential=$have_store (empty)" \
+               "  credential.new=$have_fragment. A record writes .new and" \
+               "  renames it into place, and vfat has no atomic rename, so a" \
+               "  power cut mid-record or a full partition leaves exactly" \
+               "  this. The login that was kept here is GONE; write a fresh" \
+               "  userconf.txt to the boot partition to set one again."
+        return 1
+    fi
+
+    # A fragment beside a store that IS intact is the outcome writing beside
+    # and renaming exists to produce: the previous credential survived, and
+    # the restore below is an ordinary one. The fragment goes, or every boot
+    # for the rest of this unit's life reports an interruption that is over.
+    if [ "$have_fragment" = yes ]; then
+        note "$CRED_STORE.new is beside the store, so a record lost the power"
+        note "  or the room mid-write. The credential below is the PREVIOUS"
+        note "  one, which is what writing beside and renaming is for."
+        note "  Removing the fragment."
+        rm -f "$CRED_STORE.new" 2>/dev/null || true
     fi
 
     # ONE LINE, and that is a validation rather than tidiness: `chpasswd`
@@ -242,8 +333,8 @@ credential_restore() {
     stored=$(cat "$CRED_STORE" 2>/dev/null)
     case "$stored" in
         *$'\n'*)
-            note "$CRED_STORE has more than one line, which chpasswd would"
-            note "  read as more than one account. Refusing all of it."
+            refuse "$CRED_STORE has more than one line, which chpasswd would" \
+                   "  read as more than one account. Refusing all of it."
             return 1
             ;;
     esac
@@ -251,35 +342,79 @@ credential_restore() {
     user=${stored%%:*}
     hash=${stored#*:}
     if [ "$user" = "$stored" ]; then
-        note "$CRED_STORE is not user:hash, so there is no credential in it"
+        refuse "$CRED_STORE is not user:hash, so there is no credential in it"
         return 1
     fi
 
+    # THE ONE ACCOUNT THIS MAY REACH, decided before anything is applied and
+    # decided by the UID. There is nothing else to fall back on: a store is
+    # only ever applied to whoever holds UID 1000 this boot.
     want=$(first_user)
-    if [ -z "$want" ] || [ "$user" != "$want" ]; then
-        note "the kept credential names '$(safe_name "$user")', which is not this unit's"
-        note "  UID-1000 account (${want:-none}). Refusing: userconf.txt can"
-        note "  only ever set that account's password and this store must not"
-        note "  be able to set any other."
+    if [ -z "$want" ]; then
+        refuse "there is no UID-1000 account in $ETC_DIR/passwd, so there is" \
+               "  no account this store may be applied to. Refusing: the one" \
+               "  rule here is that only the UID-1000 user is ever touched," \
+               "  and on this boot there is no such user."
         return 1
     fi
 
+    # $want, not $user: this note is about the account the hash would land on,
+    # and $user comes off a partition anyone with a card reader can write.
     if ! is_crypt_hash "$hash"; then
-        note "the kept credential's hash (${#hash} characters) is not a"
-        note "  crypt(3) string. Refusing: applying it would leave $user"
-        note "  locked out or, if it is empty, with no password at all."
+        refuse "the kept credential's hash (${#hash} characters) is not a" \
+               "  crypt(3) string. Refusing: applying it would leave $want" \
+               "  locked out or, if it is empty, with no password at all."
         return 1
     fi
 
-    live=$(live_hash "$user")
+    # THE NAME IN THE STORE IS A LABEL, NOT AN AUTHORISATION, and reading it
+    # as an authorisation is what bricked a unit reachable from the documented
+    # happy path.
+    #
+    # docs/IMAGE.md tells an operator to write `username:hash` to the boot
+    # partition. Nothing obliges them to write `otp`, and userconf-pi does not
+    # either -- /usr/lib/userconf-pi/userconf takes `getent passwd 1000`,
+    # RENAMES that account when the seed names a different one, and only then
+    # runs `chpasswd -e` on the new name. `rename_user` touches
+    # /etc/{passwd,shadow,group,gshadow,subuid,subgid,sudoers.d} and /home:
+    # every one of them inside the read-only overlay. So the rename dies with
+    # the power and the store, on the FAT partition, does not -- and the next
+    # boot found a store naming an account that no longer existed.
+    #
+    # Refusing it meant: no network, no sshd, tty1 held by the front panel,
+    # and a tty2 prompt that took neither the operator's chosen username nor
+    # `otp`. A unit that prints one-time pads, bricked by the documented path,
+    # recoverable only by pulling the card. The same sequence destroyed a
+    # WORKING persisted login the moment an operator seeded `alice:...` to
+    # rename themselves.
+    #
+    # APPLYING IT TO $want INSTEAD GRANTS THIS STORE NOTHING NEW. The rule
+    # above is "only the UID-1000 account may be touched", and that is exactly
+    # what happens here -- $user is never handed to chpasswd, so a card
+    # claiming `root:` still cannot set root's password. Whoever can write
+    # this store can already write a userconf.txt that renames UID 1000 and
+    # sets its password, so this reaches no account the documented path does
+    # not.
+    if [ "$user" != "$want" ]; then
+        relabel=yes
+        note "the kept credential names '$(safe_name "$user")'; this unit's"
+        note "  UID-1000 account is $want. userconf-pi renames UID 1000 to"
+        note "  whatever a seed names, and that rename lives in /etc and"
+        note "  /home -- inside the overlay -- so it does not survive the"
+        note "  power cycle while this store does. Applying the kept hash to"
+        note "  $want and rewriting the store to match."
+    fi
+
+    live=$(live_hash "$want")
     if [ "$live" = "$hash" ]; then
-        note "$user's password is already the kept one"
+        note "$want's password is already the kept one"
+        [ "$relabel" = no ] || credential_relabel "$want" "$hash"
         return 0
     fi
 
-    if ! printf '%s:%s\n' "$user" "$hash" | "${CHPASSWD[@]}"; then
-        note "chpasswd could not put $user's kept password back, so the"
-        note "  operator's login does not work on this boot"
+    if ! printf '%s:%s\n' "$want" "$hash" | "${CHPASSWD[@]}"; then
+        refuse "chpasswd could not put $want's kept password back, so the" \
+               "  operator's login does not work on this boot"
         return 1
     fi
 
@@ -288,17 +423,56 @@ credential_restore() {
     # stub, or that wrote to a different tree answers 0 in at least one of
     # those cases, and a restore nobody verified is exactly the shape of
     # defect this repository keeps finding green.
-    live=$(live_hash "$user")
+    live=$(live_hash "$want")
     if [ "$live" != "$hash" ]; then
-        note "chpasswd exited 0 but $ETC_DIR/shadow still does not hold the"
-        note "  kept hash for $user, so the operator's password is NOT back"
+        refuse "chpasswd exited 0 but $ETC_DIR/shadow still does not hold the" \
+               "  kept hash for $want, so the operator's password is NOT back"
         return 1
     fi
 
-    note "put $user's password back from $CRED_STORE (${#hash}-character"
+    # ONLY NOW, and that ordering is the point: a store rewritten before the
+    # apply was read back would be a store relabelled for a login that never
+    # came back.
+    [ "$relabel" = no ] || credential_relabel "$want" "$hash"
+
+    note "put $want's password back from $CRED_STORE (${#hash}-character"
     note "  hash). A fresh userconf.txt this boot will override it and be"
     note "  kept in its place."
     return 0
+}
+
+# THE REWRITE IS A CONVENIENCE; THE LOGIN IS THE JOB, so this cannot fail the
+# restore. A card that has gone read-only or filled up still takes the
+# `chpasswd` -- that lands in /etc/shadow, inside the overlay -- and the
+# operator's password IS back. Failing here would hand them a failed unit for
+# a boot that worked, and the cost of not failing is bounded and self-healing:
+# the next boot finds the same mismatch, says the same thing, and applies the
+# same hash to the same account. What it must not do is leave the store half
+# written, which is why this is the same write-beside-and-rename
+# credential_record uses.
+credential_relabel() {
+    if credential_write "$1" "$2"; then
+        note "rewrote $CRED_STORE to name $1"
+        return 0
+    fi
+    note "could not rewrite $CRED_STORE to name $1. The login IS back for"
+    note "  this boot; the store still carries the stale name, so the next"
+    note "  boot will say all of this again and apply it again."
+    return 1
+}
+
+# Written beside and renamed, so that losing power mid-write leaves the
+# previous credential rather than half of this one. vfat has no atomic
+# anything, but a rename within one directory is the closest it offers -- and
+# credential_restore reads a leftover `.new` as the tell that this did not
+# finish.
+credential_write() {
+    if printf '%s:%s\n' "$1" "$2" > "$CRED_STORE.new" 2>/dev/null \
+       && mv -f "$CRED_STORE.new" "$CRED_STORE" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$CRED_STORE.new" 2>/dev/null || true
+    return 1
 }
 
 credential_record() {
@@ -319,11 +493,7 @@ credential_record() {
         return 1
     fi
 
-    # Written beside and renamed, so that losing power mid-write leaves the
-    # previous credential rather than half of this one. vfat has no atomic
-    # anything, but a rename within one directory is the closest it offers.
-    if printf '%s:%s\n' "$user" "$hash" > "$CRED_STORE.new" 2>/dev/null \
-       && mv -f "$CRED_STORE.new" "$CRED_STORE" 2>/dev/null; then
+    if credential_write "$user" "$hash"; then
         note "kept $user's password (${#hash}-character hash) in $CRED_STORE,"
         note "  so it survives the power cycle. It is the same hash the"
         note "  operator's own userconf.txt carried, on the same partition:"

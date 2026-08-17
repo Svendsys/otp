@@ -3613,22 +3613,207 @@ replace = "    return 0"
 
 
 [[mutation]]
-name = "identity-credential-may-name-any-account"
+name = "identity-credential-applied-to-the-account-the-card-names"
 tier = "fast"
 guard = """
 Whoever can write the store can already write userconf.txt, and this must
 hand them no account the documented path would not. userconf-pi refuses
 `root` outright and renames the UID-1000 user to whatever a seed names, so
 the only account /boot/firmware/userconf.txt can ever set a password on is
-the UID-1000 one. Without this clause a line an attacker drops on the card in
-a reader sets root's password on the next boot instead."""
+the UID-1000 one.
+
+THE RULE IS THE UID, NOT THE STRING IN THE STORE, and that distinction is
+what the lockout fix rests on: the name on the card is a label, so it is
+never handed to chpasswd. Pass it through instead and a line an attacker
+drops on a card in a reader sets root's password on the next boot."""
 tests = [
-  "tests/test_overlay_root.py::test_the_store_may_only_name_the_uid_1000_account",
+  "tests/test_overlay_root.py::test_the_store_may_only_ever_set_the_uid_1000_accounts_password",
 ]
 [[mutation.edit]]
 file = "device/persist-identity.sh"
-find = 'if [ -z "$want" ] || [ "$user" != "$want" ]; then'
-replace = "if false; then"
+find = '''    if ! printf '%s:%s\n' "$want" "$hash" | "${CHPASSWD[@]}"; then'''
+replace = '''    if ! printf '%s:%s\n' "$user" "$hash" | "${CHPASSWD[@]}"; then'''
+
+
+[[mutation]]
+name = "identity-credential-with-no-uid-1000-account-applied-anyway"
+tier = "fast"
+guard = """
+The one refusal the name check kept when it stopped being a name check. A
+boot whose /etc/passwd has no UID-1000 line has no account this store may be
+applied to -- and the store still names one. Drop the clause and the script
+runs chpasswd against whatever the card said, on a tree where the rule that
+bounds it does not resolve to anything."""
+tests = [
+  "tests/test_overlay_root.py::test_the_store_may_only_ever_set_the_uid_1000_accounts_password",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = '    if [ -z "$want" ]; then'
+replace = "    if false; then"
+
+
+[[mutation]]
+name = "identity-credential-mismatched-name-refused-again"
+tier = "fast"
+guard = """
+THE LOCKOUT, PUT BACK. A seed naming any user other than the image's own
+FIRST_USER_NAME makes userconf-pi rename the UID-1000 account before it
+applies the hash, and that rename touches only /etc and /home -- both inside
+the read-only overlay -- so it dies with the power while the store on the FAT
+partition does not. Refusing the resulting mismatch bricked the unit at the
+next power cycle: no network, no sshd, tty1 held by the front panel, and a
+tty2 prompt that took neither the operator's chosen username nor `otp`. On a
+machine that prints one-time pads, reachable from the documented happy path,
+and equally destructive to a WORKING persisted login the moment an operator
+seeded a new name."""
+tests = [
+  "tests/test_overlay_root.py::test_a_store_naming_the_pre_rename_account_still_logs_the_operator_in",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = """    if [ "$user" != "$want" ]; then
+        relabel=yes"""
+replace = """    if [ "$user" != "$want" ]; then
+        return 1"""
+
+
+[[mutation]]
+name = "identity-credential-stale-label-left-on-the-card"
+tier = "fast"
+guard = """
+Applying a mismatched store without rewriting it leaves the stale name there
+for the rest of the unit's life: every boot repeats the whole explanation,
+and any check that reads the store -- tier 3's included -- goes on describing
+an account that does not exist. The rewrite is what makes the mismatch a
+one-boot event."""
+tests = [
+  "tests/test_overlay_root.py::test_a_store_naming_the_pre_rename_account_still_logs_the_operator_in",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = """    # came back.
+    [ "$relabel" = no ] || credential_relabel "$want" "$hash\""""
+replace = "    # came back."
+
+
+[[mutation]]
+name = "identity-credential-stale-label-never-retried"
+tier = "fast"
+guard = """
+The SECOND call site, and it is not a duplicate of the first. A rewrite the
+card would not take is deliberately not a failure -- the login is back and
+that is the job -- so the next boot has to try again. By then the hash is
+already on the account, the restore takes its early exit before chpasswd, and
+this is the only line that can still fix the label. Without it a unit that
+failed to relabel once never relabels again."""
+tests = [
+  "tests/test_overlay_root.py::test_a_stale_label_is_rewritten_even_when_the_password_already_matches",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = """        note "$want's password is already the kept one"
+        [ "$relabel" = no ] || credential_relabel "$want" "$hash\""""
+replace = """        note "$want's password is already the kept one\""""
+
+
+[[mutation]]
+name = "identity-empty-store-read-as-a-card-that-was-never-seeded"
+tier = "fast"
+guard = """
+The one malformed shape that used to exit 0. `credential_record` writes
+`credential.new` and renames it over `credential`; vfat has no atomic rename,
+so a power cut mid-record or a full partition can leave a zero-length
+`credential`, or a `credential.new` with nothing beside it. Every other bad
+store fails the unit loudly. This one returned 0 with a note that reads
+exactly like a fresh card, so an operator lost the login they had with
+nothing on the machine having failed and nothing anywhere to read. The tell
+is that either name is on the card at all."""
+tests = [
+  "tests/test_overlay_root.py::test_a_zero_length_store_is_not_read_as_a_card_that_was_never_seeded",
+  "tests/test_overlay_root.py::test_a_record_fragment_with_no_store_beside_it_is_not_a_fresh_card",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = '    if [ "$have_store" = no ] && [ "$have_fragment" = no ]; then'
+replace = '    if [ ! -s "$CRED_STORE" ]; then'
+
+
+[[mutation]]
+name = "identity-record-fragment-left-beside-a-good-store"
+tier = "fast"
+guard = """
+The third arrangement an interrupted record leaves: the previous credential
+intact and a fragment beside it. That is the outcome writing beside and
+renaming exists to produce, so the restore is an ordinary one -- but the
+fragment has to go, or the tell above fires on every boot for the rest of the
+unit's life and reports an interruption that was already survived."""
+tests = [
+  "tests/test_overlay_root.py::test_a_record_fragment_beside_a_good_store_is_cleared_and_the_store_wins",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = """        note "  Removing the fragment."
+        rm -f "$CRED_STORE.new" 2>/dev/null || true"""
+replace = '        note "  Removing the fragment."'
+
+
+[[mutation]]
+name = "identity-refusal-never-reaches-the-card"
+tier = "fast"
+guard = """
+Every reason this script declines goes to stderr, the unit sends stderr to
+the journal, device/install.sh makes the journal volatile, and journal
+forwarding to the console is on the tier-3 harness's kernel command line and
+NOT in the image's cmdline.txt. So on a shipped unit the refusal died with
+the power -- on the machine whose operator may be locked out of the only
+shell that could have read it. Taking the card out is the one thing they can
+still do, and the one thing they have to do anyway to write a new
+userconf.txt."""
+tests = [
+  "tests/test_overlay_root.py::test_every_refusal_is_left_on_the_card_a_locked_out_operator_can_read",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = '    } > "$CRED_NOTE" 2>/dev/null || true'
+replace = "    } > /dev/null 2>&1 || true"
+
+
+[[mutation]]
+name = "identity-refusal-outlives-the-fault-it-reported"
+tier = "fast"
+guard = """
+The other half of the file above. A "your login could not be restored" left
+on the card of a unit that is now fine is a fault report for a fault that is
+over, and this appliance has no clock to date it with -- so the operator
+cannot tell a live complaint from a dead one. Cleared on every restore that
+works."""
+tests = [
+  "tests/test_overlay_root.py::test_every_refusal_is_left_on_the_card_a_locked_out_operator_can_read",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = '    [ "$rc" = 0 ] && rm -f "$CRED_NOTE" 2>/dev/null'
+replace = "    :"
+
+
+[[mutation]]
+name = "identity-notes-never-reach-the-units-console"
+tier = "fast"
+guard = """
+`StandardError=journal` on a unit whose journal is volatile, on an image
+whose cmdline.txt carries no forwarding, is a unit that says nothing anybody
+can hear. journal+console is the narrowest fix there is: it puts THIS unit's
+stderr on /dev/console at sysinit -- before any getty, before the front panel
+takes tty1 -- and leaves every other unit on the machine quiet, which is why
+the machine-wide journald lever stays a harness-only one."""
+tests = [
+  "tests/test_overlay_root.py::test_the_identity_units_notes_reach_the_console_and_not_only_the_journal",
+]
+[[mutation.edit]]
+file = "device/systemd/otp-unit-identity.service"
+find = "StandardError=journal+console"
+replace = "StandardError=journal"
 
 
 [[mutation]]
@@ -3986,7 +4171,7 @@ to the journal -- which under the tier-3 harness is forwarded to the serial
 console and uploaded as an artifact. An escape sequence in that field is a
 small thing to hand a terminal and one `tr` to refuse."""
 tests = [
-  "tests/test_overlay_root.py::test_the_store_may_only_name_the_uid_1000_account",
+  "tests/test_overlay_root.py::test_the_store_may_only_ever_set_the_uid_1000_accounts_password",
 ]
 [[mutation.edit]]
 file = "device/persist-identity.sh"
