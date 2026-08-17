@@ -979,8 +979,18 @@ device-tree-compiler`, and for `coldplug-replay` only, `kmod` and
 `e2fsprogs`. Each is checked before the emulator starts and named if absent
 — because *every* one of these, missing, produces the same console: nothing
 at all, or a stop at `Run /init as init process`. That is the single most
-expensive symptom in this harness's history to misdiagnose. `--plan` prints
-the qemu argv and the preconditions without booting.
+expensive symptom in this harness's history to misdiagnose.
+
+**`--plan` needs none of them.** It prints the qemu argv and exits, so it
+works on a machine with no emulator installed — which is the machine of the
+person deciding whether to install one. It used to demand the whole list
+before it would print, and that was the check in the wrong place: printing a
+plan is string construction. (It was also six red tests on `ubuntu-latest`,
+which has neither `qemu-system-aarch64` nor `fdtput`.) The only thing behind
+the plan that wants anything is resolving the release name out of the
+archive, which asks for `curl` and `gzip` at the point it uses them, and
+`OTP_RIG_KERNEL=<release>` removes even that. A *run* is still refused up
+front, before it fetches or unpacks anything.
 
 ## Proving the guards can fail
 
@@ -1019,13 +1029,13 @@ stayed green.
 
 ```sh
 python3 tests/mutation_gate.py --list
-python3 tests/mutation_gate.py --tier fast       # 143 rows, 145s
+python3 tests/mutation_gate.py --tier fast       # 145 rows, 123s
 sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
 ```
 
 **Runtime decided the trigger.** The issue expected nightly or
-label-triggered; measured, the fast tier is a hundred and forty-five seconds
-at 143 rows — still cheaper than the suite it audits — so it runs per pull
+label-triggered; measured, the fast tier is a hundred and twenty-three
+seconds at 145 rows — still cheaper than the suite it audits — so it runs per pull
 request as its own `mutation` job, and the ordinary suite's wall clock does
 not move. The three CUPS-rig rows run in the existing `hardware` job, the
 only place with a real `cupsd`, for 36 seconds on top of about eight minutes.
