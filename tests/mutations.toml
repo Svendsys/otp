@@ -3956,3 +3956,39 @@ tests = [
 file = "harness/img-boot.sh"
 find = '    mdir -b -i "$IMG@@$BOOT_OFFSET" ::/otp-identity >> "$1" 2>/dev/null || true'
 replace = "    :"
+
+
+[[mutation]]
+name = "tier3-readme-floor-can-go-stale"
+tier = "fast"
+guard = """
+The count in harness/README.md is the only summary of what tier 3 proves that
+anybody reads before trusting a green run, and written by hand it goes stale
+on the first commit that adds a check -- silently, and in the direction that
+OVERSTATES, because a reader takes the larger number for the older list. This
+row is the number moving without the list moving."""
+tests = [
+  "tests/test_img_verdict.py::test_the_readme_counts_the_checks_this_tier_actually_requires",
+]
+[[mutation.edit]]
+file = "harness/README.md"
+find = "**21 guest checks in boot 1 and 20 in boot 2**"
+replace = "**19 guest checks in boot 1 and 19 in boot 2**"
+
+
+[[mutation]]
+name = "identity-credential-name-echoed-to-a-terminal-raw"
+tier = "fast"
+guard = """
+The store is on a partition anyone with a card reader can write, its user
+field is the one part of it this script ever quotes back, and these notes go
+to the journal -- which under the tier-3 harness is forwarded to the serial
+console and uploaded as an artifact. An escape sequence in that field is a
+small thing to hand a terminal and one `tr` to refuse."""
+tests = [
+  "tests/test_overlay_root.py::test_the_store_may_only_name_the_uid_1000_account",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = "    printf '%s' \"$1\" | tr -cd 'a-zA-Z0-9._-' | cut -c1-32"
+replace = "    printf '%s' \"$1\""

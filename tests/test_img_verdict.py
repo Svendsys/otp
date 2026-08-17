@@ -718,6 +718,31 @@ def test_a_credential_that_did_not_outlive_the_power_cycle_fails(tmp_path):
     assert proc.returncode == 1
 
 
+def test_the_readme_counts_the_checks_this_tier_actually_requires():
+    """
+    The floor, held against the list rather than restated beside it.
+
+    `harness/README.md` tells a reader how many guest checks each boot has to
+    report, and that number is the only summary of what tier 3 proves that
+    anybody reads before trusting a green run. Written by hand it goes stale
+    on the first commit that adds a check -- silently, in the direction that
+    overstates, because a reader takes the larger number for the older list.
+    Counted from `img-boot.sh` here, the way `required_checks` counts
+    everything else in this file.
+    """
+    readme = (REPO / "harness" / "README.md").read_text()
+    counts = {"boot 1": len(required_checks("boot1")),
+              "boot 2": len(required_checks("boot2"))}
+    match = re.search(
+        r"\*\*(\d+) guest checks in boot 1 and (\d+) in boot 2\*\*", readme)
+    assert match, \
+        "harness/README.md no longer states how many guest checks a boot owes"
+    assert (int(match.group(1)), int(match.group(2))) \
+        == (counts["boot 1"], counts["boot 2"]), (
+            f"harness/README.md says {match.group(1)}/{match.group(2)} guest "
+            f"checks, img-boot.sh requires {counts['boot 1']}/{counts['boot 2']}")
+
+
 def test_the_host_reads_the_store_a_level_below_the_root(tmp_path):
     """
     The harness's own listing, held against what mtools actually does.

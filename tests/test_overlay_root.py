@@ -903,6 +903,24 @@ def test_the_store_may_only_name_the_uid_1000_account(tmp_path):
     assert shadow_hash(root, "root") == "!", "root's password was set"
     assert chpasswd_argv(tmp_path) == [], chpasswd_argv(tmp_path)
 
+    # AND THE NAME IT QUOTES BACK IS STRIPPED FIRST. That field comes off a
+    # partition anyone with a card reader can write, and this script's stderr
+    # is the journal -- forwarded to the serial console under the tier-3
+    # harness, which uploads it. An escape sequence there is one `tr` to
+    # refuse.
+    proc, _, _ = run_persist_identity(
+        tmp_path / "escape",
+        credential="ro\x1b[2Jot:" + SEEDED_HASH + "\n")
+    assert proc.returncode != 0, proc.stdout
+    for gone in ("\x1b", "["):
+        assert gone not in proc.stderr, repr(proc.stderr)
+    # The positive control for the stripping: what is left of the name IS
+    # reported, so "no escape in the output" is not satisfied by a note that
+    # says nothing about which account the card named. `2J` survives because
+    # digits and letters are not escapes -- the ESC byte and the bracket that
+    # made them a clear-screen sequence are what had to go.
+    assert "'ro2Jot'" in proc.stderr, proc.stderr
+
     # The positive control, same fixture: the UID-1000 account is `otp` here,
     # and a store naming it is applied. Without this the test above passes on
     # a script that refuses every store there is.

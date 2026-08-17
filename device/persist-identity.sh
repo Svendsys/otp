@@ -211,6 +211,16 @@ is_crypt_hash() {
     [ "${#1}" -ge 20 ]
 }
 
+# AND NOTHING OUT OF THE STORE REACHES A TERMINAL RAW. The store is on a
+# partition anyone with a card reader can write, its user field is the one
+# part of it this script ever quotes back, and these notes go to the journal
+# -- which under the tier-3 harness is forwarded to the serial console. An
+# escape sequence in that field is a small thing to hand a terminal and one
+# `tr` to refuse. Cut to 32 as well, which is the longest a user name may be.
+safe_name() {
+    printf '%s' "$1" | tr -cd 'a-zA-Z0-9._-' | cut -c1-32
+}
+
 # NEITHER PHASE EVER PRINTS THE HASH. This script's stderr is the journal,
 # the journal is forwarded to the serial console under the tier-3 harness,
 # and that console is uploaded as a CI artifact. A length is enough to tell
@@ -247,7 +257,7 @@ credential_restore() {
 
     want=$(first_user)
     if [ -z "$want" ] || [ "$user" != "$want" ]; then
-        note "the kept credential names '$user', which is not this unit's"
+        note "the kept credential names '$(safe_name "$user")', which is not this unit's"
         note "  UID-1000 account (${want:-none}). Refusing: userconf.txt can"
         note "  only ever set that account's password and this store must not"
         note "  be able to set any other."
