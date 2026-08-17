@@ -323,22 +323,43 @@ def test_the_release_notes_identity_claim_is_backed_by_the_harness():
     after the thing behind it stops being checked.
 
     It says the second boot came up as the same machine as the first. Three
-    named checks make that true -- the machine-id in use matches the copy
-    kept OUTSIDE the overlay, boot1 really recorded a host key fingerprint,
-    and boot2's keys are identical to it -- and without all three the
-    sentence is a claim about nothing on a device that prints key material.
+    named guest checks make that true -- the machine-id in use matches the
+    copy kept OUTSIDE the overlay, boot1 really recorded that id where boot2
+    could read it, and boot2's id is identical to it -- and without all three
+    the sentence is a claim about nothing on a device that prints key
+    material. The fourth name is the host-side half, which owes nothing to a
+    check running inside the guest: systemd itself said the second boot was
+    not a first boot.
+
+    AND IT MAY NOT CLAIM A STABLE SSH FINGERPRINT. It used to, because this
+    unit used to copy its host keys onto the FAT partition. `ENABLE_SSH=0`
+    means the image ships with `ssh.service` disabled and never runs sshd, so
+    that was a fingerprint nobody could be shown, bought with private keys on
+    a partition every local account can read. A release note is the one place
+    this project's claims reach someone who cannot check them, and a
+    withdrawn feature it still advertises is the worst version of that.
     """
     body = step_named(build_steps(), ATTACH)["with"]["body"]
     assert "machine-id" in body, body
-    assert "host keys" in body, body
-    # The exposure is part of the claim, not a footnote: FAT has no
-    # permission bits and the note is the only place a person who flashes
-    # this image is told so.
+    # The exposure is part of the claim, not a footnote: the boot partition
+    # is vfat mounted with `defaults`, so everything on it is 0755 root:root,
+    # and the note is the only place a person who flashes this image is told.
     assert "otp-identity" in body, body
+    assert "world-readable" in body, body
+    assert "fingerprint" not in body.lower(), (
+        "the release note still advertises a stable SSH host key "
+        "fingerprint; the image disables sshd and keeps no host key outside "
+        "the overlay: " + body)
+    assert "copy of the host keys" not in body.lower(), body
+    # And it says so rather than going quiet, because "the identity is kept
+    # on the FAT partition" invites exactly the wrong guess about what else
+    # is up there.
+    assert "no SSH host key is written outside the overlay" in body, body
     harness = (REPO / "harness" / "img-boot.sh").read_text()
     for name in ("machine-id-persisted-outside-the-overlay",
-                 "ssh-host-key-fingerprint-recorded",
-                 "ssh-host-keys-identical-across-the-power-cycle"):
+                 "machine-id-recorded-for-the-next-boot",
+                 "machine-id-identical-across-the-power-cycle",
+                 "second-boot-is-not-a-first-boot"):
         assert name in harness, (
             f"the release note claims this unit keeps its identity across a "
             f"power cycle, but img-boot.sh no longer requires {name}")

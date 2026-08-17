@@ -745,6 +745,27 @@ systemctl stop getty@tty1.service 2>/dev/null || true
 # so it would last one boot and the next preset-all would put the socket
 # back. A mask is a symlink to /dev/null written into the image.
 #
+# AND IT STAYS, now that this appliance has decided not to run sshd at all.
+# That decision could be read as making the mask pointless, and it is the
+# other way round. image/build.sh sets ENABLE_SSH=0, so pi-gen leaves
+# ssh.service DISABLED -- but the ONE boot that is genuinely a machine's
+# first still runs `preset-all`, and preset-all enables ssh.service and
+# ssh.socket together. Measured, in run 32020772161: boot1 starts
+# ssh.service at 130s; boot2 does not contain the string ssh.service,
+# ssh.socket or OpenBSD anywhere and still reaches multi-user.target.
+# Persisting the machine-id is what ended it after the first boot; on the
+# first boot itself the socket is still what turns cancel-rename's reload
+# into `fatal: Cannot bind any address` and a `Failed with result` line on
+# the console of a key printer.
+#
+# NOT ALSO MASKING ssh.service, and that is a deliberate omission rather
+# than an oversight. It would take SSH off the machine as a side effect of a
+# bug fix -- the alternative refused above -- and it would leave ssh.socket
+# enabled on that first boot with nothing behind it. What the appliance does
+# NOT do is keep anything for sshd across the power cycle: no host keys go
+# outside the overlay (see device/persist-identity.sh), so the fingerprint of
+# that one first boot's sshd dies with it.
+#
 # Bare, with no `|| true`, like the networkd-wait-online mask above: this
 # runs in the pi-gen chroot against an image that has openssh-server in it,
 # and a mask that silently failed to apply is the defect it exists to stop.
@@ -1110,19 +1131,34 @@ OVERLAY
     # --- the identity the overlay would otherwise throw away --------------
     #
     # The userspace half of the exception the initramfs script above makes.
-    # Two jobs, and the split between them is about WHEN, not about taste:
+    # One job on each side, and the split between them is about WHEN, not
+    # about taste:
     #
     #   - the initrd RESTORES /etc/machine-id, because PID 1 reads that file
     #     before any unit exists;
-    #   - this unit RECORDS it, and looks after the SSH host keys, because
-    #     both need a mounted boot partition and the host keys need modes a
-    #     FAT filesystem cannot carry.
+    #   - this unit RECORDS it, because writing to the store needs a mounted
+    #     boot partition and nothing has one that early.
+    #
+    # THE SSH HOST KEYS ARE NOT PERSISTED, and this is where that used to
+    # happen. image/build.sh sets ENABLE_SSH=0, so the image ships with
+    # ssh.service disabled and this appliance does not run sshd; the only
+    # thing that ever started it was the first-boot `preset-all` the
+    # machine-id above ends. A fingerprint nobody can be shown is not worth
+    # private keys on a partition every local account can read.
     #
     # ONLY ON AN OVERLAY MACHINE, which is why it is inside this branch. A
-    # writable root keeps /etc/machine-id and /etc/ssh by itself; copying
-    # SSH private keys onto a FAT partition there would be exposure bought
-    # for nothing. The tier-2 Debian guest has no cmdline.txt, takes the
-    # other branch, and never gets this unit.
+    # writable root keeps /etc/machine-id by itself, so there is nothing here
+    # to do and nothing to put on the boot partition. The tier-2 Debian guest
+    # has no cmdline.txt, takes the other branch, and never gets this unit.
+    #
+    # ENABLED, not merely installed. WantedBy=sysinit.target in the unit is
+    # what the symlink comes from, and without the `enable` the file sits in
+    # /etc/systemd/system doing nothing -- an image that installs and enables
+    # nothing boots perfectly and loses its identity on every power cycle.
+    # tests/test_overlay_root.py drives these four lines with `install`
+    # shadowed and systemctl recording, for the reason the probe install
+    # above is driven that way: this block had no fast-tier coverage at all,
+    # and deleting it outright left the suite green.
     install -m 0755 "$REPO_DIR/device/persist-identity.sh" \
         "$PREFIX/persist-identity.sh"
     install -m 0644 "$REPO_DIR/device/systemd/otp-unit-identity.service" \
@@ -1146,10 +1182,11 @@ power-cycle is a full reset and nothing a session touched survives it.
 Settings still persist -- they live on the boot partition, which is outside
 the overlay.
 
-Three machine-wide changes were made as well -- two because an unbounded
-network wait held this image's boot open for its whole length, and one
-because the overlay made every boot look like a first boot (see the
-comments in this script):
+Four machine-wide changes were made as well -- two because an unbounded
+network wait held this image's boot open for its whole length, one because
+the overlay made every boot look like a first boot, and one because an
+online resize of a read-only root cannot work (see the comments in this
+script):
 
   * systemd-networkd-wait-online.service is MASKED. Nothing on this machine
     can wait for network-online.target through networkd any more, including
@@ -1162,20 +1199,34 @@ comments in this script):
     be: with the socket holding port 22, the reload that userconf-pi runs at
     the end of a seeded first boot left sshd unable to bind and
     RestartPreventExitStatus=255 kept it down for the rest of the boot. Undo
-    with `sudo systemctl unmask ssh.socket`. ssh.service itself is untouched.
+    with `sudo systemctl unmask ssh.socket`. ssh.service is NOT masked, and
+    it is not enabled either: the image is built with ENABLE_SSH=0, so it is
+    disabled and the only boot it runs on is a machine's very first, where
+    systemd's own preset-all switches it on. From the second boot onwards
+    this machine has no sshd.
+  * systemd-growfs-root.service is MASKED. systemd-fstab-generator hooks it
+    onto the root mount on every boot with no symlink for `disable` to
+    remove, and on an overlay root it can only fail -- `File system "/" not
+    backed by block device` -- so it printed a red line on the console of a
+    key printer on every boot of every image this project built. Nothing on
+    this machine can grow the root filesystem any more. Undo with
+    `sudo systemctl unmask systemd-growfs-root.service`.
 
-All three are deliberate on an air-gapped key printer and all three outlive
+All four are deliberate on an air-gapped key printer and all four outlive
 this script. tty1 is the front panel; the login prompt is on tty2 (Alt+F2).
 
-THIS UNIT'S IDENTITY IS ON THE BOOT PARTITION, in /boot/firmware/otp-identity:
-its machine-id and a copy of its SSH host keys. That is the one exception to
-"nothing survives a power cycle", and it exists because /etc is inside the
-overlay -- without it systemd calls every boot a first boot and the host keys
-change every time the power is pulled. FAT has no permission bits, so the
-private keys there are readable by anyone who can mount the card. That is the
-same set of people who can already read them off the root filesystem, which
-is not encrypted either, but it is worth knowing before you hand the card to
-anyone.
+THIS UNIT'S MACHINE-ID IS ON THE BOOT PARTITION, in
+/boot/firmware/otp-identity. That is the one exception to "nothing survives a
+power cycle", and it exists because /etc is inside the overlay -- without it
+systemd calls every boot a first boot, runs preset-all every time, and
+re-enables units nobody chose. Nothing else is kept there: no SSH host key
+leaves the overlay, because this machine does not run sshd.
+
+The boot partition is vfat mounted with `defaults`, so every file on it is
+0755 root:root -- readable by EVERY account on this machine, not only by
+someone holding the card. A machine-id is an identifier rather than a secret
+and no pad byte or password is written there, but that is worth knowing
+before you decide what else to put on that partition.
 
 To change the software afterwards, take `boot=overlay` back out of
 /boot/firmware/cmdline.txt, reboot, edit, and rerun this script.

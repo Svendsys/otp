@@ -1042,6 +1042,47 @@ per_boot_verdict() {
     printf 'IMG-NOTE %s targets-reached: %s\n' "$phase" \
         "$(grep -ohE 'Reached target [a-zA-Z0-9@:._-]+' "$CONSOLE_TXT" 2>/dev/null \
              | sort -u | tr '\n' ' ')"
+
+    # AND THE ONE TARGET WHOSE ABSENCE IS THE FINDING. This is systemd's own
+    # answer to "was this a first boot", read off the console, owing nothing
+    # to any check inside the guest and nothing to a file on the card.
+    #
+    # first-boot-complete.target is pulled in only when PID 1 decided this
+    # was a first boot -- which it does by reading /etc/machine-id, before a
+    # single unit exists. Until the machine-id was persisted, /etc was the
+    # overlay and that file said `uninitialized`, so EVERY boot of this
+    # appliance was a first boot: preset-all every time, ssh.socket enabled
+    # every time, the host keys regenerated every time.
+    #
+    # BOTH DIRECTIONS, and that is what makes the boot2 clause a check rather
+    # than a coincidence. An absence is equally satisfied by a console that
+    # was never written, by a boot that died in the initrd, and by a grep
+    # looking for a string systemd no longer prints. Boot1 requires the same
+    # string, from the same grep over the same kind of file, to be THERE --
+    # and boot1 genuinely is a first boot every run, because harness gets a
+    # fresh `xz -dc` of the image before it starts.
+    #
+    # REPORTED FIRST, GATED NOW: run 32020772161 printed both halves in the
+    # targets-reached note above -- boot1 with the target, boot2 without --
+    # which is the same promotion rule multi-user.target arrived under.
+    case "$phase" in
+        boot1)
+            if grep -qF "Reached target first-boot-complete.target" \
+                    "$CONSOLE_TXT" 2>/dev/null; then
+                printf 'IMG-CHECK %s first-boot-really-was-a-first-boot PASS\n' "$phase"
+            else
+                printf 'IMG-CHECK %s first-boot-really-was-a-first-boot FAIL\n' "$phase"
+            fi
+            ;;
+        boot2)
+            if grep -qF "Reached target first-boot-complete.target" \
+                    "$CONSOLE_TXT" 2>/dev/null; then
+                printf 'IMG-CHECK %s second-boot-is-not-a-first-boot FAIL\n' "$phase"
+            else
+                printf 'IMG-CHECK %s second-boot-is-not-a-first-boot PASS\n' "$phase"
+            fi
+            ;;
+    esac
 }
 
 # --- what the guest said about the overlay -------------------------------
@@ -1061,11 +1102,11 @@ network-wait-cannot-hold-the-boot-open \
 machine-id-persisted-outside-the-overlay"
 GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
 front-panel-survives-the-credential-apply diagnostic-sheet-renders \
-diagnostic-sheet-reaches-cups ssh-host-key-fingerprint-recorded"
+diagnostic-sheet-reaches-cups machine-id-recorded-for-the-next-boot"
 GUEST_CHECKS_BOOT2="root-writes-discarded-by-the-power-cycle \
 settings-survive-the-power-cycle userconf-unseeded-boot-skips-the-wizard \
 userconf-wizard-cannot-prompt userconf-malformed-seed-fails-fast \
-ssh-host-keys-identical-across-the-power-cycle"
+machine-id-identical-across-the-power-cycle"
 
 guest_gate() {
     local phase="$1" count counts passed total missing want name

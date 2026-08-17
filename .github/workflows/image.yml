@@ -475,15 +475,21 @@ jobs:
             first boot still had its front panel on tty1 afterwards, and
             neither boot was left waiting on a network this appliance does
             not have. The unit's IDENTITY survived the power-cycle as well:
-            the second boot was using the same machine-id as the first, and
-            its SSH host keys had the same fingerprints. That is a change --
-            `/etc` is inside the RAM overlay, so before this the machine-id
-            reverted to `uninitialized` every time, systemd read every boot
-            as a first boot, and the host keys were regenerated on each one.
-            The machine-id and a copy of the host keys are kept in
-            `/boot/firmware/otp-identity`, on the FAT partition, where
-            anyone who can mount the card can read them. That gate does not
-            exercise the OLED, the buttons or a printer -- see the header of
+            the second boot came up with the same machine-id the first boot
+            recorded, and systemd did not treat it as a first boot --
+            `first-boot-complete.target` is in the first boot's targets and
+            not in the second's. That is a change -- `/etc` is inside the RAM
+            overlay, so before this the machine-id reverted to
+            `uninitialized` every time and systemd read every boot as a first
+            boot, which is what kept re-enabling `ssh.socket` and
+            regenerating the host keys. The machine-id is kept in
+            `/boot/firmware/otp-identity`, on the FAT partition, which is
+            mounted with `defaults` -- so it is world-readable to every
+            account on the unit as well as to anyone who can mount the card.
+            Nothing else is kept there: this image does **not** run `sshd`
+            (`ENABLE_SSH=0`, so `ssh.service` is disabled), and no SSH host
+            key is written outside the overlay. That gate does not exercise
+            the OLED, the buttons or a printer -- see the header of
             `harness/img-boot.sh` for exactly what it does and does not
             prove.
 

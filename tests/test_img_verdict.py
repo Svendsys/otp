@@ -93,7 +93,13 @@ def multi_user_line(ts):
             f"- Multi-User System.")
 
 
-def kernel_lines(*, entries=1, last_ts="20.000000"):
+# The target PID 1 pulls in only when it decided this boot was a first boot,
+# spelled the way the targets-reached note in run 32020772161 caught it.
+FIRST_BOOT_TARGET = ("[   15.000000] systemd[1]: Reached target "
+                     "first-boot-complete.target - First Boot Complete.")
+
+
+def kernel_lines(*, entries=1, last_ts="20.000000", first_boot=False):
     lines = []
     for _ in range(entries):
         lines.append("[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x410fd034]")
@@ -107,6 +113,14 @@ def kernel_lines(*, entries=1, last_ts="20.000000"):
         f"[   {last_ts}] systemd[1]: Reached target sysinit.target - System Initialization.",
         multi_user_line(last_ts),
     ]
+    # boot1 REALLY IS a first boot, every run: the harness gives each run a
+    # fresh `xz -dc` of the image, so /etc/machine-id still says
+    # `uninitialized` when PID 1 reads it. boot2 must not be one, and that is
+    # the whole point of persisting the id -- so the healthy fixture carries
+    # the line in boot1 and withholds it in boot2, which is exactly what run
+    # 32020772161's two targets-reached notes showed.
+    if first_boot:
+        lines.append(FIRST_BOOT_TARGET)
     return lines
 
 
@@ -151,7 +165,8 @@ def forwarded(text, *, ident="python3", pid=412, ts="46.000000"):
 
 
 def healthy(phase):
-    return (kernel_lines() + [SUCCESS] + [journal_forwarded(phase)]
+    return (kernel_lines(first_boot=(phase == "boot1"))
+            + [SUCCESS] + [journal_forwarded(phase)]
             + guest_report(phase))
 
 
@@ -834,7 +849,8 @@ def test_the_hardware_rng_line_is_quoted_back_with_its_driver(tmp_path):
     "bcm2835-rng" to "g " on the very first real run -- losing the one
     detail the note exists to carry.
     """
-    plain = [ln for ln in kernel_lines() if "hwrng" not in ln.lower()]
+    plain = [ln for ln in kernel_lines(first_boot=True)
+             if "hwrng" not in ln.lower()]
     real = "[    2.401337] bcm2835-rng 3f104000.rng: hwrng registered"
     proc, verdict = run_verdict(
         tmp_path,
@@ -904,7 +920,7 @@ def test_every_target_reached_is_named_not_just_counted(tmp_path):
                "[  180.3] systemd[1]: Reached target multi-user.target - Multi-User System."]
     proc, verdict = run_verdict(
         tmp_path,
-        {"boot1": kernel_lines() + reached
+        {"boot1": kernel_lines(first_boot=True) + reached
                   + [SUCCESS, journal_forwarded("boot1")]
                   + guest_report("boot1")})
     note = next(ln for ln in verdict.splitlines() if "targets-reached" in ln)
@@ -913,6 +929,83 @@ def test_every_target_reached_is_named_not_just_counted(tmp_path):
     # One line, and each target once: this is a note somebody reads.
     assert note.count("multi-user.target") == 1, note
     assert proc.returncode == 0, proc.stderr
+
+
+# --- systemd's own answer to "was this a first boot" ----------------------
+#
+# The one piece of evidence for the machine-id fix that owes nothing to a
+# check inside the guest and nothing to a file on the card:
+# first-boot-complete.target is pulled in only when PID 1 read
+# /etc/machine-id and decided this was a first boot. It rode as a note in the
+# targets-reached line for one run -- 32020772161, present in boot1 and
+# absent in boot2 -- which is the promotion rule multi-user.target arrived
+# under.
+
+
+def test_a_second_boot_that_was_a_first_boot_all_over_again_fails(tmp_path):
+    """
+    THE regression this gate exists for. Every guest check can still be green
+    on a unit whose machine-id reverted: the store agrees with the live id
+    because otp-unit-identity.service refilled it a second earlier, the
+    overlay still discards, the settings still survive. The target says it
+    anyway, in PID 1's own words.
+    """
+    proc, verdict = run_verdict(
+        tmp_path,
+        {"boot1": healthy("boot1"),
+         "boot2": kernel_lines(first_boot=True) + [SUCCESS]
+                  + [journal_forwarded("boot2")] + guest_report("boot2")},
+        phases=("boot1", "boot2"))
+    assert "IMG-CHECK boot2 second-boot-is-not-a-first-boot FAIL" in verdict, \
+        verdict
+    assert proc.returncode == 1
+
+
+def test_a_second_boot_that_was_not_a_first_boot_passes(tmp_path):
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1"), "boot2": healthy("boot2")},
+        phases=("boot1", "boot2"))
+    assert "IMG-CHECK boot2 second-boot-is-not-a-first-boot PASS" in verdict, \
+        verdict
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_a_first_boot_that_never_completed_one_fails(tmp_path):
+    """
+    THE POSITIVE CONTROL for the clause above, and the reason boot2's absence
+    can mean anything. An absence is equally satisfied by a console nothing
+    was written to, by a boot that died in the initrd, and by a grep looking
+    for a string systemd stopped printing. boot1 is a first boot on every run
+    -- the harness gives each one a fresh `xz -dc` of the image -- so the same
+    string, found by the same grep over the same kind of file, has to be
+    THERE.
+    """
+    proc, verdict = run_verdict(tmp_path, {"boot1": kernel_lines() + [SUCCESS]
+                                           + [journal_forwarded("boot1")]
+                                           + guest_report("boot1")})
+    assert "IMG-CHECK boot1 first-boot-really-was-a-first-boot FAIL" in verdict, \
+        verdict
+    assert proc.returncode == 1
+
+
+def test_a_first_boot_that_did_complete_one_passes(tmp_path):
+    proc, verdict = run_verdict(tmp_path, {"boot1": healthy("boot1")})
+    assert "IMG-CHECK boot1 first-boot-really-was-a-first-boot PASS" in verdict, \
+        verdict
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_neither_first_boot_clause_is_asked_of_the_other_phase(tmp_path):
+    """
+    Two names, one per phase, and neither may appear in the other's verdict:
+    a phase-blind pair would demand the target of boot2 and refuse it of
+    boot1, and fail every run there has ever been.
+    """
+    _, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1"), "boot2": healthy("boot2")},
+        phases=("boot1", "boot2"))
+    assert "boot2 first-boot-really-was-a-first-boot" not in verdict, verdict
+    assert "boot1 second-boot-is-not-a-first-boot" not in verdict, verdict
 
 
 def test_a_boot_whose_crng_never_seeds_fails(tmp_path):

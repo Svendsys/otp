@@ -1627,10 +1627,10 @@ tests = [
 file = "harness/img-boot.sh"
 find = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
 front-panel-survives-the-credential-apply diagnostic-sheet-renders \
-diagnostic-sheet-reaches-cups ssh-host-key-fingerprint-recorded"'''
+diagnostic-sheet-reaches-cups machine-id-recorded-for-the-next-boot"'''
 replace = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
 diagnostic-sheet-renders diagnostic-sheet-reaches-cups \
-ssh-host-key-fingerprint-recorded"'''
+machine-id-recorded-for-the-next-boot"'''
 
 
 [[mutation]]
@@ -2195,63 +2195,85 @@ replace = 'if [ "$LIVE_MACHINE_ID" = "$KEPT_MACHINE_ID" ]; then'
 
 
 [[mutation]]
-name = "guest-host-key-fingerprint-not-read-back"
+name = "guest-machine-id-record-not-read-back"
 tier = "fast"
 guard = """
-Computing a fingerprint is not recording one. boot2 compares against a file
-on the boot partition, so boot1 has to say the file is THERE -- otherwise a
-write that never landed shows up two boots later as a mystery rather than as
-boot1's failure."""
+Reading an id is not recording one. boot2 compares against a file on the boot
+partition, so boot1 has to say the file is THERE -- otherwise a write that
+never landed shows up two boots later as a mystery rather than as boot1's
+failure."""
 tests = [
-  "tests/test_overlay_root.py::test_a_fingerprint_that_never_reached_the_card_fails",
+  "tests/test_overlay_root.py::test_an_id_that_never_reached_the_card_fails",
 ]
 [[mutation.edit]]
 file = "harness/img-guest-check.sh"
-find = '''          "$(if [ -n "$HOSTKEYS_NOW" ] && [ "$HOSTKEYS_READBACK" = "$HOSTKEYS_NOW" ]; \
+find = '''          "$(if [ -n "$LIVE_MACHINE_ID" ] \
+                && [ "$MACHINE_ID_READBACK" = "$LIVE_MACHINE_ID" ]; \
              then echo yes; else echo no; fi)" \'''
-replace = '''          "$(if [ -n "$HOSTKEYS_NOW" ]; then echo yes; else echo no; fi)" \'''
+replace = '''          "$(if [ -n "$LIVE_MACHINE_ID" ]; then echo yes; else echo no; fi)" \'''
 
 
 [[mutation]]
-name = "guest-host-key-fingerprint-recorded-with-no-keys"
+name = "guest-machine-id-recorded-with-no-id"
 tier = "fast"
 guard = """
-The other half of the positive control. A machine with no host keys computes
-an empty fingerprint, writes an empty record and reads it back -- empty
-equals empty -- and boot2's "identical" then means nothing at all."""
+The other half of the positive control. A machine whose /etc/machine-id
+cannot be read writes an empty record and reads it back -- empty equals empty
+-- and boot2's "identical" then means nothing at all."""
 tests = [
-  "tests/test_overlay_root.py::test_a_machine_with_no_host_keys_records_nothing_and_says_so",
+  "tests/test_overlay_root.py::test_a_machine_with_no_id_at_all_records_nothing_and_says_so",
 ]
 [[mutation.edit]]
 file = "harness/img-guest-check.sh"
-find = '''          "$(if [ -n "$HOSTKEYS_NOW" ] && [ "$HOSTKEYS_READBACK" = "$HOSTKEYS_NOW" ]; \
+find = '''          "$(if [ -n "$LIVE_MACHINE_ID" ] \
+                && [ "$MACHINE_ID_READBACK" = "$LIVE_MACHINE_ID" ]; \
              then echo yes; else echo no; fi)" \'''
-replace = '''          "$(if [ "$HOSTKEYS_READBACK" = "$HOSTKEYS_NOW" ]; then echo yes; else echo no; fi)" \'''
+replace = '''          "$(if [ "$MACHINE_ID_READBACK" = "$LIVE_MACHINE_ID" ]; then echo yes; else echo no; fi)" \'''
 
 
 [[mutation]]
-name = "guest-host-keys-two-absences-accepted"
+name = "guest-machine-id-two-absences-accepted"
 tier = "fast"
 guard = """
-THE reading this check has to be unable to make. Nothing recorded by boot1
-and no keys in boot2 compare equal as strings, so a machine that lost its
-host keys entirely would certify that they survived the power cycle -- which
-is exactly the machine this check was added for."""
-# The both-empty case only. test_a_second_boot_with_keys_but_no_record_fails
-# is deliberately NOT here: with keys this boot and nothing recorded the two
+THE reading this check has to be unable to make. Nothing recorded by boot1 and
+no readable id in boot2 compare equal as strings, so a machine that lost its
+identity entirely would certify that it survived the power cycle -- which is
+exactly the machine this check was added for."""
+# The both-empty case only. test_a_second_boot_with_an_id_but_no_record_fails
+# is deliberately NOT here: with an id this boot and nothing recorded the two
 # strings differ, so the bare comparison still says FAIL and that test stays
 # green under this edit. Listing it would put a name in the table that the
 # runner never sees go red, which is the shape of claim this file exists to
 # refuse.
 tests = [
-  "tests/test_overlay_root.py::test_two_absences_are_not_identical_host_keys",
+  "tests/test_overlay_root.py::test_two_absences_are_not_an_identical_machine_id",
 ]
 [[mutation.edit]]
 file = "harness/img-guest-check.sh"
-find = '''          "$(if [ -n "$HOSTKEYS_NOW" ] && [ -n "$HOSTKEYS_BOOT1" ] \
-                && [ "$HOSTKEYS_NOW" = "$HOSTKEYS_BOOT1" ]; \
+find = '''          "$(if [ -n "$LIVE_MACHINE_ID" ] && [ -n "$MACHINE_ID_BOOT1" ] \
+                && [ "$LIVE_MACHINE_ID" = "$MACHINE_ID_BOOT1" ]; \
              then echo yes; else echo no; fi)" \'''
-replace = '''          "$(if [ "$HOSTKEYS_NOW" = "$HOSTKEYS_BOOT1" ]; then echo yes; else echo no; fi)" \'''
+replace = '''          "$(if [ "$LIVE_MACHINE_ID" = "$MACHINE_ID_BOOT1" ]; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "guest-machine-id-boot2-reads-the-store-it-is-auditing"
+tier = "fast"
+guard = """
+THE HOLE THIS PAIR WAS ADDED FOR, and the reason boot2's record has to be a
+file the probe wrote rather than the store the shipped script writes.
+otp-unit-identity.service fills an empty store from the live id and exits 0,
+so on a card whose store was wiped between the boots the two agree perfectly
+and machine-id-persisted-outside-the-overlay reads PASS on a unit that is a
+different machine than it was an hour ago. Compare against the store here and
+boot2 is held against a value boot2 itself produced."""
+tests = [
+  "tests/test_overlay_root.py::test_an_id_regenerated_by_the_power_cycle_fails_the_second_boot",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''    MACHINE_ID_BOOT1=$(tr -d '\n\r' < "$MACHINE_ID_RECORD" 2>/dev/null)'''
+replace = '''    MACHINE_ID_BOOT1=$(tr -d '\n\r' < "$IDENTITY_STORE/machine-id" 2>/dev/null)'''
 
 
 [[mutation]]
@@ -2379,23 +2401,6 @@ replace = 'if false; then'
 
 
 [[mutation]]
-name = "identity-restored-host-key-left-readable"
-tier = "fast"
-guard = """
-FAT carries no permission bits, so a key copied back from the store arrives
-with whatever the vfat mount options give it. sshd REFUSES a private key it
-can read from a group or from the world, and says so only in its own log --
-which on this appliance is volatile."""
-tests = [
-  "tests/test_overlay_root.py::test_a_later_boot_puts_the_kept_host_keys_back",
-]
-[[mutation.edit]]
-file = "device/persist-identity.sh"
-find = '        install -m 0600 "$key" "$ETC_DIR/ssh/" || rc=1'
-replace = '        cp "$key" "$ETC_DIR/ssh/" || rc=1'
-
-
-[[mutation]]
 name = "identity-store-overwritten-by-a-boot-that-lost-it"
 tier = "fast"
 guard = """
@@ -2451,3 +2456,164 @@ tests = [
 file = "device/install.sh"
 find = "systemctl enable userconfig.service 2>/dev/null || true"
 replace = "systemctl status userconfig.service >/dev/null 2>&1 || true"
+
+
+# --- the userspace half of the identity, which had no fast tier at all ----
+#
+# Everything above drives persist-identity.sh and the guest probe directly.
+# None of it touched the four lines in device/install.sh that put the script
+# and its unit on the machine, or the unit's own content: deleting the
+# install block left the suite green, and so did gutting the unit down to
+# `ExecStart=/bin/true` with no [Install] section. An image that installs and
+# enables nothing boots, prints, and loses its identity on every power cycle,
+# and the only thing that would have said so is a sixteen-minute tier-3
+# build.
+
+[[mutation]]
+name = "install-identity-unit-never-installed"
+tier = "fast"
+guard = """
+The unit file has to reach /etc/systemd/system, or `systemctl enable` on the
+next line resolves an [Install] section out of a file that is not there.
+Deleting this line leaves a machine with the script in /opt/otp-unit and
+nothing that ever runs it."""
+tests = [
+  "tests/test_overlay_root.py::test_the_identity_script_and_its_unit_are_both_installed",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = '''    install -m 0644 "$REPO_DIR/device/systemd/otp-unit-identity.service" \
+        /etc/systemd/system/otp-unit-identity.service'''
+replace = '''    :'''
+
+
+[[mutation]]
+name = "install-identity-unit-never-enabled"
+tier = "fast"
+guard = """
+A unit file with no symlink pointing at it is a unit systemd never runs.
+Nothing else on this image enables it -- and the accident that used to,
+first-boot `preset-all`, is exactly what this unit exists to end, so it
+cannot be relied on to enable its own cure. The machine-id is then recorded
+by nothing and every boot is a first boot again, in silence."""
+tests = [
+  "tests/test_overlay_root.py::test_the_identity_unit_is_enabled_and_not_merely_dropped_in_place",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = "    systemctl enable otp-unit-identity.service"
+replace = "    systemctl status otp-unit-identity.service >/dev/null 2>&1 || true"
+
+
+[[mutation]]
+name = "identity-unit-wanted-by-nothing"
+tier = "fast"
+guard = """
+`systemctl enable` reads [Install] and makes the symlink it names. Without
+the section the enable is accepted, prints nothing an operator would notice,
+and creates no symlink at all -- the unit is installed, enabled by the
+letter, and pulled into no boot."""
+tests = [
+  "tests/test_overlay_root.py::test_the_unit_still_runs_before_anything_that_reads_the_identity",
+]
+[[mutation.edit]]
+file = "device/systemd/otp-unit-identity.service"
+find = """[Install]
+WantedBy=sysinit.target"""
+replace = """# [Install] removed"""
+
+
+[[mutation]]
+name = "identity-unit-runs-nothing"
+tier = "fast"
+guard = """
+A oneshot that succeeds without doing anything is the quietest possible
+version of this failure: the unit is enabled, active and green in
+`systemctl status`, and the store on the boot partition is never written."""
+tests = [
+  "tests/test_overlay_root.py::test_the_unit_still_runs_before_anything_that_reads_the_identity",
+]
+[[mutation.edit]]
+file = "device/systemd/otp-unit-identity.service"
+find = "ExecStart=/opt/otp-unit/persist-identity.sh"
+replace = "ExecStart=/bin/true"
+
+
+[[mutation]]
+name = "identity-host-keys-copied-to-the-boot-partition"
+tier = "fast"
+guard = """
+The owner's decision, held as a property of the shipped script rather than of
+the comment that announces it. This appliance does not run sshd -- ENABLE_SSH
+=0 leaves ssh.service disabled and only a genuine first boot's preset-all
+ever started it -- so a host key on the FAT partition buys a fingerprint
+nobody can be shown, at the price of a private key every local account can
+read. A negative assertion needs to be able to fail; this is what makes it."""
+tests = [
+  "tests/test_overlay_root.py::test_no_private_key_is_written_to_the_boot_partition",
+]
+[[mutation.edit]]
+file = "device/persist-identity.sh"
+find = """sync 2>/dev/null || true"""
+replace = """cp "$ETC_DIR"/ssh/ssh_host_*_key "$STORE/" 2>/dev/null || true
+sync 2>/dev/null || true"""
+
+
+# --- the two clauses systemd itself answers -------------------------------
+
+[[mutation]]
+name = "tier3-second-boot-may-be-a-first-boot"
+tier = "fast"
+guard = """
+The one piece of evidence for the machine-id fix that owes nothing to a check
+inside the guest: first-boot-complete.target is pulled in only when PID 1 read
+/etc/machine-id and decided this was a first boot. Every guest check can be
+green on a unit whose identity reverted -- the store agrees with the live id
+because otp-unit-identity.service refilled it seconds earlier -- and this is
+the line that says otherwise."""
+tests = [
+  "tests/test_img_verdict.py::test_a_second_boot_that_was_a_first_boot_all_over_again_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = """                printf 'IMG-CHECK %s second-boot-is-not-a-first-boot FAIL\\n' "$phase\""""
+replace = """                printf 'IMG-CHECK %s second-boot-is-not-a-first-boot PASS\\n' "$phase\""""
+
+
+[[mutation]]
+name = "tier3-first-boot-target-not-required"
+tier = "fast"
+guard = """
+The positive control boot2's absence rests on. An absence is equally
+satisfied by a console nothing was written to, by a boot that died in the
+initrd, and by a grep looking for a string systemd stopped printing. boot1 is
+a first boot on every run -- the harness gives each one a fresh `xz -dc` of
+the image -- so the same string, from the same grep over the same kind of
+file, has to be found there."""
+tests = [
+  "tests/test_img_verdict.py::test_a_first_boot_that_never_completed_one_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = """                printf 'IMG-CHECK %s first-boot-really-was-a-first-boot FAIL\\n' "$phase\""""
+replace = """                printf 'IMG-CHECK %s first-boot-really-was-a-first-boot PASS\\n' "$phase\""""
+
+
+[[mutation]]
+name = "install-growfs-mask-missing-from-the-summary"
+tier = "fast"
+guard = """
+The summary is what an operator gets instead of a diff, and it said "Three
+machine-wide changes" while the script made four -- the growfs mask landed in
+the same round as the ssh.socket mask and never reached the paragraph anyone
+reads. A permanent change with no undo instruction is the one that hurts six
+months later. The test derives the list from every `systemctl mask` in the
+file rather than restating it, which is why dropping a bullet is what fails
+rather than a stale number."""
+tests = [
+  "tests/test_overlay_root.py::test_the_closing_summary_names_what_was_done_to_the_whole_machine",
+]
+[[mutation.edit]]
+file = "device/install.sh"
+find = """  * systemd-growfs-root.service is MASKED."""
+replace = """  * systemd-growfs-root.service was left alone."""

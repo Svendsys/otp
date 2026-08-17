@@ -37,6 +37,7 @@ IMG_BOOT = REPO / "harness" / "img-boot.sh"
 GUEST_CHECK = REPO / "harness" / "img-guest-check.sh"
 IMGCHECK_UNIT = REPO / "device" / "systemd" / "otp-unit-imgcheck.service"
 IDENTITY_SH = REPO / "device" / "persist-identity.sh"
+IDENTITY_UNIT = REPO / "device" / "systemd" / "otp-unit-identity.service"
 
 # What a machine-id looks like once systemd has generated one: 32 lower-case
 # hex characters. Both ends of the persistence -- the initramfs restore and
@@ -501,7 +502,7 @@ def test_the_overlay_restores_the_machine_id_after_it_is_assembled(tmp_path):
         "writes to the initrd's root and the write is lost at pivot"
 
 
-# --- the userspace half: recording it, and the host keys ------------------
+# --- the userspace half: recording the machine-id -------------------------
 
 # persist-identity.sh asks findmnt the same question the guest probe does:
 # which filesystem contains the store. The stub answers out of the
@@ -517,12 +518,16 @@ esac
 
 
 def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
-                         etc_keys=("ed25519",), store_keys=(),
-                         store_src="/dev/mmcblk0p1"):
-    """Run the shipped script against a fake boot partition and a fake /etc."""
+                         etc_keys=("ed25519",), store_src="/dev/mmcblk0p1"):
+    """Run the shipped script against a fake boot partition and a fake /etc.
+
+    `etc_keys` puts real-looking host keys in the fake /etc/ssh. They are not
+    there to be persisted -- they are there so that "nothing copies them" is a
+    statement about a tree that HAD them.
+    """
     tmp_path.mkdir(parents=True, exist_ok=True)
     boot = tmp_path / "boot"
-    (boot / "otp-identity" / "ssh").mkdir(parents=True, exist_ok=True)
+    (boot / "otp-identity").mkdir(parents=True, exist_ok=True)
     root = tmp_path / "root"
     (root / "etc" / "ssh").mkdir(parents=True, exist_ok=True)
     if machine_id is not None:
@@ -532,11 +537,6 @@ def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
     for name in etc_keys:
         (root / "etc" / "ssh" / f"ssh_host_{name}_key").write_text(f"live {name}\n")
         (root / "etc" / "ssh" / f"ssh_host_{name}_key.pub").write_text(f"pub {name}\n")
-    for name in store_keys:
-        (boot / "otp-identity" / "ssh" / f"ssh_host_{name}_key").write_text(
-            f"stored {name}\n")
-        (boot / "otp-identity" / "ssh" / f"ssh_host_{name}_key.pub").write_text(
-            f"storedpub {name}\n")
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -556,20 +556,81 @@ def test_a_first_boot_records_what_it_has(tmp_path):
     proc, boot, _ = run_persist_identity(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert (boot / "otp-identity" / "machine-id").read_text().strip() == LIVE_ID
-    assert (boot / "otp-identity" / "ssh" / "ssh_host_ed25519_key").read_text() \
-        == "live ed25519\n"
 
 
-def test_a_later_boot_puts_the_kept_host_keys_back(tmp_path):
-    proc, _, root = run_persist_identity(
-        tmp_path, stored_id=LIVE_ID, store_keys=("ed25519",), etc_keys=())
+def test_no_private_key_is_written_to_the_boot_partition(tmp_path):
+    """
+    THE OWNER'S DECISION, held against the shipped script rather than against
+    the comment that announces it.
+
+    An earlier version of this script copied /etc/ssh/ssh_host_*_key onto the
+    FAT partition so the fingerprint of a key printer stopped changing on
+    every power cycle. image/build.sh sets ENABLE_SSH=0, so pi-gen leaves
+    ssh.service disabled and this appliance never runs sshd -- the only thing
+    that ever started it was the first-boot `preset-all` that persisting the
+    machine-id ends, and run 32020772161's boot2 console does not mention
+    ssh.service, ssh.socket or OpenBSD once while still reaching
+    multi-user.target. So the fingerprint was one nobody could ever be shown,
+    and the private keys were on a partition every local account can read.
+
+    The fake /etc/ssh here HAS keys. Nothing may end up on the card, and
+    nothing may create a place to put them either -- an empty `ssh` directory
+    on the boot partition is the next person's invitation.
+    """
+    proc, boot, _ = run_persist_identity(
+        tmp_path, etc_keys=("ed25519", "rsa", "ecdsa"))
     assert proc.returncode == 0, proc.stderr
-    restored = root / "etc" / "ssh" / "ssh_host_ed25519_key"
-    assert restored.read_text() == "stored ed25519\n"
-    # FAT cannot carry the mode, so it is re-applied here. sshd refuses a
-    # private key it can read from a group or from the world, and says so
-    # only in its own log.
-    assert oct(restored.stat().st_mode)[-3:] == "600", oct(restored.stat().st_mode)
+    landed = [p for p in boot.rglob("*") if p.is_file()]
+    assert [p.name for p in landed] == ["machine-id"], landed
+    assert not (boot / "otp-identity" / "ssh").exists(), \
+        "the store still has somewhere to put private keys"
+    # And the script must not be reading them either, which is the half a
+    # listing of the card cannot see. Comments are stripped first: the header
+    # names regenerate_ssh_host_keys.service precisely to explain why none of
+    # this is here any more.
+    code = "\n".join(line for line in IDENTITY_SH.read_text().splitlines()
+                     if not line.lstrip().startswith("#"))
+    for gone in ("ssh_host", "ssh-keygen", "SSH_STORE"):
+        assert gone not in code, \
+            f"persist-identity.sh still handles SSH host keys: {gone}"
+
+
+def test_the_unit_that_runs_it_no_longer_orders_itself_around_sshd():
+    """
+    The orderings that existed only for the host-key half, deleted with it.
+
+    `After=regenerate_ssh_host_keys.service` was there because that unit
+    opens with `rm -f /etc/ssh/ssh_host_*_key*` and would have deleted a
+    restore placed before it; `Before=ssh.service ssh.socket` named the
+    consumers; `ConditionPathIsReadWrite=/etc` covered the restore's writes.
+    Nothing here writes to /etc any more and no sshd starts on this image, so
+    all three are edges nobody can check -- and an unreachable ordering is
+    the shape of thing this repository keeps finding green.
+    """
+    unit = IDENTITY_UNIT.read_text()
+    body = "\n".join(line for line in unit.splitlines()
+                     if not line.startswith("#"))
+    for gone in ("After=regenerate_ssh_host_keys.service",
+                 "Before=ssh.service", "ConditionPathIsReadWrite="):
+        assert gone not in body, f"{gone} outlived the half it existed for"
+
+
+def test_the_unit_still_runs_before_anything_that_reads_the_identity():
+    """
+    The positive control for the test above: a unit stripped of every
+    ordering would satisfy it perfectly and record the machine-id after the
+    boot had finished using it.
+    """
+    unit = IDENTITY_UNIT.read_text()
+    for required in ("After=local-fs.target",
+                     "Before=sysinit.target",
+                     "ExecStart=/opt/otp-unit/persist-identity.sh",
+                     "Type=oneshot",
+                     "[Install]",
+                     "WantedBy=sysinit.target"):
+        assert required in unit, (
+            f"otp-unit-identity.service no longer says {required!r}, so the "
+            f"machine-id is recorded by nothing, late, or never")
 
 
 def test_a_store_inside_the_overlay_is_refused_rather_than_written(tmp_path):
@@ -596,6 +657,72 @@ def test_a_kept_machine_id_is_not_overwritten_by_a_boot_that_lost_it(tmp_path):
     proc, boot, _ = run_persist_identity(tmp_path, stored_id=other)
     assert proc.returncode != 0, proc.stdout
     assert (boot / "otp-identity" / "machine-id").read_text().strip() == other
+
+
+# --- and the four lines that put it on the machine ------------------------
+#
+# THE HALF NOTHING WATCHED. Everything above drives persist-identity.sh
+# directly, so the script could be perfect while install.sh never shipped it:
+# deleting the install block outright left the whole fast suite green, and so
+# did gutting the unit -- no [Install] section, no ExecStart worth running.
+# An image that installs and enables nothing boots, prints, and loses its
+# identity on every power cycle, and the only thing that would have said so
+# is a sixteen-minute tier-3 build. Same shape as the probe install above,
+# which is watched for the same reason.
+
+IDENTITY_INSTALL_BLOCK = (
+    '    install -m 0755 "$REPO_DIR/device/persist-identity.sh" \\',
+    "    systemctl enable otp-unit-identity.service")
+
+
+def run_identity_install(tmp_path, *, repo_dir=None):
+    """Run install.sh's identity-install block against a substitute REPO_DIR.
+
+    `install` is shadowed by a shell function rather than stubbed on PATH,
+    for the reason run_probe_install shadows it: the block writes into
+    /etc/systemd/system and /opt/otp-unit, and a test has no business
+    touching either.
+    """
+    block = slice_between(INSTALL.read_text(), *IDENTITY_INSTALL_BLOCK)
+    return run_block(block, tmp_path,
+                     preamble=("install() { printf 'INSTALL %s\\n' \"$*\"; }\n"
+                               f'REPO_DIR="{repo_dir or REPO}"\n'
+                               f'PREFIX="{tmp_path}/opt"'))
+
+
+def test_the_identity_script_and_its_unit_are_both_installed(tmp_path):
+    """
+    Both files, and to the paths the unit and the harness name. The unit's
+    ExecStart is an absolute /opt/otp-unit/persist-identity.sh, so a script
+    installed anywhere else is a unit that fails to start.
+    """
+    proc = run_identity_install(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    installed = [ln for ln in proc.stdout.splitlines() if ln.startswith("INSTALL")]
+    assert any("device/persist-identity.sh" in ln
+               and f"{tmp_path}/opt/persist-identity.sh" in ln
+               for ln in installed), installed
+    assert any("otp-unit-identity.service" in ln
+               and "/etc/systemd/system/otp-unit-identity.service" in ln
+               for ln in installed), installed
+
+
+def test_the_identity_unit_is_enabled_and_not_merely_dropped_in_place(tmp_path):
+    """
+    A unit file in /etc/systemd/system with no symlink pointing at it is a
+    unit systemd never runs. Nothing else on this image enables it -- and the
+    accident that used to, first-boot `preset-all`, is precisely what this
+    unit exists to end, so it cannot be relied on to enable its own cure.
+    """
+    proc = run_identity_install(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    calls = systemctl_calls(tmp_path)
+    assert "enable otp-unit-identity.service" in calls, calls
+    # And after the unit file lands, or systemd enables a file it has not
+    # read: `enable` resolves [Install] out of the unit on disk.
+    assert "daemon-reload" in calls, calls
+    assert calls.index("daemon-reload") < calls.index(
+        "enable otp-unit-identity.service"), calls
 
 
 # --- ssh.socket, which turned a documented reload into a dead sshd --------
@@ -1207,12 +1334,21 @@ def test_cloud_init_is_switched_off_on_an_air_gapped_printer(tmp_path):
 
 def test_the_closing_summary_names_what_was_done_to_the_whole_machine():
     """
-    The documented path is "run this on a Pi you already have", and two of
-    the steps above are not confined to the unit: a shared systemd unit is
-    MASKED, and cloud-init is switched off permanently. Both outlive this
-    script, both change how software installed later behaves, and neither
-    was in the summary the operator reads at the end -- which listed the
-    overlay and stopped, reading as though nothing else had been touched.
+    The documented path is "run this on a Pi you already have", and four of
+    the steps above are not confined to the unit: three shared systemd units
+    are MASKED and cloud-init is switched off permanently. All four outlive
+    this script, all four change how software installed later behaves, and
+    none of them was in the summary the operator reads at the end -- which
+    listed the overlay and stopped, reading as though nothing else had been
+    touched.
+
+    EVERY MASK THIS SCRIPT ISSUES, and that is what the list is derived from
+    rather than restated. The summary said "three machine-wide changes" while
+    the script made four: systemd-growfs-root.service was masked in the same
+    round that added the ssh.socket mask and never reached the paragraph an
+    operator reads, so the one persistent change with no undo instruction was
+    the newest one. A hand-written list is a list that goes stale exactly
+    that way.
 
     The summary is what someone gets instead of a diff. Undo instructions
     are required with them: a machine-wide change nobody can find again is
@@ -1221,15 +1357,27 @@ def test_the_closing_summary_names_what_was_done_to_the_whole_machine():
     """
     install = INSTALL.read_text()
     summary = install[install.index('log "Done. Reboot to start the unit."'):]
-    for claim in ("systemd-networkd-wait-online.service", "cloud-init"):
-        assert claim in summary, (
-            f"install.sh changes {claim} on any machine it touches and the "
+    body = install[:install.index('log "Done. Reboot to start the unit."')]
+    # Indentation allowed: the growfs mask is inside the overlay branch, and
+    # a pattern anchored at column one is exactly how it went unlisted.
+    masked = sorted(set(re.findall(r"^[ \t]*systemctl mask (\S+)$", body, re.M)))
+    assert len(masked) == 3, masked
+    for unit in masked:
+        assert unit in summary, (
+            f"install.sh masks {unit} on any machine it touches and the "
             f"closing summary does not mention it")
-    for undo in ("unmask systemd-networkd-wait-online.service",
-                 "/etc/cloud/cloud-init.disabled"):
-        assert undo in summary, (
+        assert f"unmask {unit}" in summary, (
             f"the summary names a permanent change without telling the "
-            f"operator how to reverse it: {undo}")
+            f"operator how to reverse it: unmask {unit}")
+    assert "cloud-init" in summary, (
+        "install.sh switches cloud-init off permanently and the closing "
+        "summary does not mention it")
+    assert "/etc/cloud/cloud-init.disabled" in summary, (
+        "the summary names a permanent change without telling the operator "
+        "how to reverse it: /etc/cloud/cloud-init.disabled")
+    # And the count in the prose, which is the half a list of names cannot
+    # keep honest -- it said "Three" while naming three of four.
+    assert "Four machine-wide changes" in summary, summary
 
 
 GETTY_BLOCK = ("install -d /etc/systemd/system/getty@tty1.service.d",
@@ -1817,18 +1965,8 @@ IDENTITY_BLOCK = (
     # Through the closing `fi` of the boot2 branch, or the slice is a shell
     # fragment that will not parse -- which is a syntax error rather than a
     # test, and would have been one either way.
-    '"boot1: ${HOSTKEYS_BOOT1:-nothing recorded} | '
-    'boot2: ${HOSTKEYS_NOW:-NO HOST KEYS AT ALL}"\nfi')
-
-# Fingerprints by CONTENT. The checks under test depend on exactly one
-# property of ssh-keygen -lf: the same bytes give the same fingerprint and
-# different bytes give a different one. A stub that answered a constant would
-# make "the keys are identical" true of two different keys, which is the
-# claim being tested.
-SSH_KEYGEN_STUB = """#!/bin/sh
-[ "$1" = "-lf" ] || { echo "stub: unexpected ssh-keygen $*" >&2; exit 64; }
-printf '256 SHA256:%s root@otp-unit (ED25519)\\n' "$(cksum < "$2" | cut -d' ' -f1)"
-"""
+    '"boot1: $(short_id "$MACHINE_ID_BOOT1") | '
+    'boot2: $(short_id "$LIVE_MACHINE_ID")"\nfi')
 
 # The probe asks findmnt exactly one thing here: which filesystem contains the
 # identity store. Anything else is a stub being asked a question nobody wrote
@@ -1840,20 +1978,22 @@ case "$*" in
 esac
 """
 
+# A different machine's id, and the one every "this is not the same box"
+# fixture below uses. 32 hex characters, like the real thing.
+OTHER_ID = "ffffffffffffffffffffffffffffffff"
+
+
 def run_identity(tmp_path, *, phase="boot1", live_id=LIVE_ID, stored_id=LIVE_ID,
-                 host_keys=("ed25519-a", "rsa-a"), recorded=None,
-                 store_src="/dev/mmcblk0p1", boot_dir="boot",
+                 recorded=None, store_src="/dev/mmcblk0p1", boot_dir="boot",
                  make_boot=True, root_source="overlay"):
     """Run the shipped identity checks against a tree this test builds.
 
     Everything the block reads is a path it takes from a variable -- $BOOTDIR,
-    $ETC_MACHINE_ID, $ETC_SSH -- so the SHIPPED lines run here rather than a
-    copy of them.
+    $ETC_MACHINE_ID -- so the SHIPPED lines run here rather than a copy of
+    them.
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     boot = tmp_path / boot_dir
-    etc_ssh = tmp_path / "etc-ssh"
-    etc_ssh.mkdir(exist_ok=True)
     machine_id = tmp_path / "machine-id"
     machine_id.write_text(live_id + "\n") if live_id is not None else None
     if make_boot:
@@ -1862,14 +2002,11 @@ def run_identity(tmp_path, *, phase="boot1", live_id=LIVE_ID, stored_id=LIVE_ID,
         if stored_id is not None:
             (boot / "otp-identity" / "machine-id").write_text(stored_id + "\n")
         if recorded is not None:
-            (boot / "otp-imgcheck-hostkeys").write_text(recorded + "\n")
-    for name in host_keys:
-        (etc_ssh / f"ssh_host_{name}_key.pub").write_text(f"ssh-{name} AAAA\n")
+            (boot / "otp-imgcheck-machine-id").write_text(recorded + "\n")
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    for name, body in (("ssh-keygen", SSH_KEYGEN_STUB),
-                       ("findmnt", FINDMNT_STUB)):
+    for name, body in (("findmnt", FINDMNT_STUB),):
         (bin_dir / name).write_text(body)
         (bin_dir / name).chmod(0o755)
 
@@ -1879,7 +2016,6 @@ def run_identity(tmp_path, *, phase="boot1", live_id=LIVE_ID, stored_id=LIVE_ID,
         f'PHASE="{phase}"\nPASS=0\nTOTAL=0\n'
         f'BOOTDIR="{boot}"\n'
         f'ETC_MACHINE_ID="{machine_id}"\n'
-        f'ETC_SSH="{etc_ssh}"\n'
         f'ROOT_SOURCE="{root_source}"\n'
         + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
         + slice_between(GUEST_CHECK.read_text(), *IDENTITY_BLOCK) + "\n")
@@ -1890,19 +2026,6 @@ def run_identity(tmp_path, *, phase="boot1", live_id=LIVE_ID, stored_id=LIVE_ID,
     return proc, boot
 
 
-def fingerprints_of(*names) -> str:
-    """What the stub above answers for a set of host keys, in the probe's
-    order -- sorted, space separated. Computed by running the same `cksum`
-    the stub runs, rather than pasted, so a fixture cannot drift away from
-    the stub and quietly turn a comparison into a mismatch nobody meant."""
-    out = []
-    for name in names:
-        proc = subprocess.run(["cksum"], input=f"ssh-{name} AAAA\n",
-                              capture_output=True, text=True)
-        out.append("SHA256:" + proc.stdout.split()[0])
-    return " ".join(sorted(out))
-
-
 def test_a_boot_that_kept_its_identity_says_so(tmp_path):
     # The positive control for everything below: every other test here
     # asserts a FAIL, and a block that failed unconditionally would satisfy
@@ -1911,79 +2034,102 @@ def test_a_boot_that_kept_its_identity_says_so(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert results(proc) == {
         "machine-id-persisted-outside-the-overlay": "PASS",
-        "ssh-host-key-fingerprint-recorded": "PASS"}, proc.stdout
+        "machine-id-recorded-for-the-next-boot": "PASS"}, proc.stdout
 
 
-def test_the_first_boot_writes_the_fingerprint_where_the_second_can_read_it(tmp_path):
+def test_the_first_boot_writes_its_id_where_the_second_can_read_it(tmp_path):
     """The record is the whole mechanism boot2's check rests on, so boot1 has
-    to leave it on the boot partition rather than merely compute it."""
+    to leave it on the boot partition rather than merely read it."""
     proc, boot = run_identity(tmp_path)
-    written = (boot / "otp-imgcheck-hostkeys").read_text().strip()
-    assert written == fingerprints_of("ed25519-a", "rsa-a"), written
-    assert results(proc)["ssh-host-key-fingerprint-recorded"] == "PASS"
+    written = (boot / "otp-imgcheck-machine-id").read_text().strip()
+    assert written == LIVE_ID, written
+    assert results(proc)["machine-id-recorded-for-the-next-boot"] == "PASS"
 
 
-def test_a_machine_with_no_host_keys_records_nothing_and_says_so(tmp_path):
+def test_the_record_is_not_the_store_the_shipped_script_writes(tmp_path):
+    """
+    THE FINDING this pair was added for, stated as a property of the file
+    names rather than of a comment.
+
+    `machine-id-persisted-outside-the-overlay` compares the live id with
+    /boot/firmware/otp-identity/machine-id -- and otp-unit-identity.service
+    has already filled that in from the live id by the time the probe looks,
+    so on a card whose store was wiped the two agree because one was copied
+    from the other seconds earlier. The record has to be a DIFFERENT file,
+    written by the probe, or boot2 is held against a value boot2 produced.
+    """
+    _, boot = run_identity(tmp_path)
+    record = boot / "otp-imgcheck-machine-id"
+    store = boot / "otp-identity" / "machine-id"
+    assert record.exists() and store.exists()
+    assert record != store, "the probe records into the store it is auditing"
+
+
+def test_a_machine_with_no_id_at_all_records_nothing_and_says_so(tmp_path):
     """
     The positive control has to be able to fail, or boot2's "identical"
-    means nothing. A machine with no host keys at all computes an empty
-    fingerprint, writes an empty record, and reads it back -- empty equals
-    empty, which is exactly the shape of agreement this check exists to
-    refuse.
+    means nothing. A machine with no readable /etc/machine-id writes an empty
+    record and reads it back -- empty equals empty, which is exactly the shape
+    of agreement this check exists to refuse.
     """
-    proc, _ = run_identity(tmp_path, host_keys=())
-    assert results(proc)["ssh-host-key-fingerprint-recorded"] == "FAIL", proc.stdout
+    proc, _ = run_identity(tmp_path, live_id=None)
+    assert results(proc)["machine-id-recorded-for-the-next-boot"] == "FAIL", \
+        proc.stdout
 
 
-def test_a_fingerprint_that_never_reached_the_card_fails(tmp_path):
+def test_an_id_that_never_reached_the_card_fails(tmp_path):
     """
-    Computing it is not recording it. With no writable boot directory the
+    Reading it is not recording it. With no writable boot directory the
     record never lands, and boot2 would have nothing to compare against --
     which must be boot1's failure rather than boot2's mystery.
     """
     proc, _ = run_identity(tmp_path, make_boot=False)
-    assert results(proc)["ssh-host-key-fingerprint-recorded"] == "FAIL", proc.stdout
+    assert results(proc)["machine-id-recorded-for-the-next-boot"] == "FAIL", \
+        proc.stdout
 
 
-def test_the_second_boot_accepts_the_same_keys(tmp_path):
-    proc, _ = run_identity(
-        tmp_path, phase="boot2",
-        recorded=fingerprints_of("ed25519-a", "rsa-a"))
-    assert results(proc)["ssh-host-keys-identical-across-the-power-cycle"] \
+def test_the_second_boot_accepts_the_same_machine(tmp_path):
+    proc, _ = run_identity(tmp_path, phase="boot2", recorded=LIVE_ID)
+    assert results(proc)["machine-id-identical-across-the-power-cycle"] \
         == "PASS", proc.stdout
 
 
-def test_host_keys_regenerated_by_the_power_cycle_fail_the_second_boot(tmp_path):
+def test_an_id_regenerated_by_the_power_cycle_fails_the_second_boot(tmp_path):
     """
-    The property, stated as its own negation. Before the machine-id was
-    persisted this was the machine: every boot was a first boot, and
-    regenerate_ssh_host_keys.service opens with
-    `rm -f /etc/ssh/ssh_host_*_key*`.
+    THE FAILURE THE OLD CHECK COULD NOT SEE, and the reason this pair exists.
+
+    The FAT store was truncated or deleted between the boots, so systemd
+    generated a fresh id and otp-unit-identity.service wrote THAT into the
+    store: the live id and the store agree perfectly, and
+    machine-id-persisted-outside-the-overlay is green on a unit that is a
+    different machine than it was an hour ago. The record boot1 left is the
+    only thing that disagrees -- so both checks are asked of the same
+    fixture here, and exactly one of them is allowed to be satisfied.
     """
-    proc, _ = run_identity(
-        tmp_path, phase="boot2", host_keys=("ed25519-b", "rsa-b"),
-        recorded=fingerprints_of("ed25519-a", "rsa-a"))
-    assert results(proc)["ssh-host-keys-identical-across-the-power-cycle"] \
+    proc, _ = run_identity(tmp_path, phase="boot2", live_id=OTHER_ID,
+                           stored_id=OTHER_ID, recorded=LIVE_ID)
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "PASS", "the fixture no longer reproduces the hole: " + proc.stdout
+    assert results(proc)["machine-id-identical-across-the-power-cycle"] \
         == "FAIL", proc.stdout
 
 
-def test_two_absences_are_not_identical_host_keys(tmp_path):
+def test_two_absences_are_not_an_identical_machine_id(tmp_path):
     """
-    THE reading this check has to be unable to make. No keys in boot2 and
+    THE reading this check has to be unable to make. No id in boot2 and
     nothing recorded by boot1 compare equal as strings, and a machine that
-    lost its host keys entirely would then certify that they survived the
-    power cycle.
+    lost its identity entirely would then certify that it kept it.
     """
-    proc, _ = run_identity(tmp_path, phase="boot2", host_keys=(), recorded=None)
-    assert results(proc)["ssh-host-keys-identical-across-the-power-cycle"] \
+    proc, _ = run_identity(tmp_path, phase="boot2", live_id=None, recorded=None)
+    assert results(proc)["machine-id-identical-across-the-power-cycle"] \
         == "FAIL", proc.stdout
 
 
-def test_a_second_boot_with_keys_but_no_record_fails(tmp_path):
+def test_a_second_boot_with_an_id_but_no_record_fails(tmp_path):
     """Half of that absence on its own: boot1 never recorded anything, so
-    there is nothing this boot's keys can be identical TO."""
+    there is nothing this boot's id can be identical TO."""
     proc, _ = run_identity(tmp_path, phase="boot2", recorded=None)
-    assert results(proc)["ssh-host-keys-identical-across-the-power-cycle"] \
+    assert results(proc)["machine-id-identical-across-the-power-cycle"] \
         == "FAIL", proc.stdout
 
 

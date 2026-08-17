@@ -53,14 +53,12 @@
 set -uo pipefail
 
 BOOTDIR=/boot/firmware
-# The two halves of this machine's identity, named rather than spelled inline
-# where they are read. Same reason $BOOTDIR is a variable: the checks over
-# them are sliced out and run against a tree tests/test_overlay_root.py
-# builds, and a hardcoded /etc would leave them exercised only by a real
-# emulated boot -- which is the one place a check that has stopped checking
-# cannot be noticed cheaply.
+# This machine's identity, named rather than spelled inline where it is read.
+# Same reason $BOOTDIR is a variable: the checks over it are sliced out and
+# run against a tree tests/test_overlay_root.py builds, and a hardcoded /etc
+# would leave them exercised only by a real emulated boot -- which is the one
+# place a check that has stopped checking cannot be noticed cheaply.
 ETC_MACHINE_ID=/etc/machine-id
-ETC_SSH=/etc/ssh
 
 # THE PHASE, and every write in this file hangs off it.
 #
@@ -103,8 +101,8 @@ case "$PHASE" in
         echo "OTP-GUEST refusing to run: the kernel command line carries no" >&2
         echo "  otp.imgcheck=boot1 or otp.imgcheck=boot2 token (phase read:" >&2
         echo "  '${PHASE:-none}'). This probe writes a sentinel to /, a" >&2
-        echo "  marker page count into $BOOTDIR/otp-unit.conf and an SSH" >&2
-        echo "  host key fingerprint into $BOOTDIR/otp-imgcheck-hostkeys --" >&2
+        echo "  marker page count into $BOOTDIR/otp-unit.conf and this" >&2
+        echo "  machine's id into $BOOTDIR/otp-imgcheck-machine-id --" >&2
         echo "  the last two outside the read-only overlay, where the first" >&2
         echo "  would overwrite the operator's settings for good. It runs" >&2
         echo "  only inside the emulated boot harness/img-boot.sh sets up." >&2
@@ -370,9 +368,9 @@ check boot-partition-separate \
 # regenerate_ssh_host_keys.service deleting and remaking the host keys again.
 # Run 72's console carries all of it, in both boots. device/install.sh answers
 # it with a machine-id restored by the initramfs and an
-# otp-unit-identity.service that keeps both that and the SSH host keys on the
-# boot partition; these are the checks that say whether any of that happened
-# on the machine rather than in a comment.
+# otp-unit-identity.service that records it on the boot partition; these are
+# the checks that say whether any of that happened on the machine rather than
+# in a comment.
 IDENTITY_STORE="$BOOTDIR/otp-identity"
 LIVE_MACHINE_ID=$(tr -d '\n\r' < "$ETC_MACHINE_ID" 2>/dev/null)
 KEPT_MACHINE_ID=$(tr -d '\n\r' < "$IDENTITY_STORE/machine-id" 2>/dev/null)
@@ -403,62 +401,76 @@ fi
 # machine-id is this machine's identifier and this console is uploaded as a
 # CI artifact; eight is enough to compare two boots by eye and not enough to
 # be the value.
+#
+# WHAT THIS CHECK CANNOT SEE, said here rather than left to be discovered:
+# it compares the live id with the STORE, and otp-unit-identity.service has
+# already run by the time it does. On a boot where the store was empty, that
+# unit wrote this boot's id into it and exited 0 -- so the two agree because
+# one was copied from the other a second ago, not because anything survived
+# a power cycle. Measured by running the shipped script against an empty
+# store: rc=0, store silently populated, no complaint. The pair below is
+# what tells "restored" from "recorded fresh this boot", and it is the same
+# two-absence hole the host-key checks used to close on their own side.
 check machine-id-persisted-outside-the-overlay \
       "$(if [ "$MACHINE_ID_KEPT" = yes ] && [ "$STORE_SRC" != "?" ] \
             && [ -n "$ROOT_SOURCE" ] \
             && [ "$STORE_SRC" != "$ROOT_SOURCE" ]; then echo yes; else echo no; fi)" \
       "$ETC_MACHINE_ID=${LIVE_MACHINE_ID:0:8}... stored=${KEPT_MACHINE_ID:0:8}... match=$MACHINE_ID_KEPT store=$IDENTITY_STORE src=$STORE_SRC root-src=${ROOT_SOURCE:-?}"
 
-# THE FINGERPRINTS, sorted, so the same set of keys cannot read as two
-# different sets because ssh-keygen was handed them in a different order.
-# Public by construction -- a fingerprint is what an SSH client prints at
-# you -- so unlike the machine-id these go into the detail in full, and the
-# two boots can be compared from the verdict alone.
-host_key_fingerprints() {
-    local pub
-    for pub in "$ETC_SSH"/ssh_host_*_key.pub; do
-        [ -f "$pub" ] || continue
-        ssh-keygen -lf "$pub" 2>/dev/null | awk '{print $2}'
-    done | sort | tr '\n' ' '
+# THE SAME CARD, POWERED OFF AND ON, STILL THE SAME MACHINE.
+#
+# A SECOND FILE, written by this probe and not by the thing under test. The
+# store above is otp-unit-identity.service's own output, so a boot that
+# truncated or deleted it is a boot that fills it in again from the id
+# systemd just generated -- and every boot is a first boot again while
+# `machine-id-persisted-outside-the-overlay` goes on reading PASS. This
+# record is written once, in boot1, and compared in boot2, so the value
+# boot2 is held against is one that predates boot2's own identity entirely.
+#
+# The detail is truncated to eight characters for the reason the check above
+# gives; the record on the card carries the full id, on the same partition
+# the store already keeps it on, so it is no new exposure.
+MACHINE_ID_RECORD="$BOOTDIR/otp-imgcheck-machine-id"
+
+# Eight characters or the word `nothing`, so an absent value cannot read as
+# the "..." of a present one.
+short_id() {
+    if [ -n "$1" ]; then printf '%s...' "${1:0:8}"; else printf 'nothing'; fi
 }
-HOSTKEY_RECORD="$BOOTDIR/otp-imgcheck-hostkeys"
-HOSTKEYS_NOW=$(host_key_fingerprints)
-HOSTKEYS_NOW=${HOSTKEYS_NOW% }
 
 if [ "$PHASE" = "boot1" ]; then
     # THE POSITIVE CONTROL, and it is the reason boot2's check can mean
-    # anything. "the fingerprints are identical" is satisfied perfectly by a
-    # machine with no host keys at all in either boot, by an ssh-keygen that
-    # is not installed, and by a record file that was never written -- three
-    # ways for the property to read green while nothing is being kept. So
-    # boot1 states, out of the same function and the same file boot2 will
-    # read: there WERE keys, a fingerprint was computed from them, and it
-    # came back off the boot partition byte for byte.
-    printf '%s\n' "$HOSTKEYS_NOW" > "$HOSTKEY_RECORD" 2>/dev/null || true
-    HOSTKEYS_READBACK=$(tr -d '\n\r' < "$HOSTKEY_RECORD" 2>/dev/null)
-    check ssh-host-key-fingerprint-recorded \
-          "$(if [ -n "$HOSTKEYS_NOW" ] && [ "$HOSTKEYS_READBACK" = "$HOSTKEYS_NOW" ]; \
+    # anything. "the two ids are identical" is satisfied perfectly by a
+    # machine with no readable /etc/machine-id in either boot and by a record
+    # file that was never written -- two ways for the property to read green
+    # while nothing is being kept. So boot1 states, out of the same variable
+    # and the same file boot2 will read: there WAS an id, and it came back
+    # off the boot partition byte for byte.
+    printf '%s\n' "$LIVE_MACHINE_ID" > "$MACHINE_ID_RECORD" 2>/dev/null || true
+    MACHINE_ID_READBACK=$(tr -d '\n\r' < "$MACHINE_ID_RECORD" 2>/dev/null)
+    check machine-id-recorded-for-the-next-boot \
+          "$(if [ -n "$LIVE_MACHINE_ID" ] \
+                && [ "$MACHINE_ID_READBACK" = "$LIVE_MACHINE_ID" ]; \
              then echo yes; else echo no; fi)" \
-          "this boot: ${HOSTKEYS_NOW:-NO HOST KEYS AT ALL} | read back from $HOSTKEY_RECORD: ${HOSTKEYS_READBACK:-nothing}"
+          "this boot: $(short_id "$LIVE_MACHINE_ID") | read back from $MACHINE_ID_RECORD: $(short_id "$MACHINE_ID_READBACK")"
 fi
 
 if [ "$PHASE" = "boot2" ]; then
-    # THE PROPERTY: the same card, powered off and on, still answers with the
-    # same host keys. Before the machine-id was persisted this was false by
-    # construction -- every boot was a first boot, and
-    # regenerate_ssh_host_keys.service starts with
-    # `rm -f /etc/ssh/ssh_host_*_key*`.
+    # THE PROPERTY: the second boot is the same machine as the first. Before
+    # the machine-id was persisted this was false by construction -- /etc is
+    # inside the overlay, pi-gen ships /etc/machine-id holding
+    # `uninitialized`, and systemd generated a new one on every power cycle.
     #
     # BOTH SIDES ARE REQUIRED TO BE NON-EMPTY, which is the clause that makes
     # this a statement rather than a tautology: two absences are equal, and
-    # `ssh-host-key-fingerprint-recorded` in boot1 is what rules the recorded
-    # side of that out with the same fixture and the same function.
-    HOSTKEYS_BOOT1=$(tr -d '\n\r' < "$HOSTKEY_RECORD" 2>/dev/null)
-    check ssh-host-keys-identical-across-the-power-cycle \
-          "$(if [ -n "$HOSTKEYS_NOW" ] && [ -n "$HOSTKEYS_BOOT1" ] \
-                && [ "$HOSTKEYS_NOW" = "$HOSTKEYS_BOOT1" ]; \
+    # `machine-id-recorded-for-the-next-boot` in boot1 is what rules the
+    # recorded side of that out with the same fixture and the same variable.
+    MACHINE_ID_BOOT1=$(tr -d '\n\r' < "$MACHINE_ID_RECORD" 2>/dev/null)
+    check machine-id-identical-across-the-power-cycle \
+          "$(if [ -n "$LIVE_MACHINE_ID" ] && [ -n "$MACHINE_ID_BOOT1" ] \
+                && [ "$LIVE_MACHINE_ID" = "$MACHINE_ID_BOOT1" ]; \
              then echo yes; else echo no; fi)" \
-          "boot1: ${HOSTKEYS_BOOT1:-nothing recorded} | boot2: ${HOSTKEYS_NOW:-NO HOST KEYS AT ALL}"
+          "boot1: $(short_id "$MACHINE_ID_BOOT1") | boot2: $(short_id "$LIVE_MACHINE_ID")"
 fi
 
 if [ "$PHASE" = "boot2" ]; then

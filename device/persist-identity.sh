@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 #
-# Keep this unit's identity across the power-cycle.
+# Keep this unit's machine-id across the power-cycle.
 #
-# Run once per boot by otp-unit-identity.service, before anything that
-# reads either thing it looks after. Installed to /opt/otp-unit by
-# device/install.sh, and only on a machine whose root is the read-only
-# overlay -- on a writable root /etc keeps both of these by itself and
-# copying SSH private keys onto a FAT partition would buy nothing.
+# Run once per boot by otp-unit-identity.service, before anything that reads
+# it. Installed to /opt/otp-unit by device/install.sh, and only on a machine
+# whose root is the read-only overlay -- on a writable root /etc keeps this
+# by itself.
 #
 # WHAT IS PERSISTED, and nothing else:
 #
@@ -15,23 +14,34 @@
 #                   systemd reads that word as "first boot" -- preset-all
 #                   on every boot, ssh.socket re-enabled on every boot,
 #                   regenerate_ssh_host_keys.service on every boot.
-#   ssh host keys   because that last one deletes and regenerates them
-#                   (ExecStartPre=/usr/bin/rm -f /etc/ssh/ssh_host_*_key*),
-#                   so the fingerprint of a machine that prints one-time
-#                   pads changed every time somebody switched it off.
 #
-# WHERE, AND WHAT THAT COSTS. The FAT boot partition, which is the only
-# writable storage outside the overlay and is already where
-# otpunit/config.py keeps the operator's settings. FAT has no permission
-# bits, so the private keys sit there readable by anyone who can mount the
-# card -- which is the same set of people who can already read them off the
-# ext4 root, because neither is encrypted and the card IS the device. It is
-# not a new exposure, but it is worth saying rather than implying: this
-# machine's SSH host keys are on the partition an operator is told to write
-# files on.
+# WHAT IS DELIBERATELY NOT PERSISTED, because an earlier version of this
+# script did it and the reason it did was wrong. The SSH HOST KEYS. They were
+# copied onto the FAT partition so that the fingerprint of a machine that
+# prints one-time pads stopped changing on every power cycle -- true, but it
+# was a fingerprint nobody could ever be shown. image/build.sh sets
+# ENABLE_SSH=0, so pi-gen leaves ssh.service DISABLED in the image and this
+# appliance does not run sshd at all. The one thing that ever started it was
+# the same first-boot `preset-all` the machine-id above ends, and run
+# 32020772161's consoles measure exactly that: boot1 starts ssh.service at
+# 130s, boot2 mentions ssh.service, ssh.socket and OpenBSD not once while
+# still reaching multi-user.target.
 #
-# The MODE is restored on the way back in, because FAT cannot carry it:
-# sshd refuses a private key it can read from a group or from the world.
+# So the choice was between re-enabling sshd on an air-gapped key printer to
+# give the persistence something to be for, and dropping the persistence. The
+# owner's decision is the second: no sshd, no host keys on the boot
+# partition, and one fewer secret outside the overlay on a machine whose
+# whole design is that a power cycle is a full reset.
+#
+# WHERE THE MACHINE-ID GOES, AND WHAT THAT COSTS. The FAT boot partition,
+# which is the only writable storage outside the overlay and is already where
+# otpunit/config.py keeps the operator's settings. It is mounted with
+# `defaults`, so every file on it is 0755 root:root and readable by EVERY
+# local account on this machine -- the `otp` user the unit runs as included
+# -- as well as by anyone who can take the card out and mount it. A
+# machine-id is an identifier, not key material, and no pad byte or password
+# is written here; but "only someone holding the card" would be the wrong
+# thing to believe about it.
 #
 # EXITS NON-ZERO WHEN IT CANNOT DO ITS JOB, deliberately. A unit whose
 # identity silently reverts every power cycle is the fault this exists to
@@ -46,11 +56,8 @@
 # emulated boot. Same shape as device/install.sh's own option loop.
 #
 #   --boot-dir DIR   where the persistent store lives
-#   --root DIR       a prefix for /etc and for `ssh-keygen -A`, which takes
-#                    one with -f. A prefix rather than a bare --etc so that
-#                    the generate branch really can be exercised: -A writes
-#                    to <prefix>/etc/ssh, so the two would otherwise disagree
-#                    about where the keys went.
+#   --root DIR       a prefix for /etc, so the read of machine-id can be
+#                    pointed at a tree a test builds
 set -uo pipefail
 
 BOOT_DIR=""
@@ -69,7 +76,6 @@ if [ -z "$BOOT_DIR" ]; then
     [ -d "$BOOT_DIR" ] || BOOT_DIR=/boot
 fi
 STORE="$BOOT_DIR/otp-identity"
-SSH_STORE="$STORE/ssh"
 
 note() { printf 'otp-identity: %s\n' "$*" >&2; }
 
@@ -97,8 +103,8 @@ if [ -z "$STORE_SRC" ] || [ "$STORE_SRC" = "$ROOT_SRC" ]; then
     exit 1
 fi
 
-if ! mkdir -p "$SSH_STORE" 2>/dev/null; then
-    note "cannot create $SSH_STORE, so this unit's identity cannot outlive"
+if ! mkdir -p "$STORE" 2>/dev/null; then
+    note "cannot create $STORE, so this unit's identity cannot outlive"
     note "  the power cycle"
     exit 1
 fi
@@ -142,61 +148,6 @@ else
         note "  script's otp_restore_machine_id."
         rc=1
     fi
-fi
-
-# --- the SSH host keys ----------------------------------------------------
-
-install -d -m 0755 "$ETC_DIR/ssh"
-
-shopt -s nullglob
-stored=("$SSH_STORE"/ssh_host_*_key)
-
-if [ "${#stored[@]}" -gt 0 ]; then
-    # RESTORE, with the modes FAT could not keep. 0600 on the private key
-    # because sshd refuses to load one that is group- or world-readable and
-    # says so only in its own log.
-    for key in "${stored[@]}"; do
-        install -m 0600 "$key" "$ETC_DIR/ssh/" || rc=1
-        [ -f "$key.pub" ] && { install -m 0644 "$key.pub" "$ETC_DIR/ssh/" || rc=1; }
-    done
-    note "restored ${#stored[@]} host key(s) from $SSH_STORE"
-else
-    # ADOPT WHAT IS THERE, and only generate if there is nothing. On the
-    # first boot of an image this runs after regenerate_ssh_host_keys.service
-    # (ConditionFirstBoot=yes) has already made a fresh set, so what is
-    # adopted is unique to this card. On the documented "run install.sh on a
-    # Pi you already have" path there is no first boot, that unit does not
-    # run, and adopting means the machine KEEPS the host key people already
-    # know rather than having it silently replaced by a provisioning script.
-    #
-    # ssh-keygen IS ONLY NEEDED BY THE GENERATE BRANCH, and the check sits
-    # here rather than at the top of this section for that reason. Restoring
-    # or adopting keys is file copying; refusing to do it on a machine that
-    # has no ssh-keygen yet would mean a unit that gains openssh later comes
-    # up with keys nothing kept.
-    live_keys=("$ETC_DIR"/ssh/ssh_host_*_key)
-    if [ "${#live_keys[@]}" -eq 0 ]; then
-        if command -v ssh-keygen >/dev/null 2>&1; then
-            note "no host keys anywhere yet; generating this unit's own"
-            # shellcheck disable=SC2086  # the prefix is one word or none
-            ssh-keygen -A ${ROOT_DIR:+-f "$ROOT_DIR"} >/dev/null 2>&1 || rc=1
-            live_keys=("$ETC_DIR"/ssh/ssh_host_*_key)
-        else
-            note "no host keys and no ssh-keygen: there is nothing to keep"
-        fi
-    fi
-    if [ "${#live_keys[@]}" -eq 0 ]; then
-        note "no host keys to record in $SSH_STORE"
-    fi
-    for key in "${live_keys[@]}"; do
-        # `cp`, NOT `install -m`. A chmod to a mode vfat cannot represent is
-        # refused by the filesystem, so `install -m 0600` onto the store
-        # fails outright -- and the mode there is worth nothing anyway,
-        # which is why it is re-applied on the way back in above.
-        cp "$key" "$SSH_STORE/" 2>/dev/null || rc=1
-        [ -f "$key.pub" ] && { cp "$key.pub" "$SSH_STORE/" 2>/dev/null || rc=1; }
-    done
-    note "recorded ${#live_keys[@]} host key(s) in $SSH_STORE"
 fi
 
 sync 2>/dev/null || true
