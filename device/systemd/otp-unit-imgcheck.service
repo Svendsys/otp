@@ -32,9 +32,17 @@ ExecStart=/opt/otp-unit/img-guest-check.sh
 # the Pi being emulated. On the default, a slow-but-healthy boot has its
 # probe killed mid-poll and reports nothing, which is a phase the harness
 # fails for having no OTP-GUEST-DONE line. 480s clears either worst case
-# with room for the work between the waits, and still lands inside the 600s
-# per-boot backstop CI gives the emulator, so a probe that really is wedged
-# is killed and reported rather than eating the whole run.
+# with room to spare, and still lands inside the 600s per-boot backstop CI
+# gives the emulator, so a probe that really is wedged is killed and
+# reported rather than eating the whole run.
+#
+# THOSE SUMS ARE OF THE SLEEPS, and each iteration also pays for the
+# systemctl or journalctl it ran -- run 31972140190 spent its whole 120s
+# wizard poll and finished boot1 at 307s of guest time, which is the shape
+# of that overhead. It is not budgeted for, deliberately: a boot that
+# consumes a poll to the end has already failed the check the poll was
+# waiting on, and the useful guarantee is that a HEALTHY boot, where every
+# poll exits on its first or second pass, is nowhere near this number.
 # tests/test_overlay_root.py re-derives the sum from the shipped probe on
 # every run -- pessimistically, over the whole file rather than per phase --
 # so a wait that changes size fails the arithmetic rather than this
