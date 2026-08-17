@@ -392,15 +392,17 @@ MACHINE_ID_KEPT=no
 if [ -n "$LIVE_MACHINE_ID" ] && [ "$LIVE_MACHINE_ID" = "$KEPT_MACHINE_ID" ]; then
     MACHINE_ID_KEPT=yes
 fi
-# The first eight characters only. A machine-id is this machine's identifier
-# and this console is uploaded as a CI artifact; eight is enough to compare
-# two boots by eye and not enough to be the value.
 # $ROOT_SOURCE IS REQUIRED TO BE SOMETHING, and that is not paranoia about a
 # value set two hundred lines up: if findmnt could not describe `/`, it is
 # empty, and "the store is not on the root's filesystem" becomes true of
 # every store there is. `root-is-overlay` would be red in that case too, but
 # a check that is only correct because a different check failed is not a
 # check -- it is a coincidence with a name.
+#
+# The detail carries the first eight characters of each id and no more. A
+# machine-id is this machine's identifier and this console is uploaded as a
+# CI artifact; eight is enough to compare two boots by eye and not enough to
+# be the value.
 check machine-id-persisted-outside-the-overlay \
       "$(if [ "$MACHINE_ID_KEPT" = yes ] && [ "$STORE_SRC" != "?" ] \
             && [ -n "$ROOT_SOURCE" ] \
