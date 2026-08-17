@@ -639,6 +639,78 @@ not a power of two, which pi-gen's output never is.
 defect in the plan — a QEMU Pi is a Pi with nothing plugged into it. Once
 per image, not per commit.
 
+### Run 72 (31983736617): three units that had been failing all along
+
+The first run with the journal actually on the console failed, in both
+boots, on exactly one check — `no-Failed-with-result` — and everything else
+passed: 17/17 in each guest, `single-kernel-entry PASS`, the marker
+forwarded, the panel detected, the sheet rendered and enqueued. Neither
+hazard the change was written against had bitten. journald does **not**
+re-forward the kmsg it imported (zero `kernel: ` lines, one
+`Booting Linux on physical CPU`), and the speaker scoping worked exactly as
+designed: every matched line was a genuine `systemd[1]:` verdict, and no
+forwarded line from anything else tripped anything.
+
+What it caught was three real unit failures that a non-forwarding console
+had simply never carried. All three predate issue #21.
+
+| Unit | Boots | Whose defect |
+| --- | --- | --- |
+| `systemd-growfs-root.service` | both | **Ours.** Fixed — see the mask in `install.sh`. |
+| `rpi-eeprom-update.service` | both | **The emulator's.** Open. |
+| `ssh.service` | boot 1 | **Ours.** Open. |
+
+**`rpi-eeprom-update.service`** dies on
+`arithmetic expression: expecting ')': "(0x >> 23) & 1"`. It reads the board
+revision from `/proc/device-tree/system/linux,revision`, then `/proc/cpuinfo`,
+then `vcgencmd`; QEMU is not the Pi firmware and supplies none of them, so
+`BOARD_INFO` is empty and `0x` is a syntax error. The same absence is
+independently visible two lines away in the unit's own log — gpiozero:
+`unable to locate Pi revision in /proc/device-tree or /proc/cpuinfo`. On real
+hardware the revision exists and the script reaches `chipNotSupported()`,
+which **exits 0**, so on every board `docs/HARDWARE.md` lists this unit
+succeeds. It is the emulator that is wrong, not the image.
+
+The obvious repair — synthesise `linux,revision` into the DTB the harness
+already passes, the way it already synthesises the command line and the
+initramfs the firmware would have supplied — is **not** safe to do blind:
+gpiozero reads the same property, and giving it one lets its native pin
+factory load. `hmi.open_buttons()` treats a constructible `Button` as a
+present button, so `unit-detects-no-panel` would start reporting
+`input: GPIO buttons` — a change to the very check this branch adds. Worth
+doing, worth doing on its own.
+
+**`ssh.service`** is the one to look at first. `userconf-pi` ends a
+successful seeded first boot in `/usr/bin/cancel-rename`, which finishes
+with `systemctl --quiet reload ssh`. That reload kills sshd for good:
+
+    systemd[1]: Reloading ssh.service - OpenBSD Secure Shell server...
+    sshd[744]: Received SIGHUP; restarting.
+    sshd[744]: fatal: Cannot bind any address.
+    systemd[1]: ssh.service: Failed with result 'exit-code'.
+
+`ssh.service` carries `RestartPreventExitStatus=255`, so nothing brings it
+back. **The provisioning boot — the one boot an operator expects to SSH into
+— silently ends with no SSH.**
+
+The cause is that `ssh.socket` is also active and owns `[::]:22`: it is
+listening at 87s, sshd starts at 131s and reports `Server listening on ::
+port 22` without ever binding it, and on `SIGHUP` sshd closes the inherited
+descriptor, re-execs, re-adopts `LISTEN_FDS`, finds nothing usable and dies
+without attempting a bind — which is why no `Bind to port … failed` line
+appears anywhere. Nothing in this repository enables `ssh.socket`; systemd's
+first-boot `preset-all` does, and `/etc/machine-id` says `uninitialized`
+while `/etc` is inside the overlay, so **every boot of this appliance is a
+first boot**. Boot 2 shows it: `regenerate_ssh_host_keys.service` and
+`sshd-keygen.service` run again, and `ssh.socket` comes up again. The host
+keys change on every power cycle.
+
+Left open deliberately. Masking `ssh.socket` would fix the reload and
+`ssh.service` would still be started by the same preset every boot — but the
+machine-id question underneath it is a product decision about a security
+appliance, not a harness repair, and guessing at it costs an arm64 build and
+two emulated boots per attempt.
+
 ## Proving the guards can fail
 
 Every tier above is a check, and a check has one failure mode that nothing
