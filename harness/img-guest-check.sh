@@ -53,6 +53,12 @@
 set -uo pipefail
 
 BOOTDIR=/boot/firmware
+# This machine's identity, named rather than spelled inline where it is read.
+# Same reason $BOOTDIR is a variable: the checks over it are sliced out and
+# run against a tree tests/test_overlay_root.py builds, and a hardcoded /etc
+# would leave them exercised only by a real emulated boot -- which is the one
+# place a check that has stopped checking cannot be noticed cheaply.
+ETC_MACHINE_ID=/etc/machine-id
 
 # THE PHASE, and every write in this file hangs off it.
 #
@@ -94,11 +100,12 @@ case "$PHASE" in
     *)
         echo "OTP-GUEST refusing to run: the kernel command line carries no" >&2
         echo "  otp.imgcheck=boot1 or otp.imgcheck=boot2 token (phase read:" >&2
-        echo "  '${PHASE:-none}'). This probe writes a sentinel to / and a" >&2
-        echo "  marker page count into $BOOTDIR/otp-unit.conf, which is" >&2
-        echo "  outside the read-only overlay and would overwrite the" >&2
-        echo "  operator's settings for good. It runs only inside the" >&2
-        echo "  emulated boot harness/img-boot.sh sets up." >&2
+        echo "  '${PHASE:-none}'). This probe writes a sentinel to /, a" >&2
+        echo "  marker page count into $BOOTDIR/otp-unit.conf and this" >&2
+        echo "  machine's id into $BOOTDIR/otp-imgcheck-machine-id --" >&2
+        echo "  the last two outside the read-only overlay, where the first" >&2
+        echo "  would overwrite the operator's settings for good. It runs" >&2
+        echo "  only inside the emulated boot harness/img-boot.sh sets up." >&2
         exit 1
         ;;
 esac
@@ -192,6 +199,144 @@ check unit-not-restart-looping \
       "$(if [ "${RESTARTS:-9}" -le 1 ] 2>/dev/null; then echo yes; else echo no; fi)" \
       "NRestarts=$RESTARTS"
 
+# --- the journal, now that the console carries it -------------------------
+
+# ONE MARKER, PUT WHERE ONLY THE JOURNAL CAN CARRY IT. Issue #21 added
+# systemd.journald.forward_to_console=1 to the emulated kernel command line so
+# that what this machine logs reaches the serial port the harness captures --
+# until then the journal was volatile, died with the guest, and everything the
+# unit did after starting was invisible. A kernel parameter that is accepted
+# and ignored looks exactly like one that works, so the harness does not take
+# it on trust: this line goes into the journal through systemd-cat and by no
+# other route. NOT through this script's stdout, which systemd already copies
+# to the console (StandardOutput=journal+console in
+# otp-unit-imgcheck.service), and the marker text is never echoed back into a
+# check's detail either -- either of those would put it on the console with
+# the forwarding switched off, and the host's gate would pass for the wrong
+# reason.
+#
+# THIS check is the other half of that pair, and it is the positive control:
+# it says the journal ACCEPTED the marker. Without it, a console with no
+# marker is equally "forwarding is off" and "systemd-cat is missing or wrote
+# nothing", and nothing outside the guest can tell those apart.
+#
+# -p notice because journald's MaxLevelConsole decides what forwarding lets
+# through. It defaults to info, and device/install.sh's journald.conf.d sets
+# only Storage and RuntimeMaxUse, so notice clears the default with a margin
+# and would still clear a console level tightened as far as notice.
+JOURNAL_TAG=otp-imgcheck
+JOURNAL_MARK="OTP-JOURNAL-FORWARDED $PHASE"
+printf '%s\n' "$JOURNAL_MARK" | systemd-cat -t "$JOURNAL_TAG" -p notice 2>/dev/null || true
+# Polled: systemd-cat returns once it has written to journald's socket, and
+# the entry is indexed on journald's own schedule rather than ours.
+MARKED=0
+for _ in $(seq 1 15); do
+    MARKED=$(journalctl -b -t "$JOURNAL_TAG" --no-pager 2>/dev/null \
+             | grep -cF "$JOURNAL_MARK" || true)
+    [ "${MARKED:-0}" != 0 ] && break
+    sleep 1
+done
+check journal-marker-accepted \
+      "$(if [ "${MARKED:-0}" != 0 ]; then echo yes; else echo no; fi)" \
+      "journalctl -b -t $JOURNAL_TAG holds ${MARKED:-0} line(s) for this phase"
+
+# --- the panel this machine does not have ---------------------------------
+
+# THE HEADLESS ROUTE, WATCHED BEING TAKEN. QEMU's raspi3b is a Pi with
+# nothing plugged into it: no OLED on the I2C bus, and -append drops the
+# dtparam=i2c_arm=on that would give the bus a device node at all. That is
+# exactly the case otpunit/diagnostics.py exists for -- "a print unit with no
+# OLED is mute" -- and until now nothing had ever watched the shipped code
+# make that decision on the artifact people flash. Issue #21.
+#
+# Read out of the unit's journal rather than off the console, for the reason
+# the userconf block below reads one: it is scoped to the unit and to this
+# boot, and it does not depend on which serial port a line landed on or on
+# the console forwarding that this same probe is busy proving.
+#
+# -b, THIS BOOT. Same argument as the userconf poll: device/install.sh's
+# Storage=volatile is the only thing that makes an unscoped read safe today,
+# and a probe must not depend for its correctness on a line in another file.
+#
+# THREE CLAUSES, because each one is a different claim and only the middle
+# one is about the thing this check is named for.
+#
+#   "no OLED ("                          otpunit/hmi.open_display reporting
+#                                        that the display probe RAISED, with
+#                                        the exception in the brackets. This
+#                                        says the unit LOOKED.
+#   "interface -- display: none,"        otpunit/hmi.Interface.describe by way
+#                                        of otpunit/__main__: the display it
+#                                        settled on, after the OLED and the
+#                                        HDMI console were both ruled out.
+#                                        This says it found NOTHING TO DRAW ON.
+#   "no usable interface; printing       otpunit/__main__ choosing the
+#    unattended"                         headless route off the back of that.
+#                                        This says what it DECIDED.
+#
+# WHY THE MIDDLE ONE HAD TO BE ADDED, and the reason is the HOLE, not the
+# emulator. Without `display: none,` this check is made of two strings that a
+# machine WITH a screen also logs: an HDMI console and no buttons produces
+# "no OLED (" -- because the SSD1306 probe still raised -- and "printing
+# unattended" -- because Interface.interactive wants a display AND buttons.
+# So a unit that found something to draw on would have passed a check whose
+# name says it detected no panel. Requiring `display: none` closes that, and
+# keys the check on the one thing the emulator genuinely cannot provide:
+# there is no /dev/i2c-* and /sys/class/drm is empty in every boot measured,
+# with the board revision and without it.
+#
+# WHAT THE EMULATED MACHINE ACTUALLY REPORTS, since an earlier version of
+# this comment got it wrong and a wrong comment is what a check gets read
+# through. harness/img-boot.sh writes /system/linux,revision into the DTB so
+# rpi-eeprom-update.service stops failing, and gpiozero reads the same
+# property -- so the pin factory loads instead of raising BadPinFactory. It
+# does NOT follow that a Button constructs. Run 32020772161, boot1
+# console-text.log:713-714:
+#
+#   no GPIO buttons ([Errno 22] Invalid argument)
+#   interface -- display: none, input: none
+#
+# Claiming GPIO5 on QEMU's gpiochip fails EINVAL, hmi.open_buttons() falls
+# through to (None, "none"), and this machine has neither half. That does not
+# weaken anything above: the hole the third clause closes belongs to a unit
+# with an HDMI console, which the emulator is not, and a check must not be
+# built out of what today's emulator happens to lack.
+#
+# The three strings are written in otpunit/ and matched here, which is how a
+# check stops checking with nothing going red -- so tests/test_img_verdict.py
+# holds each of them against the module that prints it, and holds
+# `display: none` against Interface.describe() by RUNNING it.
+#
+# POLLED, and it has to be. otp-unit.service is Type=simple, so systemd calls
+# it active the instant the process is SPAWNED -- `unit-active` above breaks
+# out of its poll before the interpreter has imported luma, gpiozero or
+# anything else, and under TCG that import is seconds of real work. Reading
+# the journal straight afterwards asks a unit that has not decided anything
+# yet, and reads "it never looked for a panel". Bounded, because a unit that
+# is never going to say it must still produce a report.
+NO_OLED=no
+NO_DISPLAY=no
+HEADLESS=no
+UNIT_LOG=""
+for _ in $(seq 1 30); do
+    UNIT_LOG=$(journalctl -b -u otp-unit.service --no-pager 2>/dev/null | tr '\n' ' ')
+    case "$UNIT_LOG" in *"no OLED ("*) NO_OLED=yes ;; esac
+    case "$UNIT_LOG" in *"interface -- display: none,"*) NO_DISPLAY=yes ;; esac
+    case "$UNIT_LOG" in *"no usable interface; printing unattended"*) HEADLESS=yes ;; esac
+    [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ] && break
+    sleep 2
+done
+# What it decided it had, quoted back. Display and input are chosen
+# independently, so WHICH of them was missing is the half worth reading. On
+# the emulated machine both are `none`; on a real Pi with lgpio the input
+# half says "GPIO buttons" whether or not anything is wired to those pins,
+# which is why Interface.prove exists and why this check is not allowed to
+# read the input half.
+UNIT_IFACE=$(printf '%s' "$UNIT_LOG" | grep -m1 -oE 'interface -- .{0,60}' || true)
+check unit-detects-no-panel \
+      "$(if [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \
+      "no-oled=$NO_OLED no-display=$NO_DISPLAY headless=$HEADLESS ${UNIT_IFACE:-no 'interface --' line in the unit journal}"
+
 # --- CUPS, which is the half of the design the overlay could break --------
 
 # /etc/cups has to be writable for cupsd to start at all, and on a read-only
@@ -223,6 +368,119 @@ BOOT_FS=$(findmnt -no FSTYPE --target "$BOOTDIR" 2>/dev/null || echo "?")
 check boot-partition-separate \
       "$(if [ "$BOOT_SRC" != "?" ] && [ "$BOOT_SRC" != "$ROOT_SOURCE" ]; then echo yes; else echo no; fi)" \
       "$BOOTDIR src=$BOOT_SRC fstype=$BOOT_FS"
+
+# --- the identity, which is the one thing allowed to survive --------------
+
+# WHAT THIS IS ABOUT. /etc is inside the overlay, so /etc/machine-id reverted
+# to pi-gen's `uninitialized` on every power cycle -- and systemd reads that
+# word as "first boot": preset-all again, ssh.socket enabled again,
+# regenerate_ssh_host_keys.service deleting and remaking the host keys again.
+# Run 72's console carries all of it, in both boots. device/install.sh answers
+# it with a machine-id restored by the initramfs and an
+# otp-unit-identity.service that records it on the boot partition; these are
+# the checks that say whether any of that happened on the machine rather than
+# in a comment.
+IDENTITY_STORE="$BOOTDIR/otp-identity"
+LIVE_MACHINE_ID=$(tr -d '\n\r' < "$ETC_MACHINE_ID" 2>/dev/null)
+KEPT_MACHINE_ID=$(tr -d '\n\r' < "$IDENTITY_STORE/machine-id" 2>/dev/null)
+# OUTSIDE THE OVERLAY, ASKED OF THE DIRECTORY THAT IS ACTUALLY WRITTEN.
+# Without this clause the check is satisfied by a store that is a plain
+# directory on the overlay's tmpfs -- /boot/firmware failing to mount is all
+# it takes. The copy and the original then agree with each other perfectly,
+# on every boot, while nothing survives any of them, and every field below
+# reads green. `boot-partition-separate` above says $BOOTDIR is its own
+# mount; this says the store is not on the same filesystem as /.
+#
+# findmnt --target, which answers for the CONTAINING mount, so a store that
+# is a directory inside the root reports the root's source rather than
+# nothing. That is the same call and the same reasoning as $BOOT_SRC above.
+STORE_SRC=$(findmnt -no SOURCE --target "$IDENTITY_STORE" 2>/dev/null || echo "?")
+MACHINE_ID_KEPT=no
+if [ -n "$LIVE_MACHINE_ID" ] && [ "$LIVE_MACHINE_ID" = "$KEPT_MACHINE_ID" ]; then
+    MACHINE_ID_KEPT=yes
+fi
+# $ROOT_SOURCE IS REQUIRED TO BE SOMETHING, and that is not paranoia about a
+# value set two hundred lines up: if findmnt could not describe `/`, it is
+# empty, and "the store is not on the root's filesystem" becomes true of
+# every store there is. `root-is-overlay` would be red in that case too, but
+# a check that is only correct because a different check failed is not a
+# check -- it is a coincidence with a name.
+#
+# The detail carries the first eight characters of each id and no more. A
+# machine-id is this machine's identifier and this console is uploaded as a
+# CI artifact; eight is enough to compare two boots by eye and not enough to
+# be the value.
+#
+# WHAT THIS CHECK CANNOT SEE, said here rather than left to be discovered:
+# it compares the live id with the STORE, and otp-unit-identity.service has
+# already run by the time it does. On a boot where the store was empty, that
+# unit wrote this boot's id into it and exited 0 -- so the two agree because
+# one was copied from the other a second ago, not because anything survived
+# a power cycle. Measured by running the shipped script against an empty
+# store: rc=0, store silently populated, no complaint. The pair below is
+# what tells "restored" from "recorded fresh this boot", and it is the same
+# two-absence hole the host-key checks used to close on their own side.
+check machine-id-persisted-outside-the-overlay \
+      "$(if [ "$MACHINE_ID_KEPT" = yes ] && [ "$STORE_SRC" != "?" ] \
+            && [ -n "$ROOT_SOURCE" ] \
+            && [ "$STORE_SRC" != "$ROOT_SOURCE" ]; then echo yes; else echo no; fi)" \
+      "$ETC_MACHINE_ID=${LIVE_MACHINE_ID:0:8}... stored=${KEPT_MACHINE_ID:0:8}... match=$MACHINE_ID_KEPT store=$IDENTITY_STORE src=$STORE_SRC root-src=${ROOT_SOURCE:-?}"
+
+# THE SAME CARD, POWERED OFF AND ON, STILL THE SAME MACHINE.
+#
+# A SECOND FILE, written by this probe and not by the thing under test. The
+# store above is otp-unit-identity.service's own output, so a boot that
+# truncated or deleted it is a boot that fills it in again from the id
+# systemd just generated -- and every boot is a first boot again while
+# `machine-id-persisted-outside-the-overlay` goes on reading PASS. This
+# record is written once, in boot1, and compared in boot2, so the value
+# boot2 is held against is one that predates boot2's own identity entirely.
+#
+# The detail is truncated to eight characters for the reason the check above
+# gives; the record on the card carries the full id, on the same partition
+# the store already keeps it on, so it is no new exposure.
+MACHINE_ID_RECORD="$BOOTDIR/otp-imgcheck-machine-id"
+
+# Eight characters or the word `nothing`, so an absent value cannot read as
+# the "..." of a present one.
+short_id() {
+    if [ -n "$1" ]; then printf '%s...' "${1:0:8}"; else printf 'nothing'; fi
+}
+
+if [ "$PHASE" = "boot1" ]; then
+    # THE POSITIVE CONTROL, and it is the reason boot2's check can mean
+    # anything. "the two ids are identical" is satisfied perfectly by a
+    # machine with no readable /etc/machine-id in either boot and by a record
+    # file that was never written -- two ways for the property to read green
+    # while nothing is being kept. So boot1 states, out of the same variable
+    # and the same file boot2 will read: there WAS an id, and it came back
+    # off the boot partition byte for byte.
+    printf '%s\n' "$LIVE_MACHINE_ID" > "$MACHINE_ID_RECORD" 2>/dev/null || true
+    MACHINE_ID_READBACK=$(tr -d '\n\r' < "$MACHINE_ID_RECORD" 2>/dev/null)
+    check machine-id-recorded-for-the-next-boot \
+          "$(if [ -n "$LIVE_MACHINE_ID" ] \
+                && [ "$MACHINE_ID_READBACK" = "$LIVE_MACHINE_ID" ]; \
+             then echo yes; else echo no; fi)" \
+          "this boot: $(short_id "$LIVE_MACHINE_ID") | read back from $MACHINE_ID_RECORD: $(short_id "$MACHINE_ID_READBACK")"
+fi
+
+if [ "$PHASE" = "boot2" ]; then
+    # THE PROPERTY: the second boot is the same machine as the first. Before
+    # the machine-id was persisted this was false by construction -- /etc is
+    # inside the overlay, pi-gen ships /etc/machine-id holding
+    # `uninitialized`, and systemd generated a new one on every power cycle.
+    #
+    # BOTH SIDES ARE REQUIRED TO BE NON-EMPTY, which is the clause that makes
+    # this a statement rather than a tautology: two absences are equal, and
+    # `machine-id-recorded-for-the-next-boot` in boot1 is what rules the
+    # recorded side of that out with the same fixture and the same variable.
+    MACHINE_ID_BOOT1=$(tr -d '\n\r' < "$MACHINE_ID_RECORD" 2>/dev/null)
+    check machine-id-identical-across-the-power-cycle \
+          "$(if [ -n "$LIVE_MACHINE_ID" ] && [ -n "$MACHINE_ID_BOOT1" ] \
+                && [ "$LIVE_MACHINE_ID" = "$MACHINE_ID_BOOT1" ]; \
+             then echo yes; else echo no; fi)" \
+          "boot1: $(short_id "$MACHINE_ID_BOOT1") | boot2: $(short_id "$LIVE_MACHINE_ID")"
+fi
 
 if [ "$PHASE" = "boot2" ]; then
     # BEFORE the write below, and read back through config.load() rather
@@ -273,6 +531,115 @@ SAVED=${SAVED//$'\n'/ }
 check setting-saved-to-the-boot-partition \
       "$(if [ "${SAVED#*save=True}" != "$SAVED" ]; then echo yes; else echo no; fi)" \
       "$SAVED"
+
+if [ "$PHASE" = "boot1" ]; then
+    # --- the diagnostic sheet, and how far the print path really gets -----
+
+    # WHAT THIS IS NOT, because issue #21 expected something else and the
+    # difference is the finding. It said "the headless diagnostic path should
+    # fire under QEMU by design". It does not fire, and cannot:
+    # otpunit/__main__ falls through to diagnostics.run_headless(), which
+    # loops on cups.devices(); Cups.devices() is built from `lpinfo -v` and
+    # keeps only usb://, a loopback IPP endpoint, or a dnssd:// entry that
+    # identifies itself as one of the attached USB devices. An emulated Pi has
+    # no printer of any kind, so that list is empty on every poll and the unit
+    # waits in silence -- no sheet is submitted, and none can be. A unit with
+    # neither a panel nor a printer says nothing at all, which is worth
+    # knowing about a design whose answer to a missing panel is "the printer
+    # becomes the console". The unit's own half of that decision is
+    # unit-detects-no-panel above, and it is the half that IS observable.
+    #
+    # WHAT THIS IS. The rest of that path, driven by hand, on the real image,
+    # through the shipped code and the shipped cupsd, with the one thing the
+    # emulator cannot provide -- a queue -- supplied here. It answers two
+    # questions a booted image is the only place to ask: can this image RENDER
+    # the sheet (reportlab installed and working, every probe in
+    # diagnostics.collect() returning on a machine rather than in a unit
+    # test), and does the shipped cupsd ACCEPT it.
+    #
+    # THE QUEUE IS THE PROBE'S, NOT THE UNIT'S. A separate name, so nothing
+    # here can be mistaken for something otp-unit did, and so a leftover from
+    # this experiment cannot be what the unit later prints into. It points at
+    # a usb:// URI with nothing behind it, which is the "queue with no
+    # physical printer" the issue asks for: the job is ACCEPTED, which is the
+    # claim, and what the backend does with it afterwards is not. /etc/cups is
+    # a tmpfs (otp-unit-etc-cups.service) so none of this can reach the card,
+    # and the queue is removed below regardless.
+    #
+    # MEASURED, not assumed: `lpadmin -p NAME -E -v usb://...` with no -m at
+    # all creates a queue that `lp` will accept a job into. Checked against a
+    # real cupsd 2.4.7 configured from device/install.sh's own directives (the
+    # rig tests/cupsrig.py builds), which answered `request id is
+    # otpimgcheck-1`. Trixie ships the same CUPS major; this boot is the first
+    # time it is asked of the image.
+    SHEET_QUEUE=otpimgcheck
+    SHEET_URI="usb://OTP/imgcheck"
+    SHEET_LPADMIN=$(/usr/sbin/lpadmin -p "$SHEET_QUEUE" -E -v "$SHEET_URI" 2>&1)
+    SHEET_LPADMIN_RC=$?
+    # BOUNDED, and bounded here rather than trusted to be quick. This is the
+    # only step in the probe that starts a Python interpreter with reportlab
+    # in it, under TCG, and otp-unit-imgcheck.service's TimeoutStartSec is
+    # what a slow one would eat -- a probe killed mid-run reports nothing at
+    # all, and the phase fails for having no OTP-GUEST-DONE line rather than
+    # for anything about the image. 90s, and the exit code is REPORTED rather
+    # than gated -- the two checks below read what the program SAID, and a
+    # bound that fired leaves that output incomplete and turns them red on
+    # its own. The number is in the detail so that a red reads as "it never
+    # finished" instead of "it failed", which are different diagnoses:
+    # anything at or above 124 is timeout(1) saying it could not get a clean
+    # status out of the child, not the program returning.
+    SHEET_SAID=$(SHEET_QUEUE="$SHEET_QUEUE" timeout -k 5 90 python3 - <<'PY' 2>&1
+import os, sys
+sys.path.insert(0, "/opt/otp-unit")
+
+queue = os.environ["SHEET_QUEUE"]
+try:
+    from otpunit import config, diagnostics
+    settings = config.load()
+    sheet = diagnostics.render_bytes(
+        diagnostics.collect(settings=settings, printer=None, queue=queue,
+                            driver="none: the harness supplied this queue"),
+        diagnostics._page_size(settings))
+    print("RENDER ok bytes=%d magic=%s"
+          % (len(sheet), bytes(sheet[:5]).decode("ascii", "replace")))
+except Exception as exc:                         # noqa: BLE001
+    print("RENDER failed %s: %s" % (type(exc).__name__, exc))
+    raise SystemExit(0)
+
+# A SEPARATE try, so "the image cannot draw the sheet" and "cupsd would not
+# take it" are never reported as the same failure.
+try:
+    from otpunit.printer import Cups
+    print("SUBMIT ok job=%s" % (Cups().submit(bytes(sheet), name=queue,
+                                              title="OTP status") or "<no id>"))
+except Exception as exc:                         # noqa: BLE001
+    print("SUBMIT failed %s: %s" % (type(exc).__name__, exc))
+PY
+)
+    SHEET_RC=$?
+    SHEET_SAID=${SHEET_SAID//[$'\n\r']/ }
+    # RENDERED means a PDF, not merely bytes. reportlab writing a truncated
+    # or empty file would satisfy "no exception was raised", and %PDF is the
+    # cheapest thing that separates a page from an artefact.
+    SHEET_RENDERED=no
+    case "$SHEET_SAID" in *"RENDER ok bytes="*"magic=%PDF"*) SHEET_RENDERED=yes ;; esac
+    check diagnostic-sheet-renders "$SHEET_RENDERED" \
+          "rc=$SHEET_RC (>=124 = no clean status at the 90s bound) $SHEET_SAID"
+    # ENQUEUED means cupsd gave it an id. lp exiting 0 is not the same claim:
+    # Cups.submit() pulls "request id is <id>" out of lp's stdout and returns
+    # "" when that is absent, so an lp that succeeded and said nothing useful
+    # reads as no job here, which is the honest answer.
+    SHEET_ENQUEUED=no
+    case "$SHEET_SAID" in
+        *"SUBMIT ok job=$SHEET_QUEUE-"*) SHEET_ENQUEUED=yes ;;
+    esac
+    check diagnostic-sheet-reaches-cups "$SHEET_ENQUEUED" \
+          "lpadmin rc=$SHEET_LPADMIN_RC ${SHEET_LPADMIN:-(silent)} | queue=$(/usr/bin/lpstat -v "$SHEET_QUEUE" 2>&1 | head -1) | $SHEET_SAID"
+    # Removed whatever happened. The overlay would discard it at the next
+    # power-cycle anyway, but boot2's checks read a machine that is supposed
+    # to look like a unit rather than like a test rig.
+    /usr/sbin/lpadmin -x "$SHEET_QUEUE" 2>/dev/null || true
+fi
 
 # --- the seeded userconf.txt path -----------------------------------------
 

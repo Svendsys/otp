@@ -36,6 +36,13 @@ INSTALL = REPO / "device" / "install.sh"
 IMG_BOOT = REPO / "harness" / "img-boot.sh"
 GUEST_CHECK = REPO / "harness" / "img-guest-check.sh"
 IMGCHECK_UNIT = REPO / "device" / "systemd" / "otp-unit-imgcheck.service"
+IDENTITY_SH = REPO / "device" / "persist-identity.sh"
+IDENTITY_UNIT = REPO / "device" / "systemd" / "otp-unit-identity.service"
+
+# What a machine-id looks like once systemd has generated one: 32 lower-case
+# hex characters. Both ends of the persistence -- the initramfs restore and
+# the guest check that reads it back -- are written around that shape.
+LIVE_ID = "0f9c2b4d6e8a1c3f5b7d9e0a2c4e6f81"
 
 
 def slice_between(text: str, first: str, last: str) -> str:
@@ -50,8 +57,15 @@ def run_block(block: str, tmp_path, *, env=None, preamble=""):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     # systemctl is stubbed rather than allowed through: the block disables a
-    # first-boot service, and a test must not touch the machine it runs on.
-    (bin_dir / "systemctl").write_text("#!/bin/sh\nexit 0\n")
+    # first-boot service and masks another, and a test must not touch the
+    # machine it runs on. It RECORDS what it was asked to do, because
+    # "install.sh masks systemd-growfs-root.service" is a claim about a
+    # command that was issued, and a stub that only exits 0 cannot tell a
+    # block that issued it from one that never did.
+    (bin_dir / "systemctl").write_text(
+        '#!/bin/sh\n'
+        'if [ -n "${SYSTEMCTL_LOG:-}" ]; then printf \'%s\\n\' "$*" >> "$SYSTEMCTL_LOG"; fi\n'
+        'exit 0\n')
     (bin_dir / "systemctl").chmod(0o755)
     runner = tmp_path / "run.sh"
     runner.write_text(
@@ -62,8 +76,15 @@ def run_block(block: str, tmp_path, *, env=None, preamble=""):
     return subprocess.run(
         ["bash", str(runner)], capture_output=True, text=True, timeout=60,
         env={**os.environ, **(env or {}),
+             "SYSTEMCTL_LOG": str(tmp_path / "systemctl-calls.log"),
              "PATH": f"{bin_dir}:{os.environ['PATH']}"},
     )
+
+
+def systemctl_calls(tmp_path) -> list:
+    """Every systemctl argument list the block under test issued."""
+    log = tmp_path / "systemctl-calls.log"
+    return log.read_text().splitlines() if log.exists() else []
 
 
 # --- the kernel command line ---------------------------------------------
@@ -118,6 +139,33 @@ def test_the_first_boot_resize_token_is_removed(tmp_path):
     # neighbours here and a sloppier sed would have taken part of one.
     assert "fsck.repair=yes" in after
     assert "rootwait" in after
+
+
+def test_systemds_own_grower_is_masked_as_well_as_pi_gens(tmp_path):
+    """
+    Two units grow the root filesystem on a Pi OS image, and disabling one
+    of them is what shipped.
+
+    rpi-resize.service is the pi-gen one and it is disabled above.
+    systemd-growfs-root.service is systemd's, and nothing enables it: it is
+    hooked onto the root mount by systemd-fstab-generator on every boot, so
+    there is no symlink for `disable` to remove and it ran on every boot of
+    every image this project has built. On an overlay root it cannot
+    succeed -- `/` is an overlayfs, systemd-growfs wants a block device --
+    and run 72's tier-3 console carries the result in both boots:
+
+        systemd-growfs[293]: File system "/" not backed by block device.
+        systemd[1]: systemd-growfs-root.service: Failed with result 'exit-code'.
+
+    It was invisible until issue #21 put the journal on the console. The
+    verb has to be `mask`: `disable` is a no-op against a generator.
+    """
+    cmdline_after(tmp_path, PI_GEN_CMDLINE)
+    calls = systemctl_calls(tmp_path)
+    assert "mask systemd-growfs-root.service" in calls, calls
+    # The pi-gen half is still done -- this is an addition to that decision,
+    # not a replacement for it.
+    assert any(c.startswith("disable rpi-resize.service") for c in calls), calls
 
 
 # --- building the initramfs the overlay lives in --------------------------
@@ -325,6 +373,397 @@ def test_install_sh_no_longer_tells_the_operator_to_run_raspi_config():
     assert not instructions, instructions
 
 
+# --- the one file the overlay lets through --------------------------------
+
+MACHINE_ID_FN = ("otp_restore_machine_id()\n{", "\treturn 0\n}")
+
+# The initrd has klibc's mount, which really mounts. Here it does not: the
+# test lays the fake card's contents at the mountpoint itself and this stands
+# in for the syscall, so what is exercised is the function's own logic --
+# which candidate it tries, what it accepts, and where it writes.
+MOUNT_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >> "$MOUNT_LOG"
+[ -z "${MOUNT_REFUSES-}" ] || exit 1
+exit 0
+"""
+UMOUNT_STUB = """#!/bin/sh
+printf 'umount %s\\n' "$*" >> "$MOUNT_LOG"
+exit 0
+"""
+
+
+def run_machine_id_restore(tmp_path, *, stored=LIVE_ID, mountable=True,
+                           make_store=True):
+    """Run the shipped initramfs function against a tree this test builds."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    mnt = tmp_path / "mnt"
+    (mnt / "otp-identity").mkdir(parents=True, exist_ok=True)
+    if make_store and stored is not None:
+        (mnt / "otp-identity" / "machine-id").write_text(stored + "\n")
+    rootmnt = tmp_path / "root"
+    (rootmnt / "etc").mkdir(parents=True, exist_ok=True)
+    # The device the first candidate resolves to. `${ROOT%p[0-9]}p1` turns
+    # .../mmcblk0p2 into .../mmcblk0p1, which is the derivation the shipped
+    # line makes on a Pi.
+    (tmp_path / "mmcblk0p1").write_text("")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name, body in (("mount", MOUNT_STUB), ("umount", UMOUNT_STUB)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+
+    runner = tmp_path / "restore.sh"
+    runner.write_text(
+        "set -u\n"
+        f'ROOT="{tmp_path}/mmcblk0p2"\n'
+        f'rootmnt="{rootmnt}"\n'
+        f'OTP_IDENTITY_MNT="{mnt}"\n'
+        + slice_between(INSTALL.read_text(), *MACHINE_ID_FN) + "\n"
+        "otp_restore_machine_id\n"
+        'printf "rc=%s\\n" "$?"\n')
+    env = {**os.environ, "MOUNT_LOG": str(tmp_path / "mount.log"),
+           "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    if not mountable:
+        env["MOUNT_REFUSES"] = "1"
+    proc = subprocess.run(["bash", str(runner)], capture_output=True,
+                          text=True, timeout=60, env=env)
+    restored = rootmnt / "etc" / "machine-id"
+    return proc, (restored.read_text().strip() if restored.exists() else None)
+
+
+def test_the_initramfs_puts_the_stored_machine_id_where_pid_1_will_read_it(tmp_path):
+    """
+    The positive control. PID 1 reads /etc/machine-id before it looks at a
+    single unit, so this is the last moment anything can put it there -- and
+    the file has to land inside the assembled overlay, not beside it.
+    """
+    proc, restored = run_machine_id_restore(tmp_path)
+    assert "rc=0" in proc.stdout, proc.stderr
+    assert restored == LIVE_ID, proc.stdout
+
+
+def test_the_identity_partition_is_mounted_read_only(tmp_path):
+    """
+    The whole point of the mechanism this rides in is that the boot never
+    holds a writable handle on storage it is not writing to. Reading a
+    machine-id needs none.
+    """
+    run_machine_id_restore(tmp_path)
+    calls = (tmp_path / "mount.log").read_text().splitlines()
+    mounts = [c for c in calls if not c.startswith("umount")]
+    assert mounts, "the function never tried to mount anything"
+    assert all(" -r " in f" {c} " for c in mounts), mounts
+
+
+def test_a_machine_id_that_is_not_32_hex_characters_is_not_written(tmp_path):
+    """
+    systemd rejects a malformed id and calls the boot a first boot -- which
+    is the state this exists to leave, arrived at by a longer route. Anything
+    that is not exactly the shape systemd accepts must be dropped here, where
+    the image's own file is still standing.
+    """
+    for bad in ("uninitialized", "", "deadbeef", LIVE_ID + "0", LIVE_ID[:-1] + "Z"):
+        proc, restored = run_machine_id_restore(tmp_path / f"bad-{len(bad)}-{bad[:4]}",
+                                                stored=bad)
+        assert "rc=0" in proc.stdout, proc.stderr
+        assert restored is None, f"{bad!r} was written as a machine-id"
+
+
+def test_a_card_with_no_stored_identity_leaves_the_boot_alone(tmp_path):
+    """Never fatal. The overlay panics when it fails because a unit that
+    booted writable is the one thing it exists to prevent; an identity is
+    not that, and a first boot is what this machine did before."""
+    proc, restored = run_machine_id_restore(tmp_path, make_store=False)
+    assert "rc=0" in proc.stdout, proc.stderr
+    assert restored is None
+
+
+def test_a_partition_that_will_not_mount_leaves_the_boot_alone(tmp_path):
+    proc, restored = run_machine_id_restore(tmp_path, mountable=False)
+    assert "rc=0" in proc.stdout, proc.stderr
+    assert restored is None
+
+
+def test_the_overlay_restores_the_machine_id_after_it_is_assembled(tmp_path):
+    """
+    Ordering, and it is not cosmetic: the write goes THROUGH the overlay into
+    its tmpfs upper layer, so a call placed before the mount would write to
+    the initrd's own root and vanish at pivot -- silently, with the boot
+    looking exactly the same.
+    """
+    script = overlay_script()
+    assert "otp_restore_machine_id" in script, \
+        "the overlay script no longer restores the machine-id, so every " \
+        "boot is a first boot again"
+    called = script.index("\n\totp_restore_machine_id")
+    assembled = script.index('panic "Failed to assemble the root overlay."')
+    assert called > assembled, \
+        "otp_restore_machine_id runs before the overlay is mounted, so it " \
+        "writes to the initrd's root and the write is lost at pivot"
+
+
+# --- the userspace half: recording the machine-id -------------------------
+
+# persist-identity.sh asks findmnt the same question the guest probe does:
+# which filesystem contains the store. The stub answers out of the
+# environment, so a test can put the store inside the overlay without needing
+# two real filesystems -- which no CI runner reliably has under /tmp.
+IDENTITY_FINDMNT_STUB = """#!/bin/sh
+case "$*" in
+    *--target*) printf '%s\\n' "${FAKE_STORE_SRC-/dev/mmcblk0p1}" ;;
+    *" /") printf '%s\\n' "${FAKE_ROOT_SRC-overlay}" ;;
+    *) echo "stub: unexpected findmnt $*" >&2; exit 64 ;;
+esac
+"""
+
+
+def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
+                         etc_keys=("ed25519",), store_src="/dev/mmcblk0p1"):
+    """Run the shipped script against a fake boot partition and a fake /etc.
+
+    `etc_keys` puts real-looking host keys in the fake /etc/ssh. They are not
+    there to be persisted -- they are there so that "nothing copies them" is a
+    statement about a tree that HAD them.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    boot = tmp_path / "boot"
+    (boot / "otp-identity").mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "root"
+    (root / "etc" / "ssh").mkdir(parents=True, exist_ok=True)
+    if machine_id is not None:
+        (root / "etc" / "machine-id").write_text(machine_id + "\n")
+    if stored_id is not None:
+        (boot / "otp-identity" / "machine-id").write_text(stored_id + "\n")
+    for name in etc_keys:
+        (root / "etc" / "ssh" / f"ssh_host_{name}_key").write_text(f"live {name}\n")
+        (root / "etc" / "ssh" / f"ssh_host_{name}_key.pub").write_text(f"pub {name}\n")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "findmnt").write_text(IDENTITY_FINDMNT_STUB)
+    (bin_dir / "findmnt").chmod(0o755)
+    proc = subprocess.run(
+        ["bash", str(IDENTITY_SH), "--boot-dir", str(boot), "--root", str(root)],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "FAKE_STORE_SRC": store_src,
+             "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    return proc, boot, root
+
+
+def test_a_first_boot_records_what_it_has(tmp_path):
+    # The positive control: the store starts empty and comes out holding this
+    # machine's identity.
+    proc, boot, _ = run_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert (boot / "otp-identity" / "machine-id").read_text().strip() == LIVE_ID
+
+
+def test_no_private_key_is_written_to_the_boot_partition(tmp_path):
+    """
+    THE OWNER'S DECISION, held against the shipped script rather than against
+    the comment that announces it.
+
+    An earlier version of this script copied /etc/ssh/ssh_host_*_key onto the
+    FAT partition so the fingerprint of a key printer stopped changing on
+    every power cycle. image/build.sh sets ENABLE_SSH=0, so pi-gen leaves
+    ssh.service disabled and this appliance never runs sshd -- the only thing
+    that ever started it was the first-boot `preset-all` that persisting the
+    machine-id ends, and run 32020772161's boot2 console does not mention
+    ssh.service, ssh.socket or OpenBSD once while still reaching
+    multi-user.target. So the fingerprint was one nobody could ever be shown,
+    and the private keys were on a partition every local account can read.
+
+    The fake /etc/ssh here HAS keys. Nothing may end up on the card, and
+    nothing may create a place to put them either -- an empty `ssh` directory
+    on the boot partition is the next person's invitation.
+    """
+    proc, boot, _ = run_persist_identity(
+        tmp_path, etc_keys=("ed25519", "rsa", "ecdsa"))
+    assert proc.returncode == 0, proc.stderr
+    landed = [p for p in boot.rglob("*") if p.is_file()]
+    assert [p.name for p in landed] == ["machine-id"], landed
+    assert not (boot / "otp-identity" / "ssh").exists(), \
+        "the store still has somewhere to put private keys"
+    # And the script must not be reading them either, which is the half a
+    # listing of the card cannot see. Comments are stripped first: the header
+    # names regenerate_ssh_host_keys.service precisely to explain why none of
+    # this is here any more.
+    code = "\n".join(line for line in IDENTITY_SH.read_text().splitlines()
+                     if not line.lstrip().startswith("#"))
+    for gone in ("ssh_host", "ssh-keygen", "SSH_STORE"):
+        assert gone not in code, \
+            f"persist-identity.sh still handles SSH host keys: {gone}"
+
+
+def test_the_unit_that_runs_it_no_longer_orders_itself_around_sshd():
+    """
+    The orderings that existed only for the host-key half, deleted with it.
+
+    `After=regenerate_ssh_host_keys.service` was there because that unit
+    opens with `rm -f /etc/ssh/ssh_host_*_key*` and would have deleted a
+    restore placed before it; `Before=ssh.service ssh.socket` named the
+    consumers; `ConditionPathIsReadWrite=/etc` covered the restore's writes.
+    Nothing here writes to /etc any more and no sshd starts on this image, so
+    all three are edges nobody can check -- and an unreachable ordering is
+    the shape of thing this repository keeps finding green.
+    """
+    unit = IDENTITY_UNIT.read_text()
+    body = "\n".join(line for line in unit.splitlines()
+                     if not line.startswith("#"))
+    for gone in ("After=regenerate_ssh_host_keys.service",
+                 "Before=ssh.service", "ConditionPathIsReadWrite="):
+        assert gone not in body, f"{gone} outlived the half it existed for"
+
+
+def test_the_unit_still_runs_before_anything_that_reads_the_identity():
+    """
+    The positive control for the test above: a unit stripped of every
+    ordering would satisfy it perfectly and record the machine-id after the
+    boot had finished using it.
+    """
+    unit = IDENTITY_UNIT.read_text()
+    for required in ("After=local-fs.target",
+                     "Before=sysinit.target",
+                     "ExecStart=/opt/otp-unit/persist-identity.sh",
+                     "Type=oneshot",
+                     "[Install]",
+                     "WantedBy=sysinit.target"):
+        assert required in unit, (
+            f"otp-unit-identity.service no longer says {required!r}, so the "
+            f"machine-id is recorded by nothing, late, or never")
+
+
+def test_a_store_inside_the_overlay_is_refused_rather_than_written(tmp_path):
+    """
+    The guard that stops the whole script being a no-op nobody notices.
+    If /boot/firmware never mounted, $BOOT_DIR is a directory on the
+    overlay's tmpfs: every copy agrees with its original, on every boot, and
+    nothing survives any of them.
+    """
+    proc, boot, _ = run_persist_identity(tmp_path, store_src="overlay")
+    assert proc.returncode != 0, proc.stdout
+    assert not (boot / "otp-identity" / "machine-id").exists(), \
+        "it wrote into the overlay anyway"
+
+
+def test_a_kept_machine_id_is_not_overwritten_by_a_boot_that_lost_it(tmp_path):
+    """
+    A stored id that does not match the running one means the initramfs
+    restore did not happen. The stored value is the one that still has a
+    chance of being restored, so replacing it with this boot's random id
+    would make the store chase a value that changes every boot.
+    """
+    other = "ffffffffffffffffffffffffffffffff"
+    proc, boot, _ = run_persist_identity(tmp_path, stored_id=other)
+    assert proc.returncode != 0, proc.stdout
+    assert (boot / "otp-identity" / "machine-id").read_text().strip() == other
+
+
+# --- and the four lines that put it on the machine ------------------------
+#
+# THE HALF NOTHING WATCHED. Everything above drives persist-identity.sh
+# directly, so the script could be perfect while install.sh never shipped it:
+# deleting the install block outright left the whole fast suite green, and so
+# did gutting the unit -- no [Install] section, no ExecStart worth running.
+# An image that installs and enables nothing boots, prints, and loses its
+# identity on every power cycle, and the only thing that would have said so
+# is a sixteen-minute tier-3 build. Same shape as the probe install above,
+# which is watched for the same reason.
+
+IDENTITY_INSTALL_BLOCK = (
+    '    install -m 0755 "$REPO_DIR/device/persist-identity.sh" \\',
+    "    systemctl enable otp-unit-identity.service")
+
+
+def run_identity_install(tmp_path, *, repo_dir=None):
+    """Run install.sh's identity-install block against a substitute REPO_DIR.
+
+    `install` is shadowed by a shell function rather than stubbed on PATH,
+    for the reason run_probe_install shadows it: the block writes into
+    /etc/systemd/system and /opt/otp-unit, and a test has no business
+    touching either.
+    """
+    block = slice_between(INSTALL.read_text(), *IDENTITY_INSTALL_BLOCK)
+    return run_block(block, tmp_path,
+                     preamble=("install() { printf 'INSTALL %s\\n' \"$*\"; }\n"
+                               f'REPO_DIR="{repo_dir or REPO}"\n'
+                               f'PREFIX="{tmp_path}/opt"'))
+
+
+def test_the_identity_script_and_its_unit_are_both_installed(tmp_path):
+    """
+    Both files, and to the paths the unit and the harness name. The unit's
+    ExecStart is an absolute /opt/otp-unit/persist-identity.sh, so a script
+    installed anywhere else is a unit that fails to start.
+    """
+    proc = run_identity_install(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    installed = [ln for ln in proc.stdout.splitlines() if ln.startswith("INSTALL")]
+    assert any("device/persist-identity.sh" in ln
+               and f"{tmp_path}/opt/persist-identity.sh" in ln
+               for ln in installed), installed
+    assert any("otp-unit-identity.service" in ln
+               and "/etc/systemd/system/otp-unit-identity.service" in ln
+               for ln in installed), installed
+
+
+def test_the_identity_unit_is_enabled_and_not_merely_dropped_in_place(tmp_path):
+    """
+    A unit file in /etc/systemd/system with no symlink pointing at it is a
+    unit systemd never runs. Nothing else on this image enables it -- and the
+    accident that used to, first-boot `preset-all`, is precisely what this
+    unit exists to end, so it cannot be relied on to enable its own cure.
+    """
+    proc = run_identity_install(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    calls = systemctl_calls(tmp_path)
+    assert "enable otp-unit-identity.service" in calls, calls
+    # And after the unit file lands, or systemd enables a file it has not
+    # read: `enable` resolves [Install] out of the unit on disk.
+    assert "daemon-reload" in calls, calls
+    assert calls.index("daemon-reload") < calls.index(
+        "enable otp-unit-identity.service"), calls
+
+
+# --- ssh.socket, which turned a documented reload into a dead sshd --------
+
+SSH_SOCKET_BLOCK = ("# --- AND THE RELOAD AT THE END OF THAT SAME SCRIPT",
+                    "systemctl mask ssh.socket")
+
+
+def test_the_socket_that_kept_sshd_from_rebinding_is_masked(tmp_path):
+    """
+    cancel-rename ends a seeded first boot with `systemctl --quiet reload
+    ssh`. With ssh.socket holding :22, sshd runs on an inherited descriptor,
+    its SIGHUP re-exec has nothing left to adopt, and RestartPreventExitStatus
+    =255 keeps it down for the rest of the boot -- run 72, boot 1.
+
+    MASKED rather than disabled, and that is the half worth asserting: the
+    enable symlinks live in /etc/systemd/system, which is inside the overlay,
+    so a disable lasts one boot and the next first-boot preset-all puts the
+    socket straight back.
+    """
+    block = slice_between(INSTALL.read_text(), *SSH_SOCKET_BLOCK)
+    proc = run_block(block, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "mask ssh.socket" in systemctl_calls(tmp_path), \
+        systemctl_calls(tmp_path)
+
+
+def test_ssh_service_itself_is_left_alone(tmp_path):
+    """
+    Masking the SERVICE would be the other way to stop the reload -- the
+    guard in cancel-rename is `systemctl --quiet is-active ssh` -- and it is
+    refused. It leaves ssh.socket listening on :22 for a service that can
+    never start, and takes SSH off a machine as a side effect of a bug fix.
+    """
+    block = slice_between(INSTALL.read_text(), *SSH_SOCKET_BLOCK)
+    run_block(block, tmp_path)
+    for call in systemctl_calls(tmp_path):
+        assert call != "mask ssh.service", call
+        assert call != "mask ssh", call
+
+
 # --- the harness end ------------------------------------------------------
 
 def test_the_harness_copies_the_overlay_token_and_never_invents_one(tmp_path):
@@ -348,6 +787,142 @@ def test_the_harness_copies_the_overlay_token_and_never_invents_one(tmp_path):
                               text=True, timeout=30)
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout == expected, f"{cmdline!r} -> {proc.stdout!r}"
+
+
+REVISION_BLOCK = ("# --- the board revision the firmware would have supplied",
+                  'log "board revision $BOARD_REVISION synthesised into $DTB '
+                  '(the firmware\'s job)"')
+
+# fdtput/fdtget come from device-tree-compiler, which the image workflow
+# installs next to qemu and mtools and the fast suite does not have. Stubbed
+# so this runs anywhere: the "blob" is a text file and the property is a line
+# in it, which is enough for every branch under test.
+FDTPUT_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FDT_LOG"
+[ -z "${FDTPUT_DEAF-}" ] || exit 0
+# fdtput -c <blob> <node>, and fdtput -t x <blob> <node> <prop> <value>.
+case "$1" in
+    -c) exit 0 ;;
+    -t) printf '%s=%s\\n' "$5" "$6" >> "$3" ; exit 0 ;;
+esac
+exit 1
+"""
+# Shell builtins only: PATH below is cut down to the tools the block itself
+# uses, and reaching for sed here would make the stub depend on something the
+# code under test does not.
+FDTGET_STUB = """#!/bin/sh
+# fdtget <blob> <node> <prop>, printing the value as a decimal integer.
+value=""
+while IFS= read -r line; do
+    case "$line" in "$3="*) value="${line#*=}" ;; esac
+done < "$1"
+[ -n "$value" ] || exit 1
+printf '%d\\n' "$((value))"
+"""
+
+
+def run_revision_block(tmp_path, *, have_fdtput=True, fdtput_deaf=False):
+    """Run the shipped board-revision block over a stand-in for the DTB."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    work = tmp_path / "work"
+    (work / "boot").mkdir(parents=True, exist_ok=True)
+    dtb = work / "boot" / "bcm2710-rpi-3-b.dtb"
+    dtb.write_text("")
+    # A PATH with nothing on it but the tools the block uses, so
+    # `have_fdtput=False` really means absent -- on a developer's machine the
+    # real device-tree-compiler is usually installed, and inheriting PATH
+    # would make that test pass for the wrong reason there and fail in CI.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for tool in ("cp", "basename"):
+        real = shutil.which(tool)
+        assert real, f"{tool} is not on PATH, so this test cannot run"
+        (bin_dir / tool).symlink_to(real)
+    if have_fdtput:
+        for name, body in (("fdtput", FDTPUT_STUB), ("fdtget", FDTGET_STUB)):
+            (bin_dir / name).write_text(body)
+            (bin_dir / name).chmod(0o755)
+    runner = tmp_path / "revision.sh"
+    runner.write_text(
+        "set -euo pipefail\n"
+        "log() { printf 'LOG %s\\n' \"$*\"; }\n"
+        f'WORK="{work}"\nDTB="{dtb}"\n'
+        + slice_between(IMG_BOOT.read_text(), *REVISION_BLOCK) + "\n"
+        'printf "DTB=%s\\n" "$DTB"\n')
+    # PATH without the real device-tree-compiler even when the host has one,
+    # so `have_fdtput=False` really means absent.
+    proc = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", str(runner)],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "FDT_LOG": str(tmp_path / "fdt.log"),
+             **({"FDTPUT_DEAF": "1"} if fdtput_deaf else {}),
+             "PATH": str(bin_dir)})
+    return proc, tmp_path / "fdt.log"
+
+
+def test_the_harness_supplies_the_board_revision_the_firmware_would_have(tmp_path):
+    """
+    QEMU is not the Pi firmware, so no /system/linux,revision reaches the
+    guest and rpi-eeprom-update.service dies on `(0x >> 23) & 1`. Measured on
+    a stock card under -M raspi3b: absent without this, 00a02082 with it, and
+    the service goes rc=2 to rc=0.
+    """
+    proc, log = run_revision_block(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text()
+    assert "linux,revision 0xa02082" in calls, calls
+    # The image's own DTB is left alone, so the evidence can still show what
+    # a device would have booted.
+    assert "otp-harness-" in proc.stdout, proc.stdout
+
+
+def test_a_revision_that_did_not_reach_the_blob_stops_the_boot(tmp_path):
+    """
+    A write that did nothing looks exactly like one that worked from here,
+    and the cost of not noticing is a red release gate blamed on the image
+    rather than on the emulator. So the property is read back.
+    """
+    proc, _ = run_revision_block(tmp_path, fdtput_deaf=True)
+    assert proc.returncode != 0
+    assert "linux,revision" in proc.stderr, proc.stderr
+
+
+def test_no_device_tree_compiler_stops_the_boot_rather_than_booting_without_it(tmp_path):
+    """
+    Booting without the property is booting the configuration this exists to
+    fix. A hard requirement, like mcopy: the failure has to name the missing
+    package rather than arrive half an hour later as a failed unit.
+    """
+    proc, _ = run_revision_block(tmp_path, have_fdtput=False)
+    assert proc.returncode != 0
+    assert "device-tree-compiler" in proc.stderr, proc.stderr
+
+
+def test_the_synthesised_revision_is_the_board_the_emulator_models():
+    """
+    A code for hardware `-M raspi3b` does not model is the run-1 DTB mistake
+    in a smaller font -- and gpiozero builds its whole board description from
+    these bits. Decoded against the scheme rpi-eeprom-update itself reads.
+    """
+    text = IMG_BOOT.read_text()
+    code = int(shell_assignment(text, "BOARD_REVISION"), 16)
+    assert (code >> 23) & 1, "new-style flag clear: rpi-eeprom-update would " \
+                             "call this a pre-2016 board and skip"
+    assert (code >> 12) & 0xF == 2, "processor is not BCM2837"
+    assert (code >> 4) & 0xFF == 0x08, "board type is not 3 Model B"
+    # 1GB, in the same units `-m 1024` gives the guest. A revision claiming
+    # more memory than the emulator provides is a description of a machine
+    # that is not there.
+    assert 256 * (2 ** ((code >> 20) & 7)) == 1024
+    assert "-M raspi3b -m 1024" in text, \
+        "the emulated machine moved; the revision above describes the old one"
+
+
+def shell_assignment(text: str, name: str) -> str:
+    """A plain NAME=value assignment, read out of a shipped script."""
+    match = re.search(rf"^{name}=(\S+)$", text, re.M)
+    assert match, f"{name} is gone"
+    return match.group(1)
 
 
 def test_the_harness_hands_the_initramfs_to_qemu():
@@ -589,7 +1164,8 @@ def test_the_refusal_comes_before_anything_the_probe_writes():
 # appearance: `slice_between` takes the first match, and "DROPIN\n" first
 # appears on the `cat <<DROPIN` line itself -- which cut the body off and
 # wrote an empty drop-in that these tests then passed judgement on.
-DROPIN_BLOCK = ("systemctl unmask userconfig.service", "StandardInput=null\nDROPIN")
+DROPIN_BLOCK = ("systemctl unmask userconfig.service",
+                "systemctl enable userconfig.service 2>/dev/null || true")
 DROPIN_DIR = "/etc/systemd/system/userconfig.service.d"
 
 
@@ -636,6 +1212,32 @@ def test_the_wizard_runs_only_when_an_operator_seeded_it(tmp_path):
     # prompt and silently discards every credential file too.
     assert "unmask userconfig.service" in log, log
     assert "mask userconfig.service" not in log.replace("unmask", ""), log
+
+
+def test_the_wizard_is_enabled_in_the_image_and_not_by_accident(tmp_path):
+    """
+    Run 32020772161, boot 2, the first boot pair with the machine-id
+    persisted:
+
+      OTP-CHECK boot2 userconf-unseeded-boot-skips-the-wizard FAIL
+        condition=no checked-at='never' is-active=inactive is-enabled=disabled
+
+    `is-enabled=disabled` on a boot where nothing disabled anything -- /etc is
+    the overlay, so boot1's `systemctl disable userconfig` died with the
+    power. That is the IMAGE's state, and it always was: what had been hiding
+    it is that every boot used to be a first boot, so `preset-all` re-enabled
+    the unit every time. The same run shows the change directly, in the
+    targets it reached: boot1 has first-boot-complete.target, boot2 does not.
+
+    userconfig.service is the ONLY consumer of the documented headless
+    credential file, so leaving it disabled means a userconf.txt an operator
+    writes to the card is ignored in silence on every boot after the first --
+    which is exactly the trade the drop-in above replaced a `mask` to avoid.
+    Enabling it is what that drop-in was written for: the condition pair costs
+    an unseeded boot two ConditionPathExists and a skip.
+    """
+    _, log = run_dropin(tmp_path, boot_dir="/boot/firmware")
+    assert "enable userconfig.service" in log, log
 
 
 def test_the_wizard_cannot_reach_a_terminal(tmp_path):
@@ -732,12 +1334,21 @@ def test_cloud_init_is_switched_off_on_an_air_gapped_printer(tmp_path):
 
 def test_the_closing_summary_names_what_was_done_to_the_whole_machine():
     """
-    The documented path is "run this on a Pi you already have", and two of
-    the steps above are not confined to the unit: a shared systemd unit is
-    MASKED, and cloud-init is switched off permanently. Both outlive this
-    script, both change how software installed later behaves, and neither
-    was in the summary the operator reads at the end -- which listed the
-    overlay and stopped, reading as though nothing else had been touched.
+    The documented path is "run this on a Pi you already have", and four of
+    the steps above are not confined to the unit: three shared systemd units
+    are MASKED and cloud-init is switched off permanently. All four outlive
+    this script, all four change how software installed later behaves, and
+    none of them was in the summary the operator reads at the end -- which
+    listed the overlay and stopped, reading as though nothing else had been
+    touched.
+
+    EVERY MASK THIS SCRIPT ISSUES, and that is what the list is derived from
+    rather than restated. The summary said "three machine-wide changes" while
+    the script made four: systemd-growfs-root.service was masked in the same
+    round that added the ssh.socket mask and never reached the paragraph an
+    operator reads, so the one persistent change with no undo instruction was
+    the newest one. A hand-written list is a list that goes stale exactly
+    that way.
 
     The summary is what someone gets instead of a diff. Undo instructions
     are required with them: a machine-wide change nobody can find again is
@@ -746,15 +1357,27 @@ def test_the_closing_summary_names_what_was_done_to_the_whole_machine():
     """
     install = INSTALL.read_text()
     summary = install[install.index('log "Done. Reboot to start the unit."'):]
-    for claim in ("systemd-networkd-wait-online.service", "cloud-init"):
-        assert claim in summary, (
-            f"install.sh changes {claim} on any machine it touches and the "
+    body = install[:install.index('log "Done. Reboot to start the unit."')]
+    # Indentation allowed: the growfs mask is inside the overlay branch, and
+    # a pattern anchored at column one is exactly how it went unlisted.
+    masked = sorted(set(re.findall(r"^[ \t]*systemctl mask (\S+)$", body, re.M)))
+    assert len(masked) == 3, masked
+    for unit in masked:
+        assert unit in summary, (
+            f"install.sh masks {unit} on any machine it touches and the "
             f"closing summary does not mention it")
-    for undo in ("unmask systemd-networkd-wait-online.service",
-                 "/etc/cloud/cloud-init.disabled"):
-        assert undo in summary, (
+        assert f"unmask {unit}" in summary, (
             f"the summary names a permanent change without telling the "
-            f"operator how to reverse it: {undo}")
+            f"operator how to reverse it: unmask {unit}")
+    assert "cloud-init" in summary, (
+        "install.sh switches cloud-init off permanently and the closing "
+        "summary does not mention it")
+    assert "/etc/cloud/cloud-init.disabled" in summary, (
+        "the summary names a permanent change without telling the operator "
+        "how to reverse it: /etc/cloud/cloud-init.disabled")
+    # And the count in the prose, which is the half a list of names cannot
+    # keep honest -- it said "Three" while naming three of four.
+    assert "Four machine-wide changes" in summary, summary
 
 
 GETTY_BLOCK = ("install -d /etc/systemd/system/getty@tty1.service.d",
@@ -978,6 +1601,837 @@ rm -f "$BOOTDIR/userconf.txt"
 echo "Entered username is invalid:"
 exit 1
 """
+
+
+# --- the journal on the console, and the panel that is not there ----------
+
+# systemd-cat writes its stdin to the journal and NOTHING to stdout. Here the
+# journal is a file, so a test can also model the machine where the write
+# never lands -- which is the case that separates "forwarding is off" from
+# "the marker was never made" when the host finds nothing on the console.
+SYSTEMD_CAT_STUB = """#!/bin/sh
+if [ -n "${SYSTEMD_CAT_DEAF-}" ]; then cat > /dev/null; exit 0; fi
+cat >> "$FAKE_TAGGED_JOURNAL"
+"""
+
+# Answers the probe's two reads and refuses everything else, for the reason
+# SYSTEMCTL_STUB does: a stub that returned "" for an unexpected question
+# would let a check pass by accident.
+#
+# A JOURNAL THAT REMEMBERS PREVIOUS BOOTS, because the real one is one config
+# line away from doing so. `-b` scopes both reads to this boot;
+# UNIT_JOURNAL_LAST_BOOT is what a persistent journal would add, and the
+# shipped `-b` is what keeps it out.
+JOURNAL_READ_STUB = """#!/bin/sh
+case "$*" in
+    *"-t otp-imgcheck"*|*"-u otp-unit.service"*) ;;
+    *) echo "stub: unexpected journalctl $*" >&2; exit 64 ;;
+esac
+case "$*" in
+    *-b*) ;;
+    *) [ -z "${UNIT_JOURNAL_LAST_BOOT-}" ] || printf '%s\\n' "$UNIT_JOURNAL_LAST_BOOT" ;;
+esac
+case "$*" in
+    *"-t otp-imgcheck"*) cat "$FAKE_TAGGED_JOURNAL" 2>/dev/null ;;
+    *"-u otp-unit.service"*) printf '%s\\n' "${UNIT_JOURNAL-}" ;;
+esac
+"""
+
+# What a unit with no panel logs on the way to printing unattended, in the
+# order otpunit/hmi.detect and otpunit/__main__ produce it.
+#
+# THE EMULATED MACHINE AS IT IS, quoted from the console rather than reasoned
+# about. Run 32020772161, boot1 console-text.log:713-714:
+#
+#   no GPIO buttons ([Errno 22] Invalid argument)
+#   interface -- display: none, input: none
+#
+# harness/img-boot.sh writes /system/linux,revision into the DTB so
+# rpi-eeprom-update.service stops failing on an empty BOARD_INFO, and
+# gpiozero reads the same property -- so the pin factory LOADS here, which is
+# why the exception in the brackets is an OSError and not BadPinFactory. It
+# does not follow that a Button constructs: claiming GPIO5 on QEMU's gpiochip
+# fails EINVAL, hmi.open_buttons() falls through to (None, "none"), and this
+# machine has neither half of an interface. An earlier version of this
+# fixture said `input: GPIO buttons` and called itself the machine as it is
+# now; it was the machine nothing has ever booted.
+HEADLESS_JOURNAL = (
+    "Aug 17 00:04:02 otp-unit systemd[1]: Started otp-unit.service.\n"
+    "Aug 17 00:04:09 otp-unit python3[412]: no OLED (FileNotFoundError: "
+    "[Errno 2] No such file or directory: '/dev/i2c-1')\n"
+    "Aug 17 00:04:09 otp-unit python3[412]: no GPIO buttons ([Errno 22] "
+    "Invalid argument)\n"
+    "Aug 17 00:04:09 otp-unit python3[412]: interface -- display: none, "
+    "input: none\n"
+    "Aug 17 00:04:09 otp-unit python3[412]: no usable interface; printing "
+    "unattended\n")
+
+# A REAL Pi with lgpio, which is every unit this project targets. gpiozero
+# only reserves and configures a pin -- there is no presence detection at all
+# -- so `Button(5)` succeeds on a board with nothing wired to it and the unit
+# reports `input: GPIO buttons`. That is the normal case on hardware, not a
+# fault, and the check must go on passing for it: if it did not, the first
+# unit anyone assembled would fail a check about its screen.
+BUTTONS_JOURNAL = (HEADLESS_JOURNAL
+                   .replace("Aug 17 00:04:09 otp-unit python3[412]: no GPIO "
+                            "buttons ([Errno 22] Invalid argument)\n", "")
+                   .replace("interface -- display: none, input: none",
+                            "interface -- display: none, "
+                            "input: GPIO buttons"))
+
+# And a machine where gpiozero cannot build a pin factory at all -- a Pi with
+# lgpio uninstalled, or an emulator that stops providing a gpiochip. A third
+# shape of "no buttons", reported differently, and the check must pass for it
+# too.
+NO_FACTORY_JOURNAL = HEADLESS_JOURNAL.replace(
+    "no GPIO buttons ([Errno 22] Invalid argument)",
+    "no GPIO buttons (BadPinFactory: Unable to load any default pin factory!)")
+
+# And a machine that DID find something to draw on. An HDMI monitor with no
+# buttons: hmi.open_display still logs "no OLED (" because the SSD1306 probe
+# raised, and __main__ still logs the headless line because
+# Interface.interactive needs both halves -- so the two strings this check
+# used to be made of are both there on a unit that has a screen.
+SCREEN_JOURNAL = HEADLESS_JOURNAL.replace(
+    "interface -- display: none, input: none",
+    "interface -- display: HDMI console, input: none")
+
+
+def journal_block() -> str:
+    """The marker and the panel checks, sliced out of the shipped probe."""
+    text = GUEST_CHECK.read_text()
+    start = text.index("# --- the journal, now that the console carries it")
+    return text[start:text.index("\n# --- CUPS,", start)]
+
+
+def run_journal(tmp_path, *, phase="boot1", unit_journal=HEADLESS_JOURNAL,
+                env=None):
+    """Run the shipped journal/panel block with a journal made of files."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    tagged = tmp_path / "tagged-journal"
+    tagged.write_text("")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name, body in (("systemd-cat", SYSTEMD_CAT_STUB),
+                       ("journalctl", JOURNAL_READ_STUB)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+
+    block = journal_block()
+    # Only the two waits are shortened, and only the waits: every condition
+    # and every string the block prints is the code that ships. Both are real
+    # time in a real boot, and
+    # test_the_probe_is_given_longer_than_its_own_bounded_wait is what holds
+    # them against the unit's TimeoutStartSec.
+    for interval, why in (("sleep 1", "the marker poll"),
+                          ("sleep 2", "the panel poll")):
+        assert block.count(interval) == 1, f"{why}'s interval moved"
+        block = block.replace(interval, "sleep 0")
+
+    runner = tmp_path / "journal.sh"
+    runner.write_text(
+        "set -uo pipefail\n"
+        f'PHASE="{phase}"\nPASS=0\nTOTAL=0\n'
+        + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
+        + block + '\nprintf "TOTALS %s/%s\\n" "$PASS" "$TOTAL"\n')
+    proc = subprocess.run(
+        ["bash", str(runner)], capture_output=True, text=True, timeout=60,
+        env={**os.environ, **(env or {}),
+             "FAKE_TAGGED_JOURNAL": str(tagged),
+             "UNIT_JOURNAL": unit_journal,
+             "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    return proc, tagged
+
+
+def test_a_headless_boot_reports_the_marker_and_the_missing_panel(tmp_path):
+    # The positive control for everything below: every other test here
+    # asserts a FAIL, and a block that failed unconditionally would satisfy
+    # all of them.
+    proc, _ = run_journal(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert results(proc) == {"journal-marker-accepted": "PASS",
+                             "unit-detects-no-panel": "PASS"}, proc.stdout
+
+
+def test_the_marker_is_never_written_where_the_console_would_get_it_anyway(tmp_path):
+    """
+    The one thing that makes the host's gate mean anything.
+
+    This probe's stdout IS the console: otp-unit-imgcheck.service carries
+    StandardOutput=journal+console, so anything printed here reaches the
+    serial port whether or not journald is forwarding. If the marker text
+    ever appeared in a check's detail -- quoted back out of the journal, or
+    echoed for debugging -- the host would find it on the console with
+    forwarding switched off and pass a boot that proved nothing.
+
+    So the block may say how MANY journal lines carry it and never what they
+    say.
+    """
+    proc, tagged = run_journal(tmp_path)
+    assert "OTP-JOURNAL-FORWARDED" in tagged.read_text(), \
+        "the marker never reached the fake journal, so this proves nothing"
+    assert "OTP-JOURNAL-FORWARDED" not in proc.stdout, proc.stdout
+    assert "OTP-JOURNAL-FORWARDED" not in proc.stderr, proc.stderr
+
+
+def test_a_journal_that_never_took_the_marker_fails(tmp_path):
+    """
+    The positive control the host cannot supply for itself.
+
+    From outside the guest, a console with no marker on it is equally
+    "forwarding is off" and "systemd-cat is missing, or wrote nothing". This
+    check is what tells those apart, so it has to be able to say no.
+    """
+    proc, _ = run_journal(tmp_path, env={"SYSTEMD_CAT_DEAF": "1"})
+    assert results(proc)["journal-marker-accepted"] == "FAIL", proc.stdout
+
+
+def test_a_unit_that_never_looked_for_a_panel_fails(tmp_path):
+    """
+    Both halves of the headless decision, because either alone is a
+    different machine.
+
+    Without "no OLED (" the unit never probed the display at all -- the log
+    below is what a unit that walked straight into the menu would leave, and
+    it still says it is printing unattended.
+    """
+    journal = "\n".join(line for line in HEADLESS_JOURNAL.splitlines()
+                        if "no OLED" not in line) + "\n"
+    proc, _ = run_journal(tmp_path, unit_journal=journal)
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
+def test_a_unit_that_saw_no_panel_and_went_on_anyway_fails(tmp_path):
+    """
+    The other half. otpunit/hmi.Interface.prove exists because opening GPIO
+    buttons proves nothing about whether buttons exist: a unit that noticed
+    the missing OLED and still entered the menu blocks on an empty button
+    queue forever, with no pad, no log line and no timeout. That machine
+    logs the first string and never the second.
+    """
+    journal = "\n".join(line for line in HEADLESS_JOURNAL.splitlines()
+                        if "no usable interface" not in line) + "\n"
+    proc, _ = run_journal(tmp_path, unit_journal=journal)
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
+def test_a_unit_that_found_a_screen_is_not_a_unit_with_no_panel(tmp_path):
+    """
+    THE HOLE the third clause closes, and it belongs to a machine no tier of
+    this harness boots -- which is the reason it had to be written down.
+
+    An HDMI monitor with no buttons logs BOTH of the strings this check used
+    to be made of: hmi.open_display reports "no OLED (" because the SSD1306
+    probe raised, and __main__ reports "printing unattended" because
+    Interface.interactive wants a display AND buttons. So a machine with a
+    screen passed a check called unit-detects-no-panel.
+
+    Not a hypothetical: a unit with a monitor plugged into it and nothing
+    wired to the GPIO header is exactly this, and docs/HARDWARE.md describes
+    that as a supported way to run one. The check has to key on the display
+    side, said out loud, whatever the emulator does or does not provide.
+    """
+    proc, _ = run_journal(tmp_path, unit_journal=SCREEN_JOURNAL)
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
+def test_a_unit_whose_buttons_constructed_still_reports_no_panel(tmp_path):
+    """
+    The other direction, and the proof the third clause did not narrow what
+    this check accepts.
+
+    On every real Pi with lgpio installed `Button(5)` succeeds -- gpiozero
+    reserves a pin and has no presence detection at all -- so a unit
+    reporting `input: GPIO buttons` with nothing wired to those pins is the
+    normal case on hardware, not a fault. The check must still pass for it,
+    or the first unit anyone assembles fails a check about its screen.
+    """
+    assert "input: GPIO buttons" in BUTTONS_JOURNAL, \
+        "this fixture is supposed to be the machine whose buttons constructed"
+    assert "no GPIO buttons" not in BUTTONS_JOURNAL, BUTTONS_JOURNAL
+    proc, _ = run_journal(tmp_path, unit_journal=BUTTONS_JOURNAL)
+    assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
+
+
+def test_the_machine_tier_3_boots_has_neither_and_still_reports_no_panel(tmp_path):
+    """
+    The emulated unit, quoted from run 32020772161's boot1 console: the pin
+    factory loads because the harness supplies a board revision, and the pin
+    claim then fails EINVAL, so BOTH halves are none.
+
+    This is the default fixture for everything in this section, and it is
+    asserted here rather than assumed: for a while it said
+    `input: GPIO buttons` and described itself as the machine as it is now,
+    which meant six tests were driving a machine that has never booted.
+    """
+    assert "no GPIO buttons ([Errno 22] Invalid argument)" in HEADLESS_JOURNAL
+    assert "interface -- display: none, input: none" in HEADLESS_JOURNAL
+    proc, _ = run_journal(tmp_path, unit_journal=HEADLESS_JOURNAL)
+    assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
+
+
+def test_a_unit_whose_pin_factory_never_loaded_still_reports_no_panel(tmp_path):
+    """
+    A third shape of "no buttons": gpiozero could not build a pin factory at
+    all -- a Pi with lgpio uninstalled reports exactly this. No one of the
+    three may be the only shape the check accepts.
+    """
+    proc, _ = run_journal(tmp_path, unit_journal=NO_FACTORY_JOURNAL)
+    assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
+
+
+def test_a_unit_that_never_said_what_it_settled_on_fails(tmp_path):
+    """
+    The interface line is the one that carries the display kind, so a unit
+    that never printed it leaves the new clause with nothing to read. An
+    absence must be a FAIL rather than a shrug: the alternative is a check
+    that goes green on a boot where the unit died between probing the display
+    and deciding what to do about it.
+    """
+    journal = "\n".join(line for line in HEADLESS_JOURNAL.splitlines()
+                        if "interface --" not in line) + "\n"
+    proc, _ = run_journal(tmp_path, unit_journal=journal)
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
+def journal_from_the_real_hmi(monkeypatch, *, oled_present, buttons_present=False):
+    """
+    The lines otpunit's own detection writes, on the machine tier 3 boots.
+
+    Not a fixture of what it is believed to log -- the real
+    hmi.detect/open_display/open_buttons, with only the two pieces of
+    hardware stubbed, so the strings come from the code that ships.
+
+    The conditions are the measured ones, from run 32020772161's boot1
+    console: no /dev/i2c-* so the SSD1306 probe raises FileNotFoundError,
+    /sys/class/drm empty, and a Button whose pin claim raises OSError EINVAL
+    -- `no GPIO buttons ([Errno 22] Invalid argument)` is the line that
+    console carries. `buttons_present=True` is the real-Pi case instead,
+    where gpiozero reserves the pin and succeeds.
+    """
+    import sys
+    sys.path.insert(0, str(REPO))
+    from otpunit import hmi
+
+    class Dummy:
+        def close(self):
+            pass
+
+    def oled(**_kwargs):
+        if oled_present:
+            return Dummy()
+        raise FileNotFoundError(
+            2, "No such file or directory", "/dev/i2c-1")
+
+    def gpio(*_args, **_kwargs):
+        if buttons_present:
+            return Dummy()
+        raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(hmi, "Ssd1306Display", oled)
+    monkeypatch.setattr(hmi, "GpioButtons", gpio)
+    monkeypatch.setattr(hmi, "screen_connected", lambda: False)
+    monkeypatch.setattr(hmi, "keyboard_connected", lambda: False)
+
+    lines = []
+    interface = hmi.detect(log=lines.append)
+    # The one line __main__ adds around describe(). Held against __main__'s
+    # own source by tests/test_img_verdict.py.
+    lines.append(f"interface -- {interface.describe()}")
+    # And the decision. Given to the mutant as well, deliberately: a check
+    # that only failed because the headless line went missing would be
+    # proving something weaker than "the detection is what it reads".
+    lines.append("no usable interface; printing unattended")
+    return "".join(
+        f"Aug 17 00:04:09 otp-unit python3[412]: {line}\n" for line in lines)
+
+
+def test_the_check_reads_what_the_shipped_detection_actually_logs(tmp_path,
+                                                                  monkeypatch):
+    """
+    End to end, with no fixture in the middle: the real hmi produces the
+    lines, the shipped probe judges them -- and what it produces has to be
+    the console this harness recorded, character for character in the parts
+    the check reads.
+    """
+    journal = journal_from_the_real_hmi(monkeypatch, oled_present=False)
+    assert "no GPIO buttons ([Errno 22] Invalid argument)" in journal, journal
+    assert "interface -- display: none, input: none" in journal, journal
+    proc, _ = run_journal(tmp_path, unit_journal=journal)
+    assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
+
+
+def test_the_fixture_is_the_journal_the_shipped_detection_produces(monkeypatch):
+    """
+    HEADLESS_JOURNAL is the default for six tests in this section, so it is
+    the fixture most worth holding against the code rather than against
+    somebody's reading of a console. The timestamps and the OLED exception's
+    wording are this file's; the two lines the check keys on are hmi's.
+    """
+    journal = journal_from_the_real_hmi(monkeypatch, oled_present=False)
+    for line in ("no GPIO buttons ([Errno 22] Invalid argument)",
+                 "interface -- display: none, input: none",
+                 "no usable interface; printing unattended"):
+        assert line in journal, (line, journal)
+        assert line in HEADLESS_JOURNAL, (line, HEADLESS_JOURNAL)
+
+
+def test_the_buttons_fixture_is_the_journal_a_real_pi_produces(monkeypatch):
+    """The same, for the shape that must go on passing on hardware."""
+    journal = journal_from_the_real_hmi(monkeypatch, oled_present=False,
+                                        buttons_present=True)
+    assert "interface -- display: none, input: GPIO buttons" in journal, journal
+    assert "no GPIO buttons" not in journal, journal
+    assert "interface -- display: none, input: GPIO buttons" in BUTTONS_JOURNAL
+    assert "no GPIO buttons" not in BUTTONS_JOURNAL, BUTTONS_JOURNAL
+
+
+def test_breaking_the_panel_absence_detection_still_turns_the_check_red(
+        tmp_path, monkeypatch):
+    """
+    THE PROOF the emulator fix is allowed to ship. `unit-detects-no-panel`
+    had to stop being able to pass for the wrong reason, and the way to show
+    that is to break the thing it watches and see it go red.
+
+    The break is the panel-absence detection itself: the SSD1306 probe
+    succeeds, so the unit has a display where the emulated machine has none.
+    Everything else is identical to the test above -- same function, same
+    stubs, same headless line handed over for free -- and the only difference
+    in the journal is what the shipped code said about the panel.
+    """
+    healthy = journal_from_the_real_hmi(monkeypatch, oled_present=False)
+    broken = journal_from_the_real_hmi(monkeypatch, oled_present=True)
+    assert healthy != broken, "the mutation changed nothing the unit logs"
+    proc, _ = run_journal(tmp_path, unit_journal=broken)
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
+def test_a_previous_boots_headless_decision_does_not_answer_for_this_one(tmp_path):
+    """
+    `-b`, and why it is load bearing three hundred lines from the file that
+    makes it safe.
+
+    device/install.sh sets Storage=volatile, so today an unscoped
+    `journalctl -u` sees only this boot anyway. Delete that one line and a
+    PREVIOUS boot's "no usable interface" satisfies a boot on which the unit
+    never got that far -- which is precisely the reading this check exists to
+    make impossible.
+    """
+    proc, _ = run_journal(
+        tmp_path, unit_journal="",
+        env={"UNIT_JOURNAL_LAST_BOOT": HEADLESS_JOURNAL})
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
+# --- the identity that has to outlive the power cycle ---------------------
+
+IDENTITY_BLOCK = (
+    "# --- the identity, which is the one thing allowed to survive",
+    # Through the closing `fi` of the boot2 branch, or the slice is a shell
+    # fragment that will not parse -- which is a syntax error rather than a
+    # test, and would have been one either way.
+    '"boot1: $(short_id "$MACHINE_ID_BOOT1") | '
+    'boot2: $(short_id "$LIVE_MACHINE_ID")"\nfi')
+
+# The probe asks findmnt exactly one thing here: which filesystem contains the
+# identity store. Anything else is a stub being asked a question nobody wrote
+# an answer for, and it says so rather than returning "".
+FINDMNT_STUB = """#!/bin/sh
+case "$*" in
+    *--target*) printf '%s\\n' "${FAKE_STORE_SRC-/dev/mmcblk0p1}" ;;
+    *) echo "stub: unexpected findmnt $*" >&2; exit 64 ;;
+esac
+"""
+
+# A different machine's id, and the one every "this is not the same box"
+# fixture below uses. 32 hex characters, like the real thing.
+OTHER_ID = "ffffffffffffffffffffffffffffffff"
+
+
+def run_identity(tmp_path, *, phase="boot1", live_id=LIVE_ID, stored_id=LIVE_ID,
+                 recorded=None, store_src="/dev/mmcblk0p1", boot_dir="boot",
+                 make_boot=True, root_source="overlay"):
+    """Run the shipped identity checks against a tree this test builds.
+
+    Everything the block reads is a path it takes from a variable -- $BOOTDIR,
+    $ETC_MACHINE_ID -- so the SHIPPED lines run here rather than a copy of
+    them.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    boot = tmp_path / boot_dir
+    machine_id = tmp_path / "machine-id"
+    machine_id.write_text(live_id + "\n") if live_id is not None else None
+    if make_boot:
+        boot.mkdir(exist_ok=True)
+        (boot / "otp-identity").mkdir(exist_ok=True)
+        if stored_id is not None:
+            (boot / "otp-identity" / "machine-id").write_text(stored_id + "\n")
+        if recorded is not None:
+            (boot / "otp-imgcheck-machine-id").write_text(recorded + "\n")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name, body in (("findmnt", FINDMNT_STUB),):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+
+    runner = tmp_path / "identity.sh"
+    runner.write_text(
+        "set -uo pipefail\n"
+        f'PHASE="{phase}"\nPASS=0\nTOTAL=0\n'
+        f'BOOTDIR="{boot}"\n'
+        f'ETC_MACHINE_ID="{machine_id}"\n'
+        f'ROOT_SOURCE="{root_source}"\n'
+        + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
+        + slice_between(GUEST_CHECK.read_text(), *IDENTITY_BLOCK) + "\n")
+    proc = subprocess.run(
+        ["bash", str(runner)], capture_output=True, text=True, timeout=60,
+        env={**os.environ, "FAKE_STORE_SRC": store_src,
+             "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    return proc, boot
+
+
+def test_a_boot_that_kept_its_identity_says_so(tmp_path):
+    # The positive control for everything below: every other test here
+    # asserts a FAIL, and a block that failed unconditionally would satisfy
+    # all of them.
+    proc, _ = run_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert results(proc) == {
+        "machine-id-persisted-outside-the-overlay": "PASS",
+        "machine-id-recorded-for-the-next-boot": "PASS"}, proc.stdout
+
+
+def test_the_first_boot_writes_its_id_where_the_second_can_read_it(tmp_path):
+    """The record is the whole mechanism boot2's check rests on, so boot1 has
+    to leave it on the boot partition rather than merely read it."""
+    proc, boot = run_identity(tmp_path)
+    written = (boot / "otp-imgcheck-machine-id").read_text().strip()
+    assert written == LIVE_ID, written
+    assert results(proc)["machine-id-recorded-for-the-next-boot"] == "PASS"
+
+
+def test_the_record_is_not_the_store_the_shipped_script_writes(tmp_path):
+    """
+    THE FINDING this pair was added for, stated as a property of the file
+    names rather than of a comment.
+
+    `machine-id-persisted-outside-the-overlay` compares the live id with
+    /boot/firmware/otp-identity/machine-id -- and otp-unit-identity.service
+    has already filled that in from the live id by the time the probe looks,
+    so on a card whose store was wiped the two agree because one was copied
+    from the other seconds earlier. The record has to be a DIFFERENT file,
+    written by the probe, or boot2 is held against a value boot2 produced.
+    """
+    _, boot = run_identity(tmp_path)
+    record = boot / "otp-imgcheck-machine-id"
+    store = boot / "otp-identity" / "machine-id"
+    assert record.exists() and store.exists()
+    assert record != store, "the probe records into the store it is auditing"
+
+
+def test_a_machine_with_no_id_at_all_records_nothing_and_says_so(tmp_path):
+    """
+    The positive control has to be able to fail, or boot2's "identical"
+    means nothing. A machine with no readable /etc/machine-id writes an empty
+    record and reads it back -- empty equals empty, which is exactly the shape
+    of agreement this check exists to refuse.
+    """
+    proc, _ = run_identity(tmp_path, live_id=None)
+    assert results(proc)["machine-id-recorded-for-the-next-boot"] == "FAIL", \
+        proc.stdout
+
+
+def test_an_id_that_never_reached_the_card_fails(tmp_path):
+    """
+    Reading it is not recording it. With no writable boot directory the
+    record never lands, and boot2 would have nothing to compare against --
+    which must be boot1's failure rather than boot2's mystery.
+    """
+    proc, _ = run_identity(tmp_path, make_boot=False)
+    assert results(proc)["machine-id-recorded-for-the-next-boot"] == "FAIL", \
+        proc.stdout
+
+
+def test_the_second_boot_accepts_the_same_machine(tmp_path):
+    proc, _ = run_identity(tmp_path, phase="boot2", recorded=LIVE_ID)
+    assert results(proc)["machine-id-identical-across-the-power-cycle"] \
+        == "PASS", proc.stdout
+
+
+def test_an_id_regenerated_by_the_power_cycle_fails_the_second_boot(tmp_path):
+    """
+    THE FAILURE THE OLD CHECK COULD NOT SEE, and the reason this pair exists.
+
+    The FAT store was truncated or deleted between the boots, so systemd
+    generated a fresh id and otp-unit-identity.service wrote THAT into the
+    store: the live id and the store agree perfectly, and
+    machine-id-persisted-outside-the-overlay is green on a unit that is a
+    different machine than it was an hour ago. The record boot1 left is the
+    only thing that disagrees -- so both checks are asked of the same
+    fixture here, and exactly one of them is allowed to be satisfied.
+    """
+    proc, _ = run_identity(tmp_path, phase="boot2", live_id=OTHER_ID,
+                           stored_id=OTHER_ID, recorded=LIVE_ID)
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "PASS", "the fixture no longer reproduces the hole: " + proc.stdout
+    assert results(proc)["machine-id-identical-across-the-power-cycle"] \
+        == "FAIL", proc.stdout
+
+
+def test_two_absences_are_not_an_identical_machine_id(tmp_path):
+    """
+    THE reading this check has to be unable to make. No id in boot2 and
+    nothing recorded by boot1 compare equal as strings, and a machine that
+    lost its identity entirely would then certify that it kept it.
+    """
+    proc, _ = run_identity(tmp_path, phase="boot2", live_id=None, recorded=None)
+    assert results(proc)["machine-id-identical-across-the-power-cycle"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_second_boot_with_an_id_but_no_record_fails(tmp_path):
+    """Half of that absence on its own: boot1 never recorded anything, so
+    there is nothing this boot's id can be identical TO."""
+    proc, _ = run_identity(tmp_path, phase="boot2", recorded=None)
+    assert results(proc)["machine-id-identical-across-the-power-cycle"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_machine_id_that_was_never_kept_fails(tmp_path):
+    proc, _ = run_identity(tmp_path, stored_id=None)
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_kept_machine_id_that_is_not_the_one_in_use_fails(tmp_path):
+    """
+    Which is what a failed initramfs restore looks like from userspace: the
+    store holds an id, systemd generated a different one because it never saw
+    it, and the boot was a first boot all over again.
+    """
+    proc, _ = run_identity(tmp_path, stored_id="ffffffffffffffffffffffffffffffff")
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_machine_with_no_machine_id_at_all_fails(tmp_path):
+    """
+    Two absences again, in the other half. An unreadable /etc/machine-id and
+    an empty store compare equal, and "the identity persisted" would be
+    certified of a machine that has no identity.
+    """
+    proc, _ = run_identity(tmp_path, live_id=None, stored_id="")
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_store_inside_the_overlay_is_not_persistence(tmp_path):
+    """
+    The clause that stops the whole check being self-satisfying. If
+    /boot/firmware never mounted, the store is a directory on the overlay's
+    tmpfs: the copy and the original agree on every boot and nothing survives
+    any of them. findmnt then reports the ROOT's source for the store, which
+    is the state named here.
+    """
+    proc, _ = run_identity(tmp_path, store_src="overlay")
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "FAIL", proc.stdout
+
+
+def test_a_root_nothing_could_describe_does_not_make_the_store_separate(tmp_path):
+    """
+    The other end of the same comparison. If findmnt could not answer for
+    `/`, $ROOT_SOURCE is empty and "the store is not on the root's
+    filesystem" is true of every store there is. `root-is-overlay` would be
+    red on that machine too, but a check that is only correct because a
+    different check failed is a coincidence with a name.
+    """
+    proc, _ = run_identity(tmp_path, root_source="")
+    assert results(proc)["machine-id-persisted-outside-the-overlay"] \
+        == "FAIL", proc.stdout
+
+
+# --- the diagnostic sheet -------------------------------------------------
+
+def sheet_block() -> str:
+    """The boot-1 print-path experiment, sliced out of the shipped probe."""
+    text = GUEST_CHECK.read_text()
+    start = text.index('if [ "$PHASE" = "boot1" ]; then\n'
+                       '    # --- the diagnostic sheet')
+    return text[start:text.index("\n# --- the seeded userconf.txt path", start)]
+
+
+# What the shipped heredoc prints when the image can draw the sheet and cupsd
+# takes it. test_the_sheet_program_prints_what_the_probe_reads runs the real
+# program and holds these shapes against it.
+SHEET_HEALTHY = "RENDER ok bytes=4632 magic=%PDF-\nSUBMIT ok job=otpimgcheck-1\n"
+
+
+def run_sheet(tmp_path, *, says=SHEET_HEALTHY, lpadmin_rc=0):
+    """Run the shipped sheet block with the Python and CUPS tools stubbed.
+
+    The interpreter and the two CUPS binaries are rewritten rather than put
+    on PATH, because the block names them by absolute path -- on purpose, the
+    way otpunit/printer.py does. Everything else, including both `check`
+    calls' conditions and the `case` patterns that read the program's output,
+    is the code that ships.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    calls = tmp_path / "lpadmin-calls"
+    lpadmin = tmp_path / "lpadmin"
+    lpadmin.write_text("#!/bin/sh\n"
+                       f'printf "%s\\n" "$*" >> "{calls}"\n'
+                       'case "$1" in -x) exit 0 ;; esac\n'
+                       f'echo "lpadmin said something"\nexit {lpadmin_rc}\n')
+    lpadmin.chmod(0o755)
+    lpstat = tmp_path / "lpstat"
+    lpstat.write_text("#!/bin/sh\necho 'device for otpimgcheck: usb://OTP/imgcheck'\n")
+    lpstat.chmod(0o755)
+    program = tmp_path / "python3"
+    # Reads the heredoc off stdin and throws it away, exactly as a python3
+    # that ran it and printed nothing else would.
+    program.write_text("#!/bin/sh\ncat > /dev/null\n"
+                       f'printf "%s" "$SHEET_SAYS"\n')
+    program.chmod(0o755)
+
+    block = sheet_block()
+    for original, replacement, why in (
+        ("/usr/sbin/lpadmin", str(lpadmin), "lpadmin"),
+        ("/usr/bin/lpstat", str(lpstat), "lpstat"),
+        ("timeout -k 5 90 python3 -", f"{program} -", "the interpreter"),
+    ):
+        assert block.count(original) >= 1, f"{why}: {original!r} in the block"
+        block = block.replace(original, replacement)
+
+    runner = tmp_path / "sheet.sh"
+    runner.write_text(
+        "set -uo pipefail\n"
+        'PHASE="boot1"\nPASS=0\nTOTAL=0\n'
+        + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
+        + block + '\nprintf "TOTALS %s/%s\\n" "$PASS" "$TOTAL"\n')
+    proc = subprocess.run(
+        ["bash", str(runner)], capture_output=True, text=True, timeout=60,
+        env={**os.environ, "SHEET_SAYS": says})
+    return proc, calls
+
+
+def test_a_sheet_that_rendered_and_was_accepted_passes(tmp_path):
+    # The positive control, and the only test here that does not assert a
+    # FAIL.
+    proc, calls = run_sheet(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert results(proc) == {"diagnostic-sheet-renders": "PASS",
+                             "diagnostic-sheet-reaches-cups": "PASS"}, proc.stdout
+    # And the machine is left as a unit rather than as a rig.
+    assert "-x otpimgcheck" in calls.read_text(), calls.read_text()
+
+
+def test_an_image_that_cannot_draw_the_sheet_fails(tmp_path):
+    """
+    The half nothing else in this repository can ask. tier 1 renders this
+    sheet against the host's reportlab; only a booted image can say whether
+    the thing that gets flashed has one.
+    """
+    proc, _ = run_sheet(tmp_path, says="RENDER failed ModuleNotFoundError: reportlab\n")
+    assert results(proc) == {"diagnostic-sheet-renders": "FAIL",
+                             "diagnostic-sheet-reaches-cups": "FAIL"}, proc.stdout
+
+
+def test_a_sheet_that_is_not_a_pdf_fails(tmp_path):
+    """
+    Bytes are not a page. reportlab writing an empty or truncated file
+    raises nothing, and "no exception" is the whole of what a bare rc=0
+    would prove -- so the magic number is checked, which is the cheapest
+    thing that separates a sheet from an artefact.
+    """
+    proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=0 magic=\n"
+                                       "SUBMIT ok job=otpimgcheck-1\n")
+    assert results(proc)["diagnostic-sheet-renders"] == "FAIL", proc.stdout
+
+
+def test_a_sheet_cupsd_would_not_take_fails_with_the_render_still_green(tmp_path):
+    """
+    Two checks, because they fail for entirely different reasons and a
+    single one would report "the print path is broken" for either.
+    """
+    proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=4632 magic=%PDF-\n"
+                                       "SUBMIT failed PrinterError: lp: Bad destination\n")
+    assert results(proc) == {"diagnostic-sheet-renders": "PASS",
+                             "diagnostic-sheet-reaches-cups": "FAIL"}, proc.stdout
+
+
+def test_an_lp_that_returned_no_job_id_is_not_an_enqueued_sheet(tmp_path):
+    """
+    ENQUEUED means cupsd gave it an id, not that lp exited 0.
+
+    Cups.submit() pulls "request id is <id>" out of lp's stdout and returns
+    "" when it is not there -- an lp that succeeded and said nothing useful
+    is a job nobody can point at, and the queue this ran against has no
+    printer behind it to notice either way.
+    """
+    proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=4632 magic=%PDF-\n"
+                                       "SUBMIT ok job=<no id>\n")
+    assert results(proc)["diagnostic-sheet-reaches-cups"] == "FAIL", proc.stdout
+
+
+def test_a_job_on_somebody_elses_queue_is_not_this_experiment(tmp_path):
+    """
+    The id has to name the queue the probe made. `lp` reports the id as
+    <queue>-<n>, so a job id from anywhere else -- the unit's own OTP queue,
+    say, if one ever existed on this machine -- would otherwise read as this
+    experiment having worked.
+    """
+    proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=4632 magic=%PDF-\n"
+                                       "SUBMIT ok job=OTP-7\n")
+    assert results(proc)["diagnostic-sheet-reaches-cups"] == "FAIL", proc.stdout
+
+
+def test_the_sheet_program_prints_what_the_probe_reads(tmp_path):
+    """
+    The shipped Python, run for real, against the shipped otpunit.
+
+    Everything above stubs the interpreter, so the `case` patterns the block
+    matches on are only as good as the guess about what the program prints.
+    This runs the actual heredoc: diagnostics.collect() over this machine and
+    render_bytes() through reportlab, which is also the only place in the
+    fast suite where the sheet the headless design rests on is drawn at all.
+
+    The submit half is expected to FAIL here -- there is no cupsd on a test
+    runner -- and that it fails in the shape the block reads is the point.
+    """
+    block = sheet_block()
+    opener = "<<'PY' 2>&1\n"
+    assert block.count(opener) == 1, "the sheet program's heredoc moved"
+    start = block.index(opener) + len(opener)
+    program = block[start:block.index("\nPY\n", start)]
+    assert "diagnostics.render_bytes" in program, program[:200]
+    # /opt/otp-unit does not exist here; the repository root is on sys.path
+    # already, so the shipped `sys.path.insert` is simply inert.
+    #
+    # CUPS_SERVER at a socket that cannot exist, so the submit half is
+    # hermetic: `lp` fails against nothing rather than reaching whatever
+    # daemon happens to be running on the machine the fast suite is on. The
+    # rig in tests/cupsrig.py is the hardware tier's job and carries a marker
+    # for it; this test must not touch a real queue by accident.
+    proc = subprocess.run(
+        ["python3", "-c", program], capture_output=True, text=True, timeout=180,
+        cwd=REPO, env={**os.environ, "SHEET_QUEUE": "otpimgcheck",
+                       "CUPS_SERVER": "/nonexistent/otp-no-such-cupsd.sock"})
+    assert proc.returncode == 0, proc.stderr
+    said = proc.stdout
+    assert re.search(r"^RENDER ok bytes=\d+ magic=%PDF-", said, re.M), said
+    assert re.search(r"^SUBMIT (ok job=|failed )", said, re.M), said
+    # And what it printed is what the shipped block reads as a rendered
+    # sheet. The glob is taken out of the probe rather than restated here:
+    # its quoted literals have to appear, in order, in what the program said.
+    glob = re.search(r"(\*\".*magic=%PDF\"\*)\) SHEET_RENDERED=yes",
+                     sheet_block())
+    assert glob, "the render pattern is gone from the probe"
+    rest = said
+    for literal in re.findall(r'"([^"]*)"', glob.group(1)):
+        assert literal in rest, (glob.group(1), literal, said)
+        rest = rest.split(literal, 1)[1]
 
 
 def userconf_block() -> str:
@@ -1548,9 +3002,16 @@ def test_the_probe_is_given_longer_than_its_own_bounded_wait(tmp_path):
     poll and a `timeout` when the credential checks landed, and a test that
     kept reading only the unit poll would have gone on approving a budget
     against 90s of a worst case several times that. Measured as this stands:
-    90s polling for otp-unit, 120s polling for systemd's verdict on the
-    wizard, 60s bounding the malformed-seed experiment -- 270s against a
-    TimeoutStartSec of 420 inside a 600s per-boot backstop.
+    90s polling for otp-unit, 15s waiting for journald to index the
+    forwarding marker, 60s waiting for the unit to decide it has no panel,
+    120s polling for systemd's verdict on the wizard, 90s bounding the
+    diagnostic sheet and 60s bounding the malformed seed -- 435s against a
+    TimeoutStartSec of 480 inside a 600s per-boot backstop.
+
+    That sum is deliberately pessimistic: the two experiments are in
+    different phases, so no single boot can pay both (boot1's worst case is
+    375s, boot2's 345s). Summing them anyway keeps the assertion below
+    arithmetic rather than bookkeeping about which phase runs what.
 
     Those three numbers are prose and the assertions below are not: the sums
     are re-derived from the shipped files on every run, so a wait that

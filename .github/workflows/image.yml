@@ -356,8 +356,13 @@ jobs:
           # on the way past -- and making that step skip on arm64 took the
           # update with it.
           sudo apt-get update
+          # device-tree-compiler is for fdtput: QEMU is not the Pi firmware
+          # and supplies no board revision, so harness/img-boot.sh writes
+          # /system/linux,revision into a copy of the image's own DTB. Without
+          # it rpi-eeprom-update.service dies on `(0x >> 23) & 1` in both
+          # boots -- the emulator's fault, reported as the image's.
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-arm mtools xz-utils
+            qemu-system-arm mtools xz-utils device-tree-compiler
           OTP_IMG_WORK=${{ runner.temp }}/otp-img \
             ./harness/img-boot.sh image/deploy/*.img.xz
       - name: Boot verdict
@@ -469,9 +474,24 @@ jobs:
             `failed_userconf.txt` rather than holding the boot open. The
             first boot still had its front panel on tty1 afterwards, and
             neither boot was left waiting on a network this appliance does
-            not have. That gate does not exercise the OLED, the buttons or a
-            printer -- see the header of `harness/img-boot.sh` for exactly
-            what it does and does not prove.
+            not have. The unit's IDENTITY survived the power-cycle as well:
+            the second boot came up with the same machine-id the first boot
+            recorded, and systemd did not treat it as a first boot --
+            `first-boot-complete.target` is in the first boot's targets and
+            not in the second's. That is a change -- `/etc` is inside the RAM
+            overlay, so before this the machine-id reverted to
+            `uninitialized` every time and systemd read every boot as a first
+            boot, which is what kept re-enabling `ssh.socket` and
+            regenerating the host keys. The machine-id is kept in
+            `/boot/firmware/otp-identity`, on the FAT partition, which is
+            mounted with `defaults` -- so it is world-readable to every
+            account on the unit as well as to anyone who can mount the card.
+            Nothing else is kept there: this image does **not** run `sshd`
+            (`ENABLE_SSH=0`, so `ssh.service` is disabled), and no SSH host
+            key is written outside the overlay. That gate does not exercise
+            the OLED, the buttons or a printer -- see the header of
+            `harness/img-boot.sh` for exactly what it does and does not
+            prove.
 
       # The bar, stated where it can be seen. Ten minutes is the budget for
       # a run that did not have to rebuild the image; a run that did is

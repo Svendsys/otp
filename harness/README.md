@@ -333,14 +333,21 @@ consoles carrying `random: crng init done` and `bcm2835-rng 3f104000.rng:
 hwrng registered`. Measured cost on a cache miss: 6m58s of pi-gen, then
 7m59s for the pair of boots, 16m16s for the whole job.
 
-Those two totals are run 16's and stay run 16's. The credential checks
-below added three names to what boot 1 must report and three to boot 2, and
-one more — the network wait — to both, so a green run now counts
-differently: 13 in boot 1 and 15 in boot 2. Run 17 measured 9/11 and 13/14
-against the counts as they stood then, which is a different arithmetic
-again; the numbers move with the list and only the list is authoritative.
-The cost is unchanged: no extra boot, and the one bounded experiment inside
-boot 2 is capped at 60 seconds.
+Those two totals are run 16's and stay run 16's. Every count below them is
+a different arithmetic again: the credential checks added three names to
+boot 1 and three to boot 2 with one — the network wait — to both, and run 20
+(31979545889) measured **13/13 and 15/15** against that list, at 175.5s and
+151.1s of guest time, 7m58s for the pair of boots on top of 7m06s of pi-gen
+and 16m14s for the whole job. The journal work then added two names to both
+boots and two more to boot 1, so a green run is **17 and 17** now. The
+numbers move with the list and only the list is authoritative;
+`tests/test_img_verdict.py` reads it out of `img-boot.sh` rather than
+restating it, so no fixture here can describe a healthy boot that is missing
+a check.
+
+The cost stays inside one budget: no extra boot, and the two bounded
+experiments are in different phases — 90 seconds for the diagnostic sheet in
+boot 1, 60 for the malformed seed in boot 2.
 
 **`OTP_IMG_PHASES` picks the boots, and it may not drop `boot2`.** It
 defaults to `boot1 boot2`; a run debugging the boot itself can shorten it,
@@ -466,6 +473,106 @@ reaches a shipped image — `img-boot.sh` writes it into the decompressed
 working copy it boots, and `image/deploy/*.img.xz` is never opened for
 writing.
 
+### The journal on the console, which is an emulation-only lever
+
+Issue #21. Run 20 (31979545889) was the first fully green pair of boots —
+13/13 in boot 1, 15/15 in boot 2, both reaching `multi-user.target`, 46848
+and 45302 bytes of uart0 — and everything in it was a statement about
+*getting started*. Whether the unit **did** anything afterwards was
+unobservable: the journal is volatile by design (`Storage=volatile`,
+`RuntimeMaxUse=16M` from `install.sh`), it dies with the guest, and nothing
+carried it to the serial port the harness captures. The only exception was
+the thirty lines the probe dumps at the very end, and nothing asserted them.
+
+`-append` now carries **`systemd.journald.forward_to_console=1`**, and that
+is where it stays. `-append` replaces the kernel command line wholesale
+under emulation — the same reason `root=` has to be restated and
+`boot=overlay` has to be copied out of the image — so the image's own
+`cmdline.txt` is untouched and a flashed unit keeps its quiet console. A
+device narrating its journal to whoever is holding the serial header is not
+a feature; a test rig doing it is the whole point.
+
+**The flag is not taken on trust**, because a kernel parameter that is
+accepted and ignored looks exactly like one that works. The probe writes one
+marker into the journal with `systemd-cat` and by *no other route* — not on
+its own stdout, which `StandardOutput=journal+console` already copies to the
+console, and never echoed back into a check's detail — and the verdict
+requires it. The guest's `journal-marker-accepted` is the other half: it says
+the journal *took* the marker, so a console without it is a forwarding
+failure rather than a `systemd-cat` that did nothing.
+
+**Two behavioural checks ride on it.** `unit-detects-no-panel` reads the
+unit's own journal for three strings: `no OLED (` (the display probe raised),
+`interface -- display: none,` (nothing was found to draw on) and `no usable
+interface; printing unattended` (the unit chose the headless route). The
+emulated Pi has no I²C panel and `-append` drops the `dtparam=i2c_arm=on`
+that would give the bus a node, so the headless route is the correct one and
+nothing had ever watched the shipped code choose it. The middle string is the
+one that survives the board revision the harness now supplies — see run 72
+below — and it also closes a hole the other two had: a unit with an HDMI
+console and no buttons logs both of them. All three are held against
+`otpunit/hmi.py` and `otpunit/__main__.py` by `tests/test_img_verdict.py`,
+because a check whose needle lives in another file is one rewording away from
+matching nothing forever.
+
+`diagnostic-sheet-renders` and `diagnostic-sheet-reaches-cups` are the print
+path, and they come with a correction to how the issue framed it. **The
+headless path does not fire under QEMU**, by design rather than by accident:
+`otpunit/__main__` falls into `diagnostics.run_headless()`, which loops on
+`cups.devices()`, and `Cups.devices()` is built from `lpinfo -v` and keeps
+only `usb://`, a loopback IPP endpoint, or a `dnssd://` entry matching an
+attached USB device. An emulated Pi has no printer of any kind, so the list
+is empty on every poll and the unit waits in silence — a unit with neither a
+panel nor a printer says nothing at all, which is worth knowing about a
+design whose answer to a missing panel is "the printer becomes the console".
+So the probe supplies the one thing the emulator cannot, a queue, and drives
+the rest through the shipped code: `diagnostics.collect()` over the real
+machine, `render_bytes()` through the image's own reportlab, and
+`Cups.submit()` into the shipped `cupsd`. What is gated is that the bytes are
+a PDF and that cupsd answered with a job id naming that queue — enqueued,
+not printed; there is nothing behind the URI and there does not need to be.
+The queue is the probe's own name, removed afterwards, and `/etc/cups` is a
+tmpfs, so none of it can reach the card. `lpadmin -p NAME -E -v usb://…`
+with no `-m` at all was measured against a real cupsd 2.4.7 configured from
+`install.sh`'s own directives before being relied on; the image is asked for
+the first time in CI.
+
+**The forbidden-pattern list was re-read at the same time**, because it had
+to be. `status=216`, `Failed with result`, `Scheduled restart job`, `Kernel
+panic` and `Unable to mount root` were written for a console carrying kernel
+output and PID 1's status lines and nothing else — once journald started,
+every unit's stdout stayed in the journal. Now the console carries whatever
+anything on the machine writes, *including this harness's own probe*, which
+quotes `userconf-service`'s output into a check detail and dumps the unit's
+journal at the end of every phase. Failing a release because a unit
+**repeated** one of those phrases is row 2 of issue #14 in a new place. The
+greps run over the lines the *system* wrote: journald prefixes a forwarded
+line with `[   45.123456] python3[412]: `, the kernel's own output has the
+timestamp and no speaker, and `systemd[1]` is kept by name because it is the
+one speaker whose "Failed with result" is a verdict rather than a quotation.
+A phrase found only in a forwarded line is reported as an `IMG-NOTE` instead,
+so the scoping cannot swallow one in silence.
+
+**What it costs.** uart0 was 46848 and 45302 bytes in run 20 with the journal
+invisible; forwarding it will grow that, and the size is now a number worth
+reading rather than ignoring — the sampler's byte column prints it every 30
+seconds. There are five copies of each console in the work directory (the two
+ports, the concatenation, the ANSI-stripped copy and the speaker-filtered
+one), all of them matched by the `console*.log` glob the failure artifact
+uploads, and all of them well inside the 16 MB budget at these sizes. The
+early-stop grep still reads the whole file once per sample; if that ever
+shows up in the sampler's timing, `tail -c` a recent window instead.
+
+One more thing moved for the same reason and it is a guess rather than a
+measurement: `single-kernel-entry` counts `Booting Linux on physical CPU`,
+and journald imports `/dev/kmsg` from the start of the buffer. If it forwards
+those entries to the console too, every early kernel line arrives twice and a
+healthy boot is failed as a reboot loop. Whether it does has **not** been
+measured here — there is no systemd on the machine this was written on — so
+the count excludes the `kernel:` identifier journald would label such a copy
+with. It costs nothing if the copy never comes, and it cannot hide a real
+loop, whose second entry prints with no speaker in front of it.
+
 The other variables: `OTP_IMG_TIMEOUT` is the per-boot backstop in seconds
 (CI sets 600; the local default is 1200 because someone running this by
 hand is debugging), and `OTP_IMG_WORK` is where the decompressed card, the
@@ -537,6 +644,260 @@ not a power of two, which pi-gen's output never is.
 defect in the plan — a QEMU Pi is a Pi with nothing plugged into it. Once
 per image, not per commit.
 
+### Run 72 (31983736617): three units that had been failing all along
+
+The first run with the journal actually on the console failed, in both
+boots, on exactly one check — `no-Failed-with-result` — and everything else
+passed: 17/17 in each guest, `single-kernel-entry PASS`, the marker
+forwarded, the panel detected, the sheet rendered and enqueued. Neither
+hazard the change was written against had bitten. journald does **not**
+re-forward the kmsg it imported (zero `kernel: ` lines, one
+`Booting Linux on physical CPU`), and the speaker scoping worked exactly as
+designed: every matched line was a genuine `systemd[1]:` verdict, and no
+forwarded line from anything else tripped anything.
+
+What it caught was three real unit failures that a non-forwarding console
+had simply never carried. All three predate issue #21.
+
+| Unit | Boots | Whose defect |
+| --- | --- | --- |
+| `systemd-growfs-root.service` | both | **Ours.** Fixed — see the mask in `install.sh`. |
+| `rpi-eeprom-update.service` | both | **The emulator's.** Fixed — see the board revision in `img-boot.sh`. |
+| `ssh.service` | boot 1 | **Ours.** Fixed — see the `ssh.socket` mask and the persisted machine-id in `install.sh`. |
+
+**`rpi-eeprom-update.service`** dies on
+`arithmetic expression: expecting ')': "(0x >> 23) & 1"`. It reads the board
+revision from `/proc/device-tree/system/linux,revision`, then `/proc/cpuinfo`,
+then `vcgencmd`; QEMU is not the Pi firmware and supplies none of them, so
+`BOARD_INFO` is empty and `0x` is a syntax error. The same absence is
+independently visible two lines away in the unit's own log — gpiozero:
+`unable to locate Pi revision in /proc/device-tree or /proc/cpuinfo`. On real
+hardware the revision exists and the script reaches `chipNotSupported()`,
+which **exits 0**, so on every board `docs/HARDWARE.md` lists this unit
+succeeds. It is the emulator that is wrong, not the image.
+
+The repair is to synthesise `linux,revision` into the DTB the harness already
+passes, the way it already synthesises the command line and the initramfs the
+firmware would have supplied. `img-boot.sh` does that now, with `fdtput` into
+a **copy** of the image's own DTB — so the evidence still shows what a device
+would have booted — and it reads the property back, because an `fdtput` that
+did nothing looks exactly like one that worked.
+
+**It was measured before it was built on**, by booting a stock Raspberry Pi OS
+Lite arm64 card under the same `-M raspi3b` with QEMU 8.2.2, twice, with an
+`init=` probe in place of systemd:
+
+| | without the property | with `0xa02082` |
+| --- | --- | --- |
+| `/proc/device-tree/system/linux,revision` | absent | `00a02082` |
+| `/proc/cpuinfo` `Revision` | no such line | `a02082` |
+| `rpi-eeprom-update` | rc 2, `(0x >> 23) & 1` | rc 0, "Skipping bootloader update." |
+| `gpiozero` `Button(5)` | `BadPinFactory` | `CONSTRUCTED factory='LGPIOFactory'` |
+| `/dev/i2c-*` | none | none |
+| `/sys/class/drm` | empty | empty |
+
+The revision is decoded field by field in the script: new-style flag set,
+1 GB (which `-m 1024` agrees with), BCM2837, type `0x08` = 3 Model B. A code
+for a board `-M raspi3b` does not model would be run 1's DTB mistake again.
+
+**The `Button(5)` row is the one to read carefully, because the image's own
+boot does not agree with it.** That row was measured with an `init=` probe on
+a stock card. Run 32020772161's boot 1, which is this image running its own
+code, says something else — `console-text.log:713-714`:
+
+    no GPIO buttons ([Errno 22] Invalid argument)
+    interface -- display: none, input: none
+
+So the revision does change what happens — an `OSError` from the pin request
+is not a `BadPinFactory`, so the factory did load — but claiming GPIO5 on
+QEMU's gpiochip then fails `EINVAL`, `hmi.open_buttons()` falls through to
+`(None, "none")`, and **the emulated unit has neither buttons nor a screen**.
+Why the standalone probe and the booted image differ is not established here.
+Where they disagree, the booted artifact is the evidence.
+
+**`unit-detects-no-panel` gained a third clause anyway, and it was not for
+the emulator's sake.** The two strings it used to be made of — `no OLED (`
+and `printing unattended` — are both logged by a unit that found an *HDMI
+console* and no buttons: `open_display` still reports the failed SSD1306
+probe, and `Interface.interactive` still refuses because it wants a display
+*and* buttons. A monitor plugged into a unit with nothing on the GPIO header
+is a configuration `docs/HARDWARE.md` describes, and it would have passed a
+check whose name says the unit detected no panel. The third clause,
+`interface -- display: none,`, keys on the display half and closes that hole
+on real hardware, whatever any emulator provides.
+`tests/test_img_verdict.py` holds that needle against the real
+`Interface.describe()` by running it — for `input: none` and for
+`input: GPIO buttons`, so it cannot come to depend on which machine it saw —
+and `test_breaking_the_panel_absence_detection_still_turns_the_check_red`
+drives the shipped `hmi.detect` with the OLED probe made to succeed and
+requires the check to go red on the journal that real code produces.
+
+**`ssh.service`** is the one to look at first. `userconf-pi` ends a
+successful seeded first boot in `/usr/bin/cancel-rename`, which finishes
+with `systemctl --quiet reload ssh`. That reload kills sshd for good:
+
+    systemd[1]: Reloading ssh.service - OpenBSD Secure Shell server...
+    sshd[744]: Received SIGHUP; restarting.
+    sshd[744]: fatal: Cannot bind any address.
+    systemd[1]: ssh.service: Failed with result 'exit-code'.
+
+`ssh.service` carries `RestartPreventExitStatus=255`, so nothing brings it
+back. **The provisioning boot — the one boot an operator expects to SSH into
+— silently ends with no SSH.**
+
+The cause is that `ssh.socket` is also active and owns `[::]:22`: it is
+listening at 87s, sshd starts at 131s and reports `Server listening on ::
+port 22` without ever binding it, and on `SIGHUP` sshd closes the inherited
+descriptor, re-execs, re-adopts `LISTEN_FDS`, finds nothing usable and dies
+without attempting a bind — which is why no `Bind to port … failed` line
+appears anywhere. Nothing in this repository enables `ssh.socket`; systemd's
+first-boot `preset-all` does, and `/etc/machine-id` says `uninitialized`
+while `/etc` is inside the overlay, so **every boot of this appliance is a
+first boot**. Boot 2 shows it: `regenerate_ssh_host_keys.service` and
+`sshd-keygen.service` run again, and `ssh.socket` comes up again. The host
+keys change on every power cycle.
+
+Both halves are fixed now, and the machine-id one is the larger of the two.
+
+`ssh.socket` is **masked** in the image. Debian's `ssh.socket` is
+`ListenStream=22`, `Accept=no`, with no `Service=`, so its implied service is
+`ssh.service`: with both enabled the socket binds :22 and sshd runs on an
+inherited descriptor it cannot get back after `execv`. With the socket
+masked, sshd binds :22 itself and the SIGHUP re-exec rebinds. Masked rather
+than disabled because `enable` symlinks live in `/etc/systemd/system`, which
+is inside the overlay. Masking `ssh.service` instead was refused: the reload
+is guarded by `systemctl --quiet is-active ssh` in `cancel-rename`, so it
+would also stop the reload — while leaving `ssh.socket` listening on :22 for
+a service that can never start.
+
+**`/etc/machine-id` is persisted**, which is what stops every boot being a
+first boot. It cannot be done by a unit: PID 1 reads that file before it
+looks at anything, so the restore is in the initramfs — one file, 33 bytes,
+copied out of `/boot/firmware/otp-identity/machine-id` on the FAT partition
+into the overlay's upper layer, after the overlay is assembled and before
+`run-init`. It uses `mount`, `mkdir`, `cat` and `umount`, all klibc, and no
+module: `fat`, `vfat`, `nls_cp437` and `nls_ascii` are in `modules.builtin`
+for every `-rpi-v8` kernel and `CONFIG_FAT_DEFAULT_IOCHARSET` is `"ascii"`.
+It never panics — the overlay is boot-critical, an identity is not.
+
+**That function was run in a real initramfs before it was trusted.** Sliced
+out of `install.sh` unmodified, packed into a stock Raspberry Pi OS Lite arm64
+initramfs as `/scripts/otptest` and booted under the same `-M raspi3b`, twice:
+with a machine-id in `::otp-identity/machine-id` it printed
+`OTP-INITRD rc=0 id=aabbccddeeff00112233445566778899` and userspace read that
+back out of `/etc/machine-id` at mode 444; on an unprovisioned card — which is
+every unit's first boot — it printed `OTP-INITRD rc=0 id=uninitialized`, left
+the file exactly as the image ships it, and the boot carried on. The vfat
+mount with no module, the `${ROOT%p[0-9]}p1` derivation and the write through
+`${rootmnt}` are measurements, not arguments.
+
+`otp-unit-identity.service` is the userspace half: it records the machine-id
+the first boot generated. It refuses to run at all if the store turns out to
+be on the same filesystem as `/` — otherwise a `/boot/firmware` that failed to
+mount would give a store in the overlay's tmpfs, agreeing with itself
+perfectly on every boot while nothing survived any of them.
+
+**The SSH host keys are NOT persisted, and that is a decision rather than an
+omission.** They were, in the first version of this: `regenerate_ssh_host_keys
+.service` opens with `rm -f /etc/ssh/ssh_host_*_key*` on every first boot, so
+the fingerprint of a machine that prints one-time pads changed every time
+somebody switched it off. But `image/build.sh` sets `ENABLE_SSH=0`, so pi-gen
+leaves `ssh.service` **disabled** and this appliance does not run `sshd` —
+the only thing that ever started it was the first-boot `preset-all` that
+persisting the machine-id ends. Run 32020772161 measures both halves of that:
+boot 1 starts `ssh.service` at 130s, because a genuine first boot still runs
+`preset-all`; boot 2 does not contain the string `ssh.service`, `ssh.socket`
+or `OpenBSD` anywhere and still reaches `multi-user.target`. So the
+persistence was buying a fingerprint nobody could be shown, at the price of
+private keys on a partition every local account can read. It is gone, and so
+is every ordering in the unit that existed for it.
+
+Three named guest checks read the machine-id back off the machine:
+`machine-id-persisted-outside-the-overlay` in both boots,
+`machine-id-recorded-for-the-next-boot` in boot 1, and
+`machine-id-identical-across-the-power-cycle` in boot 2 — with the boot-1 one
+as the positive control, because two absences are identical and a machine
+that lost its identity entirely would otherwise certify that it kept it.
+
+**Why the last two exist, and it is not symmetry for its own sake.** The
+first check compares the live id against the store — and
+`otp-unit-identity.service` has already run by then, filling an empty store
+from the live id and exiting 0. Verified by running the shipped script
+against an empty store: `rc=0`, store silently populated, nothing said. So a
+card whose store was truncated or deleted between boots is a card where every
+boot is a first boot and the check reads PASS on every one of them. Boot 1
+therefore records the id into `/boot/firmware/otp-imgcheck-machine-id`, a
+file the **probe** owns, and boot 2 is held against that. The
+`first-boot-complete.target` gate above is the third, independent answer.
+
+**The cost, said out loud.** `/boot/firmware` is vfat mounted with
+`defaults`, so everything on it is `0755 root:root` — readable by **every
+account on the unit**, including the `otp` user the print unit runs as, not
+only by someone holding the card. A machine-id is an identifier rather than a
+secret and no pad byte or password is written there; the release note and
+`install.sh`'s closing summary both say so in those terms rather than the
+older "the same people who can already read the root filesystem", which
+understated who that is. Tightening the mount to `fmask=0077,dmask=0077` was
+considered and not done: `otp-unit.service` carries
+`ReadWritePaths=-/boot/firmware` so that `otpunit/config.py` can save the
+operator's settings there, and a store only root could write would break that
+without protecting anything that is a secret.
+
+### Run 32020772161: what stopping the first-boot loop uncovered
+
+The first boot pair with all of the above in it. Boot 1 went **19/19** and
+every host-side check passed. Boot 2 went **18/19**, and the single failure is
+the interesting part of the run.
+
+**All three of run 72's unit failures are gone**, in both boots: no
+`Failed with result` reached the speaker-scoped console at all, so neither
+`rpi-eeprom-update.service` nor `ssh.service` nor `systemd-growfs-root.service`
+failed. `unit-detects-no-panel` passed in both boots, and the check keyed on
+the display exactly as intended — **not** for the predicted reason: the
+console says `no GPIO buttons ([Errno 22] Invalid argument)` and
+`interface -- display: none, input: none`, so the emulated unit has neither
+half. The prediction that a `Button` would construct here came from an
+`init=` probe on a stock card and does not hold for the booted image; see the
+`linux,revision` section above.
+`machine-id-persisted-outside-the-overlay` passed in both boots.
+
+The targets each boot reached carry the machine-id fix independently, without
+reading a single check: boot 1 reached `first-boot-complete.target` and boot 2
+**did not**. `regenerate_ssh_host_keys.service` pulls that target in and is
+`ConditionFirstBoot=yes`, so its absence in boot 2 is systemd saying the second
+boot was not a first boot — which had never been true of this image before.
+That note is a **gate** now, in both directions: boot 1 must reach the target
+(it is a first boot on every run — the harness gives each one a fresh
+`xz -dc` of the image) and boot 2 must not.
+
+What failed was:
+
+```
+OTP-CHECK boot2 userconf-unseeded-boot-skips-the-wizard FAIL
+  condition=no checked-at='never' is-active=inactive is-enabled=disabled
+```
+
+`condition=no` and `is-active=inactive` are the wanted answers. The other two
+are not, and both come from `is-enabled=disabled` — a unit systemd never
+looked at has no condition timestamp either.
+
+**Nothing disabled it on that boot.** `/etc` is inside the overlay, so boot 1's
+`systemctl disable userconfig` — `cancel-rename`'s own second-to-last act —
+died with the power. `disabled` is what the IMAGE says, and it always was.
+What had been hiding it is the bug this branch fixed: every boot was a first
+boot, systemd ran `preset-all` every time, and `preset-all` re-enabled the
+unit every time. Stop the first-boot loop and the accident stops with it.
+
+That is a real regression for an operator, not a stale expectation:
+`userconfig.service` is the only consumer of `userconf.txt`, so a disabled
+unit means a credential file written to the card is ignored in silence on
+every boot after the first — precisely the trade `install.sh`'s comment
+refuses to make by masking, arriving through a different door. So the fix is
+`systemctl enable userconfig.service` in the image, which is what the
+`ConditionPathExists` drop-in was written for in the first place: an unseeded
+boot pays two condition evaluations and a skip. The check was right; the image
+was wrong.
+
 ## Proving the guards can fail
 
 Every tier above is a check, and a check has one failure mode that nothing
@@ -574,16 +935,20 @@ stayed green.
 
 ```sh
 python3 tests/mutation_gate.py --list
-python3 tests/mutation_gate.py --tier fast       # 38 rows, 29s
+python3 tests/mutation_gate.py --tier fast       # 124 rows, 103s
 sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
 ```
 
 **Runtime decided the trigger.** The issue expected nightly or
-label-triggered; measured, the fast tier is twenty-nine seconds at 38 rows —
-still cheaper than the suite it audits — so it runs per pull request as its
-own `mutation` job, and the ordinary suite's wall clock does not move. The three CUPS-rig rows run in
-the existing `hardware` job, the only place with a real `cupsd`, for 36
-seconds on top of about eight minutes.
+label-triggered; measured, the fast tier is a hundred and three seconds at
+124 rows — still cheaper than the suite it audits — so it runs per pull
+request as its own `mutation` job, and the ordinary suite's wall clock does
+not move. The three CUPS-rig rows run in the existing `hardware` job, the
+only place with a real `cupsd`, for 36 seconds on top of about eight minutes.
+Those numbers are counted, not carried forward: an earlier revision of this
+paragraph still said 38 rows and twenty-nine seconds long after both had
+moved, and the revision after that said 114 rows for a round in which there
+were 115.
 
 Every way this could rot into a no-op is a loud failure rather than a skip: a
 `find` string that no longer matches (the fast suite checks that much without
@@ -609,7 +974,7 @@ Both were single-edit rows that survived:
 **What is not covered.** No row needs a booted guest, and the checks that
 only exist *inside* one — tier 2's spool redirect above, tty1 ownership, the
 persistence phases, and now tier 3's overlay probe — cannot be mutated from
-here. What the nineteen overlay rows attack is the *host-side gate* over what the
+here. What the overlay and identity rows attack is the *host-side gate* over what the
 guest says and the *provisioning* that sets the overlay up; that the guest
 reports the truth about a machine with a read-only root is a claim only a
 booted image can settle, and only the image build makes one. Proving the

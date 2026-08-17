@@ -42,8 +42,13 @@ jobs:
     # tests/mutations.toml.
     #
     # PER PR, not nightly, and that is measured rather than assumed: the fast
-    # tier is 19 mutations in 11 seconds, which is cheaper than the suite it
-    # audits. The issue expected nightly or label-triggered; at this price
+    # tier is 124 mutations in 103 seconds, which is cheaper than the suite it
+    # audits. Counted, not carried forward -- this line said 19 in 11 seconds
+    # for a long time after both had moved, and 114 for one round after it
+    # was 115. Re-run `python3 tests/mutation_gate.py --tier fast` and read
+    # its last line before touching this sentence.
+    #
+    # The issue expected nightly or label-triggered; at this price
     # that would be the wrong call, because a gate that reports on the commit
     # which broke the guard is worth several that report the next morning. A
     # separate job rather than a step in `test`, so the ordinary suite's wall
@@ -91,7 +96,8 @@ jobs:
             "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
             | tar -xJf - --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           ./shellcheck --version
-          ./shellcheck device/install.sh image/build.sh image/render-manual.sh \
+          ./shellcheck device/install.sh device/persist-identity.sh \
+                       image/build.sh image/render-manual.sh \
                        harness/kernel-sim.sh harness/vm-check.sh \
                        harness/vm-guest-check.sh harness/img-boot.sh \
                        harness/img-guest-check.sh

@@ -1,0 +1,37 @@
+[Unit]
+Description=Keep this unit's machine-id across the power cycle
+Documentation=https://github.com/Svendsys/otp/issues/21
+DefaultDependencies=no
+# The store is on the FAT boot partition, so it has to be mounted first.
+After=local-fs.target
+Before=sysinit.target
+# DefaultDependencies=no drops the implicit shutdown ordering, so it has to
+# be stated -- the same reason otp-unit-etc-cups.service states it.
+Conflicts=shutdown.target
+Before=shutdown.target
+
+# WHAT USED TO BE HERE, and why it is not. This unit also copied the SSH host
+# keys onto the boot partition, so it carried
+# `After=regenerate_ssh_host_keys.service` (that unit opens with
+# `rm -f /etc/ssh/ssh_host_*_key*`, so a restore placed before it was
+# deleted by it), `Before=ssh.service ssh.socket`, and
+# `ConditionPathIsReadWrite=/etc` for the restore's writes. image/build.sh
+# sets ENABLE_SSH=0, so this appliance ships with ssh.service disabled and
+# never runs sshd; the only thing that ever started it was the first-boot
+# `preset-all` that persisting the machine-id ends. The host-key half is gone
+# and every ordering that existed for it went with it -- an ordering edge
+# nothing needs is an ordering edge nobody can check.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/otp-unit/persist-identity.sh
+# The journal is volatile and, under the tier-3 harness, forwarded to the
+# serial console -- so what this says about a failed restore is readable
+# where it matters. StandardError only: a healthy run's notes are worth
+# having, and it writes them all to stderr.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target

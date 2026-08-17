@@ -396,6 +396,126 @@ if [ ! -f "$KERNEL" ] || [ -z "$DTB" ]; then
     exit 1
 fi
 log "kernel=$KERNEL dtb=$DTB"
+
+# --- the board revision the firmware would have supplied -----------------
+#
+# THE FIRMWARE IS WHAT WRITES THIS, and QEMU is not the firmware. On a real
+# Pi, start.elf adds a /system node to the device tree carrying
+# linux,revision -- the 24-bit board code. The static DTB does not have one:
+# measured with `fdtget` against bcm2710-rpi-3-b.dtb out of
+# linux-image-6.12.47+rpt-rpi-v8, there is no /system node at all.
+#
+# WHAT IT COST, in run 72's console, both boots:
+#
+#   /usr/bin/rpi-eeprom-update: 512: arithmetic expression: expecting ')':
+#   "(0x >> 23) & 1"
+#   systemd[1]: rpi-eeprom-update.service: Failed with result 'exit-code'.
+#
+# rpi-eeprom-update reads /sys/firmware/devicetree/base/system/linux,revision,
+# then /proc/cpuinfo, then vcgencmd; with none of them BOARD_INFO is empty
+# and `0x` is a shell syntax error. On real hardware it reaches
+# chipNotSupported() and exits 0, so the unit succeeds on every board
+# docs/HARDWARE.md lists. It is the emulator that is wrong, and this is the
+# same kind of thing the harness already does for the command line and the
+# initramfs: supply what the firmware would have.
+#
+# MEASURED BEFORE IT WAS BUILT ON, by booting a stock Raspberry Pi OS Lite
+# arm64 card under this same `-M raspi3b` with QEMU 8.2.2, twice:
+#
+#   without the property   linux,revision ABSENT, /proc/cpuinfo has no
+#                          Revision line, rpi-eeprom-update rc=2 with the
+#                          `(0x >> 23) & 1` message above
+#   with it                dt-rev=00a02082, /proc/cpuinfo Revision a02082,
+#                          rpi-eeprom-update rc=0: "Device does not a have
+#                          a Raspberry Pi bootloader EEPROM (e.g. Pi 4 or
+#                          Pi 5). Skipping bootloader update."
+#
+# 0xa02082 IS THE MACHINE QEMU IS PRETENDING TO BE, decoded field by field
+# against the scheme rpi-eeprom-update itself reads: new-style flag set
+# (bit 23), memory 1GB (bits 20-22 = 2, and -m 1024 below agrees), Sony UK,
+# BCM2837, type 0x08 = 3 Model B, revision 1.2. Handing the guest a code for
+# a board `-M raspi3b` does not model would be the DTB mistake from run 1 in
+# a smaller font.
+#
+# THE SAME PROPERTY IS READ BY GPIOZERO, and that is not a side effect to be
+# discovered later -- it moves where the button probe fails, which was
+# measured in the same pair of boots with an `init=` probe on a stock card:
+#
+#   without   Button(5) raised BadPinFactory: Unable to load any default
+#             pin factory
+#   with      Button(5) CONSTRUCTED factory='LGPIOFactory' pin=GPIO5
+#
+# (QEMU does provide /dev/gpiochip0 and /dev/gpiochip1, which is what lgpio
+# opens.)
+#
+# WHAT THE IMAGE'S OWN BOOT SAYS, WHICH IS NOT THAT, and where those two
+# disagree the booted artifact wins -- an `init=` probe is not this unit.
+# Run 32020772161, boot1 console-text.log:713-714:
+#
+#   no GPIO buttons ([Errno 22] Invalid argument)
+#   interface -- display: none, input: none
+#
+# So the factory does load with the revision -- an OSError from the pin
+# request is not a BadPinFactory -- but claiming GPIO5 on QEMU's gpiochip
+# then fails EINVAL, hmi.open_buttons() falls through to (None, "none"), and
+# the emulated unit finds NO BUTTONS. Why the standalone probe and the image
+# differ is not established here and is not load bearing for anything below;
+# what is load bearing is that no claim in this repository may say the
+# emulated unit has buttons.
+#
+# What it also does not find is a SCREEN: there is no /dev/i2c-* and
+# /sys/class/drm is empty in both boots, so hmi.open_display raises and
+# returns none. unit-detects-no-panel keys on the DISPLAY half anyway -- see
+# the comment on that check in harness/img-guest-check.sh for the HDMI hole
+# that clause closes, which is real whether or not buttons construct here.
+#
+# fdtput, NOT a dtc round trip. `dtc -I dtb -O dts` and back rewrites the
+# whole blob -- phandles, __symbols__, the overlay fixups -- to change one
+# property; fdtput patches the blob in place and resizes it by the 47 bytes
+# the node costs. The patched copy is a COPY: the image's own DTB is left
+# alone, so what a device would boot and what this booted stay comparable in
+# the evidence.
+#
+# A HARD REQUIREMENT, like mcopy. Booting without the property is booting
+# the configuration this exists to fix, and a boot that quietly did that
+# would fail on rpi-eeprom-update.service half an hour later and read as a
+# regression in the image.
+if ! command -v fdtput >/dev/null; then
+    echo "ERROR: fdtput (device-tree-compiler) is needed to give the guest" >&2
+    echo "       a board revision. Without it rpi-eeprom-update.service" >&2
+    echo "       fails on an empty BOARD_INFO and the boot is red for a" >&2
+    echo "       fault in the emulator rather than in the image." >&2
+    exit 1
+fi
+BOARD_REVISION=0xa02082
+# Beside $WORK/boot rather than in it: that directory is what the *.dtb glob
+# above picks the guest's device tree out of, and dropping a second .dtb into
+# it is precisely the "next person adds a file to that directory" the comment
+# on the glob warns about.
+DTB_PATCHED="$WORK/otp-harness-$(basename "$DTB")"
+cp "$DTB" "$DTB_PATCHED"
+# `-c` on a node that already exists is FDT_ERR_EXISTS and rc 1, not a
+# no-op -- measured against fdtput 1.7.0. A firmware DTB that one day ships
+# its own empty /system must not fail the run for that, so the create is
+# allowed to fail and only the property write is required. The read-back
+# below is the gate in both cases.
+fdtput -c "$DTB_PATCHED" /system 2>/dev/null || true
+if ! fdtput -t x "$DTB_PATCHED" /system linux,revision "$BOARD_REVISION"; then
+    echo "ERROR: could not write linux,revision into $DTB_PATCHED" >&2
+    exit 1
+fi
+# READ BACK, because a write that did nothing looks exactly like one that
+# worked from here, and the cost of not noticing is a red release gate
+# blamed on the image. fdtget prints the property as a decimal integer.
+DTB_REVISION=$(fdtget "$DTB_PATCHED" /system linux,revision 2>/dev/null || true)
+if [ "${DTB_REVISION:-0}" != "$((BOARD_REVISION))" ]; then
+    echo "ERROR: $DTB_PATCHED does not carry linux,revision after the patch" >&2
+    echo "       (read back: '${DTB_REVISION:-nothing}', wanted $((BOARD_REVISION)))" >&2
+    exit 1
+fi
+DTB="$DTB_PATCHED"
+log "board revision $BOARD_REVISION synthesised into $DTB (the firmware's job)"
+
 IMG_CMDLINE=""
 if [ -s "$WORK/boot/cmdline.txt" ]; then
     IMG_CMDLINE=$(tr -d '\r\n' < "$WORK/boot/cmdline.txt")
@@ -553,6 +673,21 @@ boot_phase() {
 # "Reached target" are systemd status lines, not kernel output -- and
 # they need the WORKING console above to reach the capture at all.
 #
+# systemd.journald.forward_to_console=1 IS AN OBSERVABILITY LEVER, AND
+# EMULATION-ONLY. Issue #21: tier 3 could see that the unit STARTED and
+# nothing it did afterwards. The journal is volatile by design
+# (device/install.sh writes Storage=volatile, RuntimeMaxUse=16M), it dies
+# with the guest, and nothing carried it to the serial port this harness
+# captures -- so every line otp-unit.service logs about the hardware it
+# found, and every line any other unit logs, was written to RAM and thrown
+# away. With this the journal streams to /dev/console, which is the PL011
+# named above, which is uart0. It changes nothing about a flashed device:
+# -append REPLACES the kernel command line wholesale here (see the header),
+# the image's own cmdline.txt is not edited, and the unit keeps its quiet
+# console on real hardware. The flag is not assumed to have worked either
+# -- harness/img-guest-check.sh puts a marker into the journal and NOWHERE
+# else, and the verdict below requires it on the console.
+#
 # otp.imgcheck=<phase> is what wakes otp-unit-imgcheck.service, whose
 # ConditionKernelCommandLine is that word. It ships in the image and is
 # inert on a flashed card, where nothing puts the word there.
@@ -563,7 +698,7 @@ boot_phase() {
         -M raspi3b -m 1024 \
         -kernel "$KERNEL" -dtb "$DTB" \
         ${INITRD:+-initrd "$INITRD"} \
-        -append "rw earlycon loglevel=7 console=ttyAMA1,115200 systemd.show_status=1 initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait $OVERLAY_TOKENS otp.imgcheck=$phase" \
+        -append "rw earlycon loglevel=7 console=ttyAMA1,115200 systemd.show_status=1 systemd.journald.forward_to_console=1 initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait $OVERLAY_TOKENS otp.imgcheck=$phase" \
         -drive "file=$IMG,if=sd,format=raw" \
         -serial "file:$console" \
         -serial "file:$console2" \
@@ -666,6 +801,28 @@ phase_paths() {
         "$CONSOLE_ALL" > "$CONSOLE_TXT" 2>/dev/null || cp "$CONSOLE_ALL" "$CONSOLE_TXT"
 }
 
+# The lines the SYSTEM wrote, as opposed to the lines it carried for
+# somebody else.
+#
+# journald formats a forwarded line as a monotonic timestamp, the speaker and
+# its pid, then the text:
+#
+#   [   45.123456] python3[412]: no OLED (...)
+#
+# The kernel's own output has the timestamp and no speaker at all, and PID 1
+# writes its status lines with no timestamp ("[  OK  ] Started ..."). Neither
+# shape matches, so both are kept; systemd[1] is kept by name, because it is
+# the one speaker whose "Failed with result" is systemd's verdict on a unit
+# rather than a phrase inside somebody's log output.
+#
+# `|| true` for the same reason every other read of a console here carries
+# one: an absent or empty file must produce an empty result, not kill the
+# verdict before it has been written.
+system_lines() {
+    awk '!/^\[[^]]*\] [^ ]+\[[0-9]+\]:/ || /^\[[^]]*\] systemd\[1\]:/' \
+        "$1" 2>/dev/null || true
+}
+
 per_boot_verdict() {
     local phase="$1"
 # Max over every timestamp in BOTH files, not the concat's last line:
@@ -678,9 +835,32 @@ per_boot_verdict() {
 # script BEFORE verdict.txt was written: no IMG-CHECK lines, no rc
 # report, no console tail, precisely in the no-evidence case. Found by
 # the review panel; the identical guard was already on the next line.
-    local LAST_TS KERNEL_ENTRIES
+    local LAST_TS KERNEL_ENTRIES SPOKEN
     LAST_TS=$(grep -oE '\[ *[0-9]+\.[0-9]+\]' "$CONSOLE_TXT" 2>/dev/null | tr -d '[] ' | sort -g | tail -1 || true)
-    KERNEL_ENTRIES=$(grep -c "Booting Linux on physical CPU" "$CONSOLE_TXT" 2>/dev/null || true)
+    # `kernel: ` EXCLUDED, and that is a consequence of the journal now
+    # streaming to this console. journald labels a forwarded kernel message
+    # with the identifier `kernel`, and the kernel's own console output never
+    # prefixes itself that way -- so if journald forwards the kmsg entries it
+    # imported (it reads /dev/kmsg from the start of the buffer), the whole
+    # early boot arrives a second time and a healthy boot counts TWO kernel
+    # entries and is failed as a reboot loop.
+    #
+    # MEASURED NOW, and the answer is no. Run 72 is the first console this
+    # repository has captured with forwarding actually on, and it carries
+    # ZERO lines matching `kernel: ` in either boot: journald does not
+    # re-forward the kmsg entries it imported. "Booting Linux on physical
+    # CPU" appears exactly once in a 1070-line console and both boots report
+    # `kernel entered 1 time(s)`, so the doubling this exclusion was written
+    # against does not happen and never did.
+    #
+    # KEPT ANYWAY. It costs one grep, it is the documented behaviour of a
+    # setting that could change with a systemd release, and it cannot hide a
+    # real loop -- a second kernel entry prints its own "Booting Linux on
+    # physical CPU" with a timestamp and no identifier, which is what is
+    # still counted. What has changed is that this is now a guard against a
+    # regression rather than a guess about an unknown.
+    KERNEL_ENTRIES=$(grep -vE '^\[[^]]*\] kernel: ' "$CONSOLE_TXT" 2>/dev/null \
+                     | grep -c "Booting Linux on physical CPU" || true)
     printf 'qemu exit: %s\n' "$QEMU_RC"
     # How far it got and how many times the kernel STARTED. Entries > 1 is
     # a reboot loop stated as a number, instead of an inference from byte
@@ -702,10 +882,102 @@ per_boot_verdict() {
     else
         printf 'IMG-CHECK %s unit-started FAIL\n' "$phase"
     fi
+    # THE JOURNAL REACHED THE CONSOLE, which is issue #21's first clause and
+    # the thing every behavioural reading below now rests on. -append carries
+    # systemd.journald.forward_to_console=1; a kernel parameter that is
+    # accepted and does nothing looks exactly like one that works, so this is
+    # not taken on trust. harness/img-guest-check.sh writes a marker into the
+    # journal with systemd-cat and NOWHERE else -- deliberately not to its own
+    # stdout, which systemd already copies to this console through
+    # StandardOutput=journal+console, and deliberately never echoed back into
+    # a check's detail either. Forwarding is the only thing that can have put
+    # it here.
+    #
+    # The guest's journal-marker-accepted is the other half of the pair: it
+    # says the journal TOOK the marker, so an absence here is a forwarding
+    # failure rather than a systemd-cat that did nothing.
+    if grep -qE "OTP-JOURNAL-FORWARDED[[:space:]]+${phase}([[:space:]]|\$)" \
+            "$CONSOLE_TXT" 2>/dev/null; then
+        printf 'IMG-CHECK %s journal-forwarded-to-console PASS\n' "$phase"
+    else
+        printf 'IMG-CHECK %s journal-forwarded-to-console FAIL\n' "$phase"
+    fi
+    # THE FORBIDDEN PHRASES, AND WHO IS ALLOWED TO SAY THEM.
+    #
+    # Until the journal was forwarded, this console carried kernel output and
+    # PID 1's status lines and nothing else: once journald started, every
+    # unit's stdout and stderr went into the journal and stayed there. Now it
+    # carries whatever anything on the machine writes -- including this
+    # harness's own probe, which quotes userconf-service's output into a check
+    # detail and dumps thirty lines of the unit's journal at the end. Failing
+    # a release because a unit QUOTED "Failed with result" is the same defect
+    # as failing one because the image's hostname contains "otp-unit", which
+    # is row 2 of issue #14.
+    #
+    # So the phrases are looked for in what the SYSTEM said. system_lines()
+    # keeps kernel output and PID 1, and drops journald-forwarded lines from
+    # anything else; a phrase found only in one of those is reported instead
+    # of gated, so the scoping can never swallow one in silence.
+    #
+    # WHICH CONSTRAINS WHAT MAY BE ADDED TO THIS LIST, and that is worth
+    # stating rather than rediscovering. Only a phrase that PID 1 or the
+    # KERNEL utters can be enforced here. Every one of the five below is such
+    # a phrase today -- `status=`, `Failed with result` and `Scheduled
+    # restart job` are systemd[1]'s verdicts on a unit, and the other two are
+    # the kernel's -- and run 74 confirms none of them appears anywhere in
+    # either console, filtered or not. But the single line that diagnosed the
+    # bug this harness was extended for is
+    #
+    #     sshd[744]: fatal: Cannot bind any address.
+    #
+    # which system_lines() drops: it is a forwarded line from a unit, not
+    # from PID 1. A phrase of that shape added here would be a gate that can
+    # never fire. Put those in a NOTE over $CONSOLE_TXT instead, or give the
+    # guest a check that reads the unit's own journal -- which is what
+    # harness/img-guest-check.sh does for everything it judges about a unit.
+    #
+    # The note quotes the line, and the quote can itself trip the `grep -q
+    # FAIL` over verdict.txt at the bottom of this file if what it repeats
+    # contains that word. That is the safe direction -- a run that stops to be
+    # read -- and the note sitting next to the red says exactly why.
+    #
+    # FALLS BACK TO THE WHOLE CONSOLE if the filtered copy cannot be written.
+    # A failed redirect under errexit would otherwise kill the script here,
+    # mid-verdict, with the file half written -- the no-evidence failure this
+    # block already carries two `|| true`s for. Guarding it into an unwritten
+    # $SPOKEN would be worse than either: every phrase would then be looked
+    # for in a file that does not exist and none would ever be found. Wider
+    # is the safe direction for a gate.
+    SPOKEN="$WORK/$phase/console-system.log"
+    if ! system_lines "$CONSOLE_TXT" > "$SPOKEN" 2>/dev/null; then
+        SPOKEN="$CONSOLE_TXT"
+    fi
     for bad in "status=216" "Failed with result" "Scheduled restart job" \
                "Kernel panic" "Unable to mount root"; do
-        if grep -qF -- "$bad" "$CONSOLE_TXT" 2>/dev/null; then
+        if grep -qF -- "$bad" "$SPOKEN" 2>/dev/null; then
             printf 'IMG-CHECK %s no-%s FAIL\n' "$phase" "$(printf '%s' "$bad" | tr ' =' '--')"
+            # WHICH LINES, indented under the red, the way guest-no-fail-lines
+            # already dumps its matches. Without this the verdict said only
+            # that a phrase occurred somewhere in a 1000-line console, and
+            # answering "which unit?" meant downloading the evidence artifact
+            # and grepping it by hand -- which is exactly what run 72 cost.
+            # The three units it would have named are the whole finding.
+            #
+            # Bounded at 10 lines and 200 columns because a reboot loop
+            # repeats its phrase for as long as it loops, and a verdict file
+            # that scrolls the real checks off the top of the job log is a
+            # worse report than one that says nothing.
+            #
+            # Quoting into the verdict can trip the `grep -q FAIL` over
+            # verdict.txt at the bottom of this file, and here that costs
+            # nothing that is not already spent: this branch has JUST written
+            # FAIL on the line above it, so the phase is red either way.
+            grep -F -- "$bad" "$SPOKEN" 2>/dev/null \
+                | head -10 | cut -c1-200 | sed 's/^/    /' || true
+        elif grep -qF -- "$bad" "$CONSOLE_TXT" 2>/dev/null; then
+            printf 'IMG-NOTE %s quoted-%s: %s\n' "$phase" \
+                   "$(printf '%s' "$bad" | tr ' =' '--')" \
+                   "$(grep -m1 -F -- "$bad" "$CONSOLE_TXT" 2>/dev/null | cut -c1-120)"
         fi
     done
     # "systemd[1]:" and not "systemd". The bare string matches the
@@ -804,6 +1076,47 @@ per_boot_verdict() {
     printf 'IMG-NOTE %s targets-reached: %s\n' "$phase" \
         "$(grep -ohE 'Reached target [a-zA-Z0-9@:._-]+' "$CONSOLE_TXT" 2>/dev/null \
              | sort -u | tr '\n' ' ')"
+
+    # AND THE ONE TARGET WHOSE ABSENCE IS THE FINDING. This is systemd's own
+    # answer to "was this a first boot", read off the console, owing nothing
+    # to any check inside the guest and nothing to a file on the card.
+    #
+    # first-boot-complete.target is pulled in only when PID 1 decided this
+    # was a first boot -- which it does by reading /etc/machine-id, before a
+    # single unit exists. Until the machine-id was persisted, /etc was the
+    # overlay and that file said `uninitialized`, so EVERY boot of this
+    # appliance was a first boot: preset-all every time, ssh.socket enabled
+    # every time, the host keys regenerated every time.
+    #
+    # BOTH DIRECTIONS, and that is what makes the boot2 clause a check rather
+    # than a coincidence. An absence is equally satisfied by a console that
+    # was never written, by a boot that died in the initrd, and by a grep
+    # looking for a string systemd no longer prints. Boot1 requires the same
+    # string, from the same grep over the same kind of file, to be THERE --
+    # and boot1 genuinely is a first boot every run, because the harness takes a
+    # fresh `xz -dc` of the image before it starts.
+    #
+    # REPORTED FIRST, GATED NOW: run 32020772161 printed both halves in the
+    # targets-reached note above -- boot1 with the target, boot2 without --
+    # which is the same promotion rule multi-user.target arrived under.
+    case "$phase" in
+        boot1)
+            if grep -qF "Reached target first-boot-complete.target" \
+                    "$CONSOLE_TXT" 2>/dev/null; then
+                printf 'IMG-CHECK %s first-boot-really-was-a-first-boot PASS\n' "$phase"
+            else
+                printf 'IMG-CHECK %s first-boot-really-was-a-first-boot FAIL\n' "$phase"
+            fi
+            ;;
+        boot2)
+            if grep -qF "Reached target first-boot-complete.target" \
+                    "$CONSOLE_TXT" 2>/dev/null; then
+                printf 'IMG-CHECK %s second-boot-is-not-a-first-boot FAIL\n' "$phase"
+            else
+                printf 'IMG-CHECK %s second-boot-is-not-a-first-boot PASS\n' "$phase"
+            fi
+            ;;
+    esac
 }
 
 # --- what the guest said about the overlay -------------------------------
@@ -816,14 +1129,18 @@ per_boot_verdict() {
 # what this tier proves; tests/test_img_verdict.py holds the two lists
 # against each other so they cannot drift apart in the other direction.
 GUEST_CHECKS_COMMON="root-is-overlay root-write-lands-and-is-readable \
-unit-active unit-not-restart-looping etc-cups-is-its-own-tmpfs cups-running \
+unit-active unit-not-restart-looping journal-marker-accepted \
+unit-detects-no-panel etc-cups-is-its-own-tmpfs cups-running \
 cupsd-config-valid boot-partition-separate setting-saved-to-the-boot-partition \
-network-wait-cannot-hold-the-boot-open"
+network-wait-cannot-hold-the-boot-open \
+machine-id-persisted-outside-the-overlay"
 GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
-front-panel-survives-the-credential-apply"
+front-panel-survives-the-credential-apply diagnostic-sheet-renders \
+diagnostic-sheet-reaches-cups machine-id-recorded-for-the-next-boot"
 GUEST_CHECKS_BOOT2="root-writes-discarded-by-the-power-cycle \
 settings-survive-the-power-cycle userconf-unseeded-boot-skips-the-wizard \
-userconf-wizard-cannot-prompt userconf-malformed-seed-fails-fast"
+userconf-wizard-cannot-prompt userconf-malformed-seed-fails-fast \
+machine-id-identical-across-the-power-cycle"
 
 guest_gate() {
     local phase="$1" count counts passed total missing want name
