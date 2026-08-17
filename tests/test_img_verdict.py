@@ -386,6 +386,31 @@ def test_the_harness_and_the_guest_agree_on_which_checks_exist():
         assert only, f"{phase} demands nothing of its own"
 
 
+def test_the_probe_looks_for_the_words_the_unit_actually_logs():
+    """
+    The headless check reads the unit's journal for two strings. They are
+    written in one file and matched in another, which is exactly how a check
+    stops checking without anything going red: reword either line in
+    otpunit/ and the probe goes on matching nothing, forever, in silence.
+
+    Both are gated together in the guest -- see unit-detects-no-panel -- so
+    a drift in either one fails every tier-3 run rather than passing it. That
+    is red rather than green, but it is red for a reason nobody would guess
+    from the failure, and this test names it in the fast suite instead.
+    """
+    probe = GUEST_CHECK.read_text()
+    for phrase, source in (
+        ("no OLED (", REPO / "otpunit" / "hmi.py"),
+        ("no usable interface; printing unattended",
+         REPO / "otpunit" / "__main__.py"),
+    ):
+        assert f'*"{phrase}"*' in probe, \
+            f"the probe no longer looks for {phrase!r}"
+        assert phrase in source.read_text(), \
+            f"{source.name} no longer logs {phrase!r}, so the probe's " \
+            f"unit-detects-no-panel check matches nothing"
+
+
 # --- the seed itself, which three files have to agree about ---------------
 
 BUILD_SH = REPO / "image" / "build.sh"
@@ -879,6 +904,103 @@ def test_kernel_panic_fails_a_boot_that_also_started_the_unit(tmp_path):
     proc, verdict = run_verdict(tmp_path, {"boot1": lines})
     assert "IMG-CHECK boot1 no-Kernel-panic FAIL" in verdict
     assert proc.returncode == 1
+
+
+# --- the journal on the console, and what else it brought with it ---------
+
+
+def test_a_console_the_journal_never_reached_fails(tmp_path):
+    """
+    The whole of issue #21's first clause, stated as a red.
+
+    systemd.journald.forward_to_console=1 is a kernel parameter, and a
+    parameter that is accepted and ignored looks exactly like one that works
+    -- from outside, "the unit logged nothing interesting" and "nothing the
+    unit logged could get out" are the same silence. The probe's marker is
+    written into the journal and nowhere else, so its absence here is the
+    only thing that can tell those apart.
+    """
+    lines = kernel_lines() + [SUCCESS] + guest_report("boot1")
+    proc, verdict = run_verdict(tmp_path, {"boot1": lines})
+    assert "IMG-CHECK boot1 journal-forwarded-to-console FAIL" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_the_marker_has_to_name_the_phase_that_is_being_judged(tmp_path):
+    """
+    Per phase, like every other marker this tier reads.
+
+    Both boots write into the same working directory and the same evidence
+    pipeline, and a phase-blind grep would let boot 1's marker answer for a
+    boot 2 whose journald never forwarded anything -- the same trap the
+    OTP-RESULT and OTP-GUEST-DONE counts are scoped to a phase to avoid.
+    """
+    lines = (kernel_lines() + [SUCCESS, journal_forwarded("boot2")]
+             + guest_report("boot1"))
+    proc, verdict = run_verdict(tmp_path, {"boot1": lines})
+    assert "IMG-CHECK boot1 journal-forwarded-to-console FAIL" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_a_unit_quoting_a_systemd_phrase_does_not_fail_the_release(tmp_path):
+    """
+    Issue #21's third clause: the forbidden list, re-read now that the
+    console carries every unit's stdout.
+
+    The probe itself is the reason this is not hypothetical. It quotes
+    userconf-service's output into a check detail and dumps thirty lines of
+    the unit's journal at the end of every phase, and journald now carries
+    all of that to the console. Failing a release because a unit REPEATED
+    "Failed with result" is row 2 of issue #14 in a new place -- the harness
+    matching text it wrote itself.
+
+    Reported rather than dropped, so the scoping cannot swallow one quietly.
+    """
+    quoted = forwarded(
+        "Aug 16 22:05:01 otp-unit systemd[1]: Failed with result 'exit-code'.",
+        ident="img-guest-check.sh", pid=900)
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1") + [quoted]})
+    assert "no-Failed-with-result FAIL" not in verdict, verdict
+    assert "IMG-NOTE boot1 quoted-Failed-with-result:" in verdict, verdict
+    assert proc.returncode == 0, proc.stderr + verdict
+
+
+def test_systemds_own_verdict_on_a_unit_still_fails_the_release(tmp_path):
+    """
+    The positive control for the scoping above, on the same fixture.
+
+    "A unit quoting the phrase does not fail the run" is equally true of a
+    gate that stopped looking altogether, and that is the direction this
+    change could break in. PID 1 saying it is the case the gate exists for
+    and it has to stay red.
+    """
+    real = "[   50.000000] systemd[1]: otp-unit.service: Failed with result 'exit-code'."
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1") + [real]})
+    assert "IMG-CHECK boot1 no-Failed-with-result FAIL" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_a_journald_copy_of_a_kernel_line_is_not_a_second_boot(tmp_path):
+    """
+    The count that says "reboot loop", protected from the forwarding.
+
+    journald imports /dev/kmsg from the start of the buffer and labels those
+    entries with the identifier `kernel`. If it forwards them to the console
+    as well, every early kernel line arrives a second time and a perfectly
+    healthy boot counts two kernel entries. Whether it does has not been
+    measured -- there is no systemd on the machine this was written on -- so
+    the count excludes the shape rather than betting on the answer.
+
+    test_a_boot_reset_loop_fails_even_with_a_successful_lap is the control:
+    a real second entry has no identifier in front of it and still fails.
+    """
+    echo = "[   50.000000] kernel: Booting Linux on physical CPU 0x0000000000 [0x410fd034]"
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1") + [echo]})
+    assert "IMG-CHECK boot1 single-kernel-entry PASS" in verdict, verdict
+    assert proc.returncode == 0, proc.stderr + verdict
 
 
 def test_empty_consoles_still_produce_a_verdict(tmp_path):

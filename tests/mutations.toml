@@ -1592,8 +1592,10 @@ tests = [
 [[mutation.edit]]
 file = "harness/img-boot.sh"
 find = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
-front-panel-survives-the-credential-apply"'''
-replace = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard"'''
+front-panel-survives-the-credential-apply diagnostic-sheet-renders \
+diagnostic-sheet-reaches-cups"'''
+replace = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
+diagnostic-sheet-renders diagnostic-sheet-reaches-cups"'''
 
 
 [[mutation]]

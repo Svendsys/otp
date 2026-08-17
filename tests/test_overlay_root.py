@@ -980,6 +980,358 @@ exit 1
 """
 
 
+# --- the journal on the console, and the panel that is not there ----------
+
+# systemd-cat writes its stdin to the journal and NOTHING to stdout. Here the
+# journal is a file, so a test can also model the machine where the write
+# never lands -- which is the case that separates "forwarding is off" from
+# "the marker was never made" when the host finds nothing on the console.
+SYSTEMD_CAT_STUB = """#!/bin/sh
+if [ -n "${SYSTEMD_CAT_DEAF-}" ]; then cat > /dev/null; exit 0; fi
+cat >> "$FAKE_TAGGED_JOURNAL"
+"""
+
+# Answers the probe's two reads and refuses everything else, for the reason
+# SYSTEMCTL_STUB does: a stub that returned "" for an unexpected question
+# would let a check pass by accident.
+#
+# A JOURNAL THAT REMEMBERS PREVIOUS BOOTS, because the real one is one config
+# line away from doing so. `-b` scopes both reads to this boot;
+# UNIT_JOURNAL_LAST_BOOT is what a persistent journal would add, and the
+# shipped `-b` is what keeps it out.
+JOURNAL_READ_STUB = """#!/bin/sh
+case "$*" in
+    *"-t otp-imgcheck"*|*"-u otp-unit.service"*) ;;
+    *) echo "stub: unexpected journalctl $*" >&2; exit 64 ;;
+esac
+case "$*" in
+    *-b*) ;;
+    *) [ -z "${UNIT_JOURNAL_LAST_BOOT-}" ] || printf '%s\\n' "$UNIT_JOURNAL_LAST_BOOT" ;;
+esac
+case "$*" in
+    *"-t otp-imgcheck"*) cat "$FAKE_TAGGED_JOURNAL" 2>/dev/null ;;
+    *"-u otp-unit.service"*) printf '%s\\n' "${UNIT_JOURNAL-}" ;;
+esac
+"""
+
+# What a unit with no panel logs on the way to printing unattended, in the
+# order otpunit/hmi.detect and otpunit/__main__ produce it.
+HEADLESS_JOURNAL = (
+    "Aug 17 00:04:02 otp-unit systemd[1]: Started otp-unit.service.\n"
+    "Aug 17 00:04:09 otp-unit python3[412]: no OLED (FileNotFoundError: "
+    "[Errno 2] No such file or directory: '/dev/i2c-1')\n"
+    "Aug 17 00:04:09 otp-unit python3[412]: no GPIO buttons (BadPinFactory)\n"
+    "Aug 17 00:04:09 otp-unit python3[412]: interface -- display: none, "
+    "input: none\n"
+    "Aug 17 00:04:09 otp-unit python3[412]: no usable interface; printing "
+    "unattended\n")
+
+
+def journal_block() -> str:
+    """The marker and the panel checks, sliced out of the shipped probe."""
+    text = GUEST_CHECK.read_text()
+    start = text.index("# --- the journal, now that the console carries it")
+    return text[start:text.index("\n# --- CUPS,", start)]
+
+
+def run_journal(tmp_path, *, phase="boot1", unit_journal=HEADLESS_JOURNAL,
+                env=None):
+    """Run the shipped journal/panel block with a journal made of files."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    tagged = tmp_path / "tagged-journal"
+    tagged.write_text("")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name, body in (("systemd-cat", SYSTEMD_CAT_STUB),
+                       ("journalctl", JOURNAL_READ_STUB)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+
+    block = journal_block()
+    # Only the wait is shortened, and only the wait: every condition and
+    # every string the block prints is the code that ships.
+    assert block.count("sleep 1") == 1, "the marker poll's interval moved"
+    block = block.replace("sleep 1", "sleep 0")
+
+    runner = tmp_path / "journal.sh"
+    runner.write_text(
+        "set -uo pipefail\n"
+        f'PHASE="{phase}"\nPASS=0\nTOTAL=0\n'
+        + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
+        + block + '\nprintf "TOTALS %s/%s\\n" "$PASS" "$TOTAL"\n')
+    proc = subprocess.run(
+        ["bash", str(runner)], capture_output=True, text=True, timeout=60,
+        env={**os.environ, **(env or {}),
+             "FAKE_TAGGED_JOURNAL": str(tagged),
+             "UNIT_JOURNAL": unit_journal,
+             "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    return proc, tagged
+
+
+def test_a_headless_boot_reports_the_marker_and_the_missing_panel(tmp_path):
+    # The positive control for everything below: every other test here
+    # asserts a FAIL, and a block that failed unconditionally would satisfy
+    # all of them.
+    proc, _ = run_journal(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert results(proc) == {"journal-marker-accepted": "PASS",
+                             "unit-detects-no-panel": "PASS"}, proc.stdout
+
+
+def test_the_marker_is_never_written_where_the_console_would_get_it_anyway(tmp_path):
+    """
+    The one thing that makes the host's gate mean anything.
+
+    This probe's stdout IS the console: otp-unit-imgcheck.service carries
+    StandardOutput=journal+console, so anything printed here reaches the
+    serial port whether or not journald is forwarding. If the marker text
+    ever appeared in a check's detail -- quoted back out of the journal, or
+    echoed for debugging -- the host would find it on the console with
+    forwarding switched off and pass a boot that proved nothing.
+
+    So the block may say how MANY journal lines carry it and never what they
+    say.
+    """
+    proc, tagged = run_journal(tmp_path)
+    assert "OTP-JOURNAL-FORWARDED" in tagged.read_text(), \
+        "the marker never reached the fake journal, so this proves nothing"
+    assert "OTP-JOURNAL-FORWARDED" not in proc.stdout, proc.stdout
+    assert "OTP-JOURNAL-FORWARDED" not in proc.stderr, proc.stderr
+
+
+def test_a_journal_that_never_took_the_marker_fails(tmp_path):
+    """
+    The positive control the host cannot supply for itself.
+
+    From outside the guest, a console with no marker on it is equally
+    "forwarding is off" and "systemd-cat is missing, or wrote nothing". This
+    check is what tells those apart, so it has to be able to say no.
+    """
+    proc, _ = run_journal(tmp_path, env={"SYSTEMD_CAT_DEAF": "1"})
+    assert results(proc)["journal-marker-accepted"] == "FAIL", proc.stdout
+
+
+def test_a_unit_that_never_looked_for_a_panel_fails(tmp_path):
+    """
+    Both halves of the headless decision, because either alone is a
+    different machine.
+
+    Without "no OLED (" the unit never probed the display at all -- the log
+    below is what a unit that walked straight into the menu would leave, and
+    it still says it is printing unattended.
+    """
+    journal = "\n".join(line for line in HEADLESS_JOURNAL.splitlines()
+                        if "no OLED" not in line) + "\n"
+    proc, _ = run_journal(tmp_path, unit_journal=journal)
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
+def test_a_unit_that_saw_no_panel_and_went_on_anyway_fails(tmp_path):
+    """
+    The other half. otpunit/hmi.Interface.prove exists because opening GPIO
+    buttons proves nothing about whether buttons exist: a unit that noticed
+    the missing OLED and still entered the menu blocks on an empty button
+    queue forever, with no pad, no log line and no timeout. That machine
+    logs the first string and never the second.
+    """
+    journal = "\n".join(line for line in HEADLESS_JOURNAL.splitlines()
+                        if "no usable interface" not in line) + "\n"
+    proc, _ = run_journal(tmp_path, unit_journal=journal)
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
+def test_a_previous_boots_headless_decision_does_not_answer_for_this_one(tmp_path):
+    """
+    `-b`, and why it is load bearing three hundred lines from the file that
+    makes it safe.
+
+    device/install.sh sets Storage=volatile, so today an unscoped
+    `journalctl -u` sees only this boot anyway. Delete that one line and a
+    PREVIOUS boot's "no usable interface" satisfies a boot on which the unit
+    never got that far -- which is precisely the reading this check exists to
+    make impossible.
+    """
+    proc, _ = run_journal(
+        tmp_path, unit_journal="",
+        env={"UNIT_JOURNAL_LAST_BOOT": HEADLESS_JOURNAL})
+    assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
+
+
+# --- the diagnostic sheet -------------------------------------------------
+
+def sheet_block() -> str:
+    """The boot-1 print-path experiment, sliced out of the shipped probe."""
+    text = GUEST_CHECK.read_text()
+    start = text.index('if [ "$PHASE" = "boot1" ]; then\n'
+                       '    # --- the diagnostic sheet')
+    return text[start:text.index("\n# --- the seeded userconf.txt path", start)]
+
+
+# What the shipped heredoc prints when the image can draw the sheet and cupsd
+# takes it. test_the_sheet_program_prints_what_the_probe_reads runs the real
+# program and holds these shapes against it.
+SHEET_HEALTHY = "RENDER ok bytes=4632 magic=%PDF-\nSUBMIT ok job=otpimgcheck-1\n"
+
+
+def run_sheet(tmp_path, *, says=SHEET_HEALTHY, lpadmin_rc=0):
+    """Run the shipped sheet block with the Python and CUPS tools stubbed.
+
+    The interpreter and the two CUPS binaries are rewritten rather than put
+    on PATH, because the block names them by absolute path -- on purpose, the
+    way otpunit/printer.py does. Everything else, including both `check`
+    calls' conditions and the `case` patterns that read the program's output,
+    is the code that ships.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    calls = tmp_path / "lpadmin-calls"
+    lpadmin = tmp_path / "lpadmin"
+    lpadmin.write_text("#!/bin/sh\n"
+                       f'printf "%s\\n" "$*" >> "{calls}"\n'
+                       'case "$1" in -x) exit 0 ;; esac\n'
+                       f'echo "lpadmin said something"\nexit {lpadmin_rc}\n')
+    lpadmin.chmod(0o755)
+    lpstat = tmp_path / "lpstat"
+    lpstat.write_text("#!/bin/sh\necho 'device for otpimgcheck: usb://OTP/imgcheck'\n")
+    lpstat.chmod(0o755)
+    program = tmp_path / "python3"
+    # Reads the heredoc off stdin and throws it away, exactly as a python3
+    # that ran it and printed nothing else would.
+    program.write_text("#!/bin/sh\ncat > /dev/null\n"
+                       f'printf "%s" "$SHEET_SAYS"\n')
+    program.chmod(0o755)
+
+    block = sheet_block()
+    for original, replacement, why in (
+        ("/usr/sbin/lpadmin", str(lpadmin), "lpadmin"),
+        ("/usr/bin/lpstat", str(lpstat), "lpstat"),
+        ("timeout -k 5 90 python3 -", f"{program} -", "the interpreter"),
+    ):
+        assert block.count(original) >= 1, f"{why}: {original!r} in the block"
+        block = block.replace(original, replacement)
+
+    runner = tmp_path / "sheet.sh"
+    runner.write_text(
+        "set -uo pipefail\n"
+        'PHASE="boot1"\nPASS=0\nTOTAL=0\n'
+        + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
+        + block + '\nprintf "TOTALS %s/%s\\n" "$PASS" "$TOTAL"\n')
+    proc = subprocess.run(
+        ["bash", str(runner)], capture_output=True, text=True, timeout=60,
+        env={**os.environ, "SHEET_SAYS": says})
+    return proc, calls
+
+
+def test_a_sheet_that_rendered_and_was_accepted_passes(tmp_path):
+    # The positive control, and the only test here that does not assert a
+    # FAIL.
+    proc, calls = run_sheet(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert results(proc) == {"diagnostic-sheet-renders": "PASS",
+                             "diagnostic-sheet-reaches-cups": "PASS"}, proc.stdout
+    # And the machine is left as a unit rather than as a rig.
+    assert "-x otpimgcheck" in calls.read_text(), calls.read_text()
+
+
+def test_an_image_that_cannot_draw_the_sheet_fails(tmp_path):
+    """
+    The half nothing else in this repository can ask. tier 1 renders this
+    sheet against the host's reportlab; only a booted image can say whether
+    the thing that gets flashed has one.
+    """
+    proc, _ = run_sheet(tmp_path, says="RENDER failed ModuleNotFoundError: reportlab\n")
+    assert results(proc) == {"diagnostic-sheet-renders": "FAIL",
+                             "diagnostic-sheet-reaches-cups": "FAIL"}, proc.stdout
+
+
+def test_a_sheet_that_is_not_a_pdf_fails(tmp_path):
+    """
+    Bytes are not a page. reportlab writing an empty or truncated file
+    raises nothing, and "no exception" is the whole of what a bare rc=0
+    would prove -- so the magic number is checked, which is the cheapest
+    thing that separates a sheet from an artefact.
+    """
+    proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=0 magic=\n"
+                                       "SUBMIT ok job=otpimgcheck-1\n")
+    assert results(proc)["diagnostic-sheet-renders"] == "FAIL", proc.stdout
+
+
+def test_a_sheet_cupsd_would_not_take_fails_with_the_render_still_green(tmp_path):
+    """
+    Two checks, because they fail for entirely different reasons and a
+    single one would report "the print path is broken" for either.
+    """
+    proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=4632 magic=%PDF-\n"
+                                       "SUBMIT failed PrinterError: lp: Bad destination\n")
+    assert results(proc) == {"diagnostic-sheet-renders": "PASS",
+                             "diagnostic-sheet-reaches-cups": "FAIL"}, proc.stdout
+
+
+def test_an_lp_that_returned_no_job_id_is_not_an_enqueued_sheet(tmp_path):
+    """
+    ENQUEUED means cupsd gave it an id, not that lp exited 0.
+
+    Cups.submit() pulls "request id is <id>" out of lp's stdout and returns
+    "" when it is not there -- an lp that succeeded and said nothing useful
+    is a job nobody can point at, and the queue this ran against has no
+    printer behind it to notice either way.
+    """
+    proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=4632 magic=%PDF-\n"
+                                       "SUBMIT ok job=<no id>\n")
+    assert results(proc)["diagnostic-sheet-reaches-cups"] == "FAIL", proc.stdout
+
+
+def test_a_job_on_somebody_elses_queue_is_not_this_experiment(tmp_path):
+    """
+    The id has to name the queue the probe made. `lp` reports the id as
+    <queue>-<n>, so a job id from anywhere else -- the unit's own OTP queue,
+    say, if one ever existed on this machine -- would otherwise read as this
+    experiment having worked.
+    """
+    proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=4632 magic=%PDF-\n"
+                                       "SUBMIT ok job=OTP-7\n")
+    assert results(proc)["diagnostic-sheet-reaches-cups"] == "FAIL", proc.stdout
+
+
+def test_the_sheet_program_prints_what_the_probe_reads(tmp_path):
+    """
+    The shipped Python, run for real, against the shipped otpunit.
+
+    Everything above stubs the interpreter, so the `case` patterns the block
+    matches on are only as good as the guess about what the program prints.
+    This runs the actual heredoc: diagnostics.collect() over this machine and
+    render_bytes() through reportlab, which is also the only place in the
+    fast suite where the sheet the headless design rests on is drawn at all.
+
+    The submit half is expected to FAIL here -- there is no cupsd on a test
+    runner -- and that it fails in the shape the block reads is the point.
+    """
+    block = sheet_block()
+    opener = "<<'PY' 2>&1\n"
+    assert block.count(opener) == 1, "the sheet program's heredoc moved"
+    start = block.index(opener) + len(opener)
+    program = block[start:block.index("\nPY\n", start)]
+    assert "diagnostics.render_bytes" in program, program[:200]
+    # /opt/otp-unit does not exist here; the repository root is on sys.path
+    # already, so the shipped `sys.path.insert` is simply inert.
+    proc = subprocess.run(
+        ["python3", "-c", program], capture_output=True, text=True, timeout=120,
+        cwd=REPO, env={**os.environ, "SHEET_QUEUE": "otpimgcheck"})
+    assert proc.returncode == 0, proc.stderr
+    said = proc.stdout
+    assert re.search(r"^RENDER ok bytes=\d+ magic=%PDF-", said, re.M), said
+    assert re.search(r"^SUBMIT (ok job=|failed )", said, re.M), said
+    # And what it printed is what the shipped block reads as a rendered
+    # sheet. The glob is taken out of the probe rather than restated here:
+    # its quoted literals have to appear, in order, in what the program said.
+    glob = re.search(r"(\*\".*magic=%PDF\"\*)\) SHEET_RENDERED=yes",
+                     sheet_block())
+    assert glob, "the render pattern is gone from the probe"
+    rest = said
+    for literal in re.findall(r'"([^"]*)"', glob.group(1)):
+        assert literal in rest, (glob.group(1), literal, said)
+        rest = rest.split(literal, 1)[1]
+
+
 def userconf_block() -> str:
     text = GUEST_CHECK.read_text()
     start = text.index("# --- the seeded userconf.txt path")
