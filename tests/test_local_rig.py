@@ -621,6 +621,35 @@ def test_the_plan_says_the_same_thing_with_the_tools_and_without(tmp_path,
         "the plan differs depending on what the host has installed")
 
 
+def test_the_one_thing_the_plan_does_need_is_asked_for_where_it_is_used(
+        tmp_path):
+    """--plan reports the release it would boot, and unpinned that is a
+    network fetch, so curl is a real precondition of THAT plan.
+
+    Named as a missing tool rather than left to arrive as curl's own
+    "could not fetch", which reads like the archive is down.
+    """
+    env = {"OTP_RIG_WORK": str(tmp_path / "work"),
+           "PATH": stub_path(tmp_path, omit=("curl",), fake_qemu=RASPI_QEMU)}
+    proc = run_rig(["--plan", "rng"], env=env)
+    assert proc.returncode != 0
+    assert "missing host tools" in proc.stderr
+    assert "curl" in proc.stderr
+
+
+def test_pinning_the_kernel_removes_even_that(tmp_path, offline):
+    """Positive control, and the claim the README makes.
+
+    Same host, same missing curl; the only difference is that nothing has
+    to be resolved, so nothing is fetched and nothing is demanded.
+    """
+    env = dict(offline)
+    env["PATH"] = stub_path(tmp_path, omit=("curl",), fake_qemu=RASPI_QEMU)
+    proc = run_rig(["--plan", "rng"], env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "missing host tools" not in proc.stderr
+
+
 def test_a_real_run_is_refused_before_it_costs_anything(tmp_path, offline):
     """The other half: the run itself is still checked, and checked FIRST.
 
