@@ -3380,3 +3380,111 @@ tests = [
 file = "otpunit/hw/buttons.py"
 find = "    print(message, file=stream, flush=True)"
 replace = "    return"
+
+
+[[mutation]]
+name = "panel-report-parks-the-thread-on-a-journal-nobody-reads"
+tier = "fast"
+guard = """
+The guard's own report, on the guard's own thread. Catching the exception
+bought a panel that survives a lost edge and then handed lgpio's single
+dispatch thread a write to stderr -- which on the unit is a stream socket
+to journald. A socket nobody is draining does not raise, it BLOCKS, and a
+thread parked in write(2) delivers no further edges: the same dead panel
+the guard exists to prevent, and harder to see, because the thread is still
+alive and every is_alive() assertion in this file still passes for it.
+`except BaseException: pass` cannot help with a call that never returns.
+
+Measured before the check existed: a pipe shrunk to 4 KiB with F_SETPIPE_SZ
+and no reader, sys.stderr pointed at it, one `_report` on a thread -- the
+thread never came back. And the moment it would happen is the moment the
+panel is losing edges, because that is when this writes.
+
+The mutation removes the question and writes regardless. The named test
+wedges a real pipe and requires a later press to arrive anyway; it goes red
+by timing out on that press, not by hanging.
+
+[stand-in] only, for the reason the row above gives: [lgpio] skips wherever
+lgpio is not installed, which is every CI run of the fast tier."""
+tests = [
+  "tests/test_hardware.py::TestNoCallbackExceptionReachesTheDispatchThread::test_a_journal_nobody_is_reading_does_not_park_the_thread[stand-in]",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "    if fd is not None and not select.select((), (fd,), (), 0)[1]:"
+replace = "    if False:      # mutation: write whether or not it would block"
+
+[[mutation]]
+name = "panel-reports-every-lost-edge-without-a-bound"
+tier = "fast"
+guard = """
+The volume half of the same hazard. One full report is 11 lines and about
+690 bytes with flush=True, and the faults that produce one produce them in
+bursts -- a panel dropping every edge writes one per press, unbounded and
+un-rate-limited, into the same journald that `_report` must never wait on.
+Bounded output is what keeps the diagnostic affordable at the only moment
+it is ever emitted.
+
+The mutation makes every loss due, so the first report's traceback is
+followed by one line per lost edge. The named test loses fifty edges inside
+one interval and requires exactly one report."""
+tests = [
+  "tests/test_hardware.py::TestALostPressIsSaidOutLoud::test_a_burst_says_the_first_in_full_and_then_counts",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """        due = (self._said_at is None
+               or (time.monotonic() - self._said_at) >= REPORT_SECONDS)"""
+replace = "        due = True      # mutation: every loss writes its own line"
+
+[[mutation]]
+name = "panel-report-failing-is-not-caught"
+tier = "fast"
+guard = """
+The last swallow in the callback, and the only place in this file where a
+programming error can hide forever -- so it is also the one most in need of
+a row saying it is load-bearing rather than decorative.
+
+Reporting is the riskiest thing the guard does: it allocates an f-string
+and formats a traceback, which is exactly what a MemoryError breaks next,
+and the write can fail on a closed stderr. Without this catch, a report
+that fails takes the dispatch thread with it -- the guard would then have
+converted "one lost edge" into "every button on the device, permanently",
+which is worse than not guarding at all.
+
+The mutation narrows the catch to a type that cannot occur there. The named
+test makes `_report` raise MemoryError and requires the callback to return
+anyway."""
+tests = [
+  "tests/test_hardware.py::TestALostPressIsSaidOutLoud::test_a_report_that_itself_fails_cannot_kill_the_panel",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "                except BaseException:           # noqa: BLE001"
+replace = "                except ValueError:              # mutation: no swallow"
+
+[[mutation]]
+name = "panel-keeps-a-press-time-a-failed-press-start-left-behind"
+tier = "fast"
+guard = """
+What the report for a lost press start promises: "the release after it is
+ignored". If a failed `_on_press` leaves the previous press's timestamp in
+place, the next release measures against it, finds more than HOLD_SECONDS,
+and emits BACK where the operator pressed OK. While a job is printing those
+mean opposite things -- BACK can purge the spool and destroy a pad pair --
+which is the confusion the whole tap-versus-hold design exists to prevent.
+
+Defensive rather than reachable: gpiozero alternates pressed/released and
+`_on_release` clears before it can fail, so nothing constructs the stale
+state from outside today. The row exists because one line is what makes the
+report's promise true without depending on that staying so.
+
+The mutation removes the clearing line."""
+tests = [
+  "tests/test_hardware.py::TestALostPressIsSaidOutLoud::test_a_lost_press_start_leaves_no_press_time_behind",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """        self._pressed_at = None
+        self._pressed_at = time.monotonic()"""
+replace = "        self._pressed_at = time.monotonic()"
