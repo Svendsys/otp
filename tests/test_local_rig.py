@@ -378,6 +378,25 @@ def test_the_readme_names_the_rig_and_its_probes():
         assert probe in text, f"harness/README.md does not name the {probe} probe"
 
 
+def test_every_harness_script_the_readme_names_is_one_that_exists():
+    """EVERY mention, not the first one.
+
+    The narrower form of this -- "img-local-rig.sh appears somewhere in the
+    README" -- went green the moment a second paragraph mentioned the rig,
+    because renaming the pointer at the top of the section left the other
+    mentions to satisfy it. A reader who follows a path that is not there
+    concludes the tool was deleted, which for a debugging tool whose entire
+    value is "existing and being current" is the same as deleting it.
+    """
+    named = set(re.findall(r'harness/([a-z0-9][a-z0-9.-]*\.(?:sh|py))',
+                           README.read_text()))
+    assert "img-local-rig.sh" in named, sorted(named)
+    missing = sorted(n for n in named if not (REPO / "harness" / n).exists())
+    assert not missing, (
+        f"harness/README.md tells the reader to run {missing}, and "
+        f"harness/ has no such file.")
+
+
 # --- 3. an unknown probe is refused ---------------------------------------
 
 def run_rig(args, *, env=None, timeout=120):

@@ -3304,9 +3304,16 @@ value is "existing and being current", and a debugging tool nobody can
 find when CI evidence runs out has neither. img-boot.sh cites "the local
 rig" twice as the evidence for two of its own load-bearing decisions, and
 those citations were unfalsifiable while the rig lived in a scratch
-directory."""
+directory.
+
+The named test used to be test_the_readme_names_the_rig_and_its_probes,
+which asks whether the string appears ANYWHERE in the README -- so this
+row went green the moment a second paragraph mentioned the rig by path,
+with the section's own pointer still renamed. Measured during this PR's
+QA. Every path the README hands a reader has to be a file that exists,
+which is the property, and it does not care how many of them there are."""
 tests = [
-  "tests/test_local_rig.py::test_the_readme_names_the_rig_and_its_probes",
+  "tests/test_local_rig.py::test_every_harness_script_the_readme_names_is_one_that_exists",
 ]
 [[mutation.edit]]
 file = "harness/README.md"
