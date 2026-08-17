@@ -700,19 +700,37 @@ The revision is decoded field by field in the script: new-style flag set,
 1 GB (which `-m 1024` agrees with), BCM2837, type `0x08` = 3 Model B. A code
 for a board `-M raspi3b` does not model would be run 1's DTB mistake again.
 
-**And the last two rows of that table are why the fix could not ship alone.**
-gpiozero reads the same property, so `hmi.open_buttons()` now succeeds here —
-exactly as it does on every real Pi, which is the whole reason
-`Interface.prove` exists. `unit-detects-no-panel` would have gone on passing,
-but only because the *display* was missing, and the two strings it was made
-of are both logged by a unit that found an HDMI console and no buttons. So it
-gained a third clause, `interface -- display: none,`, which keys on the half
-the emulator genuinely cannot fake: no I²C bus, no DRM connector, in every
-boot measured. `tests/test_img_verdict.py` holds that needle against the real
-`Interface.describe()` by running it, and
-`test_breaking_the_panel_absence_detection_still_turns_the_check_red` drives
-the shipped `hmi.detect` with the OLED probe made to succeed and requires the
-check to go red on the journal that real code produces.
+**The `Button(5)` row is the one to read carefully, because the image's own
+boot does not agree with it.** That row was measured with an `init=` probe on
+a stock card. Run 32020772161's boot 1, which is this image running its own
+code, says something else — `console-text.log:713-714`:
+
+    no GPIO buttons ([Errno 22] Invalid argument)
+    interface -- display: none, input: none
+
+So the revision does change what happens — an `OSError` from the pin request
+is not a `BadPinFactory`, so the factory did load — but claiming GPIO5 on
+QEMU's gpiochip then fails `EINVAL`, `hmi.open_buttons()` falls through to
+`(None, "none")`, and **the emulated unit has neither buttons nor a screen**.
+Why the standalone probe and the booted image differ is not established here.
+Where they disagree, the booted artifact is the evidence.
+
+**`unit-detects-no-panel` gained a third clause anyway, and it was not for
+the emulator's sake.** The two strings it used to be made of — `no OLED (`
+and `printing unattended` — are both logged by a unit that found an *HDMI
+console* and no buttons: `open_display` still reports the failed SSD1306
+probe, and `Interface.interactive` still refuses because it wants a display
+*and* buttons. A monitor plugged into a unit with nothing on the GPIO header
+is a configuration `docs/HARDWARE.md` describes, and it would have passed a
+check whose name says the unit detected no panel. The third clause,
+`interface -- display: none,`, keys on the display half and closes that hole
+on real hardware, whatever any emulator provides.
+`tests/test_img_verdict.py` holds that needle against the real
+`Interface.describe()` by running it — for `input: none` and for
+`input: GPIO buttons`, so it cannot come to depend on which machine it saw —
+and `test_breaking_the_panel_absence_detection_still_turns_the_check_red`
+drives the shipped `hmi.detect` with the OLED probe made to succeed and
+requires the check to go red on the journal that real code produces.
 
 **`ssh.service`** is the one to look at first. `userconf-pi` ends a
 successful seeded first boot in `/usr/bin/cancel-rename`, which finishes
@@ -774,25 +792,56 @@ mount with no module, the `${ROOT%p[0-9]}p1` derivation and the write through
 `${rootmnt}` are measurements, not arguments.
 
 `otp-unit-identity.service` is the userspace half: it records the machine-id
-the first boot generated, and restores or adopts the SSH host keys, ordered
-after `regenerate_ssh_host_keys.service` (which opens with
-`rm -f /etc/ssh/ssh_host_*_key*`) and before `ssh.service`. It refuses to run
-at all if the store turns out to be on the same filesystem as `/` — otherwise
-a `/boot/firmware` that failed to mount would give a store in the overlay's
-tmpfs, agreeing with itself perfectly on every boot while nothing survived
-any of them.
+the first boot generated. It refuses to run at all if the store turns out to
+be on the same filesystem as `/` — otherwise a `/boot/firmware` that failed to
+mount would give a store in the overlay's tmpfs, agreeing with itself
+perfectly on every boot while nothing survived any of them.
 
-Three named guest checks read it back off the machine:
+**The SSH host keys are NOT persisted, and that is a decision rather than an
+omission.** They were, in the first version of this: `regenerate_ssh_host_keys
+.service` opens with `rm -f /etc/ssh/ssh_host_*_key*` on every first boot, so
+the fingerprint of a machine that prints one-time pads changed every time
+somebody switched it off. But `image/build.sh` sets `ENABLE_SSH=0`, so pi-gen
+leaves `ssh.service` **disabled** and this appliance does not run `sshd` —
+the only thing that ever started it was the first-boot `preset-all` that
+persisting the machine-id ends. Run 32020772161 measures both halves of that:
+boot 1 starts `ssh.service` at 130s, because a genuine first boot still runs
+`preset-all`; boot 2 does not contain the string `ssh.service`, `ssh.socket`
+or `OpenBSD` anywhere and still reaches `multi-user.target`. So the
+persistence was buying a fingerprint nobody could be shown, at the price of
+private keys on a partition every local account can read. It is gone, and so
+is every ordering in the unit that existed for it.
+
+Three named guest checks read the machine-id back off the machine:
 `machine-id-persisted-outside-the-overlay` in both boots,
-`ssh-host-key-fingerprint-recorded` in boot 1, and
-`ssh-host-keys-identical-across-the-power-cycle` in boot 2 — with the boot-1
-one as the positive control, because two absences are identical and a machine
-that lost its host keys entirely would otherwise certify that it kept them.
+`machine-id-recorded-for-the-next-boot` in boot 1, and
+`machine-id-identical-across-the-power-cycle` in boot 2 — with the boot-1 one
+as the positive control, because two absences are identical and a machine
+that lost its identity entirely would otherwise certify that it kept it.
 
-**The cost, said out loud.** The private host keys are on a FAT partition,
-readable by anyone who can mount the card. That is the same set of people who
-can already read them off the unencrypted ext4 root, and the release note and
-`install.sh`'s closing summary both say so rather than implying otherwise.
+**Why the last two exist, and it is not symmetry for its own sake.** The
+first check compares the live id against the store — and
+`otp-unit-identity.service` has already run by then, filling an empty store
+from the live id and exiting 0. Verified by running the shipped script
+against an empty store: `rc=0`, store silently populated, nothing said. So a
+card whose store was truncated or deleted between boots is a card where every
+boot is a first boot and the check reads PASS on every one of them. Boot 1
+therefore records the id into `/boot/firmware/otp-imgcheck-machine-id`, a
+file the **probe** owns, and boot 2 is held against that. The
+`first-boot-complete.target` gate above is the third, independent answer.
+
+**The cost, said out loud.** `/boot/firmware` is vfat mounted with
+`defaults`, so everything on it is `0755 root:root` — readable by **every
+account on the unit**, including the `otp` user the print unit runs as, not
+only by someone holding the card. A machine-id is an identifier rather than a
+secret and no pad byte or password is written there; the release note and
+`install.sh`'s closing summary both say so in those terms rather than the
+older "the same people who can already read the root filesystem", which
+understated who that is. Tightening the mount to `fmask=0077,dmask=0077` was
+considered and not done: `otp-unit.service` carries
+`ReadWritePaths=-/boot/firmware` so that `otpunit/config.py` can save the
+operator's settings there, and a store only root could write would break that
+without protecting anything that is a secret.
 
 ### Run 32020772161: what stopping the first-boot loop uncovered
 
@@ -803,18 +852,23 @@ the interesting part of the run.
 **All three of run 72's unit failures are gone**, in both boots: no
 `Failed with result` reached the speaker-scoped console at all, so neither
 `rpi-eeprom-update.service` nor `ssh.service` nor `systemd-growfs-root.service`
-failed. `unit-detects-no-panel` passed in both boots — the board revision let
-gpiozero construct a `Button` exactly as predicted, and the check keyed on the
-display instead, exactly as intended. `machine-id-persisted-outside-the-overlay`
-passed in both, `ssh-host-key-fingerprint-recorded` in boot 1 and
-`ssh-host-keys-identical-across-the-power-cycle` in boot 2: **the same card,
-powered off and on, came back with the same host keys.**
+failed. `unit-detects-no-panel` passed in both boots, and the check keyed on
+the display exactly as intended — **not** for the predicted reason: the
+console says `no GPIO buttons ([Errno 22] Invalid argument)` and
+`interface -- display: none, input: none`, so the emulated unit has neither
+half. The prediction that a `Button` would construct here came from an
+`init=` probe on a stock card and does not hold for the booted image; see the
+`linux,revision` section above.
+`machine-id-persisted-outside-the-overlay` passed in both boots.
 
 The targets each boot reached carry the machine-id fix independently, without
 reading a single check: boot 1 reached `first-boot-complete.target` and boot 2
 **did not**. `regenerate_ssh_host_keys.service` pulls that target in and is
 `ConditionFirstBoot=yes`, so its absence in boot 2 is systemd saying the second
 boot was not a first boot — which had never been true of this image before.
+That note is a **gate** now, in both directions: boot 1 must reach the target
+(it is a first boot on every run — the harness gives each one a fresh
+`xz -dc` of the image) and boot 2 must not.
 
 What failed was:
 

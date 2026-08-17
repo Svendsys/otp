@@ -1640,40 +1640,52 @@ esac
 # What a unit with no panel logs on the way to printing unattended, in the
 # order otpunit/hmi.detect and otpunit/__main__ produce it.
 #
-# THE BUTTONS CONSTRUCT HERE, and that is the emulated machine as it is now
-# rather than as it was. harness/img-boot.sh writes /system/linux,revision
-# into the DTB so rpi-eeprom-update.service stops failing on an empty
-# BOARD_INFO; gpiozero reads the same property, so its pin factory loads and
-# `Button(5)` succeeds. Measured by booting a stock Raspberry Pi OS Lite arm64
-# card under `-M raspi3b` with QEMU 8.2.2, with the property and without it:
+# THE EMULATED MACHINE AS IT IS, quoted from the console rather than reasoned
+# about. Run 32020772161, boot1 console-text.log:713-714:
 #
-#   without   Button(5) raised BadPinFactory: Unable to load any default
-#             pin factory
-#   with      Button(5) CONSTRUCTED factory='LGPIOFactory' pin=GPIO5
+#   no GPIO buttons ([Errno 22] Invalid argument)
+#   interface -- display: none, input: none
 #
-# There is no `no GPIO buttons (` line in this fixture for that reason, and
-# the interface line says what the unit now reports. What did NOT change in
-# either boot: no /dev/i2c-*, and /sys/class/drm empty -- so the display side
-# is still none, which is what unit-detects-no-panel keys on.
+# harness/img-boot.sh writes /system/linux,revision into the DTB so
+# rpi-eeprom-update.service stops failing on an empty BOARD_INFO, and
+# gpiozero reads the same property -- so the pin factory LOADS here, which is
+# why the exception in the brackets is an OSError and not BadPinFactory. It
+# does not follow that a Button constructs: claiming GPIO5 on QEMU's gpiochip
+# fails EINVAL, hmi.open_buttons() falls through to (None, "none"), and this
+# machine has neither half of an interface. An earlier version of this
+# fixture said `input: GPIO buttons` and called itself the machine as it is
+# now; it was the machine nothing has ever booted.
 HEADLESS_JOURNAL = (
     "Aug 17 00:04:02 otp-unit systemd[1]: Started otp-unit.service.\n"
     "Aug 17 00:04:09 otp-unit python3[412]: no OLED (FileNotFoundError: "
     "[Errno 2] No such file or directory: '/dev/i2c-1')\n"
+    "Aug 17 00:04:09 otp-unit python3[412]: no GPIO buttons ([Errno 22] "
+    "Invalid argument)\n"
     "Aug 17 00:04:09 otp-unit python3[412]: interface -- display: none, "
-    "input: GPIO buttons\n"
+    "input: none\n"
     "Aug 17 00:04:09 otp-unit python3[412]: no usable interface; printing "
     "unattended\n")
 
-# The same machine before the board revision was supplied: gpiozero could not
-# build a pin factory, so open_buttons reported and fell through to none. Kept
-# as a fixture of its own because a unit really can have neither -- a Pi with
-# lgpio uninstalled, or a future emulator that stops providing a gpiochip --
-# and the check must go on passing for it.
-NO_BUTTONS_JOURNAL = HEADLESS_JOURNAL.replace(
-    "interface -- display: none, input: GPIO buttons",
-    "no GPIO buttons (BadPinFactory: Unable to load any default pin "
-    "factory!)\nAug 17 00:04:09 otp-unit python3[412]: interface -- "
-    "display: none, input: none")
+# A REAL Pi with lgpio, which is every unit this project targets. gpiozero
+# only reserves and configures a pin -- there is no presence detection at all
+# -- so `Button(5)` succeeds on a board with nothing wired to it and the unit
+# reports `input: GPIO buttons`. That is the normal case on hardware, not a
+# fault, and the check must go on passing for it: if it did not, the first
+# unit anyone assembled would fail a check about its screen.
+BUTTONS_JOURNAL = (HEADLESS_JOURNAL
+                   .replace("Aug 17 00:04:09 otp-unit python3[412]: no GPIO "
+                            "buttons ([Errno 22] Invalid argument)\n", "")
+                   .replace("interface -- display: none, input: none",
+                            "interface -- display: none, "
+                            "input: GPIO buttons"))
+
+# And a machine where gpiozero cannot build a pin factory at all -- a Pi with
+# lgpio uninstalled, or an emulator that stops providing a gpiochip. A third
+# shape of "no buttons", reported differently, and the check must pass for it
+# too.
+NO_FACTORY_JOURNAL = HEADLESS_JOURNAL.replace(
+    "no GPIO buttons ([Errno 22] Invalid argument)",
+    "no GPIO buttons (BadPinFactory: Unable to load any default pin factory!)")
 
 # And a machine that DID find something to draw on. An HDMI monitor with no
 # buttons: hmi.open_display still logs "no OLED (" because the SSD1306 probe
@@ -1681,7 +1693,7 @@ NO_BUTTONS_JOURNAL = HEADLESS_JOURNAL.replace(
 # Interface.interactive needs both halves -- so the two strings this check
 # used to be made of are both there on a unit that has a screen.
 SCREEN_JOURNAL = HEADLESS_JOURNAL.replace(
-    "interface -- display: none, input: GPIO buttons",
+    "interface -- display: none, input: none",
     "interface -- display: HDMI console, input: none")
 
 
@@ -1805,7 +1817,8 @@ def test_a_unit_that_saw_no_panel_and_went_on_anyway_fails(tmp_path):
 
 def test_a_unit_that_found_a_screen_is_not_a_unit_with_no_panel(tmp_path):
     """
-    The clause the board revision made necessary, and the hole it closes.
+    THE HOLE the third clause closes, and it belongs to a machine no tier of
+    this harness boots -- which is the reason it had to be written down.
 
     An HDMI monitor with no buttons logs BOTH of the strings this check used
     to be made of: hmi.open_display reports "no OLED (" because the SSD1306
@@ -1813,11 +1826,10 @@ def test_a_unit_that_found_a_screen_is_not_a_unit_with_no_panel(tmp_path):
     Interface.interactive wants a display AND buttons. So a machine with a
     screen passed a check called unit-detects-no-panel.
 
-    That was survivable while nothing could construct a Button here, because
-    the input half was reliably missing too. It is not survivable now: with
-    /system/linux,revision in the DTB, gpiozero's factory loads and the
-    headless decision rests on the display side alone. What the check keys on
-    has to be the display side, said out loud.
+    Not a hypothetical: a unit with a monitor plugged into it and nothing
+    wired to the GPIO header is exactly this, and docs/HARDWARE.md describes
+    that as a supported way to run one. The check has to key on the display
+    side, said out loud, whatever the emulator does or does not provide.
     """
     proc, _ = run_journal(tmp_path, unit_journal=SCREEN_JOURNAL)
     assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
@@ -1825,30 +1837,46 @@ def test_a_unit_that_found_a_screen_is_not_a_unit_with_no_panel(tmp_path):
 
 def test_a_unit_whose_buttons_constructed_still_reports_no_panel(tmp_path):
     """
-    The other direction, and the proof the emulator fix did not quietly
-    change what this check says.
+    The other direction, and the proof the third clause did not narrow what
+    this check accepts.
 
-    Once the harness supplies a board revision, `Button(5)` succeeds under
-    QEMU exactly as it does on every real Pi -- gpiozero reserves a pin and
-    has no presence detection at all. A unit reporting `input: GPIO buttons`
-    on a machine with nothing wired to those pins is therefore the normal
-    case, not a fault, and this check must still pass for it. If it did not,
-    the fix to rpi-eeprom-update.service would have turned a green check red
-    for a reason that has nothing to do with the image.
+    On every real Pi with lgpio installed `Button(5)` succeeds -- gpiozero
+    reserves a pin and has no presence detection at all -- so a unit
+    reporting `input: GPIO buttons` with nothing wired to those pins is the
+    normal case on hardware, not a fault. The check must still pass for it,
+    or the first unit anyone assembles fails a check about its screen.
     """
-    proc, _ = run_journal(tmp_path)
-    assert "GPIO buttons" in HEADLESS_JOURNAL, \
+    assert "input: GPIO buttons" in BUTTONS_JOURNAL, \
         "this fixture is supposed to be the machine whose buttons constructed"
+    assert "no GPIO buttons" not in BUTTONS_JOURNAL, BUTTONS_JOURNAL
+    proc, _ = run_journal(tmp_path, unit_journal=BUTTONS_JOURNAL)
     assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
 
 
-def test_a_unit_with_neither_buttons_nor_a_screen_still_reports_no_panel(tmp_path):
+def test_the_machine_tier_3_boots_has_neither_and_still_reports_no_panel(tmp_path):
     """
-    And the machine as it was before the revision arrived, which is also a
-    machine that can really exist -- a Pi with lgpio uninstalled reports
-    exactly this. Neither shape may be the only one the check accepts.
+    The emulated unit, quoted from run 32020772161's boot1 console: the pin
+    factory loads because the harness supplies a board revision, and the pin
+    claim then fails EINVAL, so BOTH halves are none.
+
+    This is the default fixture for everything in this section, and it is
+    asserted here rather than assumed: for a while it said
+    `input: GPIO buttons` and described itself as the machine as it is now,
+    which meant six tests were driving a machine that has never booted.
     """
-    proc, _ = run_journal(tmp_path, unit_journal=NO_BUTTONS_JOURNAL)
+    assert "no GPIO buttons ([Errno 22] Invalid argument)" in HEADLESS_JOURNAL
+    assert "interface -- display: none, input: none" in HEADLESS_JOURNAL
+    proc, _ = run_journal(tmp_path, unit_journal=HEADLESS_JOURNAL)
+    assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
+
+
+def test_a_unit_whose_pin_factory_never_loaded_still_reports_no_panel(tmp_path):
+    """
+    A third shape of "no buttons": gpiozero could not build a pin factory at
+    all -- a Pi with lgpio uninstalled reports exactly this. No one of the
+    three may be the only shape the check accepts.
+    """
+    proc, _ = run_journal(tmp_path, unit_journal=NO_FACTORY_JOURNAL)
     assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
 
 
@@ -1866,16 +1894,20 @@ def test_a_unit_that_never_said_what_it_settled_on_fails(tmp_path):
     assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
 
 
-def journal_from_the_real_hmi(monkeypatch, *, oled_present):
+def journal_from_the_real_hmi(monkeypatch, *, oled_present, buttons_present=False):
     """
     The lines otpunit's own detection writes, on the machine tier 3 boots.
 
     Not a fixture of what it is believed to log -- the real
     hmi.detect/open_display/open_buttons, with only the two pieces of
-    hardware stubbed, so the strings come from the code that ships. The
-    conditions are the measured ones: no /dev/i2c-* (the SSD1306 probe
-    raises), /sys/class/drm empty, and a Button that CONSTRUCTS, which is
-    what the board revision in the DTB buys.
+    hardware stubbed, so the strings come from the code that ships.
+
+    The conditions are the measured ones, from run 32020772161's boot1
+    console: no /dev/i2c-* so the SSD1306 probe raises FileNotFoundError,
+    /sys/class/drm empty, and a Button whose pin claim raises OSError EINVAL
+    -- `no GPIO buttons ([Errno 22] Invalid argument)` is the line that
+    console carries. `buttons_present=True` is the real-Pi case instead,
+    where gpiozero reserves the pin and succeeds.
     """
     import sys
     sys.path.insert(0, str(REPO))
@@ -1891,8 +1923,13 @@ def journal_from_the_real_hmi(monkeypatch, *, oled_present):
         raise FileNotFoundError(
             2, "No such file or directory", "/dev/i2c-1")
 
+    def gpio(*_args, **_kwargs):
+        if buttons_present:
+            return Dummy()
+        raise OSError(22, "Invalid argument")
+
     monkeypatch.setattr(hmi, "Ssd1306Display", oled)
-    monkeypatch.setattr(hmi, "GpioButtons", lambda *a, **k: Dummy())
+    monkeypatch.setattr(hmi, "GpioButtons", gpio)
     monkeypatch.setattr(hmi, "screen_connected", lambda: False)
     monkeypatch.setattr(hmi, "keyboard_connected", lambda: False)
 
@@ -1913,12 +1950,40 @@ def test_the_check_reads_what_the_shipped_detection_actually_logs(tmp_path,
                                                                   monkeypatch):
     """
     End to end, with no fixture in the middle: the real hmi produces the
-    lines, the shipped probe judges them.
+    lines, the shipped probe judges them -- and what it produces has to be
+    the console this harness recorded, character for character in the parts
+    the check reads.
     """
     journal = journal_from_the_real_hmi(monkeypatch, oled_present=False)
-    assert "input: GPIO buttons" in journal, journal
+    assert "no GPIO buttons ([Errno 22] Invalid argument)" in journal, journal
+    assert "interface -- display: none, input: none" in journal, journal
     proc, _ = run_journal(tmp_path, unit_journal=journal)
     assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
+
+
+def test_the_fixture_is_the_journal_the_shipped_detection_produces(monkeypatch):
+    """
+    HEADLESS_JOURNAL is the default for six tests in this section, so it is
+    the fixture most worth holding against the code rather than against
+    somebody's reading of a console. The timestamps and the OLED exception's
+    wording are this file's; the two lines the check keys on are hmi's.
+    """
+    journal = journal_from_the_real_hmi(monkeypatch, oled_present=False)
+    for line in ("no GPIO buttons ([Errno 22] Invalid argument)",
+                 "interface -- display: none, input: none",
+                 "no usable interface; printing unattended"):
+        assert line in journal, (line, journal)
+        assert line in HEADLESS_JOURNAL, (line, HEADLESS_JOURNAL)
+
+
+def test_the_buttons_fixture_is_the_journal_a_real_pi_produces(monkeypatch):
+    """The same, for the shape that must go on passing on hardware."""
+    journal = journal_from_the_real_hmi(monkeypatch, oled_present=False,
+                                        buttons_present=True)
+    assert "interface -- display: none, input: GPIO buttons" in journal, journal
+    assert "no GPIO buttons" not in journal, journal
+    assert "interface -- display: none, input: GPIO buttons" in BUTTONS_JOURNAL
+    assert "no GPIO buttons" not in BUTTONS_JOURNAL, BUTTONS_JOURNAL
 
 
 def test_breaking_the_panel_absence_detection_still_turns_the_check_red(

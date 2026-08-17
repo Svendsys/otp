@@ -258,8 +258,8 @@ check journal-marker-accepted \
 # Storage=volatile is the only thing that makes an unscoped read safe today,
 # and a probe must not depend for its correctness on a line in another file.
 #
-# THREE CLAUSES, because each one is a different claim and the middle one is
-# the only one that stays true now that the harness supplies a board revision.
+# THREE CLAUSES, because each one is a different claim and only the middle
+# one is about the thing this check is named for.
 #
 #   "no OLED ("                          otpunit/hmi.open_display reporting
 #                                        that the display probe RAISED, with
@@ -274,26 +274,33 @@ check journal-marker-accepted \
 #    unattended"                         headless route off the back of that.
 #                                        This says what it DECIDED.
 #
-# WHY THE MIDDLE ONE HAD TO BE ADDED, and it is the whole reason this check
-# survived the emulator fix. harness/img-boot.sh now writes
-# /system/linux,revision into the DTB so rpi-eeprom-update.service stops
-# failing -- and gpiozero reads the same property. Measured, booting a stock
-# card under `-M raspi3b` with and without it: `Button(5) raised BadPinFactory`
-# becomes `Button(5) CONSTRUCTED factory='LGPIOFactory'`. So hmi.open_buttons
-# now succeeds here, exactly as it does on every real Pi -- gpiozero reserves
-# a pin and there is no presence detection, which is why Interface.prove
-# exists at all.
+# WHY THE MIDDLE ONE HAD TO BE ADDED, and the reason is the HOLE, not the
+# emulator. Without `display: none,` this check is made of two strings that a
+# machine WITH a screen also logs: an HDMI console and no buttons produces
+# "no OLED (" -- because the SSD1306 probe still raised -- and "printing
+# unattended" -- because Interface.interactive wants a display AND buttons.
+# So a unit that found something to draw on would have passed a check whose
+# name says it detected no panel. Requiring `display: none` closes that, and
+# keys the check on the one thing the emulator genuinely cannot provide:
+# there is no /dev/i2c-* and /sys/class/drm is empty in every boot measured,
+# with the board revision and without it.
 #
-# With buttons present, "printing unattended" is reached only because the
-# DISPLAY is None: Interface.interactive is `display is not None and buttons
-# is not None`. That makes the third clause a consequence of the display side
-# and nothing else, and it leaves a hole the first two clauses cannot see --
-# a machine that DID find a screen (an HDMI console) but no buttons logs
-# "no OLED (" and "printing unattended" too, and would have passed a check
-# whose name says the unit detected no panel. Requiring `display: none` closes
-# it and keys the check on the one thing the emulator genuinely cannot
-# provide: there is no /dev/i2c-* and /sys/class/drm is empty in every boot
-# measured, with the revision and without it.
+# WHAT THE EMULATED MACHINE ACTUALLY REPORTS, since an earlier version of
+# this comment got it wrong and a wrong comment is what a check gets read
+# through. harness/img-boot.sh writes /system/linux,revision into the DTB so
+# rpi-eeprom-update.service stops failing, and gpiozero reads the same
+# property -- so the pin factory loads instead of raising BadPinFactory. It
+# does NOT follow that a Button constructs. Run 32020772161, boot1
+# console-text.log:713-714:
+#
+#   no GPIO buttons ([Errno 22] Invalid argument)
+#   interface -- display: none, input: none
+#
+# Claiming GPIO5 on QEMU's gpiochip fails EINVAL, hmi.open_buttons() falls
+# through to (None, "none"), and this machine has neither half. That does not
+# weaken anything above: the hole the third clause closes belongs to a unit
+# with an HDMI console, which the emulator is not, and a check must not be
+# built out of what today's emulator happens to lack.
 #
 # The three strings are written in otpunit/ and matched here, which is how a
 # check stops checking with nothing going red -- so tests/test_img_verdict.py
@@ -320,9 +327,11 @@ for _ in $(seq 1 30); do
     sleep 2
 done
 # What it decided it had, quoted back. Display and input are chosen
-# independently, so WHICH of them was missing is the half worth reading --
-# and since the board revision arrived, the input half is expected to say
-# "GPIO buttons" on a machine with no buttons wired to anything.
+# independently, so WHICH of them was missing is the half worth reading. On
+# the emulated machine both are `none`; on a real Pi with lgpio the input
+# half says "GPIO buttons" whether or not anything is wired to those pins,
+# which is why Interface.prove exists and why this check is not allowed to
+# read the input half.
 UNIT_IFACE=$(printf '%s' "$UNIT_LOG" | grep -m1 -oE 'interface -- .{0,60}' || true)
 check unit-detects-no-panel \
       "$(if [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \

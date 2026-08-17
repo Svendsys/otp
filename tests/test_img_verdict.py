@@ -439,11 +439,13 @@ def test_the_probe_looks_for_the_display_the_unit_actually_reports():
     describe() on the real dataclass instead, with the interface a unit that
     found nothing to draw on ends up holding.
 
-    It matters more than the other two now. The harness supplies a board
-    revision so rpi-eeprom-update.service stops failing; gpiozero reads the
-    same property, its pin factory loads, and `Button(5)` succeeds -- so on
-    the emulated Pi the INPUT half is present and this is the clause that
-    still says the panel is not.
+    It has to hold for BOTH input halves, and that is the half of this test
+    an earlier version got wrong. The needle stops at `display: none,` on
+    purpose: a unit with lgpio and nothing wired to the header reports
+    `input: GPIO buttons`, and the emulated Pi reports `input: none` -- run
+    32020772161, boot1 console-text.log:713-714, `no GPIO buttons ([Errno 22]
+    Invalid argument)`. A needle that ran on into the input field would key
+    the check on which of those two machines it was looking at.
     """
     import sys
     sys.path.insert(0, str(REPO))
@@ -452,15 +454,16 @@ def test_the_probe_looks_for_the_display_the_unit_actually_reports():
     needle = "interface -- display: none,"
     assert f'*"{needle}"*' in GUEST_CHECK.read_text(), \
         f"the probe no longer looks for {needle!r}"
-    # The interface hmi.detect() builds on a machine with no OLED, no HDMI
-    # connector and buttons that constructed -- which is the emulated Pi,
-    # measured.
-    described = hmi.Interface(display=None, buttons=object(),
-                              display_kind="none",
-                              input_kind="GPIO buttons").describe()
-    assert needle == f"interface -- {described.split(' input:')[0]}", \
-        f"Interface.describe() now says {described!r}, so the probe's " \
-        f"unit-detects-no-panel check matches nothing"
+    # Both machines that reach the headless decision with nothing to draw on:
+    # the emulated Pi, whose pin claim fails EINVAL, and a real Pi, where
+    # gpiozero reserves the pin and succeeds. The needle must match each.
+    for input_kind, buttons in (("none", None), ("GPIO buttons", object())):
+        described = hmi.Interface(display=None, buttons=buttons,
+                                  display_kind="none",
+                                  input_kind=input_kind).describe()
+        assert needle == f"interface -- {described.split(' input:')[0]}", \
+            f"Interface.describe() now says {described!r}, so the probe's " \
+            f"unit-detects-no-panel check matches nothing"
     # And the line __main__ wraps it in. Read as text, because importing
     # __main__ runs it.
     assert 'log(f"interface -- {interface.describe()}")' in \

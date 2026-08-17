@@ -438,19 +438,36 @@ log "kernel=$KERNEL dtb=$DTB"
 # a smaller font.
 #
 # THE SAME PROPERTY IS READ BY GPIOZERO, and that is not a side effect to be
-# discovered later -- it is measured, in the same pair of boots:
+# discovered later -- it moves where the button probe fails, which was
+# measured in the same pair of boots with an `init=` probe on a stock card:
 #
 #   without   Button(5) raised BadPinFactory: Unable to load any default
 #             pin factory
 #   with      Button(5) CONSTRUCTED factory='LGPIOFactory' pin=GPIO5
 #
 # (QEMU does provide /dev/gpiochip0 and /dev/gpiochip1, which is what lgpio
-# opens.) So from now on the emulated unit finds BUTTONS -- exactly as every
-# real Pi does, which is the whole reason hmi.Interface.prove exists. What it
-# still does not find is a SCREEN: there is no /dev/i2c-* and /sys/class/drm
-# is empty in both boots, so hmi.open_display raises and returns none. That
-# is the half unit-detects-no-panel now keys on; see the comment on that
-# check in harness/img-guest-check.sh.
+# opens.)
+#
+# WHAT THE IMAGE'S OWN BOOT SAYS, WHICH IS NOT THAT, and where those two
+# disagree the booted artifact wins -- an `init=` probe is not this unit.
+# Run 32020772161, boot1 console-text.log:713-714:
+#
+#   no GPIO buttons ([Errno 22] Invalid argument)
+#   interface -- display: none, input: none
+#
+# So the factory does load with the revision -- an OSError from the pin
+# request is not a BadPinFactory -- but claiming GPIO5 on QEMU's gpiochip
+# then fails EINVAL, hmi.open_buttons() falls through to (None, "none"), and
+# the emulated unit finds NO BUTTONS. Why the standalone probe and the image
+# differ is not established here and is not load bearing for anything below;
+# what is load bearing is that no claim in this repository may say the
+# emulated unit has buttons.
+#
+# What it also does not find is a SCREEN: there is no /dev/i2c-* and
+# /sys/class/drm is empty in both boots, so hmi.open_display raises and
+# returns none. unit-detects-no-panel keys on the DISPLAY half anyway -- see
+# the comment on that check in harness/img-guest-check.sh for the HDMI hole
+# that clause closes, which is real whether or not buttons construct here.
 #
 # fdtput, NOT a dtc round trip. `dtc -I dtb -O dts` and back rewrites the
 # whole blob -- phandles, __symbols__, the overlay fixups -- to change one

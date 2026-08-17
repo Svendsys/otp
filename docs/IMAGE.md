@@ -85,20 +85,28 @@ session touches survives a power-cycle, and pulling the plug cannot corrupt
 the card, because nothing writes to it. Settings still persist — they live on
 the boot partition, which is outside the overlay.
 
-**Two other things live there, and they are the only exception to the
-sentence above.** `/boot/firmware/otp-identity` holds this unit's
-`machine-id` and a copy of its SSH host keys. Without them `/etc/machine-id`
-reverted to `uninitialized` on every power-cycle, systemd read every boot as a
-*first* boot — re-running `preset-all` and regenerating the host keys each
-time — and the fingerprint of a machine that prints one-time pads changed
-whenever somebody switched it off. The machine-id is put back by the
-initramfs, because systemd reads that file before any service exists.
+**One other thing lives there, and it is the only exception to the sentence
+above.** `/boot/firmware/otp-identity` holds this unit's `machine-id`.
+Without it `/etc/machine-id` reverted to `uninitialized` on every
+power-cycle and systemd read every boot as a *first* boot — re-running
+`preset-all`, re-enabling `ssh.socket`, and regenerating the host keys each
+time. The machine-id is put back by the initramfs, because systemd reads that
+file before any service exists.
 
-FAT has no permission bits, so the private host keys in that directory are
-readable by anyone who can mount the card. That is the same set of people who
-can already read them off the root filesystem, which is not encrypted either
-— the card *is* the device — but it is worth knowing before you hand one to
-somebody.
+**The SSH host keys are deliberately not kept.** They were, briefly, so that
+the fingerprint of a machine that prints one-time pads stopped changing —
+but the image is built with `ENABLE_SSH=0`, so `ssh.service` is disabled and
+this unit does not run `sshd`. The only boot it ever ran on was a machine's
+very first, where systemd's own `preset-all` switched it on; persisting the
+machine-id ended that, and from the second boot onwards there is no `sshd`
+here at all. A fingerprint nobody can be shown is not worth a private key
+outside the overlay.
+
+The boot partition is vfat mounted with `defaults`, so every file on it is
+`0755 root:root` — readable by **every account on the unit**, not only by
+someone who takes the card out. Nothing secret is written there: a
+machine-id is an identifier, and settings are the operator's own. It is worth
+knowing before you decide to put anything else on that partition.
 
 This used to be a manual step, printed as advice at the end of `install.sh`.
 It was a manual step nowhere else in this project: the image did not do it,
