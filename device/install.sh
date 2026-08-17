@@ -849,7 +849,7 @@ else
 # it can build, with stub mount/umount on PATH. A hardcoded path would leave
 # the only exercise of it an emulated boot of an image nobody can build
 # locally, which is the one place a mistake here is expensive to find.
-OTP_IDENTITY_MNT=/otp-identity
+OTP_IDENTITY_MNT=/otp-boot
 
 otp_restore_machine_id()
 {

@@ -498,6 +498,7 @@ if [ "${DTB_REVISION:-0}" != "$((BOARD_REVISION))" ]; then
 fi
 DTB="$DTB_PATCHED"
 log "board revision $BOARD_REVISION synthesised into $DTB (the firmware's job)"
+
 IMG_CMDLINE=""
 if [ -s "$WORK/boot/cmdline.txt" ]; then
     IMG_CMDLINE=$(tr -d '\r\n' < "$WORK/boot/cmdline.txt")
