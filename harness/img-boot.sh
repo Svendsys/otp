@@ -645,8 +645,10 @@ boot_phase() {
 # initcall_blacklist, one entry, one conviction:
 #
 #   bcm2835_pm_driver_init -- THE ~11.5s RESET, confirmed by bisection
-#   (runs 6/7) and re-verified in the local rig (alive past 15s with
-#   this blacklisted; runs 1-5 without it reset at ~11.5s every time).
+#   (runs 6/7) and re-verified in the local rig, which is committed now:
+#   `harness/img-local-rig.sh idle-survive` climbed uptime 4.17 -> 49.30
+#   with one kernel entry, against runs 1-5 resetting at ~11.5s every
+#   time without the blacklist. Anyone can re-run that in a minute.
 #   The PM block demands a 0x5a password on every write; the pm
 #   cluster writes passworded values against QEMU's partial model, and
 #   one lands where the model keeps its watchdog. An emulation
@@ -1000,9 +1002,12 @@ per_boot_verdict() {
     # byte this unit generates goes through getrandom(), which BLOCKS until
     # that line is printed, so its absence is not a warning: it is a unit
     # that cannot make key material and, before issue #16, would have hung
-    # silently trying. Measured at ~2.4s guest in the local rig (see the
-    # header), and the wording is confirmed verbatim against a running
-    # kernel: "[    0.193894] random: crng init done". A hard gate.
+    # silently trying. Measured at ~2.4s guest in the local rig, which is
+    # committed now: `harness/img-local-rig.sh rng` re-measured it at
+    # 2.62s, 2.63s and 3.32s over three runs on the image's own kernel,
+    # with a blocking read of /dev/random returning in 0.02s each time.
+    # The wording is confirmed verbatim against a running kernel:
+    # "[    0.193894] random: crng init done". A hard gate.
     #
     # "hwrng registered" is the hw_random core accepting bcm2835-rng, which
     # is builtin (CONFIG_HW_RANDOM_BCM2835=y). It is what separates "the
