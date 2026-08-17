@@ -1,0 +1,45 @@
+[Unit]
+Description=Keep this unit's machine-id and SSH host keys across the power cycle
+Documentation=https://github.com/Svendsys/otp/issues/21
+DefaultDependencies=no
+# The store is on the FAT boot partition, so it has to be mounted first.
+After=local-fs.target
+# AFTER the unit that deletes and regenerates host keys, not before it.
+# raspberrypi-sys-mods' regenerate_ssh_host_keys.service carries
+# ConditionFirstBoot=yes and
+# ExecStartPre=/usr/bin/rm -f /etc/ssh/ssh_host_*_key*, so a restore placed
+# before it would be deleted by it. It is a sysinit-level unit with
+# DefaultDependencies=no, so ordering after it costs nothing and is a no-op
+# on the boots where its condition is false -- which is every boot after the
+# first, once the machine-id above is stable.
+#
+# NOT After=sshd-keygen.service. That one is WantedBy=ssh.service and pulled
+# into the transaction at multi-user; ordering a sysinit unit after it makes
+# a cycle systemd resolves by dropping an edge of its own choosing. It does
+# not need the ordering either: `ssh-keygen -A` only creates key types that
+# are missing, so it leaves a restored set alone.
+After=regenerate_ssh_host_keys.service
+Before=sysinit.target
+# Belt and braces. sysinit.target already orders both of these after this
+# unit; naming them says which consumers this is FOR, and survives someone
+# moving the unit out of sysinit.
+Before=ssh.service ssh.socket
+# DefaultDependencies=no drops the implicit shutdown ordering, so it has to
+# be stated -- the same reason otp-unit-etc-cups.service states it.
+Conflicts=shutdown.target
+Before=shutdown.target
+ConditionPathIsReadWrite=/etc
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/otp-unit/persist-identity.sh
+# The journal is volatile and, under the tier-3 harness, forwarded to the
+# serial console -- so what this says about a failed restore is readable
+# where it matters. StandardError only: a healthy run's notes are worth
+# having, and it writes them all to stderr.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target

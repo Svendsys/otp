@@ -651,6 +651,68 @@ GETTY
 systemctl daemon-reload
 systemctl stop getty@tty1.service 2>/dev/null || true
 
+# --- AND THE RELOAD AT THE END OF THAT SAME SCRIPT ------------------------
+#
+# cancel-rename's last act, after the getty, is
+#
+#   if systemctl --quiet is-active ssh; then
+#       systemctl --quiet reload ssh
+#   fi
+#
+# -- read out of userconf-pi 0.19's /usr/bin/cancel-rename, the version in
+# archive.raspberrypi.com/debian trixie. On the image as it stood that
+# reload killed sshd for the rest of the boot. Run 72's tier-3 console,
+# boot 1:
+#
+#   systemd[1]: Reloading ssh.service - OpenBSD Secure Shell server...
+#   sshd[744]: Received SIGHUP; restarting.
+#   sshd[744]: fatal: Cannot bind any address.
+#   systemd[1]: ssh.service: Failed with result 'exit-code'.
+#
+# ssh.service carries RestartPreventExitStatus=255, so nothing brings it
+# back. The ONE boot an operator expects to be able to SSH into -- the boot
+# that applies their seeded credentials -- ends with no SSH, in silence.
+#
+# WHY IT DIES, which is what decides which line fixes it. Debian's
+# openssh-server 1:10.0p1-7+deb13u4 ships ssh.socket next to ssh.service:
+#
+#   [Socket]
+#   ListenStream=22
+#   Accept=no
+#
+# Accept=no with no Service= means the socket's implied service is
+# ssh.service, so when both are enabled ssh.socket binds :22 first and
+# systemd hands sshd the listening descriptor instead of letting it bind.
+# sshd's SIGHUP handler closes its listeners and re-execs; the re-exec has
+# no LISTEN_FDS left to adopt, ssh.socket still owns :22, and there is
+# nothing it can bind. Both units are enabled because systemd runs
+# `preset-all` on a FIRST boot -- and until the machine-id below is
+# persisted, every boot of this appliance is a first boot.
+#
+# THE SOCKET IS WHAT IS MASKED, and not either alternative:
+#
+#   - mask ssh.service, and `is-active ssh` above is false so no reload
+#     happens at all -- but that leaves ssh.socket listening on :22 for a
+#     service that can never start, and takes SSH off the machine as a
+#     side effect of a bug fix.
+#   - a drop-in ExecReload that does nothing hides the fault instead of
+#     fixing it, and a reload that silently does not reload is the shape of
+#     defect this repository exists to refuse.
+#
+# With the socket masked, ssh.service starts standalone, sshd binds :22
+# itself, and the SIGHUP re-exec rebinds it -- which is the ordinary path on
+# every machine that is not socket-activated.
+#
+# MASKED, NOT DISABLED, for the reason the growfs mask below is: `disable`
+# removes symlinks under /etc/systemd/system, which is inside the overlay,
+# so it would last one boot and the next preset-all would put the socket
+# back. A mask is a symlink to /dev/null written into the image.
+#
+# Bare, with no `|| true`, like the networkd-wait-online mask above: this
+# runs in the pi-gen chroot against an image that has openssh-server in it,
+# and a mask that silently failed to apply is the defect it exists to stop.
+systemctl mask ssh.socket
+
 # --- the read-only root overlay ------------------------------------------
 
 # This section used to be a paragraph of advice printed at the end telling
@@ -734,6 +796,84 @@ else
 
 . /scripts/local
 
+# THE ONE THING ALLOWED THROUGH THE OVERLAY, AND WHY IT HAS TO BE HERE.
+#
+# /etc is inside the overlay, so /etc/machine-id is whatever the card says
+# plus whatever this boot wrote to a tmpfs. pi-gen ships it holding the word
+# `uninitialized` -- read out of a stock Raspberry Pi OS Lite arm64 image --
+# and systemd's documented reading of that word is "this is a first boot":
+# PID 1 generates an ID, writes it to /etc (the tmpfs), creates
+# /run/systemd/first-boot, and runs preset-all. The write dies with the
+# power, so the NEXT boot is a first boot too, and the one after that.
+# Measured consequences on run 72's console: ssh.socket enabled again every
+# boot, regenerate_ssh_host_keys.service and sshd-keygen.service run again
+# every boot, and the host keys of a machine that prints one-time pads
+# change on every power cycle.
+#
+# IN THE INITRAMFS BECAUSE NOTHING LATER IS EARLY ENOUGH. PID 1 reads
+# /etc/machine-id before it looks at a single unit, so no service, drop-in
+# or generator can put the file there in time. The initrd is the last moment
+# that exists, and this file is already the thing that assembles the root --
+# so the exception rides with the mechanism it is an exception to, rather
+# than in some other file that has to be kept in step with it.
+#
+# NARROW ON PURPOSE: one file, 33 bytes, named. Not /etc, not a list, and
+# the SSH host keys are deliberately NOT done here -- they need modes a
+# FAT partition cannot express, and sshd starts late enough that ordinary
+# userspace can place them (see otp-unit-identity.service).
+#
+# WHERE IT COMES FROM: the FAT boot partition, the same partition
+# otpunit/config.py already persists settings to and the only writable
+# storage this design has outside the overlay. It is mounted READ-ONLY
+# here; the copy that puts a machine-id there is made from userspace, on a
+# partition systemd has mounted read-write by then.
+#
+# EVERY COMMAND BELOW IS ONE THE INITRD REALLY HAS. `mount`, `mkdir`, `cat`
+# and `umount` are klibc-utils, which initramfs-tools depends on; nothing
+# here needs busybox, which is the trap the header of this section is
+# written around. And no module is needed either: in the kernel this image
+# installs (linux-image-6.12.47+rpt-rpi-v8, and every -rpi-v8 build) fat,
+# vfat, nls_cp437 and nls_ascii are all in modules.builtin, with
+# CONFIG_FAT_DEFAULT_IOCHARSET="ascii" -- so a bare `mount -t vfat` works
+# with an empty /lib/modules.
+#
+# IT NEVER PANICS. The overlay is boot-critical and panics on failure; an
+# identity is not. Everything here is best effort: a card with no stored
+# machine-id, an unreadable partition, or a stored value that is not 32 hex
+# characters all leave /etc/machine-id exactly as the image shipped it,
+# which is the behaviour this replaces rather than a new failure. What
+# notices is tier 3, not the boot.
+otp_restore_machine_id()
+{
+	local dev id
+
+	mkdir -p /otp-identity
+	# CANDIDATES, AND A MARKER, rather than a guess. On the Pi the FAT
+	# partition is always partition 1 of the card the root came off, so the
+	# first candidate is ${ROOT} with its partition number replaced; the
+	# second is the literal device for the layout every image this project
+	# builds has. Nothing is trusted just for mounting: the file has to be
+	# under otp-identity/, a directory only device/install.sh's own
+	# persistence puts there, so mounting the wrong thing does nothing.
+	for dev in "${ROOT%p[0-9]}p1" /dev/mmcblk0p1; do
+		[ -e "${dev}" ] || continue
+		mount -r -t vfat "${dev}" /otp-identity 2>/dev/null || continue
+		id=$(cat /otp-identity/otp-identity/machine-id 2>/dev/null)
+		umount /otp-identity 2>/dev/null || true
+		# 32 lower-case hex characters, which is the only thing systemd
+		# accepts. A short, empty or corrupt value is dropped rather than
+		# written: systemd would reject it and call the boot a first boot,
+		# which is the state this is trying to leave.
+		case "${id}" in
+		*[!0-9a-f]*|"") continue ;;
+		esac
+		[ "${#id}" = 32 ] || continue
+		echo "${id}" > "${rootmnt}/etc/machine-id" 2>/dev/null || continue
+		return 0
+	done
+	return 0
+}
+
 local_mount_root()
 {
 	local_top
@@ -781,6 +921,12 @@ local_mount_root()
 	     overlay "${rootmnt?}"; then
 		panic "Failed to assemble the root overlay."
 	fi
+
+	# LAST, and only once the overlay is up: this writes THROUGH the
+	# overlay into its tmpfs upper layer, so it has to have somewhere to
+	# write to. See the comment on the function for why one file is
+	# allowed past a mechanism whose whole purpose is that nothing is.
+	otp_restore_machine_id
 }
 OVERLAY
     grep -qxF overlay /etc/initramfs-tools/modules 2>/dev/null \
@@ -898,6 +1044,29 @@ OVERLAY
         exit 1
     fi
     log "  overlay initramfs: $OVERLAY_INITRAMFS"
+
+    # --- the identity the overlay would otherwise throw away --------------
+    #
+    # The userspace half of the exception the initramfs script above makes.
+    # Two jobs, and the split between them is about WHEN, not about taste:
+    #
+    #   - the initrd RESTORES /etc/machine-id, because PID 1 reads that file
+    #     before any unit exists;
+    #   - this unit RECORDS it, and looks after the SSH host keys, because
+    #     both need a mounted boot partition and the host keys need modes a
+    #     FAT filesystem cannot carry.
+    #
+    # ONLY ON AN OVERLAY MACHINE, which is why it is inside this branch. A
+    # writable root keeps /etc/machine-id and /etc/ssh by itself; copying
+    # SSH private keys onto a FAT partition there would be exposure bought
+    # for nothing. The tier-2 Debian guest has no cmdline.txt, takes the
+    # other branch, and never gets this unit.
+    install -m 0755 "$REPO_DIR/device/persist-identity.sh" \
+        "$PREFIX/persist-identity.sh"
+    install -m 0644 "$REPO_DIR/device/systemd/otp-unit-identity.service" \
+        /etc/systemd/system/otp-unit-identity.service
+    systemctl daemon-reload
+    systemctl enable otp-unit-identity.service
 fi
 
 # WHAT THIS SCRIPT DID TO SOMEONE ELSE'S MACHINE, said out loud. The
@@ -915,9 +1084,10 @@ power-cycle is a full reset and nothing a session touched survives it.
 Settings still persist -- they live on the boot partition, which is outside
 the overlay.
 
-Two machine-wide changes were made as well, because an unbounded network
-wait held this image's boot open for its whole length (see the comments in
-this script):
+Three machine-wide changes were made as well -- two because an unbounded
+network wait held this image's boot open for its whole length, and one
+because the overlay made every boot look like a first boot (see the
+comments in this script):
 
   * systemd-networkd-wait-online.service is MASKED. Nothing on this machine
     can wait for network-online.target through networkd any more, including
@@ -926,9 +1096,24 @@ this script):
   * cloud-init is switched off permanently, via /etc/cloud/cloud-init.disabled.
     This machine will not run any cloud-init datasource again -- including
     user-data written to the boot partition. Undo by deleting that file.
+  * ssh.socket is MASKED, so sshd is never socket-activated here. It had to
+    be: with the socket holding port 22, the reload that userconf-pi runs at
+    the end of a seeded first boot left sshd unable to bind and
+    RestartPreventExitStatus=255 kept it down for the rest of the boot. Undo
+    with `sudo systemctl unmask ssh.socket`. ssh.service itself is untouched.
 
-Both are deliberate on an air-gapped key printer and both outlive this
-script. tty1 is the front panel; the login prompt is on tty2 (Alt+F2).
+All three are deliberate on an air-gapped key printer and all three outlive
+this script. tty1 is the front panel; the login prompt is on tty2 (Alt+F2).
+
+THIS UNIT'S IDENTITY IS ON THE BOOT PARTITION, in /boot/firmware/otp-identity:
+its machine-id and a copy of its SSH host keys. That is the one exception to
+"nothing survives a power cycle", and it exists because /etc is inside the
+overlay -- without it systemd calls every boot a first boot and the host keys
+change every time the power is pulled. FAT has no permission bits, so the
+private keys there are readable by anyone who can mount the card. That is the
+same set of people who can already read them off the root filesystem, which
+is not encrypted either, but it is worth knowing before you hand the card to
+anyone.
 
 To change the software afterwards, take `boot=overlay` back out of
 /boot/firmware/cmdline.txt, reboot, edit, and rerun this script.
