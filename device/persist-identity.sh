@@ -323,13 +323,15 @@ credential_restore_inner() {
     # THE TELL IS THAT THE FILE IS THERE AT ALL. A card nobody has seeded has
     # NEITHER of these names on it.
     if [ ! -s "$CRED_STORE" ]; then
-        refuse "there is no usable credential in $CRED_STORE, and this is not" \
-               "  a card that was never seeded: credential=$have_store (empty)" \
-               "  credential.new=$have_fragment. A record writes .new and" \
-               "  renames it into place, and vfat has no atomic rename, so a" \
-               "  power cut mid-record or a full partition leaves exactly" \
-               "  this. The login that was kept here is GONE; write a fresh" \
-               "  userconf.txt to the boot partition to set one again."
+        refuse "there is no usable credential in $CRED_STORE. This is NOT a" \
+               "  card that was never seeded -- one of the two names a record" \
+               "  uses is on it, and whichever it is holds nothing usable:" \
+               "  credential present=$have_store (zero length)," \
+               "  credential.new present=$have_fragment (never committed). A" \
+               "  record writes .new and renames it into place, and vfat has" \
+               "  no atomic rename, so a power cut mid-record or a full" \
+               "  partition leaves exactly this. The login that was kept here" \
+               "  is GONE; write a fresh userconf.txt to the boot partition."
         return 1
     fi
 
