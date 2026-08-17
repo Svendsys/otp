@@ -2615,5 +2615,11 @@ tests = [
 ]
 [[mutation.edit]]
 file = "device/install.sh"
-find = """  * systemd-growfs-root.service is MASKED."""
-replace = """  * systemd-growfs-root.service was left alone."""
+find = '''  * systemd-growfs-root.service is MASKED. systemd-fstab-generator hooks it
+    onto the root mount on every boot with no symlink for `disable` to
+    remove, and on an overlay root it can only fail -- `File system "/" not
+    backed by block device` -- so it printed a red line on the console of a
+    key printer on every boot of every image this project built. Nothing on
+    this machine can grow the root filesystem any more. Undo with
+    `sudo systemctl unmask systemd-growfs-root.service`.'''
+replace = '''  * nothing else on this machine was touched.'''
