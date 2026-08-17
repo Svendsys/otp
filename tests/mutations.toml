@@ -1111,9 +1111,15 @@ tests = [
   "tests/test_overlay_root.py::test_no_shadow_entry_at_all_fails",
 ]
 [[mutation.edit]]
+# The assignment is part of the `find` because boot2's
+# credential-survives-the-power-cycle now asks the same question of the same
+# variable, so the `if` line alone matches twice. Which of the two is being
+# mutated matters: this row is about boot1's attribution of the APPLY.
 file = "harness/img-guest-check.sh"
-find = '''    if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; then'''
-replace = '''    if [ -n "$UC_SHADOW" ]; then'''
+find = '''    if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; then
+        UC_APPLIED=yes'''
+replace = '''    if [ -n "$UC_SHADOW" ]; then
+        UC_APPLIED=yes'''
 
 
 [[mutation]]
@@ -1625,12 +1631,12 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
-find = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
-front-panel-survives-the-credential-apply diagnostic-sheet-renders \
-diagnostic-sheet-reaches-cups machine-id-recorded-for-the-next-boot"'''
-replace = '''GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
-diagnostic-sheet-renders diagnostic-sheet-reaches-cups \
-machine-id-recorded-for-the-next-boot"'''
+# The NAME, not the line it sits on. The list gained two credential checks
+# in the same commit that made this row rot, and a `find` spanning whole
+# lines would drop a neighbouring check with it -- mutating two properties
+# and proving neither. The name appears exactly once in this file.
+find = "front-panel-survives-the-credential-apply "
+replace = ""
 
 
 [[mutation]]

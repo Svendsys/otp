@@ -1147,11 +1147,13 @@ network-wait-cannot-hold-the-boot-open \
 machine-id-persisted-outside-the-overlay"
 GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
 front-panel-survives-the-credential-apply diagnostic-sheet-renders \
-diagnostic-sheet-reaches-cups machine-id-recorded-for-the-next-boot"
+diagnostic-sheet-reaches-cups machine-id-recorded-for-the-next-boot \
+credential-recorded-outside-the-overlay credential-recorded-for-the-next-boot"
 GUEST_CHECKS_BOOT2="root-writes-discarded-by-the-power-cycle \
 settings-survive-the-power-cycle userconf-unseeded-boot-skips-the-wizard \
 userconf-wizard-cannot-prompt userconf-malformed-seed-fails-fast \
-machine-id-identical-across-the-power-cycle"
+machine-id-identical-across-the-power-cycle \
+credential-survives-the-power-cycle"
 
 guest_gate() {
     local phase="$1" count counts passed total missing want name

@@ -22,6 +22,7 @@ sliced at the boundary where its behaviour is still parameterised -- the
 boot directory and the command-line file are variables, and the verification
 that decides whether provisioning fails is entirely inside that boundary.
 """
+import hashlib
 import os
 import re
 import shutil
@@ -2937,8 +2938,31 @@ def userconf_block() -> str:
     return text[start:text.index("\nsync 2>/dev/null || true", start)]
 
 
+def shadow_field(shadow_text: str, user: str) -> str:
+    """Field 2 of an /etc/shadow line, as the probe's own awk reads it."""
+    for line in shadow_text.splitlines():
+        fields = line.split(":")
+        if fields[0] == user:
+            return fields[1]
+    return ""
+
+
+def sha256_of(text: str) -> str:
+    """What the probe's `sha256sum` answers for the same bytes.
+
+    The probe digests the hash rather than carrying it between the boots
+    because its console is uploaded as a CI artifact and a crypt string is
+    offline-crackable at leisure. Recomputed here rather than pasted, so the
+    fixture cannot drift away from the thing under test.
+    """
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
-                 executable=True, shadow=None, env=None):
+                 executable=True, shadow=None, env=None,
+                 credential="otp:$6$otpimgcheck$hashbytes",
+                 boot1_digest="auto", store_src="/dev/mmcblk0p1",
+                 root_source="overlay"):
     """Run the shipped userconf block with a substituted systemd and shadow.
 
     Three absolute paths are rewritten rather than stubbed on the filesystem
@@ -2968,20 +2992,52 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
     (bin_dir / "journalctl").write_text(JOURNALCTL_STUB)
     (bin_dir / "journalctl").chmod(0o755)
 
+    # The credential store the probe audits, and the record boot1 leaves for
+    # boot2. Supplied here rather than left to the block, because both are
+    # written by the IMAGE -- persist-identity.sh puts the store there from the
+    # wizard's ExecStartPost -- and this rig has no image.
+    store = bootdir / "otp-identity"
+    store.mkdir(parents=True, exist_ok=True)
+    if credential is not None:
+        (store / "credential").write_text(credential + "\n")
+    # "auto" is the healthy path: the digest boot1 would have written of the
+    # hash this fixture's own /etc/shadow holds. Computed from the fixture
+    # rather than pasted, so a test that changes the hash cannot leave a
+    # record describing the old one and call the mismatch a finding.
+    if boot1_digest == "auto":
+        boot1_digest = sha256_of(shadow_field(shadow_file.read_text(), "otp"))
+    if boot1_digest is not None:
+        (bootdir / "otp-imgcheck-credential").write_text(boot1_digest + "\n")
+
     block = userconf_block()
-    for original, replacement, why in (
-        ("/etc/shadow", str(shadow_file), "the shadow file"),
-        ("/usr/lib/userconf-pi/userconf-service", str(svc), "the service"),
-        ("timeout -k 5 60", "timeout -k 1 2", "the experiment's bound"),
-        ("sleep 2", "sleep 0", "the condition poll"),
+    for original, replacement, why, count in (
+        # THE READ, not the path: the comments in the block name /etc/shadow
+        # eight times over and rewriting those would prove nothing. TWICE,
+        # not once, because boot1 reads the account's hash to say the seed
+        # was applied and boot2 reads it again to say the hash outlived the
+        # power cycle -- a rewrite that patched one would leave the other
+        # reading the machine this test runs on.
+        ("{print $2}' /etc/shadow", "{print $2}' " + str(shadow_file),
+         "the shadow read", 2),
+        ("/usr/lib/userconf-pi/userconf-service", str(svc), "the service", 1),
+        ("timeout -k 5 60", "timeout -k 1 2", "the experiment's bound", 1),
+        ("sleep 2", "sleep 0", "the condition poll", 1),
     ):
-        assert block.count(original) == 1, f"{why}: {original!r} in the block"
+        assert block.count(original) == count, \
+            f"{why}: {original!r} appears {block.count(original)}x, want {count}"
         block = block.replace(original, replacement)
 
     runner = tmp_path / "userconf.sh"
     runner.write_text(
         "set -uo pipefail\n"
         f'PHASE="{phase}"\nBOOTDIR="{bootdir}"\nPASS=0\nTOTAL=0\n'
+        # What the identity section above the block would have set. Named
+        # here for the same reason $BOOTDIR is: the credential checks compare
+        # the store's filesystem against the root's, and that comparison has
+        # to be steerable or the clause that catches an unmounted
+        # /boot/firmware can never be shown to work.
+        f'IDENTITY_STORE="{store}"\nSTORE_SRC="{store_src}"\n'
+        f'ROOT_SOURCE="{root_source}"\n'
         + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
         + block + '\nprintf "TOTALS %s/%s\\n" "$PASS" "$TOTAL"\n')
     proc = subprocess.run(
@@ -3015,7 +3071,9 @@ def test_a_seeded_first_boot_reports_applied_credentials_and_no_wizard(tmp_path)
         "network-wait-cannot-hold-the-boot-open": "PASS",
         "userconf-seed-applied": "PASS",
         "userconf-seeded-boot-ran-no-wizard": "PASS",
-        "front-panel-survives-the-credential-apply": "PASS"}, proc.stdout
+        "front-panel-survives-the-credential-apply": "PASS",
+        "credential-recorded-outside-the-overlay": "PASS",
+        "credential-recorded-for-the-next-boot": "PASS"}, proc.stdout
 
 
 def test_a_boot_still_waiting_on_the_network_fails(tmp_path):
@@ -3289,9 +3347,200 @@ def test_an_unseeded_second_boot_is_quiet_and_leaves_evidence(tmp_path):
         "network-wait-cannot-hold-the-boot-open": "PASS",
         "userconf-unseeded-boot-skips-the-wizard": "PASS",
         "userconf-wizard-cannot-prompt": "PASS",
+        "credential-survives-the-power-cycle": "PASS",
         "userconf-malformed-seed-fails-fast": "PASS"}, proc.stdout
     assert (bootdir / "failed_userconf.txt").exists()
     assert not (bootdir / "userconf.txt").exists()
+
+
+# --- and the credential the seed used to lose ------------------------------
+#
+# These drive the SAME block through the same rig. The image the checks
+# describe is the one the owner's decision produced: the applied hash is kept
+# in /boot/firmware/otp-identity/credential, restored at sysinit, and still in
+# force after the power cycle. Every test below is a way for that to look
+# right while being false.
+
+
+def test_a_boot_that_applied_the_seed_but_kept_nothing_fails(tmp_path):
+    """
+    THE OLD BEHAVIOUR, stated as a failure.
+
+    Everything else in boot1 was equally true of the image that lost the
+    password: the hash reaches /etc/shadow, the wizard finishes, the panel
+    survives. /etc is inside the overlay, so all of it died with the power.
+    An empty store is that image, and it has to be red.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           credential=None)
+    assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
+        proc.stdout
+    # The other one still passes: boot1 watched the apply happen and wrote its
+    # own record. That is the point of splitting them -- the positive control
+    # must not go red for the thing it is controlling for.
+    assert results(proc)["credential-recorded-for-the-next-boot"] == "PASS"
+
+
+def test_a_store_holding_something_other_than_the_applied_hash_fails(tmp_path):
+    """
+    A store that exists is not a store that is right. This is the shape a
+    stale credential has: the operator seeded a NEW password, the wizard
+    applied it, and the recording phase never ran -- so the next power cycle
+    puts the OLD one back and the operator is locked out of a password they
+    believe they changed.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           credential="otp:$6$otpimgcheck$somethingelse")
+    assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_store_naming_another_account_fails(tmp_path):
+    """`chpasswd` takes `user:hash`, so a store naming somebody else restores
+    nothing -- and the digest of its hash field can still match perfectly."""
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           credential="pi:$6$otpimgcheck$hashbytes")
+    assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_credential_store_inside_the_overlay_is_not_persistence(tmp_path):
+    """
+    #35's hole, on the credential side. An unmounted /boot/firmware leaves the
+    store as a directory on the overlay's tmpfs: it agrees with /etc/shadow
+    perfectly, on every boot, while nothing survives any of them.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           store_src="overlay", root_source="overlay")
+    assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_root_nothing_could_describe_does_not_make_the_credential_kept(tmp_path):
+    """
+    The same clause from the other end. If findmnt could not describe `/`,
+    $ROOT_SOURCE is empty and "the store is not on the root's filesystem"
+    becomes true of every store there is -- a check that is only correct
+    because a different one failed.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           root_source="")
+    assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_first_boot_with_no_credential_at_all_records_nothing_and_says_so(tmp_path):
+    """
+    The positive control's own negative. A machine whose /etc/shadow has no
+    entry for the account has no credential to record, and a record file
+    written from an empty string would be a digest of nothing that boot2's
+    equally-empty read would match.
+    """
+    proc, bootdir = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                                 shadow="pi:$6$x$y:20000:0:99999:7:::\n")
+    assert results(proc)["credential-recorded-for-the-next-boot"] == "FAIL", \
+        proc.stdout
+    written = (bootdir / "otp-imgcheck-credential").read_text().strip()
+    assert written == "", written
+
+
+def test_the_second_boot_accepts_the_password_that_outlived_the_power(tmp_path):
+    """The healthy boot2 path, spelled out: the hash carries the seed's salt
+    and digests to what boot1 recorded, with no seed on the card."""
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2)
+    assert results(proc)["credential-survives-the-power-cycle"] == "PASS", \
+        proc.stdout
+
+
+def test_a_second_boot_back_on_the_build_time_password_fails(tmp_path):
+    """
+    THE DEFECT, measured before this change and now a red line: boot2 came up
+    with pi-gen's random FIRST_USER_PASS, which nobody has, on a device whose
+    only other way in is the card.
+    """
+    proc, _ = run_userconf(
+        tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+        shadow="otp:$6$RaNdOmSaLt$buildtimebytes:20000:0:99999:7:::\n",
+        boot1_digest=sha256_of("$6$otpimgcheck$hashbytes"))
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+
+
+def test_two_absences_are_not_a_credential_that_survived(tmp_path):
+    """
+    The two-absence hole the review caught on the machine-id side, closed on
+    this one with the same shape of clause. No hash in /etc/shadow and no
+    record from boot1 compare equal, and both are empty.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+                           shadow="root:!:20000:0:99999:7:::\n",
+                           boot1_digest=None)
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_second_boot_with_a_password_but_no_record_fails(tmp_path):
+    """Half of the pair above, on its own: boot1 never wrote a record, so
+    there is nothing this boot's hash can be held against."""
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+                           boot1_digest=None)
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_password_that_could_have_come_from_a_seed_this_boot_fails(tmp_path):
+    """
+    The clause that makes this a statement about a POWER CYCLE.
+
+    A userconf.txt still on the card is a boot where the wizard is armed --
+    the delete failed, or the operator left the file there -- so the hash in
+    /etc/shadow may have been applied a moment ago rather than restored. That
+    is also the rejected "keep the seed file" option arriving by accident,
+    with the operator's credential line readable in any card reader forever.
+    """
+    bootdir = tmp_path / "firmware"
+    bootdir.mkdir(parents=True, exist_ok=True)
+    (bootdir / "userconf.txt").write_text("otp:$6$otpimgcheck$hashbytes\n")
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2)
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_restored_hash_that_was_mangled_on_the_way_back_fails(tmp_path):
+    """
+    Attribution is not integrity. A truncated restore still begins with the
+    seed's salt, so the salt clause alone would pass it -- and a truncated
+    crypt string is a password nobody can type.
+    """
+    proc, _ = run_userconf(
+        tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+        shadow="otp:$6$otpimgcheck$hashbyt:20000:0:99999:7:::\n",
+        boot1_digest=sha256_of("$6$otpimgcheck$hashbytes"))
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+
+
+def test_the_probe_never_writes_the_hash_where_the_console_can_see_it(tmp_path):
+    """
+    This console is uploaded as a CI artifact, and a crypt string on it is a
+    crypt string anyone who downloads the run can attack at leisure -- for as
+    long as they like, against a hash the operator may have reused elsewhere.
+    What travels between the boots is a sha256 of it, and what is printed is
+    twelve characters of that.
+    """
+    secret = "$6$otpimgcheck$hashbytes"
+    for phase, env in (("boot1", HEALTHY_BOOT1), ("boot2", HEALTHY_BOOT2)):
+        proc, bootdir = run_userconf(tmp_path / phase, phase=phase, env=env)
+        assert secret not in proc.stdout, proc.stdout
+        assert "hashbytes" not in proc.stdout, proc.stdout
+        # And the record the probe itself leaves on the card is the digest,
+        # not the hash. The store beside it holds the hash in full -- that is
+        # the thing under test -- so this file must add nothing to it.
+        record = (bootdir / "otp-imgcheck-credential").read_text().strip()
+        assert record == sha256_of(secret), record
+    # The positive control: the digest IS in the output, so "the hash is
+    # absent" is not satisfied by a probe that printed nothing at all.
+    assert sha256_of(secret)[:12] in proc.stdout, proc.stdout
 
 
 def test_a_masked_wizard_is_quiet_for_the_wrong_reason(tmp_path):
