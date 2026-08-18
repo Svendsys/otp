@@ -110,7 +110,17 @@ jobs:
         env:
           SHELLCHECK_VERSION: v0.9.0
         run: |
-          curl -fsSL --retry 3 \
+          # --retry-all-errors, because plain --retry does not cover 403
+          # and 403 is what this download actually returns when it fails.
+          # Run 32168411327 got `curl: (22) The requested URL returned
+          # error: 403`, then `xz: (stdin): File format not recognized`
+          # as tar was handed the empty stream, and the job reported a
+          # shellcheck failure on a branch whose scripts shellcheck had
+          # never been run against. curl retries 408, 429 and the 5xx
+          # family on --retry alone; a rate-limited release download is
+          # none of those. Five tries with a delay, so a check that says
+          # "shellcheck failed" means shellcheck ran.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
             "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
             | tar -xJf - --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           ./shellcheck --version
