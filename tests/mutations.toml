@@ -4150,6 +4150,27 @@ find = "            if discarded >= BACKLOG_MAX_BYTES:"
 replace = "            if False:  # mutation: never say the drain gave up"
 
 [[mutation]]
+name = "panel-revival-cries-wolf-about-the-drain-giving-up"
+tier = "fast"
+guard = """
+The other direction of the same line, because the two are one edit apart and
+only one of them is caught by the row above.
+
+A revival that emptied the pipe and says it stopped at its bound sends
+whoever reads the journal hunting a replay that did not happen -- on a unit
+whose journal is its only diagnostic, and where the whole argument for
+reporting at all is that nothing is written when nothing is wrong.
+
+The mutation says it every time."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_dead_dispatcher_is_restarted_and_the_journal_says_so",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "            if discarded >= BACKLOG_MAX_BYTES:"
+replace = "            if True:  # mutation: always say the drain gave up"
+
+[[mutation]]
 name = "panel-replays-what-was-pressed-at-a-dead-panel"
 tier = "fast"
 guard = """
