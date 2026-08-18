@@ -2334,10 +2334,23 @@ def test_cloud_init_is_switched_off_on_an_air_gapped_printer(tmp_path):
     here; it spent 57 seconds of every boot finding no datasource; and it
     is a provisioning agent that takes user-data off the boot partition --
     the one partition an operator is told to write files on -- on a device
-    that prints one-time pads and has no network by design. Its generator
-    reads this file before it links cloud-init.target into
-    multi-user.target, so cloud-config.service is not in the transaction at
-    all and userconfig.service's `After=` on it becomes void.
+    that prints one-time pads and has no network by design.
+
+    THE PACKAGES ARE PURGED OUT OF THE IMAGE NOW (issue #34) and this line
+    still has to be written, on the two machines a purge cannot reach: one
+    that gets cloud-init back as somebody's later dependency, and the
+    hand-provisioned Pi this script is mostly run on, which never meets a
+    pi-gen stage at all.
+
+    /usr/lib/cloud-init/ds-identify is what reads the file, not the
+    generator directly: `is_disabled()` returns 0 on
+    `[ -f /etc/cloud/cloud-init.disabled ]` before any datasource search,
+    `_main` returns 2 at that, and the generator's rc=2 branch is what
+    leaves cloud-init.target out of multi-user.target's wants -- so
+    cloud-config.service is not in the transaction at all and
+    userconfig.service's `After=` on it becomes void. Read off cloud-init
+    25.2-1~bpo13+1+rpt20; nothing here runs either script, and the tier-3
+    checks say what they measure instead.
     """
     _, cloud = run_boot_finishes(tmp_path)
     assert (cloud / "cloud-init.disabled").exists(), sorted(

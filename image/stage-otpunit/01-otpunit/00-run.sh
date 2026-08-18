@@ -104,11 +104,18 @@ CLOUD_PACKAGES_RE="$(echo "$CLOUD_PACKAGES" | tr ' ' '|')"
 # `Remv` both count: apt prints the first for the packages it purges and the
 # second for anything it removes on the way, and it is the second that would
 # be the finding.
+#
+# ONE COMMAND PER LINE IN HERE, however long the line gets, and this is
+# the reason rather than a preference. on_chroot's delimiter is unquoted,
+# so the HOST shell expands this body before capsh hands it to `sh -e` in
+# the chroot -- which means a `\` at end of line is joined by the host,
+# and `<<-` has already stripped only the FIRST physical line's tab by
+# then. Measured: a three-line pipeline arrived in the chroot as one line
+# with two stray tabs in the middle of it. It runs; it reads like a fault
+# in the build log, which is the one place anybody would be looking.
 on_chroot <<-EOF
 	set -e
-	unexpected=\$(apt-get -s purge -y ${CLOUD_PACKAGES} \
-	             | awk '\$1 == "Remv" || \$1 == "Purg" { print \$2 }' \
-	             | grep -vxE '${CLOUD_PACKAGES_RE}' || true)
+	unexpected=\$(apt-get -s purge -y ${CLOUD_PACKAGES} | awk '\$1 == "Remv" || \$1 == "Purg" { print \$2 }' | grep -vxE '${CLOUD_PACKAGES_RE}' || true)
 	if [ -n "\$unexpected" ]; then
 		echo "ERROR: purging cloud-init would also remove:" >&2
 		echo "\$unexpected" | sed 's/^/         /' >&2

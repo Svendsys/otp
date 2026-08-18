@@ -1561,9 +1561,14 @@ cloud-init is what pulls network-online.target into this image's boot, it
 spends a minute of every boot finding no datasource, and it takes user-data
 off the boot partition -- the partition an operator is told to write files
 on -- on a device that prints one-time pads and has no network by design.
-The kill switch is read by its generator before cloud-init.target is linked
-into multi-user.target, which is what takes cloud-config.service out of the
-transaction and voids the wizard's `After=` on it."""
+The packages are purged out of the image now (issue #34) and this line is
+the belt to that purge's braces: it is what disables a cloud-init some later
+dependency drags back in, and it is the whole of the defence on the
+hand-provisioned Pi this script is mostly run on. ds-identify reads the
+marker before any datasource search and answers 2, which is what leaves
+cloud-init.target out of multi-user.target's wants -- taking
+cloud-config.service out of the transaction and voiding the wizard's
+`After=` on it."""
 tests = [
   "tests/test_overlay_root.py::test_cloud_init_is_switched_off_on_an_air_gapped_printer",
 ]
@@ -1631,8 +1636,8 @@ tests = [
 ]
 [[mutation.edit]]
 file = "image/stage-otpunit/01-otpunit/00-run.sh"
-find = '''	             | awk '\$1 == "Remv" || \$1 == "Purg" { print \$2 }' \'''
-replace = '''	             | awk '\$1 == "Purg" { print \$2 }' \'''
+find = '''| awk '\$1 == "Remv" || \$1 == "Purg" { print \$2 }' |'''
+replace = '''| awk '\$1 == "Purg" { print \$2 }' |'''
 
 
 [[mutation]]
