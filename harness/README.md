@@ -1444,12 +1444,12 @@ stayed green.
 
 ```sh
 python3 tests/mutation_gate.py --list
-python3 tests/mutation_gate.py --tier fast       # 237 rows, 279s
+python3 tests/mutation_gate.py --tier fast       # 264 rows, 323s
 sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
 ```
 
 **Runtime decided the trigger.** The issue expected nightly or
-label-triggered; measured, the fast tier is about five minutes at 237 rows
+label-triggered; measured, the fast tier is about five and a half minutes at 264 rows
 — still cheaper than the suite it audits — so it runs per pull
 request as its own `mutation` job, and the ordinary suite's wall clock does
 not move. The three CUPS-rig rows run in the existing `hardware` job, the
