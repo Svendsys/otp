@@ -28,6 +28,32 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
+      # mtools, AND IT IS NOT OPTIONAL DECORATION. tier 3's card functions --
+      # fat_listing, fat_digest_of, fat_digests, strip_probe_droppings -- sit
+      # above the block tests/test_img_verdict.py slices, so for as long as
+      # this suite could not run them, `grep -rn "fat_digest_of" tests/*.py`
+      # returned nothing and rewriting the digest function to hand every file
+      # the same sixty-four characters left the suite passing. It now builds
+      # a real FAT partition with mformat/mcopy and runs the shipped
+      # functions against it, which needs the tools the image job already
+      # installs for the same reason. Those tests SKIP without it, so this
+      # line is what stops the coverage silently reverting;
+      # tests/test_image_workflow.py asserts the line is here.
+      - name: Install mtools for the tier-3 card tests
+        # Capped and retried like every other apt call in this file. The
+        # flags are not decoration: on 2026-08-18 azure.archive.ubuntu.com
+        # stopped answering and apt sat silent for seven and a half minutes
+        # inside `update`, because its default is a 120s per-connection
+        # timeout with no retry. This step is in the two quickest jobs in
+        # the repository -- `test` finishes in about ninety seconds -- so an
+        # unbounded install here is the difference between a fast suite and
+        # a job that reports nothing for a quarter of an hour.
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -o Acquire::Retries=3 \
+                       -o Acquire::http::Timeout=15 \
+                       -o Acquire::https::Timeout=15 update
+          sudo apt-get install -y --no-install-recommends mtools
       # Bounded: a UI regression can make the suite spin rather than fail
       # -- FakeButtons returns None forever at poll_seconds=0, so a screen
       # that stops honouring BACK loops instead of raising. Unbounded, that
@@ -82,6 +108,28 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
+      # mtools, for the same reason the `test` job installs it and with a
+      # sharper edge here: several rows in the fast tier break the card
+      # functions and name the tests that drive them against a real FAT
+      # partition. mutation_gate.py refuses a row whose named tests SKIPPED
+      # -- "a skipped test cannot go red" -- so without this the rows do not
+      # quietly pass, they fail the job by name. That is the right direction
+      # and it is still a job nobody can read, hence the line.
+      - name: Install mtools for the tier-3 card rows
+        # Capped and retried like every other apt call in this file. The
+        # flags are not decoration: on 2026-08-18 azure.archive.ubuntu.com
+        # stopped answering and apt sat silent for seven and a half minutes
+        # inside `update`, because its default is a 120s per-connection
+        # timeout with no retry. This step is in the two quickest jobs in
+        # the repository -- `test` finishes in about ninety seconds -- so an
+        # unbounded install here is the difference between a fast suite and
+        # a job that reports nothing for a quarter of an hour.
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -o Acquire::Retries=3 \
+                       -o Acquire::http::Timeout=15 \
+                       -o Acquire::https::Timeout=15 update
+          sudo apt-get install -y --no-install-recommends mtools
       # Bounded like the suite above, and this one has a second way to hang:
       # a mutation can wedge a test rather than fail it. The runner caps each
       # mutated run itself; this is the backstop. `timeout` sends SIGTERM,

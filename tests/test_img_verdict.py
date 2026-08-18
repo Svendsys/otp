@@ -19,17 +19,53 @@ to /boot/firmware must not. That means a gate over what the guest reported,
 and the gate has the failure mode every gate in this repository has been
 caught with -- a phase that never ran produces no output, which looks
 exactly like a phase with nothing to say.
+
+AND A THIRD, WHOSE EVIDENCE IS THE OTHER SHAPE. The `release` phase boots the
+same card with no otp.imgcheck token, which is how a flashed unit boots, and
+everything it claims is an absence: the shipped probe printed nothing, tagged
+nothing, and left nothing on the card. That is the failure mode above in its
+purest form -- a boot that never happened satisfies every clause -- so each
+absence here is paired with the presence that proves the observation was
+possible, and there is a test per clause for the console that violates only
+that clause. The one that matters most is
+test_a_release_boot_whose_probe_unit_is_missing_fails: without it, DELETING
+the probe from the image would make this phase greener.
 """
+import hashlib
+import inspect
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 REPO = Path(__file__).resolve().parent.parent
 IMG_BOOT = REPO / "harness" / "img-boot.sh"
 GUEST_CHECK = REPO / "harness" / "img-guest-check.sh"
+IMGCHECK_UNIT = REPO / "device" / "systemd" / "otp-unit-imgcheck.service"
 MARKER = "# Everything downstream reads the combination"
+
+
+def shell_list(name: str) -> list:
+    """A space-separated `NAME="a b c"` list, read out of img-boot.sh.
+
+    Read rather than restated, for the reason `required_checks` is: a fixture
+    that carried its own copy of these names would go on describing a healthy
+    release boot after somebody renamed one in the harness, and the clause
+    that renamed file belongs to would be exercised by nothing.
+    """
+    match = re.search(rf'^{name}="(.*?)"$', IMG_BOOT.read_text(), re.S | re.M)
+    assert match, f"{name} is gone from {IMG_BOOT}"
+    return match.group(1).replace("\\\n", " ").split()
+
+
+# The probe's own two records, and the three files a release boot must leave
+# byte-for-byte alone. Both lists live in img-boot.sh.
+PROBE_DROPPINGS = shell_list("PROBE_DROPPINGS")
+FAT_CONTENTS = shell_list("FAT_CONTENTS")
 
 # The raw bytes of the success line as run 12's evidence artifact recorded
 # them: color around the OK, color around the unit name, CR at the end.
@@ -99,10 +135,43 @@ FIRST_BOOT_TARGET = ("[   15.000000] systemd[1]: Reached target "
                      "first-boot-complete.target - First Boot Complete.")
 
 
-def kernel_lines(*, entries=1, last_ts="20.000000", first_boot=False):
+# THE KERNEL'S OWN ECHO OF WHAT IT WAS HANDED, which is where the verdict
+# reads the otp.imgcheck token back from. Not from the harness's -append: the
+# harness building the command line and the harness checking it are the same
+# program, so the only statement about the token that cannot be wrong by
+# agreeing with itself is the one the kernel prints.
+#
+# The base is img-boot.sh's -append with its two shell expansions resolved the
+# way a real run resolves them -- boot=overlay out of the image's cmdline.txt,
+# and the phase token, which the release phase does not get at all.
+CMDLINE_BASE = ("rw earlycon loglevel=7 console=ttyAMA1,115200 "
+                "systemd.show_status=1 systemd.journald.forward_to_console=1 "
+                "initcall_blacklist=bcm2835_pm_driver_init "
+                "root=/dev/mmcblk0p2 rootfstype=ext4 rootwait boot=overlay")
+
+
+def cmdline_line(phase, *, token=None):
+    """`Kernel command line:` as the kernel prints it, for one phase.
+
+    `token` overrides what follows the base, so a test can hand the release
+    phase the very token it is supposed not to have -- including the
+    `otp.imgcheck=` form, which is the interesting one: systemd matches a
+    bare word against the left-hand side of an assignment too, so an empty
+    value still starts the unit.
+    """
+    if token is None:
+        token = "" if phase == "release" else f"otp.imgcheck={phase}"
+    tail = f" {token}" if token else ""
+    return f"[    0.000000] Kernel command line: {CMDLINE_BASE}{tail}"
+
+
+def kernel_lines(*, entries=1, last_ts="20.000000", first_boot=False,
+                 phase="boot1", cmdline=True, multi_user=True):
     lines = []
     for _ in range(entries):
         lines.append("[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x410fd034]")
+    if cmdline:
+        lines.append(cmdline_line(phase))
     lines += [
         "[    0.100000] Linux version 6.12.96+rpt-rpi-v8 (build@host)",
         # Filtered back out by the two tests that need them missing, so
@@ -111,8 +180,9 @@ def kernel_lines(*, entries=1, last_ts="20.000000", first_boot=False):
         CRNG,
         "[    9.180895] systemd[1]: Hostname set to <otp-unit>.",
         f"[   {last_ts}] systemd[1]: Reached target sysinit.target - System Initialization.",
-        multi_user_line(last_ts),
     ]
+    if multi_user:
+        lines.append(multi_user_line(last_ts))
     # boot1 REALLY IS a first boot, every run: the harness gives each run a
     # fresh `xz -dc` of the image, so /etc/machine-id still says
     # `uninitialized` when PID 1 reads it. boot2 must not be one, and that is
@@ -137,7 +207,16 @@ def guest_report(phase, *, checks=None, failing=(), done=True, counts=None):
     for name in names:
         state = "FAIL" if name in failing else "PASS"
         passed += state == "PASS"
-        lines.append(f"OTP-CHECK {phase} {name} {state} detail=whatever\r")
+        # The CUPS queue's name really does travel on this console, inside
+        # this one check's detail -- `queue=$(lpstat -v otpimgcheck)`. The
+        # release phase's guest-probe-cups-queue-unnamed clause uses boot1's
+        # console as the control that its grep can find the name at all, so a
+        # fixture that left it out would make that control read zero and the
+        # clause fail for a fixture's reason rather than an image's.
+        detail = "detail=whatever"
+        if name == "diagnostic-sheet-reaches-cups":
+            detail = "lpadmin rc=0 | queue=device for otpimgcheck: usb://OTP/imgcheck"
+        lines.append(f"OTP-CHECK {phase} {name} {state} {detail}\r")
     if done:
         lines.append(f"OTP-GUEST-DONE {phase}\r")
     got, total = counts if counts else (passed, len(names))
@@ -164,8 +243,92 @@ def forwarded(text, *, ident="python3", pid=412, ts="46.000000"):
     return f"[   {ts}] {ident}[{pid}]: {text}\r"
 
 
+# SYSTEMD SAYING IT LOOKED AT THE PROBE AND DID NOT START IT.
+#
+# The wording is systemd v257's, from src/core/job.c: a start job that ends
+# JOB_DONE with u->condition_result false and a non-trigger failed condition
+# logs "%s was skipped because of an unmet condition check (%s=%s%s)." with
+# %s = unit_status_string(), which under the default StatusUnitFormat is
+# "<id> - <description>". Run 12's console proves that format is the one this
+# image uses -- its success line is "Started ESC[..motp-unit.serviceESC[0m -
+# OTP pad print unit." -- so the unit's NAME is on the line whatever systemd
+# does to the prose around it.
+#
+# job.c also sets do_console = false for exactly this case, so a condition
+# skip is never printed as a `[ INFO ]` status line. That is NOT the same as
+# "the journal or nothing", and this comment used to say it was: the line
+# speaks as systemd[1], and PID 1 falls back to /dev/kmsg when journald is
+# not up, which at loglevel=7 reaches the console. journal-forwarding-alive
+# is what says forwarding works, out of a speaker that is not PID 1.
+SKIP_WORDING = ("was skipped because of an unmet condition check "
+                "(ConditionKernelCommandLine=otp.imgcheck).")
+
+# The wording the image really prints, which is not the one above. systemd
+# reworded the message after v258 -- see
+# test_the_wording_a_real_image_actually_printed_is_accepted, which carries
+# the console line run 32180661689 produced.
+SKIP_WORDING_MAIN = ("skipped, unmet condition check "
+                     "ConditionKernelCommandLine=otp.imgcheck")
+
+
+def imgcheck_description() -> str:
+    """The probe unit's Description=, read out of the shipped unit file.
+
+    NOT restated here, and it was. This fixture carried its own copy of the
+    string, so lengthening `Description=` in
+    device/systemd/otp-unit-imgcheck.service moved the real console line
+    towards the harness's `cut` while every test here went on measuring the
+    old one -- the "fixture carries its own copy" defect `shell_list()`,
+    `required_checks()` and `probe_phases()` all exist to prevent, in the one
+    place where the length of the string is now load-bearing.
+    """
+    match = re.search(r"^Description=(.*)$", IMGCHECK_UNIT.read_text(), re.M)
+    assert match, f"{IMGCHECK_UNIT} no longer has a Description="
+    return match.group(1).strip()
+
+
+def condition_skipped(unit="otp-unit-imgcheck.service",
+                      description=None,
+                      wording=SKIP_WORDING, ts="18.400000"):
+    if description is None:
+        description = imgcheck_description()
+    return f"[   {ts}] systemd[1]: {unit} - {description} {wording}\r"
+
+
+# The probe's other fingerprints, as the release phase greps for them: the
+# journal tag in speaker position, and the name of the CUPS queue the probe
+# creates for its diagnostic sheet. Both appear in boot1 because the probe
+# ran there, and that is what makes their absence in the release phase mean
+# something.
+def probe_journal_tag(phase="boot1"):
+    return journal_forwarded(phase)
+
+
+def release_console(*, skip_line=True, forwarding=True, first_boot=False,
+                    probe_said=(), **kw):
+    """A healthy release boot: the machine came up and the probe stayed inert.
+
+    No OTP-GUEST-, no journal marker under the probe's tag, no mention of its
+    queue -- and, because every one of those is an absence, two positives: the
+    unit started, and systemd named the probe unit while skipping it.
+
+    `forwarding` controls whether anything on the console arrived by the only
+    route journald forwarding provides -- a timestamped line from a speaker
+    that is not PID 1. Without one, nothing this phase says about silence is
+    backed by a working channel, and the harness says so.
+    """
+    lines = kernel_lines(phase="release", first_boot=first_boot, **kw) + [SUCCESS]
+    if skip_line:
+        lines.append(condition_skipped())
+    if forwarding:
+        lines.append(forwarded("interface -- display: none, input: none"))
+    return lines + list(probe_said)
+
+
 def healthy(phase):
-    return (kernel_lines(first_boot=(phase == "boot1"))
+    if phase == "release":
+        return release_console()
+    return (kernel_lines(phase=phase, first_boot=(phase == "boot1"))
             + [SUCCESS] + [journal_forwarded(phase)]
             + guest_report(phase))
 
@@ -188,36 +351,208 @@ FAT_ROOT = ["::/kernel8.img", "::/bcm2710-rpi-3-b.dtb", "::/config.txt",
 FAT_STORE = ["::/otp-identity/machine-id", "::/otp-identity/credential"]
 
 
+# The probe's own two records, in the `::/name` form the listing carries them
+# in. boot1 writes both; boot2 reads them and leaves them; the release phase
+# deletes them before it boots and requires them not to come back. Named off
+# img-boot.sh's PROBE_DROPPINGS rather than spelled here, so a rename in the
+# harness cannot leave this fixture describing files nothing looks for.
+FAT_DROPPINGS = [f"::/{name}" for name in PROBE_DROPPINGS]
+
+
 def healthy_listings(phase):
     """The boot partition either side of a healthy phase.
 
-    boot1 goes in with the harness's seed and comes out without it; boot2
-    goes in clean and comes out holding the quarantined malformed seed the
-    guest fed to userconf-service by hand.
+    boot1 goes in with the harness's seed and comes out without it, and with
+    the probe's two records on it; boot2 goes in with those and comes out
+    holding the quarantined malformed seed the guest fed to userconf-service
+    by hand as well.
 
     THE CREDENTIAL IS NOT THERE BEFORE boot1 and is afterwards, because the
     image ships none: it is written by the wizard's own ExecStartPost on the
     boot that applies an operator's seed, and by nothing else. From boot2 on
     it is on the card at both ends, which is what a power cycle keeping it
     looks like from outside the machine.
+
+    THE RELEASE PHASE GOES IN WITHOUT THE DROPPINGS, because the harness took
+    them off between boot2 and this boot, and comes out the same way. Its
+    before-listing is therefore boot2's after-listing minus exactly those two
+    names -- which is what makes the strip observable at all.
     """
     if phase == "boot1":
         return (FAT_ROOT + ["::/userconf.txt", "::/otp-identity/machine-id"],
-                FAT_ROOT + FAT_STORE)
+                FAT_ROOT + FAT_STORE + FAT_DROPPINGS)
     if phase == "boot2":
-        return (FAT_ROOT + FAT_STORE,
-                FAT_ROOT + FAT_STORE + ["::/failed_userconf.txt"])
+        return (FAT_ROOT + FAT_STORE + FAT_DROPPINGS,
+                FAT_ROOT + FAT_STORE + FAT_DROPPINGS + ["::/failed_userconf.txt"])
+    if phase == "release":
+        stripped = FAT_ROOT + FAT_STORE + ["::/failed_userconf.txt"]
+        return list(stripped), list(stripped)
     return list(FAT_ROOT), list(FAT_ROOT)
 
 
+# --- the card functions, driven against a real FAT partition ---------------
+#
+# WHY THIS SECTION EXISTS AND WHAT IT REPLACES. Everything above this line
+# hands the verdict block a directory of files somebody else wrote: the
+# listings and the digests arrive as text and no test ran the code that
+# produces them. That code -- fat_listing, fat_digest_of, fat_digests and
+# strip_probe_droppings -- sits ABOVE the marker verdict_block() slices from,
+# so `grep -rn "fat_digest_of\|fat_digests\|mtype" tests/*.py` returned
+# nothing at all, and rewriting fat_digest_of to hand every file the same
+# sixty-four characters left the suite at its full count and unchanged. Both
+# sides of identity-store-unchanged would then have been 64 characters and
+# always equal, so it would have read PASS at runtime forever as well -- and
+# that clause is the one the release note names as backing the only login
+# this appliance has.
+#
+# The repository's existing answer to this is a text assertion with the
+# limitation stated in its guard (tier3-host-lists-only-the-fat-root: "no
+# test in the fast tier runs fat_listing ... The named test reads the command
+# out of the shipped harness"). This does better: mformat and mcopy build a
+# real FAT partition at a real offset, the shipped functions run against it,
+# and the digests are compared against sha256 taken in Python over the exact
+# bytes. The measurements in the harness's own comments come from here.
+#
+# THE COST IS A DEPENDENCY, and it is disclosed rather than hidden: these
+# tests need mtools, so they skip where it is absent. .github/workflows/ci.yml
+# installs it in the `test` job and in the `mutation` job for exactly that
+# reason, and test_image_workflow.py holds both installs in place -- because
+# a skip that becomes permanent is this whole section quietly reverting to
+# the state it was written to fix. tests/mutation_gate.py refuses a row whose
+# named tests skipped, so a mutation row pointed here fails loudly on a
+# machine without mtools instead of passing.
+
+MTOOLS = [tool for tool in ("mformat", "mcopy", "mdir", "mtype", "mdel")
+          if shutil.which(tool) is None]
+needs_mtools = pytest.mark.skipif(
+    bool(MTOOLS), reason=f"mtools missing: {' '.join(MTOOLS)}")
+
+#: Where a real card's FAT partition starts. Non-zero on purpose: the harness
+#: addresses the partition as `$IMG@@$BOOT_OFFSET` and an offset of zero would
+#: exercise a form it never uses.
+CARD_OFFSET = 1024 * 1024
+CARD_FAT_BYTES = 16 * 1024 * 1024
+
+
+def card_block() -> str:
+    """The card functions, sliced out of img-boot.sh.
+
+    A third slice, beside verdict_block()'s and phase_list_block()'s, and for
+    the same reason: a copy here would go on passing after somebody changed
+    the original. It runs from fat_listing() to the end of
+    strip_probe_droppings(), which takes $PROBE_DROPPINGS and $FAT_CONTENTS
+    with it -- so the lists these functions iterate are the shipped lists.
+    """
+    text = IMG_BOOT.read_text()
+    start = text.index("fat_listing() {")
+    end = text.index("\n# root=/dev/mmcblk0p2 rather than", start)
+    block = text[start:end]
+    for name in ("fat_digest_of() {", "fat_digests() {",
+                 "strip_probe_droppings() {", 'PROBE_DROPPINGS="',
+                 'FAT_CONTENTS="'):
+        assert name in block, f"{name} is no longer inside the card slice"
+    return block
+
+
+def build_card(path: Path, files: dict) -> Path:
+    """A FAT partition at CARD_OFFSET inside `path`, holding `files`.
+
+    `files` maps a path relative to the FAT root -- `otp-unit.conf`,
+    `otp-identity/credential` -- to the exact bytes it should contain.
+    Directories are made as needed.
+    """
+    with open(path, "wb") as handle:
+        handle.truncate(CARD_OFFSET + CARD_FAT_BYTES)
+    image = f"{path}@@{CARD_OFFSET}"
+
+    def mtool(*args):
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, (args, proc.stdout, proc.stderr)
+
+    mtool("mformat", "-i", image, "-F", "-T", str(CARD_FAT_BYTES // 512), "::")
+    made = set()
+    for name, data in files.items():
+        if "/" in name:
+            directory = name.rsplit("/", 1)[0]
+            if directory not in made:
+                mtool("mmd", "-i", image, f"::/{directory}")
+                made.add(directory)
+        scratch = path.parent / ("_" + name.replace("/", "_"))
+        scratch.write_bytes(data)
+        mtool("mcopy", "-o", "-i", image, str(scratch), f"::{name}")
+    return path
+
+
+def run_card_block(tmp_path, card: Path, body: str):
+    """Run the shipped card functions against `card`, then `body`."""
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    script = "\n".join([
+        "set -euo pipefail",
+        f'WORK="{work}"',
+        f'IMG="{card}"',
+        f'BOOT_OFFSET="{CARD_OFFSET}"',
+        card_block(),
+        body,
+    ])
+    proc = subprocess.run(["bash", "-c", script], capture_output=True,
+                          text=True, timeout=120)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc
+
+
+def digest_lines(text: str) -> dict:
+    """`name digest` lines, as fat_digests writes them."""
+    out = {}
+    for line in text.splitlines():
+        if line.strip():
+            name, value = line.split(None, 1)
+            out[name] = value.strip()
+    return out
+
+
+def prestrip_listing(phase):
+    """What the card held before the harness deleted the probe's records.
+
+    Boot 2's after-listing, unchanged: nothing touches the card between that
+    snapshot and the strip. This is the control the deletion needs -- if the
+    earlier boots ever stop writing these files, the release phase is
+    asserting an absence it was handed rather than one it created.
+    """
+    if phase == "release":
+        return healthy_listings("boot2")[1]
+    return healthy_listings(phase)[0]
+
+
+def digest_of(name):
+    """A stable 64-character stand-in for one file's contents.
+
+    Per-name, so two different files never compare equal by accident, and 64
+    hex characters because the harness requires that length on both sides --
+    the empty string hashes to a perfectly good digest and two of those are
+    equal, which is how "the credential survived" would come to mean "there
+    has never been a credential".
+    """
+    return hashlib.sha256(name.encode()).hexdigest()
+
+
+def healthy_digests(phase):
+    """The three content digests either side of a phase, unchanged."""
+    kept = {name: digest_of(name) for name in FAT_CONTENTS}
+    return dict(kept), dict(kept)
+
+
 def run_verdict(tmp_path, consoles, *, phases=("boot1",), uart1_lines=None,
-                qemu_rc="124", early_stop="", boot_files=None):
+                qemu_rc="124", early_stop="", boot_files=None,
+                prestrip=None, digests=None):
     """Run the sliced block over synthetic per-phase evidence directories.
 
     `consoles` maps a phase name to its uart0 lines. The verdict block reads
     a phase as a directory on disk -- both consoles, qemu's exit code, whether
-    the harness stopped it, and the FAT root either side of the boot -- so the
-    fixture writes exactly what a real boot leaves behind.
+    the harness stopped it, the FAT root either side of the boot, the listing
+    taken before the release phase's strip, and the content digests of the
+    three files a release boot must not disturb -- so the fixture writes
+    exactly what a real boot leaves behind.
     """
     if uart1_lines is None:
         # What the real second UART holds: early bootconsole lines that stop
@@ -239,6 +574,14 @@ def run_verdict(tmp_path, consoles, *, phases=("boot1",), uart1_lines=None,
             "".join(f"{line}\n" for line in before))
         (pdir / "boot-files-after.txt").write_text(
             "".join(f"{line}\n" for line in after))
+        (pdir / "boot-files-before-strip.txt").write_text(
+            "".join(f"{line}\n"
+                    for line in (prestrip or {}).get(phase,
+                                                     prestrip_listing(phase))))
+        dbefore, dafter = (digests or {}).get(phase, healthy_digests(phase))
+        for which, values in (("before", dbefore), ("after", dafter)):
+            (pdir / f"boot-digests-{which}.txt").write_text(
+                "".join(f"{name} {value}\n" for name, value in values.items()))
     script = "\n".join(
         [
             "set -euo pipefail",
@@ -247,6 +590,12 @@ def run_verdict(tmp_path, consoles, *, phases=("boot1",), uart1_lines=None,
             f'WORK="{work}"',
             f'PHASES="{" ".join(phases)}"',
             'TIMEOUT="600"',
+            # The two lists the verdict block reads and the boot loop above
+            # it sets. Re-emitted from what shell_list() read out of
+            # img-boot.sh rather than written out here, so this preamble
+            # cannot describe a set of files the harness no longer has.
+            f'PROBE_DROPPINGS="{" ".join(PROBE_DROPPINGS)}"',
+            f'FAT_CONTENTS="{" ".join(FAT_CONTENTS)}"',
             verdict_block(),
         ]
     )
@@ -259,11 +608,21 @@ def run_verdict(tmp_path, consoles, *, phases=("boot1",), uart1_lines=None,
 
 # --- which boots the run is allowed to consist of -------------------------
 
-PHASES_ASSIGNMENT = 'PHASES="${OTP_IMG_PHASES:-boot1 boot2}"'
+PHASES_ASSIGNMENT = 'PHASES="${OTP_IMG_PHASES:-boot1 boot2 release}"'
+
+
+#: The first thing in img-boot.sh after the phase guards. Used as the end of
+#: the slice rather than the guard's own `exit 1; fi`, which stopped working
+#: the moment there were TWO guards: `text.index("\n    exit 1\nfi")` finds
+#: the membership check's, so the order check added after it fell outside the
+#: slice and every phase-list test went on exercising the half that was there
+#: before. Ending at the first function definition takes whatever guards live
+#: in between, including the ones nobody has written yet.
+PHASE_GUARD_END = "\nlog() { printf"
 
 
 def phase_list_block() -> str:
-    """The phase list and the guard on it, sliced out of img-boot.sh.
+    """The phase list and the guards on it, sliced out of img-boot.sh.
 
     Sits above the verdict block and outside it, so it is a second slice
     rather than part of `run_verdict`'s.
@@ -271,7 +630,10 @@ def phase_list_block() -> str:
     text = IMG_BOOT.read_text()
     assert PHASES_ASSIGNMENT in text, f"{IMG_BOOT} no longer sets PHASES"
     start = text.index(PHASES_ASSIGNMENT)
-    end = text.index("\n    exit 1\nfi", start) + len("\n    exit 1\nfi")
+    assert PHASE_GUARD_END in text[start:], (
+        f"{IMG_BOOT} no longer defines log() after the phase guards, so this "
+        f"slice does not know where they end")
+    end = start + text[start:].index(PHASE_GUARD_END)
     return text[start:end]
 
 
@@ -286,11 +648,28 @@ def run_phase_list(tmp_path, phases=None):
                           text=True, timeout=30, env=env)
 
 
-def test_the_default_is_two_boots(tmp_path):
-    # The default is the whole tier: one boot cannot observe a power-cycle.
+def demanded_phases() -> list:
+    """The phases img-boot.sh refuses to run without, off its own guard loop.
+
+    Read rather than restated: the default assignment and the guard are two
+    lines that have to agree, and a test that hard-coded either would go on
+    approving a default that had quietly lost a phase.
+    """
+    match = re.search(r"^for want in ([a-z0-9 ]+); do$",
+                      phase_list_block(), re.M)
+    assert match, "the phase guard no longer loops over the phases it demands"
+    return match.group(1).split()
+
+
+def test_the_default_runs_every_phase_the_guard_demands(tmp_path):
+    # The default is the whole tier: one boot cannot observe a power-cycle,
+    # and neither of the two that can is booted the way a flashed unit boots.
     proc = run_phase_list(tmp_path)
     assert proc.returncode == 0, proc.stderr
-    assert "PHASES=boot1 boot2" in proc.stdout, proc.stdout
+    assert f"PHASES={' '.join(demanded_phases())}" in proc.stdout, proc.stdout
+    # And the list really is the three this tier is built out of, so a guard
+    # that had lost one could not agree with a default that had lost it too.
+    assert demanded_phases() == ["boot1", "boot2", "release"], demanded_phases()
 
 
 def test_an_empty_phase_list_falls_back_to_the_default(tmp_path):
@@ -298,7 +677,7 @@ def test_an_empty_phase_list_falls_back_to_the_default(tmp_path):
     # would boot nothing at all and have no phase to fail on.
     proc = run_phase_list(tmp_path, "")
     assert proc.returncode == 0, proc.stderr
-    assert "PHASES=boot1 boot2" in proc.stdout, proc.stdout
+    assert f"PHASES={' '.join(demanded_phases())}" in proc.stdout, proc.stdout
 
 
 def phases_refused(proc) -> list:
@@ -318,7 +697,8 @@ def test_a_phase_list_without_boot2_is_refused(tmp_path):
     boot1 console exited 0 and still printed the two-boot conclusion, which
     image.yml quotes into a tagged release's body.
     """
-    for phases in ("boot1", "boot1 boot3", "noboot2", "boot22"):
+    for phases in ("boot1 release", "boot1 boot3 release", "noboot2 boot1 release",
+                   "boot22 boot1 release"):
         proc = run_phase_list(tmp_path, phases)
         assert proc.returncode != 0, f"{phases!r} was accepted"
         assert "boot2" in phases_refused(proc), proc.stderr
@@ -340,43 +720,153 @@ def test_a_phase_list_without_boot1_is_refused_too(tmp_path):
     A debugging switch whose one-boot setting produces a red with no
     relation to the image is one people learn to distrust the harness over.
     """
-    for phases in ("boot2", "boot2 boot3", "boot2 boot2"):
+    for phases in ("boot2 release", "boot2 boot3 release", "boot2 boot2 release"):
         proc = run_phase_list(tmp_path, phases)
         assert proc.returncode != 0, f"{phases!r} was accepted"
         assert "boot1" in phases_refused(proc), proc.stderr
         assert "PHASES=" not in proc.stdout, proc.stdout
     # And the reason is stated, not just the name: the next person to try
     # this has to be told the card is seeded whatever they asked for.
-    proc = run_phase_list(tmp_path, "boot2")
+    proc = run_phase_list(tmp_path, "boot2 release")
     assert "seeded" in proc.stderr, proc.stderr
 
 
-def test_a_phase_list_that_keeps_both_boots_is_accepted(tmp_path):
+def test_a_phase_list_without_the_release_boot_is_refused(tmp_path):
+    """
+    THE PHASE WHOSE ABSENCE TURNS NOTHING RED ON ITS OWN.
+
+    boot1 and boot2 report: drop one and named checks go missing and the run
+    is loud about it. The release boot asserts a SILENCE -- the shipped probe
+    printed nothing, tagged nothing, wrote nothing -- so a run without it
+    produces a completely green verdict for an image nobody asked the
+    question of. That is the shape of missing coverage this repository keeps
+    finding, and the guard is the only thing that makes dropping it cost
+    anything.
+
+    It is also the phase that deletes the probe's two records from the card,
+    so a list that kept it and dropped the boots that write them would have
+    nothing to delete -- which the two tests above already refuse.
+    """
+    for phases in ("boot1 boot2", "boot1 boot2 boot3", "boot1 boot2 releases"):
+        proc = run_phase_list(tmp_path, phases)
+        assert proc.returncode != 0, f"{phases!r} was accepted"
+        assert "release" in phases_refused(proc), proc.stderr
+        assert "PHASES=" not in proc.stdout, proc.stdout
+    # And the reason names what a run without it fails to observe.
+    proc = run_phase_list(tmp_path, "boot1 boot2")
+    assert "otp.imgcheck" in proc.stderr, proc.stderr
+    assert "inert" in proc.stderr, proc.stderr
+
+
+def test_a_phase_list_that_keeps_every_boot_is_accepted(tmp_path):
     # The positive control: a guard that refused everything would satisfy
-    # the two tests above.
-    for phases in ("boot1 boot2", "boot1 boot2 boot3"):
+    # the three tests above. The second list is also what says the order
+    # check below is a check on the three demanded boots and not a second
+    # membership rule -- an unknown extra phase still passes through.
+    for phases in ("boot1 boot2 release", "boot1 boot2 release boot3"):
         proc = run_phase_list(tmp_path, phases)
         assert proc.returncode == 0, proc.stderr
         assert f"PHASES={phases}" in proc.stdout, proc.stdout
 
 
-def test_the_two_boot_claim_is_only_made_by_a_run_that_booted_twice(tmp_path):
+def test_a_phase_list_in_the_wrong_order_is_refused(tmp_path):
+    """
+    MEMBERSHIP IS NOT ENOUGH, and until this the guard only checked that.
+
+    The three boots are the same card in sequence and the order is part of
+    what each one means. `boot1 release boot2` strips the probe's two
+    records off the card before boot2 -- the boot that reads them -- so
+    boot2 fails the machine-id and credential checks those records exist
+    for. `boot2 boot1 release` hands a seeded card to the checks that expect
+    an unseeded one, which is the confusing red the guard already refuses a
+    MISSING boot1 for.
+
+    NEITHER IS A FALSE GREEN. Every mis-ordering traced ends the run red, so
+    this closes no hole in the verdict; what it closes is forty minutes of
+    arm64 spent arriving at a red in the wrong phase, with a message about
+    the image, for a fault in an environment variable. The repository's own
+    standard for that is one paragraph up in img-boot.sh: a debugging switch
+    whose settings produce confusing reds is a switch people learn to
+    distrust the harness over.
+    """
+    for phases in ("boot1 release boot2", "boot2 boot1 release",
+                   "release boot2 boot1", "boot2 release boot1"):
+        proc = run_phase_list(tmp_path, phases)
+        assert proc.returncode != 0, f"{phases!r} was accepted"
+        assert "PHASES=" not in proc.stdout, proc.stdout
+        assert "boot1 boot2 release" in proc.stderr, proc.stderr
+        # The message says it is the ORDER, not a missing boot: all three
+        # are present in every list above, and the membership guard's text
+        # would send the reader looking for one that is not.
+        assert "leaves out" not in proc.stderr, proc.stderr
+    # A demanded phase repeated is refused too: booting the seeded card a
+    # second time as boot1 is the same wrong-phase red in another costume.
+    proc = run_phase_list(tmp_path, "boot1 boot1 boot2 release")
+    assert proc.returncode != 0, proc.stderr
+
+
+def test_the_order_the_guard_demands_is_the_order_it_checks_for(tmp_path):
+    """
+    One list, two uses. The loop that says which phases are demanded is the
+    loop that builds the order they are demanded in, so the set and the
+    sequence cannot drift apart the way two written-out copies would --
+    which is the same reason `demanded_phases()` reads the loop instead of
+    restating it.
+    """
+    block = phase_list_block()
+    assert "PHASES_EXPECTED=" in block, block
+    # Built inside the `for want in ...` loop, not written out beside it.
+    loop = block[block.index("for want in "):]
+    assert 'PHASES_EXPECTED="${PHASES_EXPECTED:+$PHASES_EXPECTED }$want"' \
+        in loop[:loop.index("\ndone")], loop
+    # And what it ends up holding is exactly what the guard demands.
+    proc = run_phase_list(tmp_path, "boot1 release boot2")
+    assert " ".join(demanded_phases()) in proc.stderr, proc.stderr
+
+
+def test_the_full_claim_is_only_made_by_a_run_that_booted_every_phase(tmp_path):
     # The concluding line is what a reader takes away, and image.yml's
     # release note says the same thing in its own words.
     proc, _ = run_verdict(tmp_path, {"boot1": healthy("boot1")},
                           phases=("boot1",))
     assert proc.returncode == 0, proc.stderr
     assert "boots twice" not in proc.stderr, proc.stderr
-    assert "NOT the two-boot claim" in proc.stderr, proc.stderr
+    assert "NOT the three-boot claim" in proc.stderr, proc.stderr
 
 
-def test_a_two_phase_run_does_make_the_two_boot_claim(tmp_path):
+def test_a_two_phase_run_does_not_claim_the_probe_stayed_inert(tmp_path):
+    """
+    The half a reader would take on trust, dropped along with its boot.
+
+    Two boots still prove the overlay and the power-cycle, and the sentence
+    goes on saying so. What it must stop saying is the release phase's claim:
+    nothing in a boot1/boot2 run ever asked what an image with no
+    otp.imgcheck token does, and a sentence that said otherwise would be
+    describing an experiment nobody ran.
+    """
     proc, _ = run_verdict(
         tmp_path, {"boot1": healthy("boot1"), "boot2": healthy("boot2")},
         phases=("boot1", "boot2"))
     assert proc.returncode == 0, proc.stderr
+    assert "NOT the three-boot claim" in proc.stderr, proc.stderr
+    assert "release" in proc.stderr.split("which needs:")[1], proc.stderr
+    assert "inert" not in proc.stderr, proc.stderr
+
+
+def test_a_three_phase_run_makes_the_whole_claim(tmp_path):
+    proc, _ = run_verdict(
+        tmp_path,
+        {"boot1": healthy("boot1"), "boot2": healthy("boot2"),
+         "release": healthy("release")},
+        phases=("boot1", "boot2", "release"))
+    assert proc.returncode == 0, proc.stderr + str(_)
     assert "the image boots twice on a read-only overlay" in proc.stderr, \
         proc.stderr
+    # And the third boot's own sentence, which is the one that has to name
+    # what it observed rather than what it hoped.
+    for clause in ("no otp.imgcheck token", "inert", "skipped",
+                   "stayed off the card"):
+        assert clause in proc.stderr, (clause, proc.stderr)
 
 
 def test_fixture_success_line_really_carries_escape_codes():
@@ -772,6 +1262,180 @@ def test_the_host_reads_the_store_a_level_below_the_root(tmp_path):
         "the host lists only the FAT root, so nothing in the store is visible"
     # Appended, not overwriting the root listing it follows.
     assert ">> \"$1\"" in text, text
+
+
+# --- the card functions, on a card ----------------------------------------
+#
+# Everything below runs the SHIPPED functions against a FAT partition built
+# here with mformat and mcopy. See the section header beside build_card() for
+# why that had to stop being a text assertion.
+
+#: A card in the state boot2 leaves behind: the operator's three files, plus
+#: the probe's two records, plus the kernel image the listing check uses as
+#: its positive control. The bytes are chosen to be different from each other
+#: and to carry a trailing newline, which is the byte the old digest dropped.
+CARD_AFTER_BOOT2 = {
+    "kernel8.img": b"\x7fELF not really\n",
+    "otp-unit.conf": b"pages=137\n",
+    "otp-imgcheck-machine-id": b"0123456789abcdef0123456789abcdef\n",
+    "otp-imgcheck-credential": b"a" * 64 + b"\n",
+    "otp-identity/machine-id": b"0123456789abcdef0123456789abcdef\n",
+    "otp-identity/credential": b"$6$otpimgcheck$xPbFgUo86\n",
+}
+
+
+@needs_mtools
+def test_the_listing_the_harness_takes_reaches_into_the_store(tmp_path):
+    """
+    test_the_host_reads_the_store_a_level_below_the_root reads the second
+    `mdir` out of the file. This RUNS it, on a card with a store on it, and
+    is the reason that test's guard could say "it would not catch an mdir
+    that ran and returned nothing".
+    """
+    card = build_card(tmp_path / "card.img", CARD_AFTER_BOOT2)
+    run_card_block(tmp_path, card,
+                   'fat_listing "$WORK/listing.txt"')
+    listing = (tmp_path / "work" / "listing.txt").read_text().split()
+    assert "::/kernel8.img" in listing, listing
+    # The two lines the second mdir exists to produce. `mdir -b` is not
+    # recursive, so without it the store shows up as `::/otp-identity/` and
+    # nothing inside it does.
+    assert "::/otp-identity/machine-id" in listing, listing
+    assert "::/otp-identity/credential" in listing, listing
+
+
+@needs_mtools
+def test_the_digest_is_the_bytes_on_the_card(tmp_path):
+    """
+    THE DIGEST WAS NOT OF THE FILE, AND NOTHING RAN IT TO FIND OUT.
+
+    fat_digest_of took mtype's output through a command substitution, which
+    strips every trailing newline, and hashed what was left. Measured here,
+    on this fixture, before the fix:
+
+        content 'pages=137\\n'      -> e01a56608c694a3e...
+        content 'pages=137\\n\\n\\n'  -> e01a56608c694a3e...
+        sha256 of the real bytes   -> 30efb6d3bb0b349f...
+
+    -- one digest for two different files, under a release note that tells
+    the reader these three came through the boot "unchanged byte for byte".
+    The reference values below are taken in Python over the exact bytes
+    written, so the harness has to agree with sha256 and not merely with
+    itself.
+    """
+    card = build_card(tmp_path / "card.img", CARD_AFTER_BOOT2)
+    run_card_block(tmp_path, card, 'fat_digests "$WORK/digests.txt"')
+    got = digest_lines((tmp_path / "work" / "digests.txt").read_text())
+    assert sorted(got) == sorted(FAT_CONTENTS), got
+    for name in FAT_CONTENTS:
+        want = hashlib.sha256(CARD_AFTER_BOOT2[name]).hexdigest()
+        assert got[name] == want, (
+            f"{name}: the harness digested {got[name]}, sha256 of the bytes "
+            f"on the card is {want}")
+
+
+@needs_mtools
+def test_two_files_that_differ_only_in_trailing_newlines_differ(tmp_path):
+    """
+    The specific byte the old implementation could not see, isolated. A boot
+    that appended two newlines to otp-unit.conf changed the file and the
+    clause said nothing.
+    """
+    same = dict(CARD_AFTER_BOOT2)
+    card_a = build_card(tmp_path / "a.img", same)
+    grown = dict(same, **{"otp-unit.conf": same["otp-unit.conf"] + b"\n\n"})
+    card_b = build_card(tmp_path / "b.img", grown)
+    digests = []
+    for index, card in enumerate((card_a, card_b)):
+        run_card_block(tmp_path, card, f'fat_digests "$WORK/d{index}.txt"')
+        digests.append(digest_lines(
+            (tmp_path / "work" / f"d{index}.txt").read_text())["otp-unit.conf"])
+    assert digests[0] != digests[1], (
+        f"'pages=137\\n' and 'pages=137\\n\\n\\n' both digest to {digests[0]}, "
+        f"so a boot that appended to the operator's settings would read as "
+        f"unchanged")
+    assert len(digests[0]) == 64 and len(digests[1]) == 64, digests
+
+
+@needs_mtools
+def test_a_file_that_is_there_and_empty_is_not_reported_absent(tmp_path):
+    """
+    `absent` IS THE SENTENCE THE SENTINEL EXISTS TO PREVENT, so it must not
+    be what a present file gets.
+
+    The comment above fat_digest_of says the word `absent` is used rather
+    than the sha256 of nothing because two hashes of the empty string compare
+    equal, which is how "the credential survived" becomes "there has never
+    been a credential". A zero-length credential reported `absent` put that
+    exact misreading straight back into the detail line -- deleted and
+    truncated-to-nothing read identically. Both are still red, because
+    neither word is 64 characters; they are now two different words.
+    """
+    card = build_card(tmp_path / "card.img",
+                      dict(CARD_AFTER_BOOT2,
+                           **{"otp-identity/credential": b""}))
+    run_card_block(tmp_path, card, 'fat_digests "$WORK/digests.txt"')
+    got = digest_lines((tmp_path / "work" / "digests.txt").read_text())
+    assert got["otp-identity/credential"] == "empty", got
+    # And the file that really is not there says the other word.
+    gone = {k: v for k, v in CARD_AFTER_BOOT2.items()
+            if k != "otp-identity/credential"}
+    card2 = build_card(tmp_path / "card2.img", gone)
+    run_card_block(tmp_path, card2, 'fat_digests "$WORK/d2.txt"')
+    got2 = digest_lines((tmp_path / "work" / "d2.txt").read_text())
+    assert got2["otp-identity/credential"] == "absent", got2
+    # Neither is a digest, which is what keeps the clause red for both.
+    assert len(got["otp-identity/credential"]) != 64
+    assert len(got2["otp-identity/credential"]) != 64
+
+
+@needs_mtools
+def test_the_strip_takes_the_probes_records_off_a_real_card(tmp_path):
+    """
+    strip_probe_droppings, run rather than read. A no-op strip left the fast
+    suite at its full count: nothing here called it, and the only thing that
+    would have noticed was probe-droppings-stayed-off-the-card, sixteen
+    minutes into an arm64 run.
+
+    Both halves are checked, because they fail in opposite directions. The
+    control listing has to be taken BEFORE the deletion -- it is the only
+    evidence the files were there to delete -- and the deletion has to
+    actually happen.
+    """
+    card = build_card(tmp_path / "card.img", CARD_AFTER_BOOT2)
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    run_card_block(tmp_path, card,
+                   'strip_probe_droppings "$WORK"\n'
+                   'fat_listing "$WORK/boot-files-after-strip.txt"')
+    control = (work / "boot-files-before-strip.txt").read_text().split()
+    after = (work / "boot-files-after-strip.txt").read_text().split()
+    for name in PROBE_DROPPINGS:
+        assert f"::/{name}" in control, (
+            f"the control listing does not carry {name}, so it is not "
+            f"evidence the strip had anything to delete: {control}")
+        assert f"::/{name}" not in after, (
+            f"{name} survived strip_probe_droppings: {after}")
+    # And it took nothing else. The operator's files are what a release boot
+    # is judged on having kept.
+    for name in FAT_CONTENTS:
+        assert f"::/{name}" in after, (name, after)
+    assert "::/kernel8.img" in after, after
+
+
+@needs_mtools
+def test_the_digest_file_answers_for_every_name_the_clause_reads(tmp_path):
+    """
+    identity-store-unchanged iterates $FAT_CONTENTS and looks each name up in
+    the digest file. A fat_digests that wrote fewer lines than the list would
+    make every missing name read as an empty digest -- red, which is the safe
+    direction, but red for a reason nothing here would have explained.
+    """
+    card = build_card(tmp_path / "card.img", CARD_AFTER_BOOT2)
+    run_card_block(tmp_path, card, 'fat_digests "$WORK/digests.txt"')
+    got = digest_lines((tmp_path / "work" / "digests.txt").read_text())
+    assert list(got) == FAT_CONTENTS, (
+        f"fat_digests wrote {list(got)} for a list of {FAT_CONTENTS}")
 
 
 def test_a_seed_that_never_reached_the_card_fails(tmp_path):
@@ -1456,7 +2120,870 @@ def test_a_backstopped_boot_that_said_nothing_is_still_called_silent(tmp_path):
     assert "without a guest report" in proc.stderr, proc.stderr
 
 
+def test_the_release_phase_is_not_narrated_as_a_missing_guest_report(tmp_path):
+    """
+    The release boot has no guest report and never will. Telling a reader
+    that it "ran to the backstop without a guest report" is a true sentence
+    pointing at the wrong thing entirely -- the phase is late because the
+    boot did not finish, which is what it was waiting for.
+    """
+    proc, _ = run_verdict(
+        tmp_path,
+        {"boot1": healthy("boot1"),
+         "release": release_console(multi_user=False)},
+        phases=("boot1", "release"), qemu_rc="124", early_stop="")
+    assert proc.returncode == 1
+    assert "release: qemu ran to the 600s backstop without the boot ever " \
+           "finishing" in proc.stderr, proc.stderr
+    assert "release: qemu ran to the 600s backstop without a guest report" \
+        not in proc.stderr, proc.stderr
+    # And a release boot that DID finish, too late for the sampler, is said
+    # to have finished rather than to have been silent.
+    proc, _ = run_verdict(
+        tmp_path / "late",
+        {"boot1": healthy("boot1"), "release": healthy("release")},
+        phases=("boot1", "release"), qemu_rc="124", early_stop="")
+    assert proc.returncode == 0, proc.stderr
+    assert "the boot DID finish" in proc.stderr, proc.stderr
+
+
 def test_guest_self_reset_is_explained_when_checks_fail(tmp_path):
     proc, verdict = run_verdict(tmp_path, {"boot1": kernel_lines()}, qemu_rc="0")
     assert proc.returncode == 1
     assert "the guest reset itself" in proc.stderr
+
+
+# --- the third boot: the shipped probe, and everything it did not do ------
+#
+# Every clause below is an absence, and an absence is the easiest thing in
+# this repository to pass by accident: a boot that never ran, a console
+# nothing was written to, an image with the unit removed and a grep for a
+# string systemd no longer prints all produce exactly the same silence a
+# healthy release boot produces. So each clause gets a console that violates
+# only it, and the healthy one has to keep passing beside them.
+#
+# test_a_release_boot_whose_probe_unit_is_missing_fails is the load-bearing
+# one. Without that clause, DELETING otp-unit-imgcheck.service from the image
+# would make this phase greener -- and the decision this phase exists to back
+# is to SHIP the probe and rely on its condition.
+
+
+def run_release(tmp_path, release_lines=None, *, boot1_lines=None, **kw):
+    """One healthy boot1 for the controls, and one release phase under test.
+
+    boot1 is not decoration here. Three of the release clauses are "this grep
+    found nothing", and the only thing in a run that can say the grep would
+    have found something is the boot where the probe demonstrably ran.
+    """
+    consoles = {
+        "boot1": healthy("boot1") if boot1_lines is None else boot1_lines,
+        "release": healthy("release") if release_lines is None else release_lines,
+    }
+    return run_verdict(tmp_path, consoles, phases=("boot1", "release"), **kw)
+
+
+def check_state(verdict, phase, name):
+    """PASS or FAIL for one named IMG-CHECK, read off the verdict file."""
+    match = re.search(
+        rf"^IMG-CHECK {re.escape(phase)} {re.escape(name)} (PASS|FAIL)",
+        verdict, re.M)
+    assert match, f"no `IMG-CHECK {phase} {name}` line in:\n{verdict}"
+    return match.group(1)
+
+
+RELEASE_CLAUSES = (
+    "Reached-target-multi-user.target",
+    "unit-started",
+    "journal-forwarding-alive",
+    "cmdline-carries-no-imgcheck-token",
+    "release-boot-is-not-a-first-boot",
+    "imgcheck-unit-considered-and-skipped",
+    "guest-probe-silent",
+    "guest-probe-journal-tag-absent",
+    "guest-probe-cups-queue-unnamed",
+    "probe-droppings-were-on-the-card",
+    "probe-droppings-stayed-off-the-card",
+    "boot-partition-unchanged",
+    "identity-store-unchanged",
+)
+
+
+def test_a_healthy_release_boot_passes_every_clause(tmp_path):
+    """The positive control for the whole section.
+
+    A set of clauses that could not pass would satisfy every failure test
+    below, and would fail every real release boot. This is also the fixture
+    all of them are one edit away from.
+    """
+    proc, verdict = run_release(tmp_path)
+    for name in RELEASE_CLAUSES:
+        assert check_state(verdict, "release", name) == "PASS", verdict
+    assert proc.returncode == 0, proc.stderr + verdict
+
+
+def test_the_release_phase_is_not_asked_for_a_guest_report(tmp_path):
+    """
+    guest_gate demands an OTP-RESULT line, an OTP-GUEST-DONE line and every
+    named guest check. This phase has no probe by construction, so being
+    asked those questions would fail every healthy release boot -- and
+    answering them by loosening guest_gate would loosen it for the two
+    phases it was written for.
+    """
+    _, verdict = run_release(tmp_path)
+    for name in ("guest-reported-once", "guest-finished",
+                 "guest-checks-all-passed", "guest-ran-every-named-check"):
+        assert f"IMG-CHECK release {name}" not in verdict, verdict
+    # And boot1 in the same run is still asked all of them.
+    for name in ("guest-reported-once", "guest-ran-every-named-check"):
+        assert check_state(verdict, "boot1", name) == "PASS", verdict
+
+
+# --- clause: systemd looked at the unit and skipped it --------------------
+
+def test_a_release_boot_whose_probe_unit_is_missing_fails(tmp_path):
+    """
+    THE INVERSION THIS PHASE MUST NOT HAVE.
+
+    An image with otp-unit-imgcheck.service deleted from it satisfies every
+    other clause here perfectly: no probe output, no journal tag, no CUPS
+    queue, nothing written to the card. If that read as a pass, this gate
+    would be rewarding the one change the owner decided against -- stripping
+    the probe from release images -- and the claim "the probe is inert on a
+    production unit" would be backed by an image with no probe in it.
+    """
+    proc, verdict = run_release(tmp_path, release_console(skip_line=False))
+    assert check_state(verdict, "release",
+                       "imgcheck-unit-considered-and-skipped") == "FAIL", verdict
+    assert "not in this image" in verdict, verdict
+    assert proc.returncode == 1
+    # And the absences are all still "true", which is exactly the point.
+    for name in ("guest-probe-silent", "guest-probe-journal-tag-absent",
+                 "probe-droppings-stayed-off-the-card"):
+        assert check_state(verdict, "release", name) == "PASS", verdict
+
+
+def test_a_skip_line_about_some_other_unit_is_not_this_one(tmp_path):
+    """
+    A boot of Raspberry Pi OS skips a dozen units on conditions. Matching
+    "was skipped because" anywhere on the console would be satisfied by any
+    one of them, and would say nothing at all about the probe.
+    """
+    other = condition_skipped(unit="systemd-firstboot.service",
+                              description="First Boot Wizard")
+    proc, verdict = run_release(
+        tmp_path, release_console(skip_line=False, probe_said=[other]))
+    assert check_state(verdict, "release",
+                       "imgcheck-unit-considered-and-skipped") == "FAIL", verdict
+    assert proc.returncode == 1
+
+
+def test_either_wording_systemd_uses_for_a_condition_skip_is_accepted(tmp_path):
+    """
+    systemd v257's job.c has two shapes for this message and picks between
+    them at runtime: the detailed one when unit_find_failed_condition()
+    returns a non-trigger condition, and the generic "Condition check
+    resulted in %s being skipped." when it returns nothing. Ours is the
+    detailed one today -- one ConditionKernelCommandLine=, not a trigger --
+    but a gate keyed on systemd's prose is a gate that goes red on a healthy
+    image the day systemd rewrites a sentence. What is not a matter of
+    wording is that the unit's NAME is on the line.
+    """
+    generic = condition_skipped(
+        unit="Condition check resulted in otp-unit-imgcheck.service",
+        description="Report the overlay root to the tier-3 image boot",
+        wording="being skipped.")
+    proc, verdict = run_release(
+        tmp_path, release_console(skip_line=False, probe_said=[generic]))
+    assert check_state(verdict, "release",
+                       "imgcheck-unit-considered-and-skipped") == "PASS", verdict
+    assert proc.returncode == 0, proc.stderr + verdict
+
+
+def test_the_wording_a_real_image_actually_printed_is_accepted(tmp_path):
+    """
+    The wording this gate was first written against is not the wording the
+    image prints. Run 32180661689 -- the release phase's first execution on
+    a machine -- failed the clause while every other release clause passed,
+    and the diagnostic quoted what was really on the console:
+
+        systemd[1]: otp-unit-imgcheck.service - Report the overlay root to
+        the tier-3 image boot skipped, unmet condition check
+        ConditionKernelCommandLine=otp.imgcheck
+
+    systemd reworded it after v258. Both v257 and v258 carry "was skipped
+    because of an unmet condition check (X=Y)."; main carries "skipped,
+    unmet condition check X=Y". So the source read behind this gate was
+    accurate for a systemd this image does not run, which is the whole
+    reason the pattern now spans the change instead of pinning to one side
+    of it.
+    """
+    observed = ("[  102.043301] systemd[1]: otp-unit-imgcheck.service - "
+                "Report the overlay root to the tier-3 image boot skipped, "
+                "unmet condition check ConditionKernelCommandLine=otp.imgcheck")
+    proc, verdict = run_release(
+        tmp_path, release_console(skip_line=False, probe_said=[observed]))
+    assert check_state(verdict, "release",
+                       "imgcheck-unit-considered-and-skipped") == "PASS", verdict
+    assert proc.returncode == 0, proc.stderr + verdict
+
+
+def test_a_unit_skipped_for_someone_elses_condition_is_not_our_evidence(tmp_path):
+    """
+    The two condition wordings name the condition that failed, and that is
+    the strongest thing this phase can be handed: it separates "systemd
+    skipped this unit" from "systemd skipped it because our token was
+    absent". A unit skipped for ConditionPathExists, say, would satisfy a
+    gate that only looked for the name and the word skipped -- and would say
+    nothing at all about the token.
+    """
+    other = ("[  102.043301] systemd[1]: otp-unit-imgcheck.service - Report "
+             "the overlay root to the tier-3 image boot skipped, unmet "
+             "condition check ConditionPathExists=/some/other/thing")
+    proc, verdict = run_release(
+        tmp_path, release_console(skip_line=False, probe_said=[other]))
+    assert check_state(verdict, "release",
+                       "imgcheck-unit-considered-and-skipped") == "FAIL", verdict
+    assert "not ConditionKernelCommandLine=otp.imgcheck" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_the_skip_line_is_quoted_into_the_evidence(tmp_path):
+    """
+    Reported as well as gated, so the exact wording this image's systemd
+    uses enters the record. The narrower form -- the one that names
+    ConditionKernelCommandLine=otp.imgcheck -- becomes promotable to a gate
+    of its own once a real boot has printed it, which is the same
+    report-then-gate ladder multi-user.target and the hwrng line came up.
+    """
+    _, verdict = run_release(tmp_path)
+    note = re.search(r"^IMG-NOTE release imgcheck-skip-line: (.*)$",
+                     verdict, re.M)
+    assert note, verdict
+    assert "otp-unit-imgcheck.service" in note.group(1), note.group(1)
+    assert "ConditionKernelCommandLine=otp.imgcheck" in note.group(1), \
+        note.group(1)
+
+
+#: How much room the quoted skip line has to have left over after the
+#: longest wording systemd could print for the shipped unit. The point is
+#: not the exact number -- it is that this test goes red BEFORE the note
+#: starts clipping, so a Description= that grows produces a failing test
+#: rather than a silently truncated record. A hundred characters is more
+#: than one line of English description plausibly gains in a single edit,
+#: and the clip has 206 to spare today.
+SKIP_NOTE_MARGIN = 100
+
+
+def test_the_quoted_skip_line_cannot_clip_the_condition_it_now_gates_on(tmp_path):
+    """
+    THE NOTE HAS TO OUTLIVE THE LONGEST WORDING, and it nearly did not.
+
+    `cut -c1-200` was chosen when this note was decoration. It is not any
+    more: the clause gates on `ConditionKernelCommandLine=otp.imgcheck` when
+    the line carries it, and the IMG-NOTE is the only place that parameter
+    reaches the record. Measured with the shipped Description=:
+
+        main's  "... skipped, unmet condition check X=Y"      174 chars
+        v257's  "... was skipped because ... (X=Y)."          194 chars
+
+    -- so the old clip cleared the wording this image prints by twenty-six
+    characters and the wording it may go back to by six. SEVEN more
+    characters of Description= and the note would have started dropping the
+    parameter, quietly, while the gate that reads it stayed green.
+
+    Both lengths are re-derived here from
+    device/systemd/otp-unit-imgcheck.service rather than written down, which
+    is the other half of the defect: the fixture in this file used to carry
+    its own copy of that string, so the unit could grow without any test
+    here noticing.
+    """
+    text = IMG_BOOT.read_text()
+    note = re.search(
+        r"IMG-NOTE %s imgcheck-skip-line.*?\n.*?cut -c1-(\d+)", text, re.S)
+    assert note, "the skip line is no longer quoted through a cut"
+    width = int(note.group(1))
+
+    stamp = "[  102.043301] systemd[1]: "
+    unit = "otp-unit-imgcheck.service"
+    desc = imgcheck_description()
+    longest = 0
+    for wording in (SKIP_WORDING, SKIP_WORDING_MAIN):
+        line = f"{stamp}{unit} - {desc} {wording}"
+        longest = max(longest, len(line))
+        assert "ConditionKernelCommandLine=otp.imgcheck" in line[:width], (
+            f"the note clips at {width} characters and this wording puts the "
+            f"condition parameter past it ({len(line)} characters):\n{line}")
+    assert width - longest >= SKIP_NOTE_MARGIN, (
+        f"the longest skip line systemd can print for this unit is {longest} "
+        f"characters and the note clips at {width}, leaving "
+        f"{width - longest}. Under {SKIP_NOTE_MARGIN} characters of headroom "
+        f"is close enough that the next edit to Description= clips the "
+        f"condition parameter out of the record silently -- widen the cut, "
+        f"or shorten the description")
+
+
+def test_the_fixture_takes_the_probe_units_description_from_the_unit():
+    """
+    The console lines this file builds have to be the console lines the
+    image produces, and the description is part of them. A copy here is the
+    defect `shell_list()` and `required_checks()` exist to prevent, and it
+    is worse in this one place than in most: the LENGTH of that string is
+    what decides whether the harness's `cut` keeps the condition parameter,
+    so a fixture holding a stale copy would keep the clip test above green
+    while the real note started truncating.
+    """
+    assert imgcheck_description() in condition_skipped(), condition_skipped()
+    assert imgcheck_description() in IMGCHECK_UNIT.read_text()
+    # And it is not this file's own string: change the unit and the fixture
+    # moves with it.
+    assert 'description="' not in inspect.getsource(condition_skipped), \
+        "condition_skipped() carries a hard-coded description again"
+
+
+# --- clause: the boot really happened and finished ------------------------
+
+def test_a_release_boot_that_never_finished_fails(tmp_path):
+    """
+    The same bar the other two phases hold. "Reached target" alone is
+    satisfied by remote-fs.target at 30 seconds -- run 31968966879 reached
+    fourteen targets and finished neither boot -- and a release phase that
+    stopped short would have had no chance to run the probe it is claiming
+    stayed quiet.
+    """
+    proc, verdict = run_release(tmp_path, release_console(multi_user=False))
+    assert check_state(verdict, "release",
+                       "Reached-target-multi-user.target") == "FAIL", verdict
+    assert proc.returncode == 1
+
+
+def test_a_release_boot_that_never_started_the_unit_fails(tmp_path):
+    # The rest of per_boot_verdict's bar, reused rather than reinvented: a
+    # release boot is still a boot of this appliance.
+    proc, verdict = run_release(
+        tmp_path, [line for line in healthy("release") if "Started " not in line])
+    assert check_state(verdict, "release", "unit-started") == "FAIL", verdict
+    assert proc.returncode == 1
+
+
+def test_a_release_boot_that_was_a_first_boot_fails(tmp_path):
+    # first-boot-complete.target in the third boot of the same card means
+    # PID 1 could not read a machine-id -- the identity the two boots before
+    # it persisted has gone, which is damage this phase is watching for.
+    proc, verdict = run_release(tmp_path, release_console(first_boot=True))
+    assert check_state(verdict, "release",
+                       "release-boot-is-not-a-first-boot") == "FAIL", verdict
+    assert proc.returncode == 1
+
+
+# --- clause: the journal really does reach this console -------------------
+
+def test_a_release_console_the_journal_never_reached_fails(tmp_path):
+    """
+    The positive control the probe's marker provides in the other two
+    phases, and which this phase cannot have because the marker is the
+    probe's.
+
+    Without it, "the probe's journal tag never appeared" is equally true of
+    a console the journal never reached at all -- and the tag clause below
+    would be measuring a channel that was closed. A forwarded line from a
+    speaker that is not PID 1 is one nothing else writes: PID 1 also writes
+    status lines straight to /dev/console and falls back to /dev/kmsg, and a
+    `python3[412]:` line has no such second route.
+    """
+    proc, verdict = run_release(tmp_path, release_console(forwarding=False))
+    assert check_state(verdict, "release",
+                       "journal-forwarding-alive") == "FAIL", verdict
+    assert "unbacked" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_pid_1_talking_to_itself_is_not_journal_forwarding(tmp_path):
+    """
+    The clause counts forwarded lines MINUS PID 1's, and this is why. A
+    console carrying nothing but systemd[1] lines is what a boot with
+    forwarding switched off looks like: PID 1's own log reaches the console
+    through /dev/kmsg whether or not journald is passing anything on.
+    """
+    only_pid1 = release_console(forwarding=False) + [
+        "[   21.000000] systemd[1]: Startup finished in 4.115s.",
+    ]
+    proc, verdict = run_release(tmp_path, only_pid1)
+    assert check_state(verdict, "release",
+                       "journal-forwarding-alive") == "FAIL", verdict
+    assert proc.returncode == 1
+
+
+# --- clause: the probe said nothing ---------------------------------------
+
+def test_a_release_boot_where_the_probe_spoke_fails(tmp_path):
+    proc, verdict = run_release(
+        tmp_path,
+        release_console(probe_said=[forwarded(
+            "OTP-GUEST starting phase=release on Linux 6.12.96+rpt-rpi-v8 aarch64",
+            ident="img-guest-check.sh", pid=903)]))
+    assert check_state(verdict, "release", "guest-probe-silent") == "FAIL", verdict
+    assert proc.returncode == 1
+
+
+def test_a_probe_that_ran_and_refused_is_not_a_probe_that_stayed_inert(tmp_path):
+    """
+    The third line the probe can print, and the reason the pattern has no
+    trailing hyphen.
+
+    `OTP-GUEST refusing to run:` is what img-guest-check.sh's own phase guard
+    prints when the unit STARTED on a command line with no otp.imgcheck
+    token. That is the probe running -- the second lock catching what the
+    first one let through -- and a unit that started when its condition
+    should have stopped it is exactly what this phase is here to notice. A
+    pattern of `OTP-GUEST-` would have walked straight past it.
+    """
+    refusal = forwarded("OTP-GUEST refusing to run: the kernel command line "
+                        "carries no", ident="img-guest-check.sh", pid=903)
+    proc, verdict = run_release(tmp_path, release_console(probe_said=[refusal]))
+    assert check_state(verdict, "release", "guest-probe-silent") == "FAIL", verdict
+    assert proc.returncode == 1
+    # And the wording really is the shipped one, not a plausible invention.
+    assert "OTP-GUEST refusing to run" in GUEST_CHECK.read_text()
+
+
+def test_the_silence_is_not_believed_when_the_control_boot_is_silent_too(tmp_path):
+    """
+    THE POSITIVE CONTROL, broken on purpose.
+
+    If the probe's own output stops matching this grep -- a renamed marker, a
+    changed prefix, a console the ANSI strip no longer handles -- then the
+    release phase would report a silence it can no longer distinguish from
+    deafness. So the clause requires the same grep to find the probe in
+    boot1, where the probe demonstrably ran, and goes red when it does not.
+    """
+    deaf = [line for line in healthy("boot1") if "OTP-GUEST" not in line]
+    proc, verdict = run_release(tmp_path, boot1_lines=deaf)
+    assert check_state(verdict, "release", "guest-probe-silent") == "FAIL", verdict
+    assert "0 in boot1" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_a_release_boot_carrying_the_probes_journal_tag_fails(tmp_path):
+    """
+    The probe's side effects go beyond files. It writes a marker into the
+    journal with `systemd-cat -t otp-imgcheck`, and journald puts the tag in
+    the speaker position of the forwarded line -- so a release console with
+    that speaker on it is one where the probe reached the journal.
+    """
+    proc, verdict = run_release(
+        tmp_path, release_console(probe_said=[journal_forwarded("release")]))
+    assert check_state(verdict, "release",
+                       "guest-probe-journal-tag-absent") == "FAIL", verdict
+    assert proc.returncode == 1
+
+
+def test_the_probe_unit_naming_itself_is_not_the_probes_journal_tag(tmp_path):
+    """
+    The skip line this phase REQUIRES names otp-unit-imgcheck.service, and
+    the tag clause looks for otp-imgcheck. Those two strings do not contain
+    one another -- the unit's name reads `otp-` then `unit-` -- and the tag
+    is matched in speaker position anyway. A clause tuned so loosely that
+    the evidence it depends on tripped it would be unable to pass.
+    """
+    _, verdict = run_release(tmp_path)
+    assert check_state(verdict, "release",
+                       "imgcheck-unit-considered-and-skipped") == "PASS", verdict
+    assert check_state(verdict, "release",
+                       "guest-probe-journal-tag-absent") == "PASS", verdict
+
+
+def test_a_release_boot_naming_the_probes_cups_queue_fails(tmp_path):
+    proc, verdict = run_release(
+        tmp_path,
+        release_console(probe_said=[forwarded(
+            "queue=device for otpimgcheck: usb://OTP/imgcheck",
+            ident="img-guest-check.sh", pid=903)]))
+    assert check_state(verdict, "release",
+                       "guest-probe-cups-queue-unnamed") == "FAIL", verdict
+    assert proc.returncode == 1
+
+
+def test_the_cups_queue_control_comes_off_the_boot_that_made_one(tmp_path):
+    # boot1 is where the probe creates `otpimgcheck` and reports it, so
+    # boot1's console is the only place in a run that can say this grep works.
+    quiet = [line.replace("otpimgcheck", "somequeue")
+             for line in healthy("boot1")]
+    proc, verdict = run_release(tmp_path, boot1_lines=quiet)
+    assert check_state(verdict, "release",
+                       "guest-probe-cups-queue-unnamed") == "FAIL", verdict
+    assert "0 in boot1" in verdict, verdict
+    assert proc.returncode == 1
+
+
+# --- clause: the token was absent, not empty ------------------------------
+
+def test_a_release_boot_handed_the_token_fails(tmp_path):
+    """
+    Including the empty-assignment form, which is the one that would make
+    this phase test nothing at all. systemd's ConditionKernelCommandLine
+    matches a bare word AND the left-hand side of an assignment, so
+    `otp.imgcheck=` still satisfies the condition, still starts the unit, and
+    leaves only the probe's own phase guard between a release image and a
+    script that writes to /boot/firmware.
+    """
+    for token in ("otp.imgcheck=release", "otp.imgcheck", "otp.imgcheck="):
+        lines = [line for line in healthy("release")
+                 if "Kernel command line:" not in line]
+        lines.insert(1, cmdline_line("release", token=token))
+        proc, verdict = run_release(tmp_path / token.replace("=", "_"), lines)
+        assert check_state(verdict, "release",
+                           "cmdline-carries-no-imgcheck-token") == "FAIL", verdict
+        assert proc.returncode == 1
+
+
+def test_a_release_boot_with_no_command_line_echo_at_all_fails(tmp_path):
+    # The absence has to be measured on a line that exists. A console with no
+    # `Kernel command line:` on it does not carry the token either, and that
+    # is not the same statement.
+    proc, verdict = run_release(tmp_path, release_console(cmdline=False))
+    assert check_state(verdict, "release",
+                       "cmdline-carries-no-imgcheck-token") == "FAIL", verdict
+    assert "no Kernel command line line" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_the_probe_phases_are_required_to_carry_the_token(tmp_path):
+    """
+    The other direction, and what makes the release phase's absence mean
+    anything: the same grep over the same kind of file finds the token in
+    boot1 and boot2. A boot that never got it would run no probe and report
+    nothing, which is a red the harness should name rather than leave to the
+    guest gate to imply.
+    """
+    lines = [line for line in healthy("boot1")
+             if "Kernel command line:" not in line]
+    lines.insert(1, cmdline_line("boot1", token=""))
+    proc, verdict = run_verdict(tmp_path, {"boot1": lines}, phases=("boot1",))
+    assert check_state(verdict, "boot1",
+                       "cmdline-carries-the-imgcheck-token") == "FAIL", verdict
+    assert proc.returncode == 1
+
+
+def token_case_block() -> str:
+    """The shipped per-phase token choice, sliced out of boot_phase()."""
+    text = IMG_BOOT.read_text()
+    start = text.index('    local imgcheck_token=""')
+    end = text.index("    esac\n", start) + len("    esac\n")
+    return text[start:end]
+
+
+def test_the_release_phase_is_handed_no_token_and_the_others_are(tmp_path):
+    """
+    Run the real `case`, rather than read it.
+
+    The verdict clause above reads the token back off the kernel's own echo,
+    which is the right place to check a BOOT. This checks the code that
+    builds the command line in the first place, so a change that put the
+    token back is red in the fast suite instead of sixteen minutes later.
+    """
+    # ONE WORD REMOVED, `local`, which only means anything inside a function
+    # and is a syntax error outside one. Everything that decides the token --
+    # the empty initial value and the case that leaves it that way for the
+    # release phase -- is the code that ships.
+    block = token_case_block()
+    assert '    local imgcheck_token=""\n' in block, block
+    block = block.replace('    local imgcheck_token=""\n',
+                          '    imgcheck_token=""\n')
+    runner = tmp_path / "token.sh"
+    runner.write_text('set -euo pipefail\nphase="$1"\n' + block
+                      + '\nprintf "TOKEN=[%s]\\n" "$imgcheck_token"\n')
+    for phase, want in (("boot1", "otp.imgcheck=boot1"),
+                        ("boot2", "otp.imgcheck=boot2"),
+                        ("release", "")):
+        proc = subprocess.run(["bash", str(runner), phase],
+                              capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, proc.stderr
+        assert f"TOKEN=[{want}]" in proc.stdout, (phase, proc.stdout)
+    # EMPTY, NOT `otp.imgcheck=`, and the word goes away because the KERNEL
+    # tokenizes this string -- not because the shell splits it. The whole
+    # -append value is one double-quoted argument, so `$imgcheck_token` is
+    # quoted and no word splitting happens to it at all; an empty expansion
+    # leaves a doubled space that the kernel's own parser skips. Said here
+    # because the comment in img-boot.sh used to claim the opposite and this
+    # docstring repeated it. An assignment with nothing after it would still
+    # satisfy the unit's condition, which is the property the counts below
+    # measure.
+    append = next(line for line in IMG_BOOT.read_text().splitlines()
+                  if line.strip().startswith("-append "))
+    assert append.strip().startswith('-append "') and append.rstrip().endswith('" \\'), \
+        ("the -append value is no longer one double-quoted argument, so the "
+         "reasoning above about how the empty token disappears no longer "
+         "describes this line: " + append)
+    assert "$imgcheck_token" in append, append
+    assert "otp.imgcheck" not in append, \
+        "the token is spelled literally on the -append line, so no phase " \
+        "can be without it"
+
+
+# --- clause: the card came out the way it went in -------------------------
+
+def test_a_release_phase_with_nothing_to_delete_fails(tmp_path):
+    """
+    THE CONTROL FOR THE DELETION.
+
+    Both records are written by boot1 and left there by boot2, so the strip
+    has something to take off. If those boots ever stop writing them, the
+    release phase's "they did not come back" is an absence it was handed for
+    free -- true of a working image and of a broken one alike -- and the run
+    has to say so instead of counting it.
+    """
+    proc, verdict = run_release(
+        tmp_path,
+        prestrip={"release": [line for line in prestrip_listing("release")
+                              if "otp-imgcheck" not in line]})
+    assert check_state(verdict, "release",
+                       "probe-droppings-were-on-the-card") == "FAIL", verdict
+    assert "not there to delete" in verdict, verdict
+    assert proc.returncode == 1
+    # And the absence afterwards still reads PASS, which is the whole reason
+    # the control has to exist.
+    assert check_state(verdict, "release",
+                       "probe-droppings-stayed-off-the-card") == "PASS", verdict
+
+
+def test_a_release_boot_that_put_the_probes_records_back_fails(tmp_path):
+    # The probe running is the case this is really about: it writes both of
+    # these in boot1 and would write them again here.
+    before, after = healthy_listings("release")
+    proc, verdict = run_release(
+        tmp_path, boot_files={"release": (before, after + FAT_DROPPINGS)})
+    assert check_state(verdict, "release",
+                       "probe-droppings-stayed-off-the-card") == "FAIL", verdict
+    assert proc.returncode == 1
+
+
+def test_a_strip_that_did_nothing_fails_rather_than_passing(tmp_path):
+    # mdel against a wrong offset writes nothing and says nothing -- that is
+    # how run 1 read a harness bug as a bad image. Both ends are required.
+    before, after = healthy_listings("release")
+    proc, verdict = run_release(
+        tmp_path,
+        boot_files={"release": (before + FAT_DROPPINGS, after + FAT_DROPPINGS)})
+    assert check_state(verdict, "release",
+                       "probe-droppings-stayed-off-the-card") == "FAIL", verdict
+    assert "before:" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_a_release_boot_that_changed_the_boot_partition_fails(tmp_path):
+    """
+    A release boot must not be the thing that eats the operator's login. The
+    identity store, the credential and the saved settings all live on this
+    partition, outside the overlay, and nothing on a boot with no
+    otp.imgcheck token has any business touching them.
+    """
+    before, after = healthy_listings("release")
+    for label, changed in (
+            ("lost", [x for x in after if "credential" not in x]),
+            ("gained", after + ["::/otp-unit.conf.new"])):
+        proc, verdict = run_release(
+            tmp_path / label, boot_files={"release": (before, changed)})
+        assert check_state(verdict, "release",
+                           "boot-partition-unchanged") == "FAIL", verdict
+        assert proc.returncode == 1
+
+
+def test_a_listing_in_a_different_order_is_not_a_changed_partition(tmp_path):
+    # Compared sorted, because mtools prints FAT directory order and a file
+    # rewritten in place can take a freed slot. Names, not positions.
+    before, after = healthy_listings("release")
+    proc, verdict = run_release(
+        tmp_path, boot_files={"release": (before, list(reversed(after)))})
+    assert check_state(verdict, "release",
+                       "boot-partition-unchanged") == "PASS", verdict
+    assert proc.returncode == 0, proc.stderr + verdict
+
+
+def test_a_release_boot_that_rewrote_a_kept_file_fails(tmp_path):
+    """
+    The listing cannot see this one: a file rewritten in place keeps its
+    name. The credential is a password hash and the machine-id is what keeps
+    a power-cycled appliance the same machine, so both are compared by
+    content -- as digests, because this work directory is a CI artifact.
+    """
+    for name in FAT_CONTENTS:
+        before, after = healthy_digests("release")
+        after[name] = digest_of("something else entirely")
+        proc, verdict = run_release(
+            tmp_path / name.replace("/", "_"),
+            digests={"release": (before, after)})
+        assert check_state(verdict, "release",
+                           "identity-store-unchanged") == "FAIL", verdict
+        assert name in verdict, verdict
+        assert proc.returncode == 1
+
+
+def test_two_files_that_are_not_there_are_not_an_unchanged_store(tmp_path):
+    """
+    The absence trap, in the one clause that compares values. `absent` is
+    equal to `absent`, and so is the sha256 of nothing to the sha256 of
+    nothing -- which is exactly how "the credential survived this boot" comes
+    to mean "there has never been a credential". The harness requires 64 hex
+    characters on both sides as well as a match.
+    """
+    gone = {name: "absent" for name in FAT_CONTENTS}
+    proc, verdict = run_release(
+        tmp_path, digests={"release": (dict(gone), dict(gone))})
+    assert check_state(verdict, "release",
+                       "identity-store-unchanged") == "FAIL", verdict
+    assert proc.returncode == 1
+
+
+def test_digests_that_were_never_taken_fail_and_still_produce_a_verdict(tmp_path):
+    """
+    TWO FAILURES IN ONE FIXTURE, and the first draft of this clause had both.
+
+    A phase whose digest files are missing must not read as three files that
+    came through the boot unchanged -- an empty comparison compares nothing
+    and reports success, which is row 4 of issue #14 arriving in a new place.
+    The clause is driven by the list of names rather than by the file, so
+    every name has to produce 64 characters or the clause is red.
+
+    And it must still produce a verdict at all. The loop was written as
+    `while read ... done < "$file"`, which under errexit dies on a file that
+    is not there -- measured, rc 1 -- and dies in the middle of writing
+    verdict.txt, in exactly the case where there is least other evidence.
+    """
+    proc, verdict = run_release(
+        tmp_path, digests={"release": ({}, {})})
+    assert verdict is not None, "the verdict file was never written"
+    assert check_state(verdict, "release",
+                       "identity-store-unchanged") == "FAIL", verdict
+    # The rest of the phase still reported, which is what says the block ran
+    # to the end rather than dying part way through it.
+    assert check_state(verdict, "release",
+                       "boot-partition-unchanged") == "PASS", verdict
+    assert proc.returncode == 1
+    # Every name is accounted for in the failure, not just the first.
+    for name in FAT_CONTENTS:
+        assert name in verdict, (name, verdict)
+
+
+def enclosing_phase_guard(text: str, needle: str):
+    """Which `if [ "$PHASE" = "X" ]` block the line holding `needle` is in.
+
+    img-guest-check.sh gates its per-boot work in top-level blocks at column
+    zero, so the enclosing guard is found by walking back from the line to
+    the first column-zero `if [ "$PHASE" = ...` or the first column-zero
+    `fi`, whichever comes first. `fi` first means the line is outside every
+    such block, and the answer is None.
+    """
+    lines = text.splitlines()
+    hits = [i for i, line in enumerate(lines) if needle in line]
+    assert len(hits) == 1, f"{needle!r} appears on {len(hits)} lines"
+    for i in range(hits[0], -1, -1):
+        opened = re.match(r'^if \[ "\$PHASE" = "([a-z0-9]+)" \]; then$',
+                          lines[i])
+        if opened:
+            return opened.group(1)
+        if lines[i] == "fi":
+            return None
+    return None
+
+
+# --- the harness structure the phase depends on ---------------------------
+
+def test_the_strip_happens_before_the_listing_the_boot_is_judged_against():
+    """
+    Ordering, because a deletion taken after the before-listing reads as
+    something the boot did -- and one taken after the boot does not happen at
+    all. The three listings in the release phase's directory have to be, in
+    file order: what the card held, what the emulator was handed, what came
+    back.
+    """
+    text = IMG_BOOT.read_text()
+    strip = text.index('        release) strip_probe_droppings "$dir" ;;')
+    before = text.index('    fat_listing "$dir/boot-files-before.txt"')
+    launch = text.index("qemu-system-aarch64 \\")
+    after = text.index('    fat_listing "$dir/boot-files-after.txt"')
+    assert strip < before < launch < after, (strip, before, launch, after)
+    # And the control listing is taken inside the strip, before the mdel.
+    block = text[text.index("strip_probe_droppings() {"):]
+    block = block[:block.index("\n}\n")]
+    assert block.index("boot-files-before-strip.txt") < block.index("mdel"), block
+
+
+def test_the_records_the_release_phase_deletes_are_the_ones_the_probe_writes():
+    """
+    Two files, two scripts, and nothing but this test holding them together.
+
+    img-boot.sh deletes $PROBE_DROPPINGS from the card; img-guest-check.sh
+    writes them, in boot1, into $BOOTDIR. Rename one in the probe and the
+    harness goes on deleting a file nothing creates -- the control above
+    would catch that on the next CI run, sixteen minutes later, but the
+    deletion would have stopped meaning anything and the phase would have
+    stopped watching the write it was built around.
+    """
+    probe = GUEST_CHECK.read_text()
+    written = set(re.findall(r'"\$BOOTDIR/(otp-imgcheck-[a-z-]+)"', probe))
+    assert written, "img-guest-check.sh no longer writes any record of its own"
+    assert set(PROBE_DROPPINGS) == written, (
+        f"img-boot.sh strips {sorted(PROBE_DROPPINGS)} and the probe writes "
+        f"{sorted(written)}")
+    # AND THEY ARE WRITTEN IN BOOT1, WHICH THIS USED TO CLAIM AND NOT CHECK.
+    # The loop here was `assert f'"$BOOTDIR/{name}"' in probe`, which the
+    # assertion above had already established for every name in the set --
+    # a comment saying "and they are written in boot1" over a line that
+    # could not tell boot1 from boot2 from a phase that never writes them
+    # at all. Boot1 is the load-bearing half: the release phase deletes
+    # these before it boots, so a write that moved to boot2 would still
+    # leave them on the card, but a write that moved to the release phase
+    # itself -- or to a phase list this run does not include -- turns
+    # probe-droppings-were-on-the-card into a control that reports an
+    # absence nobody created.
+    #
+    # Checked structurally rather than by proximity: find the variable each
+    # name is assigned to, find the redirection that writes it, and read
+    # off which top-level `if [ "$PHASE" = ... ]` block that redirection
+    # sits in.
+    for name in PROBE_DROPPINGS:
+        holder = re.search(rf'^([A-Z_]+)="\$BOOTDIR/{re.escape(name)}"$',
+                           probe, re.M)
+        assert holder, (
+            f"{name} is no longer assigned to a variable in "
+            f"img-guest-check.sh, so this test cannot find where it is "
+            f"written")
+        write = f'> "${holder.group(1)}"'
+        assert probe.count(write) == 1, (
+            f"{write} appears {probe.count(write)} times; which one is the "
+            f"boot1 write is now a matter of reading order")
+        assert enclosing_phase_guard(probe, write) == "boot1", (
+            f"{name} is written outside boot1 ("
+            f"{enclosing_phase_guard(probe, write)!r}). The release phase "
+            f"deletes it before booting and requires it to have been there "
+            f"to delete, and only boot1 puts it there.")
+
+
+def test_the_release_phase_has_a_stop_condition_of_its_own():
+    """
+    The sampler stops the other two phases on the probe's done line. This
+    phase has no probe, so with the same marker it would burn the whole
+    OTP_IMG_TIMEOUT backstop on every green run -- 600 seconds of CI, on
+    every build, to observe nothing.
+
+    The marker it uses instead is the one the verdict already gates every
+    phase on, and the settle window after it is the one thing here that is
+    arithmetic rather than a habit: a write the guest made into its page
+    cache reaches the card once writeback runs, and the kernel's defaults for
+    that are dirty_expire_centisecs=3000 and dirty_writeback_centisecs=500.
+    """
+    text = IMG_BOOT.read_text()
+    block = text[text.index("    local stop_marker="):text.index("    while kill -0")]
+    assert 'stop_marker="Reached target multi-user.target"' in block, block
+    settle = re.search(r"^\s*settle=(\d+)$", block, re.M)
+    assert settle, block
+    assert int(settle.group(1)) >= 35, (
+        f"a {settle.group(1)}s settle does not clear the 30s dirty-page "
+        f"expiry plus the 5s writeback tick, so a write this phase is "
+        f"supposed to catch could still be in the guest's page cache")
+    # The marker is the one the verdict demands of every phase, so the
+    # sampler cannot stop on evidence the verdict does not accept.
+    assert '"Reached target multi-user.target"' in verdict_block()
+    # And it is the sampler's own variable that is grepped for, not the
+    # probe's line with a second grep bolted on beside it.
+    assert 'grep -cF "$stop_marker"' in text, text

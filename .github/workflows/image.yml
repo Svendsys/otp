@@ -131,19 +131,41 @@ jobs:
     # cancelled qemu mid-experiment, and skipped the verdict and the
     # evidence upload (failure() is false on cancellation).
     #
-    # TWO boots now, for the read-only overlay (issue #9): the second is a
-    # power-cycle of the same card, and the backstop is per boot. The
-    # arithmetic that sizes this is the WORST case, where neither boot ever
-    # reports: ~10 minutes of non-boot work on a cache-miss rebuild
-    # (checkout, apt, pi-gen, cache save, upload, decompress) + 2 x (600s
-    # backstop + timeout's 30s kill grace) + verdict overhead = ~31.5, so 40
-    # keeps the same kind of margin 25 gave one boot.
+    # THREE boots now. Two are the read-only overlay (issue #9): the second
+    # is a power-cycle of the same card. The third is the `release` boot --
+    # the same card with no otp.imgcheck token on the kernel command line,
+    # which is how a flashed unit boots -- and it is what establishes that
+    # the probe shipped in every image stays inert on a production machine.
+    # The backstop is PER BOOT, so a third boot is a third backstop.
+    #
+    # THE ARITHMETIC, worst case, where no boot ever reports:
+    #
+    #   3 x (600s backstop + timeout's 30s kill grace)   31.5 min
+    #   pi-gen on a cache miss, with headroom for a
+    #     slow runner (measured at 6m58s on run
+    #     31752321387; 15 taken here)                    15.0 min
+    #   checkout, apt, cache save, artifact upload,
+    #     decompress, verdict (16m16s total minus
+    #     7m59s of boots minus 6m58s of pi-gen on
+    #     that run = 1m19s; 2.5 taken here)               2.5 min
+    #                                                    --------
+    #                                                    49.0 min
+    #
+    # 55 leaves six minutes over that, which is the same shape of margin 40
+    # gave two boots. 40 no longer fits: 31.5 of backstop alone against a
+    # 15-minute pi-gen is 46.5 before anything else, so a run that lost all
+    # three boots would be CANCELLED rather than reported -- and a cancelled
+    # job skips the verdict and the evidence upload, because failure() is
+    # false on cancellation. That is the failure this cap exists to avoid.
     #
     # Healthy runs are nowhere near it, and that is measured rather than
-    # hoped: run 31752321387, a cache MISS with both boots, took 16m16s end
+    # hoped: run 31752321387, a cache MISS with two boots, took 16m16s end
     # to end -- 6m58s of pi-gen and 7m59s for the pair of boots, because the
-    # harness stops each one the moment its guest check reports done.
-    timeout-minutes: 40
+    # harness stops each one the moment its guest check reports done. The
+    # release boot has no guest check to report, so it stops on
+    # multi-user.target plus a 45s settle instead: expect it to add roughly
+    # the length of one boot plus that settle, not the 600s backstop.
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
 
@@ -485,9 +507,29 @@ jobs:
           # somewhere anyone can copy has been told half of it. A release
           # note is the one place this project's claims reach someone who
           # cannot check them.
+          #
+          # AND IT ADMITS WHAT IS IN THE IMAGE, for exactly that reason. This
+          # artifact ships a test probe that runs as root and writes to the
+          # boot partition, and the owner's decision was to KEEP it rather
+          # than strip it from release builds -- a gate run against a
+          # specially prepared image proves nothing about the one people
+          # flash. A note that quietly omitted it would be hiding the thing
+          # a reader would most want to know, and one that mentioned it
+          # without saying what backs its inertness would be asking for
+          # trust. So the sentence names the probe, names the condition that
+          # keeps it asleep, and names the boot that observed it asleep:
+          # tier 3's third phase, which boots the same card with no
+          # otp.imgcheck token at all. The clauses that make it true are
+          # imgcheck-unit-considered-and-skipped, guest-probe-silent,
+          # guest-probe-journal-tag-absent,
+          # probe-droppings-stayed-off-the-card and
+          # identity-store-unchanged; tests/test_image_workflow.py holds
+          # this body against those names, the way it already does for the
+          # credential.
           body: >
             This image passed the tier-3 boot gate: it was booted under
-            QEMU twice, `otp-unit.service` reached `Started` on both, the
+            QEMU three times, `otp-unit.service` reached `Started` on all
+            three, the
             root filesystem was a RAM overlay over a read-only card, a file
             written to `/` in the first boot was gone in the second, and a
             setting written to `/boot/firmware` was still there. A
@@ -534,10 +576,22 @@ jobs:
             account on the unit as well as to anyone who can mount the card.
             Nothing else is kept there: this image does **not** run `sshd`
             (`ENABLE_SSH=0`, so `ssh.service` is disabled), and no SSH host
-            key is written outside the overlay. That gate does not exercise
-            the OLED, the buttons or a printer -- see the header of
-            `harness/img-boot.sh` for exactly what it does and does not
-            prove.
+            key is written outside the overlay. This image also **contains a
+            test probe**, `/opt/otp-unit/img-guest-check.sh`, started by
+            `otp-unit-imgcheck.service` -- and it is kept rather than
+            stripped, because a gate run against a specially prepared build
+            says nothing about the artifact you are holding. Its
+            `ConditionKernelCommandLine=otp.imgcheck` is what keeps it
+            asleep, and a **third boot of the same card with no such token**
+            -- which is how your unit boots -- is what says so: systemd
+            named the unit and skipped it, the probe printed nothing to the
+            console and wrote nothing to its journal tag, and the two files
+            it leaves on the boot partition were deleted before that boot
+            and were still gone after it, with the identity store, the
+            credential and the saved settings unchanged byte for byte. That
+            gate does not exercise the OLED, the buttons or a printer -- see
+            the header of `harness/img-boot.sh` for exactly what it does and
+            does not prove.
 
       # The bar, stated where it can be seen. Ten minutes is the budget for
       # a run that did not have to rebuild the image; a run that did is
@@ -550,9 +604,11 @@ jobs:
           CACHED='${{ steps.imgcache.outputs.cache-hit }}'
           {
             echo
-            echo "Budget: each of the two boots stops as soon as the"
-              echo "guest check reports done; 600s per boot is the"
-              echo "backstop only a boot that never reports pays."
+            echo "Budget: each of the two probe boots stops as soon as the"
+              echo "guest check reports done, and the release boot -- which"
+              echo "has no probe -- stops 45s after multi-user.target; 600s"
+              echo "per boot is the backstop only a boot that never gets"
+              echo "there pays."
             echo
             if [ "$CACHED" = "true" ]; then
               echo "This run restored the image from cache and went straight"
@@ -567,7 +623,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The job log shows the last eighty console lines per boot; this
-      # carries everything -- both UARTs of both boots in full, the verdict,
+      # carries everything -- both UARTs of every boot in full, the verdict,
       # and the boot partition's own cmdline.txt and config.txt, so the
       # divergence between what the device would boot and what this harness
       # booted is part of the record. Two diagnoses this week were built on
@@ -575,6 +631,39 @@ jobs:
       #
       # The consoles moved into a directory per boot when tier 3 grew a
       # second one, so the glob has a level in it that the old path did not.
+      #
+      # AND THE CARD EVIDENCE, WHICH THIS GLOB DID NOT MATCH. The release
+      # phase's entire new claim is about the boot partition -- what the
+      # probe had left on it, what the harness deleted, what came back, and
+      # whether the three files whose contents are the point survived -- and
+      # every one of those is decided from a file in $WORK/<phase>/ that
+      # nothing here collected: boot-files-before-strip.txt,
+      # boot-files-before.txt, boot-files-after.txt, boot-digests-before.txt
+      # and boot-digests-after.txt. A `boot-partition-unchanged FAIL` printed
+      # ten differing entries and the listings they came out of could not be
+      # retrieved after the run. `*/boot-*.txt` takes all five for all three
+      # phases and cannot collide with the `boot/` directory below it, which
+      # is a directory and not a `boot-`-prefixed file.
+      #
+      # Truncating the digest in verdict.txt is still right and is NOT
+      # softened by this: verdict.txt travels too, so the twelve characters
+      # are the trade harness/img-boot.sh describes rather than a limit on
+      # what a reader can get at. The digest files carry sha256 of a password
+      # hash, never the hash.
+      #
+      # `if: failure()` -- this is the diagnosis path. A green run publishes
+      # no card evidence, which is deliberate and is why img-boot.sh prints
+      # the twelve characters into the verdict at all.
+      #
+      # EVERY FILE A PHASE LEAVES BEHIND, and that is now held as a rule
+      # rather than as a list somebody remembered to extend.
+      # tests/test_image_workflow.py reads the per-phase filenames out of
+      # img-boot.sh and requires each one to match a glob here, so the next
+      # evidence file the harness starts writing is red in the fast suite
+      # instead of missing from an artifact sixteen minutes into an arm64
+      # run. `qemu-rc` and `early-stop` are one line each and are what
+      # separate "the emulator was killed at the backstop" from "the harness
+      # stopped it on its marker".
       - name: Upload the boot evidence
         if: failure()
         uses: actions/upload-artifact@v4
@@ -582,6 +671,9 @@ jobs:
           name: tier3-boot-evidence
           path: |
             ${{ runner.temp }}/otp-img/*/console*.log
+            ${{ runner.temp }}/otp-img/*/boot-*.txt
+            ${{ runner.temp }}/otp-img/*/qemu-rc
+            ${{ runner.temp }}/otp-img/*/early-stop
             ${{ runner.temp }}/otp-img/verdict.txt
             ${{ runner.temp }}/otp-img/boot/cmdline.txt
             ${{ runner.temp }}/otp-img/boot/config.txt

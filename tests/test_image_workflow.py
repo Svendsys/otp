@@ -30,6 +30,7 @@ not reproducible here.
 from __future__ import annotations
 
 import re
+from fnmatch import fnmatch
 from pathlib import Path
 
 import yaml
@@ -163,6 +164,114 @@ def test_the_plain_artifact_is_still_uploaded_before_the_boot():
         "an upload that finds no image must fail rather than shrug"
 
 
+EVIDENCE = "Upload the boot evidence"
+
+
+def phase_evidence_files() -> set:
+    """Every file img-boot.sh leaves in a phase's directory, off the harness.
+
+    Read rather than listed, for the reason `required_checks` in
+    tests/test_img_verdict.py is: a list written out here would go on
+    approving an upload that had stopped collecting a file the harness had
+    started writing, which is precisely the defect below.
+    """
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    found = set(re.findall(r'\$(?:dir|WORK/\$phase)/([A-Za-z0-9._-]+)',
+                           harness))
+    assert found, "img-boot.sh no longer writes anything into a phase directory"
+    return found
+
+
+def test_every_file_a_phase_leaves_behind_travels_as_evidence():
+    """
+    THE CARD EVIDENCE WAS NOT COLLECTED, IN THE PHASE WHOSE CLAIM IS THE CARD.
+
+    The upload globbed `*/console*.log`, `verdict.txt` and the boot
+    partition's own cmdline.txt and config.txt. `$WORK` is
+    `${runner.temp}/otp-img`, so boot-files-before-strip.txt,
+    boot-digests-before.txt, boot-digests-after.txt and the pre-existing
+    boot-files-{before,after}.txt matched no glob at all -- and those five
+    files are the entire basis of probe-droppings-were-on-the-card,
+    probe-droppings-stayed-off-the-card, boot-partition-unchanged and
+    identity-store-unchanged. A `boot-partition-unchanged FAIL` naming ten
+    differing entries could not be traced to the listings it came out of
+    after the run had finished.
+
+    Held as a rule and not as a list. The filenames come out of the harness,
+    so a new one has to be added to the upload or this goes red -- in the
+    fast suite, rather than as an artifact somebody could not download
+    sixteen minutes into an arm64 run.
+    """
+    step = step_named(build_steps(), EVIDENCE)
+    globs = [line.strip() for line in step["with"]["path"].splitlines()
+             if line.strip()]
+    # The phase directory is one level under $WORK; only the globs that have
+    # that level in them can match a per-phase file.
+    per_phase = [Path(g).name for g in globs
+                 if "/otp-img/*/" in g.replace("\\", "/")]
+    assert per_phase, f"no glob reaches into a phase directory: {globs}"
+    for name in sorted(phase_evidence_files()):
+        assert any(fnmatch(name, pattern) for pattern in per_phase), (
+            f"img-boot.sh writes $WORK/<phase>/{name} and no path in the "
+            f"{EVIDENCE!r} step collects it, so the run that needed it "
+            f"cannot be diagnosed after the fact. Globs: {per_phase}")
+
+
+#: The jobs whose steps must install mtools, and why each one needs it.
+MTOOLS_JOBS = {
+    "test": ("tests/test_img_verdict.py builds a real FAT partition and runs "
+             "img-boot.sh's own fat_listing/fat_digest_of/fat_digests/"
+             "strip_probe_droppings against it; without mtools those tests "
+             "SKIP and the card functions go back to being covered by "
+             "nothing"),
+    "mutation": ("several fast-tier rows break those functions and name "
+                 "those tests; mutation_gate.py refuses a row whose named "
+                 "tests skipped, so the rows fail the job rather than pass "
+                 "it"),
+}
+
+
+def test_the_jobs_that_need_mtools_install_mtools():
+    """
+    A SKIP THAT BECOMES PERMANENT IS THE HOLE REOPENING.
+
+    The card functions were unreachable from any test for the whole of their
+    existence: they sit above the block test_img_verdict.py slices, and
+    rewriting fat_digest_of to hand every file the same sixty-four characters
+    left the suite passing and would have reported
+    `identity-store-unchanged PASS` at runtime forever. The tests that close
+    that need mtools, and they are marked to skip without it -- which is the
+    right behaviour on a developer's machine and exactly the wrong behaviour
+    in CI, where a skip is indistinguishable from a pass in the summary.
+
+    So the installs are asserted here rather than trusted. Deleting either
+    line is a one-line change that silently removes the coverage this whole
+    section was written to add, and this is what makes it a red test instead.
+    """
+    ci = yaml.safe_load((WORKFLOWS / "ci.yml").read_text())
+    for job, why in MTOOLS_JOBS.items():
+        assert job in ci["jobs"], f"ci.yml no longer has a {job!r} job"
+        runs = " ".join(step.get("run", "") for step in ci["jobs"][job]["steps"])
+        assert re.search(r"apt-get install[^\n]*\bmtools\b", runs), (
+            f"ci.yml's {job!r} job does not install mtools. {why}.")
+
+
+def test_the_boot_evidence_upload_still_carries_the_verdict():
+    """
+    The digest in the verdict is truncated to twelve characters on purpose --
+    it covers a password hash -- and that trade is only honest while the
+    verdict itself is retrievable. It is the one file outside a phase
+    directory that this artifact exists for.
+    """
+    step = step_named(build_steps(), EVIDENCE)
+    globs = step["with"]["path"]
+    assert "verdict.txt" in globs, globs
+    assert step.get("if") == "failure()", (
+        "the boot evidence upload is the diagnosis path and img-boot.sh's "
+        "comments say so; changing when it runs changes what those comments "
+        "claim")
+
+
 # --- the gate itself ------------------------------------------------------
 
 
@@ -241,10 +350,29 @@ def test_the_note_is_appended_so_it_cannot_eat_the_release_notes():
         "the note carries hard line breaks and will render ragged"
 
 
-def test_the_release_notes_two_boot_claim_is_backed_by_the_harness():
+# How many boots the note is allowed to claim, spelled the way English
+# spells it. Derived and not hard-coded, because the number in the note is
+# the number of phases the harness demands and those two moved apart exactly
+# once: the release phase made the gate three boots and the sentence went on
+# saying "twice" for the whole of this branch, with a later sentence in the
+# SAME paragraph calling the release boot "a third boot of the same card".
+# One paragraph, two counts, and the test in this file pinned the wrong half.
+BOOT_COUNT_WORDS = {1: "once", 2: "twice", 3: "three times",
+                    4: "four times", 5: "five times"}
+
+
+def demanded_boots() -> int:
+    """How many boots img-boot.sh refuses to run without."""
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    phases = re.search(r"^for want in ([a-z0-9 ]+); do$", harness, re.M)
+    assert phases, "img-boot.sh no longer names the phases it demands"
+    return len(phases.group(1).split())
+
+
+def test_the_release_notes_boot_count_is_the_one_the_harness_demands():
     """
-    The note tells whoever downloads a tagged image that it was booted
-    twice, that a file written to `/` in the first boot was gone in the
+    The note tells whoever downloads a tagged image how many times it was
+    booted, that a file written to `/` in the first boot was gone in the
     second, and that a setting written to `/boot/firmware` was not. Nothing
     in this workflow makes any of that true: `OTP_IMG_PHASES` decides which
     boots happen, and the harness is what reads it.
@@ -255,19 +383,127 @@ def test_the_release_notes_two_boot_claim_is_backed_by_the_harness():
     workflow must not set the variable to something that drops a boot. A
     run halved to save CI minutes has to go red rather than ship a release
     body that says what did not happen.
+
+    THE COUNT IS DERIVED AND THE OTHER COUNTS ARE FORBIDDEN, which is the
+    half this test used to get wrong. It asserted the literal word "twice"
+    while the phase guard demanded three boots and a later sentence in the
+    same paragraph called the release boot "a third boot of the same card" --
+    so the assertion was not backing the note, it was holding a stale
+    sentence in place against the rest of the paragraph. Requiring the right
+    word is not enough on its own either: a note that says both would still
+    pass. Exactly one count word, and it has to be the harness's.
     """
     body = step_named(build_steps(), ATTACH)["with"]["body"]
-    assert "twice" in body, body
+    boots = demanded_boots()
+    assert boots in BOOT_COUNT_WORDS, (
+        f"the harness now demands {boots} boots and this file has no word "
+        f"for that; add one rather than dropping the check")
+    said = sorted(word for word in BOOT_COUNT_WORDS.values() if word in body)
+    assert said == [BOOT_COUNT_WORDS[boots]], (
+        f"img-boot.sh demands {boots} boots, so the release note has to say "
+        f"{BOOT_COUNT_WORDS[boots]!r} and nothing else; it says {said}")
     harness = (REPO / "harness" / "img-boot.sh").read_text()
     assert "leaves out:$PHASES_MISSING" in harness, \
         ("img-boot.sh no longer refuses a phase list that drops a boot, so "
-         "the release note's two-boot claim is no longer backed by anything")
+         "the release note's boot-count claim is no longer backed by anything")
     phases = (step_named(build_steps(), BOOT).get("env") or {}).get("OTP_IMG_PHASES")
     if phases is not None:
-        for boot in ("boot1", "boot2"):
+        for boot in ("boot1", "boot2", "release"):
             assert boot in str(phases).split(), \
                 (f"the boot step pins OTP_IMG_PHASES={phases!r}, which does "
-                 f"not run {boot}, but the release note claims both")
+                 f"not run {boot}, but the release note claims all three")
+
+
+def test_the_job_cap_clears_every_boots_backstop():
+    """
+    The job cap has to LOSE the race to the script's own timeout, always.
+
+    A GitHub job cap firing is a cancellation, and a cancelled job skips the
+    verdict and the evidence upload -- `failure()` is false on cancellation --
+    so a run that hit the cap costs the diagnosis as well as the run. That was
+    learned the hard way at fifteen minutes, and it is why the number has
+    moved twice since.
+
+    ARITHMETIC, NOT A HABIT, and derived from the two shipped files that
+    decide it: how many boots the harness refuses to run without, and what
+    backstop this workflow gives each one. `timeout -k 30` means a boot can
+    take the backstop plus a thirty-second kill grace before the wrapper
+    returns. A fourth phase, or a raised backstop, has to move this key --
+    and until it does, this test is what says so, in seconds rather than in
+    a cancelled arm64 run three quarters of an hour later.
+
+    IT IS A TRIPWIRE AS WELL AS A DERIVATION, and calling it only the second
+    understates it. The arithmetic below is genuinely derived -- change the
+    backstop or the kill grace and the sums move on their own -- but
+    `boots == 3` is a hard assertion, so adding or removing a phase turns
+    this red whether or not the cap still clears the new worst case. That is
+    deliberate and it is not redundant with the derivation: a fourth boot
+    inside a cap that happens to be generous enough would pass the sums in
+    silence, and every other file that states a boot count (the release note
+    above, harness/README.md, this workflow's budget summary) would go on
+    saying three. The tripwire is what makes somebody look at all of them.
+    """
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    boots = demanded_boots()
+    assert boots == 3, (
+        f"img-boot.sh now demands {boots} boots. The sums below re-derive "
+        f"themselves, but the boot count is stated by hand in the release "
+        f"note, in harness/README.md and in this workflow's budget summary, "
+        f"and none of those move on their own -- check them, then move this "
+        f"number")
+
+    backstop = int((step_named(build_steps(), BOOT)["env"])["OTP_IMG_TIMEOUT"])
+    grace = int(re.search(r"timeout -k (\d+) \"\$TIMEOUT\"", harness).group(1))
+    cap = int(workflow()["jobs"]["build"]["timeout-minutes"])
+    worst_boots = boots * (backstop + grace) / 60
+    assert cap > worst_boots, (
+        f"timeout-minutes: {cap} does not even cover {boots} boots at "
+        f"{backstop}s + {grace}s of kill grace ({worst_boots:.1f} min), so a "
+        f"run that lost every boot would be cancelled instead of reported")
+    # And the rest of the job has to fit as well: pi-gen on a cache miss was
+    # 6m58s on run 31752321387, and everything else on that run (checkout,
+    # apt, cache save, artifact upload, decompress, verdict) was 1m19s.
+    # Doubling both leaves the margin this key is supposed to carry.
+    assert cap >= worst_boots + 2 * (6 + 58 / 60) + 2 * (1 + 19 / 60), (
+        f"timeout-minutes: {cap} leaves no room for a slow pi-gen on top of "
+        f"{worst_boots:.1f} minutes of worst-case boots")
+
+
+def test_the_release_notes_inert_probe_claim_is_backed_by_the_harness():
+    """
+    THE NOTE ADMITS THE IMAGE CONTAINS A TEST PROBE, and that admission is
+    only safe while something has watched the probe stay asleep.
+
+    /opt/otp-unit/img-guest-check.sh ships on every unit, runs as root, and
+    writes to /boot/firmware -- outside the read-only overlay, so
+    permanently. The owner's decision was to keep it rather than strip it
+    from release builds, because a gate run against a specially prepared
+    image says nothing about the artifact people flash. What makes that safe
+    is `ConditionKernelCommandLine=otp.imgcheck` and the third tier-3 boot,
+    which boots the same card with no such token and requires systemd to have
+    named the unit and skipped it, the probe to have printed nothing, and its
+    two records to have stayed off the card after the harness deleted them.
+
+    Drop any of those clauses from the gate, or drop the boot that runs them,
+    and the paragraph attached to a tag becomes a promise nobody checked --
+    the worse direction, because it is a security claim about a script that
+    runs as root on the reader's machine.
+    """
+    body = step_named(build_steps(), ATTACH)["with"]["body"]
+    assert "img-guest-check.sh" in body, body
+    assert "otp.imgcheck" in body, body
+    assert "third boot" in body, body
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    for name in ("imgcheck-unit-considered-and-skipped",
+                 "guest-probe-silent",
+                 "guest-probe-journal-tag-absent",
+                 "probe-droppings-stayed-off-the-card",
+                 "identity-store-unchanged"):
+        assert name in harness, (
+            f"the release note says the shipped probe stayed inert and "
+            f"img-boot.sh no longer has a {name} clause to say it with")
+    # And the phase that runs them is one the harness refuses to skip.
+    assert "for want in boot1 boot2 release; do" in harness, harness
 
 
 def test_the_release_notes_credential_claim_is_backed_by_the_harness():

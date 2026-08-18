@@ -173,7 +173,12 @@ DELIBERATELY_NOT_IN_THE_RIG = {
     "systemd.journald.forward_to_console=1": "no journald in the rig's initramfs",
     # Shell expansions in img-boot.sh's own line, not literal tokens.
     "$OVERLAY_TOKENS": "the overlay is the image's, and the rig boots no image",
-    "otp.imgcheck=$phase": "wakes a unit that ships in the image; the rig has none",
+    # otp.imgcheck=<phase> in the two probe boots and EMPTY in the release
+    # boot, which is the whole of tier 3's third phase: the token has to be
+    # absent from the command line rather than present with no value, because
+    # ConditionKernelCommandLine matches the left-hand side of an assignment
+    # too. The rig boots no image and has no such unit either way.
+    "$imgcheck_token": "wakes a unit that ships in the image; the rig has none",
 }
 
 

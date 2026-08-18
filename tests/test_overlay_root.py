@@ -1827,11 +1827,43 @@ def test_the_guest_probe_cannot_run_on_a_flashed_unit():
     this one condition. systemd matches a bare word against both the word
     and the left hand side of an assignment, so otp.imgcheck=boot1 starts
     it and a device command line that says nothing about it does not.
+
+    THIS TEST IS A SPELLING CHECK AND THAT IS ALL IT EVER WAS. It reads one
+    string out of the unit file and finds it in the harness. It cannot see a
+    drop-in, a preset, an install.sh that starts the unit another way, or a
+    systemd release that reads the condition differently, and it says nothing
+    whatever about what a booted machine does. What backs the claim now is
+    tier 3's `release` phase -- a third boot of the same card with no
+    otp.imgcheck token, which requires systemd's own condition-skip line
+    naming this unit, no output from the probe, and the probe's two records
+    staying off the card after the harness deletes them. This stays as the
+    cheap half of that pair: it goes red in seconds rather than in sixteen
+    minutes.
+
+    DERIVED FROM THE UNIT FILE, in both directions. The condition's parameter
+    is read out of the shipped unit and the harness is required to build its
+    token out of that exact word -- so renaming the condition cannot leave the
+    harness supplying a token nothing looks for, which would make every probe
+    boot silently inert and every release boot trivially green.
     """
     unit = IMGCHECK_UNIT.read_text()
-    assert "ConditionKernelCommandLine=otp.imgcheck" in unit
-    # And the harness is the only thing that supplies it.
-    assert "otp.imgcheck=$phase" in IMG_BOOT.read_text()
+    condition = re.search(r"^ConditionKernelCommandLine=(\S+)$", unit, re.M)
+    assert condition, "otp-unit-imgcheck.service no longer has the condition"
+    word = condition.group(1)
+    assert word == "otp.imgcheck", word
+
+    harness = IMG_BOOT.read_text()
+    # The token the two probe phases get is the condition's own word plus the
+    # phase; the release phase gets nothing at all, and the -append line
+    # carries only the variable, so no phase can have the token forced on it.
+    assert f'imgcheck_token="{word}=$phase"' in harness, harness
+    append = next(line for line in harness.splitlines()
+                  if line.strip().startswith("-append "))
+    assert "$imgcheck_token" in append and word not in append, append
+    # And the release phase is the arm that leaves it empty.
+    assert re.search(r"case \"\$phase\" in\n\s*release\) ;;\n", harness), \
+        "no phase gets an empty imgcheck token, so nothing boots this image " \
+        "the way a flashed unit boots it"
 
 
 # --- the build refuses to ship an image it cannot probe ------------------
@@ -2287,10 +2319,23 @@ def test_the_probe_is_inert_on_a_command_line_without_the_token(tmp_path):
     assert "refusing to run" in proc.stderr, proc.stderr
 
 
-def test_the_probe_runs_for_the_two_phases_the_harness_supplies(tmp_path):
+def probe_phases() -> list:
+    """The phases the shipped guard accepts, read out of its own case arm."""
+    block = slice_between(GUEST_CHECK.read_text(), *PHASE_GUARD_BLOCK)
+    match = re.search(r"^\s*([a-z0-9|]+)\) ;;$", block, re.M)
+    assert match, block
+    return match.group(1).split("|")
+
+
+def test_the_probe_runs_for_the_phases_the_harness_supplies(tmp_path):
     # The positive control: everything else here asserts a refusal, and a
-    # script that refused everything would satisfy all of them.
-    for phase in ("boot1", "boot2"):
+    # script that refused everything would satisfy all of them. The phase
+    # names come off the guard's own case arm rather than being restated, so
+    # a guard that quietly stopped accepting one is a red here and not a
+    # sixteen-minute tier-3 run reporting a guest that never spoke.
+    accepted = probe_phases()
+    assert accepted == ["boot1", "boot2"], accepted
+    for phase in accepted:
         proc = run_phase_guard(
             tmp_path, f"{DEVICE_CMDLINE.strip()} otp.imgcheck={phase}\n")
         assert proc.returncode == 0, proc.stderr
@@ -2301,8 +2346,15 @@ def test_a_phase_that_is_not_one_of_the_two_is_refused(tmp_path):
     # `otp.imgcheck` bare is the interesting one: systemd's
     # ConditionKernelCommandLine matches a bare word as well as an
     # assignment, so that token starts the unit and names no phase.
+    #
+    # `otp.imgcheck=release` is here because tier 3 now has a third phase of
+    # that name, and it is the phase in which NOTHING is supposed to happen.
+    # The harness gives it no token at all -- that is the point of it -- but
+    # if a future change ever did hand it one by accident, the probe's own
+    # guard has to be the thing that still refuses. Two locks on the same
+    # door, and this is the second one being asked about the new key.
     for token in ("otp.imgcheck", "otp.imgcheck=", "otp.imgcheck=boot3",
-                  "otp.imgcheck=unknown"):
+                  "otp.imgcheck=release", "otp.imgcheck=unknown"):
         proc = run_phase_guard(tmp_path, f"{DEVICE_CMDLINE.strip()} {token}\n")
         assert proc.returncode != 0, token
         assert "REACHED-THE-CHECKS" not in proc.stdout, token
