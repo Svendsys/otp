@@ -342,8 +342,17 @@ def build_panel(monkeypatch, **injected):
     module = types.ModuleType("gpiozero")
     module.Button = FakeButton
     monkeypatch.setitem(sys.modules, "gpiozero", module)
-    thread = FakeDispatcher(alive=True)
-    injected.setdefault("dispatcher", lambda: thread)
+    # None, and not the default stand-in, when the caller brought its own
+    # probe. It used to be the default either way, which is a decoy: a
+    # caller that injects `dispatcher=lambda: mine` and then asserts
+    # `panel.stand_in_dispatcher.probes == 0` would be asking a thread the
+    # panel never touched, and the assertion would pass however many times
+    # the real probe ran. An AttributeError on None is the loud version of
+    # "there is nothing here to read".
+    thread = None
+    if "dispatcher" not in injected:
+        thread = FakeDispatcher(alive=True)
+        injected["dispatcher"] = lambda: thread
     injected.setdefault("reviver", Reviver())
     panel = GpioButtons(**injected)
     # What the panel was given, where a test can read it back. The panel
@@ -1180,9 +1189,45 @@ class TestTheDispatchThreadIsWatched:
         assert len(reports) == 1, reports
         said = reports[0]
         assert "dispatch thread was DEAD" in said
-        assert "96 byte(s) of edges banked" in said, (
+        assert "96 byte(s) of undelivered edges" in said, (
             f"the line does not say what was thrown away: {said!r}")
         assert "revival 1 since this panel was built" in said
+        assert "bound" not in said, (
+            f"a drain that emptied the pipe said it had stopped at its "
+            f"bound, which would send whoever reads the journal looking "
+            f"for a replay that did not happen: {said!r}")
+
+    def test_a_drain_that_stopped_at_its_bound_says_the_rest_is_coming(
+            self, monkeypatch, reports):
+        """
+        The one case where discarding the backlog does NOT prevent a replay.
+
+        `_discard_backlog` gives up at BACKLOG_MAX_BYTES so that a pipe
+        somebody is still filling cannot hold the app's event loop for as
+        long as it likes. The price is that everything past the bound stays
+        in the pipe and the replacement thread delivers it -- presses aimed
+        at a panel that was not listening, arriving at machine speed, which
+        is the whole hazard the drain exists for. The journal is the only
+        diagnostic this device has, so the one report that says "discarded
+        rather than replayed" may not stay quiet about the megabyte where
+        that is not what happened.
+        """
+        thread = FakeDispatcher(alive=False)
+        panel = build_panel(
+            monkeypatch, dispatcher=lambda: thread,
+            reviver=Reviver(discarded=buttons_mod.BACKLOG_MAX_BYTES))
+
+        assert panel.wait(timeout=0) is None
+
+        assert panel.revived == 1, (
+            "nothing was revived, so no success line was written and this "
+            "test is asserting about a report that does not exist")
+        said = reports[0]
+        assert "stopped at its" in said and "bound" in said, (
+            f"the drain stopped at its bound and the report does not say "
+            f"so, which leaves it claiming the backlog was discarded when "
+            f"the rest of it is about to be delivered: {said!r}")
+        assert "WILL be delivered by the replacement" in said
 
     def test_a_revival_changes_nothing_but_the_dispatcher(
             self, monkeypatch, reports):
@@ -1218,10 +1263,19 @@ class TestTheDispatchThreadIsWatched:
             self, monkeypatch, reports):
         """
         The repair allocates a thread, and the fault it is here to meet is
-        the one that breaks allocating next. `_watch` runs on the app's
-        event loop, where a raise ends `App.run()` and `main()` returns 0 --
-        which systemd's `Restart=on-failure` reads as success and does not
-        restart. One failed revival must cost a log line, not the unit.
+        the one that breaks allocating next.
+
+        This said an exception out of `_watch` ends `App.run()`, `main()`
+        returns 0, and `Restart=on-failure` reads that as success and does
+        not restart. That was wrong: `__main__.main` does not catch
+        arbitrary exceptions, so they come out of it and the process exits
+        1. Measured, `ui.App.run` patched to raise MemoryError on the
+        `--sim` path -- the only one that ends in `return 0` -- gave a
+        traceback out of `main()` and `EXIT=1`. What a raise here really
+        buys is therefore a restart every RestartSec=15 for as long as the
+        dispatcher stays dead, each one discarding the pad in progress and
+        its key material. One failed revival must cost a log line, not the
+        unit and not the pad.
         """
         thread = FakeDispatcher(alive=False)
         reviver = Reviver(raises=MemoryError("no memory to start a thread"))
@@ -1465,6 +1519,13 @@ class TestFindingLgpiosDispatchThread:
         -- lgpio, rpigpio, pigpio, native -- so a unit whose panel came up
         on any of the other three has no lgpio dispatch thread at all, and
         the honest answer about a thread that does not exist is None.
+
+        None is the right ANSWER and it is not a solved problem. On such a
+        unit the supervisor does nothing, while the fault it exists for is
+        still there: `NativeDispatchThread._run` calls
+        `pin._call_when_changed` with no guard either (gpiozero 2.0.1,
+        native.py:353-370). Which factory the shipped unit runs on is
+        issue #43, and it needs a Pi to answer.
         """
         monkeypatch.delitem(sys.modules, "lgpio", raising=False)
         assert buttons_mod.dispatch_thread() is None
@@ -1590,8 +1651,30 @@ class TestDiscardingAStaleBacklog:
 
         assert buttons_mod._discard_backlog(source) == 960
 
-    def test_it_never_leaves_the_descriptor_able_to_park_the_caller(
+    def test_it_reads_only_while_the_descriptor_cannot_park_and_puts_it_back(
             self, pipe):
+        """
+        Both halves of the flag, and only the flag.
+
+        This was named for a property it does not test and which is not
+        true as stated -- "it never leaves the descriptor able to park the
+        caller". What it asserts is that every read happened with
+        O_NONBLOCK set and that the descriptor was blocking again
+        afterwards -- and the second of those is the descriptor being left
+        ABLE to park, deliberately, because lgpio's own loop needs it that
+        way (`buf += self._file.read(16)`, lgpio.py:542, meets None
+        otherwise and raises).
+
+        The parking this cannot rule out is the other one: the
+        `BufferedReader`'s lock, held by a reader already inside a blocking
+        read(2), which no flag on the descriptor reaches. Measured -- the
+        drain did not return in five seconds. It is unreachable today
+        because the only caller is the app's single event-loop thread and
+        it only drains a dispatch thread that `is_alive()` says has
+        stopped; `_discard_backlog`'s docstring is where that argument
+        lives, because it is about the caller and not about anything a
+        test of this function can hold still.
+        """
         source, write = pipe
         os.write(write, b"e" * 32)
         watched = WatchedReader(source)

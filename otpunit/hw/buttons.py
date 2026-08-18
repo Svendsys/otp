@@ -158,13 +158,33 @@ def dispatch_thread():
     into the name it then fails to open. That is not something to provoke
     from a recovery path, and this one may run while a pad is printing.
 
-    The second is that finding no lgpio is the right answer rather than a
-    problem to fix. gpiozero picks the first pin factory that imports --
+    The second is that None is the only honest answer about a thread that
+    does not exist. gpiozero picks the first pin factory that imports --
     lgpio, then rpigpio, then pigpio, then native (gpiozero 2.0.1,
-    devices.py:281-302, which catches the import failure and warns) -- so a
-    unit whose panel is running on any of the other three has no lgpio
-    dispatch thread to supervise, and the honest thing to report about a
-    thread that does not exist is nothing at all.
+    devices.py:281-302) -- so a unit whose panel is running on any of the
+    other three has no lgpio dispatch thread, this returns None, and
+    `_watch` does nothing at all.
+
+    WHICH IS A LIMIT, AND IT IS NOT A SMALL ONE. Said plainly because
+    everything else in this file reads as though the fault were covered:
+    the same fault is UNSUPERVISED on the other three. `NativeFactory`
+    dispatches on a thread of its own and calls
+    `pin._call_when_changed(ticks, state)` with no guard around it either
+    (gpiozero 2.0.1, native.py:353-370), so one exception out of a callback
+    there ends `NativeDispatchThread` and every button in the process goes
+    deaf in exactly the way #37 and this supervisor exist to answer -- and
+    nothing here can even see that thread.
+
+    And which factory a booted unit lands on is not established anywhere.
+    `import lgpio` does not merely fail to be useful on a read-only
+    working directory, it RAISES (above); gpiozero catches `Exception`
+    rather than `ImportError` around each attempt (devices.py:299), so
+    that raise is indistinguishable from lgpio not being installed and the
+    chain walks on; `otp-unit.service` sets `WorkingDirectory=/opt/otp-unit`
+    under `ProtectSystem=strict`; and `device/packages.txt` has neither
+    python3-rpi.gpio nor python3-pigpio, so the next stop would be native.
+    Answering that needs a Pi and is tracked as issue #43. Until it is
+    answered, read this file as covering the lgpio case and no other.
     """
     lgpio = sys.modules.get("lgpio")
     return None if lgpio is None else getattr(lgpio, "_notify_thread", None)
@@ -203,8 +223,39 @@ def _discard_backlog(source) -> int:
     and only then reads, so it empties both.
 
     Non-blocking for the duration, because there is no way to ask how much
-    is there: a blocking read on an empty pipe would park the caller, which
-    here is the thread the app waits for presses on.
+    is there: without it a read that reached an empty pipe would park the
+    caller inside read(2), and the caller here is the thread the app waits
+    for presses on.
+
+    WHAT THAT DOES NOT BUY, because this used to claim it did. The flag is
+    on the DESCRIPTOR. The drain still has to take the `BufferedReader`'s
+    own lock, and a reader already parked inside a blocking read(2) is
+    holding that lock and is not woken by the flag changing under it.
+    Measured, with a reader thread sitting in `read(16)` on an empty pipe
+    and `_discard_backlog` called on the same file object from another
+    thread: the drain did not return within five seconds, and because its
+    `finally` had not run either, the descriptor was left NON-BLOCKING --
+    which then kills lgpio's own loop, whose `buf += self._file.read(16)`
+    (lgpio.py:542) meets a `None` and raises `can't concat NoneType to
+    bytes`. So the failure mode of calling this against a live reader is
+    both callers wedged and the panel deaf afterwards.
+
+    WHAT MAKES IT SAFE TODAY IS THE CALLER, not the flag. `_watch` runs
+    this on the app's single event-loop thread and only after `is_alive()`
+    has said the dispatch thread stopped -- a dead thread holds no lock --
+    and the process has one panel; every `wait()` there is -- `ui.App.run`,
+    its `poll_seconds` screens, `ui._drain`, the drain inside
+    `should_cancel`, `hmi.Interface.prove` and `unattended`'s `pressed` --
+    is reached from that thread, and outside this file the application
+    starts no thread at all -- grepping otpunit/ for `threading` finds
+    this module and nothing else. It is
+    NOT made safe against a concurrent reader, deliberately: the only lock
+    that would help is the `BufferedReader`'s, and taking it means waiting
+    for whoever holds it -- which in the case that matters is the parked
+    reader, so it turns a park into a park. A live dispatch thread is not
+    something this may interrupt in any case; there would be nothing to
+    repair. If a second thread ever waits on a panel, this needs a design
+    and not a lock.
     """
     fd = source.fileno()
     dropped = 0
@@ -712,12 +763,51 @@ class GpioButtons(Buttons):
         BACK where the operator pressed OK, which while a job is printing
         are opposite things.
 
-        And it may not raise. This runs on the app's event loop, where an
-        exception ends `App.run()`, `main()` returns 0, and systemd's
-        `Restart=on-failure` reads that as success and leaves the unit off
-        -- the failure `KeyboardButtons.allow_quit` exists for. So the same
-        `except BaseException` the callback guard uses, for the same
-        reason, with the same last-resort swallow around the reporting.
+        AND IT MAY NOT RAISE -- for a reason that is not the one this
+        docstring gave. It said an exception here ends `App.run()`,
+        `main()` returns 0, and systemd's `Restart=on-failure` reads that
+        as success and leaves the unit off. THAT WAS WRONG.
+        `__main__.main` does not catch arbitrary exceptions at all; they
+        propagate out of it. Measured, with `ui.App.run` patched to raise
+        MemoryError and the most forgiving path taken -- `--sim`, the only
+        one that ends in `return 0`:
+
+            File "otpunit/__main__.py", line 190, in main
+                app.run()
+            MemoryError: no memory to draw the menu
+            EXIT=1
+
+        So `Restart=on-failure` DOES restart, every `RestartSec=15`, for
+        as long as the fault lasts -- and each restart throws away the pad
+        in progress and its key material. The real cost of raising here is
+        therefore worse than the one claimed: not an appliance sitting
+        dark, but one power-cycling itself every fifteen seconds while an
+        operator watches, losing a pad each time and printing none. The
+        decision to swallow stands on the better reason.
+
+        (The `KeyboardButtons.allow_quit` failure the old text pointed at
+        is fixed history rather than a live hazard: `__main__.py` returns
+        1 when the menu ends without a shutdown request, and says in a
+        comment that returning 0 there is what used to keep the unit off.)
+
+        `_revive_at` is read and then written with nothing between the two
+        holding anything off. That is safe for one reason and it is worth
+        naming: there is only ever one thread in here, the same one
+        `_discard_backlog` depends on being alone. Two threads waiting on
+        one panel would both read a stale `_revive_at` and both revive.
+
+        A WARNING FOR WHOEVER WRITES THE NEXT TEST, the same one `_guarded`
+        carries and with more surface here: `pytest.fail`, `pytest.skip`
+        and pytest's assertion-rewriting machinery all raise BaseException
+        subclasses, and `_dispatcher` and `_reviver` are exactly the
+        callables a test supplies. Measured: a reviver containing a false
+        `assert` and a probe calling `pytest.fail` gave `2 passed`. Assert
+        from the test's own thread, on what the panel recorded -- `revived`,
+        the stand-in reviver's `called`, what `_report` was handed -- and
+        never from inside a callable this file will call.
+
+        So the same `except BaseException` the callback guard uses, with
+        the same last-resort swallow around the reporting.
         """
         try:
             if self._closed:
@@ -766,17 +856,45 @@ class GpioButtons(Buttons):
         Sized so `_report`'s cap never has to cut them: the longest of
         these is well under REPORT_MAX_CHARS before an exception's own
         `str()` is added, and that is what the cap is for.
+
+        WHAT THE SUCCESS LINE MAY CLAIM ABOUT THE BYTES IT THREW AWAY, and
+        it used to claim more. It said they were "presses made at a panel
+        that was not listening", and most of them are -- but not all, and
+        the measurement is in this branch's own notes. lgpio reads with
+        `self._file.read(16)` on a BufferedReader, which pulls up to 8192
+        bytes out of the pipe, so the edges written in the SAME `write()`
+        as the one that killed the thread are already inside Python before
+        it dies: measured, the kernel held 0 bytes and the reader held 960.
+        Those were queued while the panel was still listening, and they go
+        with the rest. Discarding them is still right -- what remains of
+        such a press is half of it, and a release whose press was eaten
+        arrives as nothing or as BACK -- but the line may not pretend the
+        operator made every one of them at a dead panel.
+
+        And the bound is said out loud when it is reached. The drain stops
+        at BACKLOG_MAX_BYTES; past that the pipe keeps what it has and the
+        replacement thread delivers it, which is precisely the replay the
+        drain exists to prevent. A report silent about that would describe
+        a backlog as discarded when a megabyte of it was and the remainder
+        is about to arrive at machine speed.
         """
         if exc is None:
+            bound = ""
+            if discarded >= BACKLOG_MAX_BYTES:
+                bound = (f"otp: front panel: the drain stopped at its "
+                         f"{BACKLOG_MAX_BYTES}-byte bound, so whatever is "
+                         f"still in the pipe WILL be delivered by the "
+                         f"replacement.\n")
             _report(
                 f"otp: front panel: lgpio's edge dispatch thread was DEAD "
                 f"-- every button in this process had stopped answering -- "
                 f"and a replacement is now running on the same notification "
                 f"handle.\n"
-                f"otp: front panel: {discarded} byte(s) of edges banked "
-                f"while nothing was reading were discarded rather than "
-                f"replayed; presses made at a panel that was not listening "
-                f"are not carried out now.\n"
+                f"otp: front panel: {discarded} byte(s) of undelivered "
+                f"edges were discarded rather than replayed: presses made "
+                f"at a panel that was not listening, and whatever the "
+                f"reader had already taken in when it stopped.\n"
+                f"{bound}"
                 f"otp: front panel: this is revival {self._revived} since "
                 f"this panel was built. Nothing else changed: no job was "
                 f"cancelled and the buttons were not rebuilt.")

@@ -4115,11 +4115,39 @@ tests = [
 [[mutation.edit]]
 file = "otpunit/hw/buttons.py"
 find = """        if exc is None:
-            _report("""
+            bound = \"\"
+            if discarded >= BACKLOG_MAX_BYTES:"""
 replace = """        if exc is None:
             return
         if exc is None:
-            _report("""
+            bound = \"\"
+            if discarded >= BACKLOG_MAX_BYTES:"""
+
+[[mutation]]
+name = "panel-revival-hides-that-the-drain-gave-up"
+tier = "fast"
+guard = """
+The one case where discarding the backlog does not prevent the replay, and
+the report is the only place it can be seen.
+
+`_discard_backlog` stops at BACKLOG_MAX_BYTES so a pipe somebody is still
+filling cannot hold the app's event loop for as long as it likes. Everything
+past the bound stays in the pipe, and the replacement thread delivers it --
+presses aimed at a panel that was not listening, arriving at machine speed
+at whatever is on screen now, which is the entire hazard the drain exists
+for. A success line that says "discarded rather than replayed" and stops
+there describes that run wrongly, and the journal is the only diagnostic
+this device has.
+
+The mutation keeps the drain and its bound exactly as they are and makes the
+report silent about having hit it."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_drain_that_stopped_at_its_bound_says_the_rest_is_coming",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "            if discarded >= BACKLOG_MAX_BYTES:"
+replace = "            if False:  # mutation: never say the drain gave up"
 
 [[mutation]]
 name = "panel-replays-what-was-pressed-at-a-dead-panel"
@@ -4190,7 +4218,7 @@ uses a reader that raises the moment it is read while the descriptor could
 still block, rather than letting the run hang -- a hang neither reports nor
 counts as caught."""
 tests = [
-  "tests/test_hardware.py::TestDiscardingAStaleBacklog::test_it_never_leaves_the_descriptor_able_to_park_the_caller",
+  "tests/test_hardware.py::TestDiscardingAStaleBacklog::test_it_reads_only_while_the_descriptor_cannot_park_and_puts_it_back",
 ]
 [[mutation.edit]]
 file = "otpunit/hw/buttons.py"
@@ -4211,7 +4239,7 @@ The mutation drops the restore. Both named tests check it: one after a
 drain that succeeded, one after a read that raised, because the restore is
 in a `finally` and only the second says so."""
 tests = [
-  "tests/test_hardware.py::TestDiscardingAStaleBacklog::test_it_never_leaves_the_descriptor_able_to_park_the_caller",
+  "tests/test_hardware.py::TestDiscardingAStaleBacklog::test_it_reads_only_while_the_descriptor_cannot_park_and_puts_it_back",
   "tests/test_hardware.py::TestDiscardingAStaleBacklog::test_a_read_that_fails_still_leaves_it_blocking",
 ]
 [[mutation.edit]]
@@ -4346,6 +4374,58 @@ tests = [
 file = "tests/mutation_gate.py"
 find = "            cached.unlink()"
 replace = "            pass  # mutation: the cache entry outlives the restore"
+
+[[mutation]]
+name = "mutation-gate-applies-a-mutation-into-a-live-bytecode-cache"
+tier = "fast"
+guard = """
+The other half of the same fault, and neither the row above nor its test
+could tell the two apart.
+
+The row above mutates `cached.unlink()`, which is shared by both writes and
+so disables both at once; its test plants a cache entry, calls
+apply_and_judge and finds the entry gone at the end, which the RESTORE side
+satisfies on its own. Measured: reverting only the apply side -- putting
+`target.write_bytes(...)` back where `self._write(...)` now stands in
+apply_and_judge -- left the gate's own file green at 33 passed and left the
+row above still reported caught, with the dangerous direction wide open.
+
+Dangerous because a mutation written within a second of the original's cache
+entry is then executed AS THE ORIGINAL: (mtime, size) are unchanged, CPython
+compares nothing else, the row SURVIVES for a reason that has nothing to do
+with its guard, and the report says so in green.
+
+The mutation is that revert. The named test watches from inside the runner,
+at the only moment the question can be answered."""
+tests = [
+  "tests/test_mutation_gate.py::TestTheTreeIsPutBack::test_the_mutated_run_never_starts_with_a_cache_entry_to_believe",
+]
+[[mutation.edit]]
+file = "tests/mutation_gate.py"
+find = "                self._write(target, target.read_bytes().replace("
+replace = "                target.write_bytes(target.read_bytes().replace("
+
+[[mutation]]
+name = "mutation-gate-scores-a-row-the-cache-could-shadow"
+tier = "fast"
+guard = """
+And the check that covers the ways the entry survives a correct write:
+`__pycache__` not writable, or another process compiling the file inside the
+window. `_write` deleting the entry is not the same as the entry being gone,
+and only the gate can tell the difference -- afterwards, a row that executed
+the original is indistinguishable from a row whose guard is missing.
+
+BROKEN and not SURVIVED, deliberately: SURVIVED sends someone off to write a
+test that already exists.
+
+The mutation stops asking."""
+tests = [
+  "tests/test_mutation_gate.py::TestTheTreeIsPutBack::test_a_mutation_the_cache_could_shadow_is_not_given_a_verdict",
+]
+[[mutation.edit]]
+file = "tests/mutation_gate.py"
+find = "            shadowed = self._shadowed_by_cache(mutation)"
+replace = "            shadowed = \"\"  # mutation: never ask before running"
 
 
 # --- the operator's login, which used to last one boot --------------------

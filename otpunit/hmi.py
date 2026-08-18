@@ -52,8 +52,19 @@ class Interface:
 
         Opening GpioButtons proves NOTHING about whether buttons exist.
         gpiozero only reserves and configures a pin; there is no presence
-        detection, so on any Pi with lgpio installed -- every unit this
-        targets -- the constructor always succeeds. That made the keyboard
+        detection on any of its four pin factories, so wherever gpiozero
+        finds a factory at all the constructor succeeds. This used to say
+        "on any Pi with lgpio installed -- every unit this targets", which
+        named a factory nothing here establishes: gpiozero catches
+        `Exception` and not `ImportError` when a factory fails to import
+        (gpiozero 2.0.1, devices.py:299), so an lgpio whose import RAISES
+        -- which it does when the working directory is read-only, and this
+        unit runs with `WorkingDirectory=/opt/otp-unit` under
+        `ProtectSystem=strict` -- is indistinguishable from an lgpio that
+        was never installed, and the fallback walks on to native. Which
+        factory a booted unit ends up on is issue #43. Nothing below
+        depends on the answer, which is the point: none of them can tell
+        you whether a button is wired to the pin. That made the keyboard
         branch unreachable, and worse: attaching a monitor to a working
         headless unit promoted `display` to non-None, `interactive` to
         True, and sent it into a menu whose first `buttons.wait()` blocks
