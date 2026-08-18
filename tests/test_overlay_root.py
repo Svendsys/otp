@@ -1950,8 +1950,14 @@ def test_the_assets_directory_stays_optional(tmp_path):
 
 # --- and the build refuses to purge more than it meant to ----------------
 
+# The end marker is the heredoc terminator and not the purge command, which
+# it used to be. A mutation that edits the last line -- `|| true` on the
+# purge, say -- would then stop the SLICE matching, every test here would
+# die on a ValueError out of slice_between, and the mutation gate would
+# count that as the guard noticing. A harness that fails for its own reasons
+# cannot report on anything.
 STAGE_PURGE_BLOCK = ("# --- cloud-init, removed rather than left switched off",
-                     "apt-get purge -y ${CLOUD_PACKAGES}\nEOF")
+                     "\nEOF\n")
 
 # What `apt-get -s purge` prints for the two packages alone: `Purg` for what
 # it purges, one line each, in apt's own format. Anything else in that
@@ -2135,8 +2141,21 @@ def test_a_simulation_that_fails_stops_the_build(tmp_path):
     somebody had carefully written.
     """
     proc, log = run_stage_purge(
-        tmp_path, simulation="Reading package lists...\n", sim_rc=100,
-        sim_stderr="E: Unable to locate package rpi-cloud-init-mods")
+        tmp_path / "no-plan", simulation="Reading package lists...\n",
+        sim_rc=100, sim_stderr="E: Unable to locate package rpi-cloud-init-mods")
+    assert proc.returncode != 0, proc.stdout
+    assert "failed in the chroot" in proc.stderr, proc.stderr
+    assert_nothing_was_removed(log)
+
+    # And the case only the status check can catch, which is why it is not
+    # enough to require both names. An apt that printed a perfectly clean
+    # plan and then failed is synthetic -- real apt 2.8.3 fails before it
+    # prints -- but without it, dropping the status check leaves the refusal
+    # above still firing on the missing names and nothing goes red for the
+    # right reason.
+    proc, log = run_stage_purge(
+        tmp_path / "clean-plan", sim_rc=100,
+        sim_stderr="E: Sub-process returned an error code")
     assert proc.returncode != 0, proc.stdout
     assert "failed in the chroot" in proc.stderr, proc.stderr
     assert_nothing_was_removed(log)
@@ -4959,6 +4978,8 @@ def netplan_report(proc):
     """The netplan half of the first check's detail line."""
     line = [ln for ln in proc.stdout.splitlines()
             if "cloud-init-is-not-installed" in ln][0]
+    assert "netplan-renderer=" in line, \
+        f"the netplan report is no longer on the check line: {line}"
     return line[line.index("netplan-renderer="):]
 
 
