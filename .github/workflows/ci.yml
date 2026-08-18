@@ -110,7 +110,17 @@ jobs:
         env:
           SHELLCHECK_VERSION: v0.9.0
         run: |
-          curl -fsSL --retry 3 \
+          # --retry-all-errors, because plain --retry does not cover 403
+          # and 403 is what this download actually returns when it fails.
+          # Run 32168411327 got `curl: (22) The requested URL returned
+          # error: 403`, then `xz: (stdin): File format not recognized`
+          # as tar was handed the empty stream, and the job reported a
+          # shellcheck failure on a branch whose scripts shellcheck had
+          # never been run against. curl retries 408, 429 and the 5xx
+          # family on --retry alone; a rate-limited release download is
+          # none of those. Five tries with a delay, so a check that says
+          # "shellcheck failed" means shellcheck ran.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
             "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
             | tar -xJf - --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           ./shellcheck --version
@@ -130,23 +140,71 @@ jobs:
     # -- six rounds of reading the code did not, and a daemon did in four
     # seconds. See harness/README.md.
     runs-on: ubuntu-latest
-    # 18 so the pytest step's own `timeout 600` below always fires first:
-    # setup (apt, the cups stack, linux-modules-extra, pips, sim bring-up)
-    # runs ~2-4 minutes, so the inner cap lands by ~14 and the failure()
-    # diagnostics still have room. Under a cap smaller than setup + inner
-    # timeout, a hung test gets the JOB cancelled instead -- failure() is
-    # false on cancellation, so the CUPS error-log step is skipped and the
-    # hang loses its diagnosis. Found by the review panel: the previous
-    # 15 made the old inner `timeout 900` unreachable dead code.
-    timeout-minutes: 18
+    # The cap exists so the inner `timeout 600`s below always fire first:
+    # a job killed by GitHub's timeout is CANCELLED, failure() is false on
+    # cancellation, so the CUPS error-log step is skipped and the hang
+    # loses its diagnosis. Found by the review panel, which raised the
+    # then-15 that made an inner `timeout 900` unreachable dead code.
+    #
+    # 30, NOT 18, AND THE OLD NUMBER'S ARITHMETIC NEVER CLOSED. It was set
+    # against "setup runs ~2-4 minutes", which left ~14 for a harness step
+    # capped at 600s and a mutation step capped at another 600s -- twenty
+    # minutes of inner budget inside an eighteen-minute job. The invariant
+    # this paragraph asserts has been false since the second `timeout 600`
+    # was added; it went unnoticed because the two steps really take about
+    # 2m45s and 35s, so the inner caps never fired.
+    #
+    # What made it visible was the setup assumption breaking instead. Runs
+    # 32160857598 and 32162479196 spent 15m27s in the apt step -- the same
+    # step takes 35s on master (run 32083989974) -- and the job was
+    # cancelled at 18m40s with the harness half-run and the CUPS log step
+    # skipped, exactly as the paragraph above warns. Nothing was wrong with
+    # the tests: `linux-modules-extra` is the biggest download in this
+    # workflow and the runner's throughput had collapsed, with the vm job's
+    # QEMU install slowing 16s -> 79s in the same window.
+    #
+    # So setup gets its own cap below rather than silently eating the test
+    # budget, and this number is now setup (8) + both inner caps (10 + 10)
+    # + room for the failure() diagnostics. A wedged job costs more minutes
+    # than it did; an anonymous cancellation that loses the evidence costs
+    # an afternoon.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install CUPS, the panel libraries and the simulators
+        # Setup is not test time and must not be spent out of the test
+        # budget. Measured at 35s on a healthy runner; 8 minutes is a wide
+        # margin that still fails a collapsed mirror with THIS step's name
+        # on it, in eight minutes, instead of anonymously cancelling the
+        # job twenty minutes later with the diagnostics skipped.
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
+          # RETRIES AND A TIMEOUT, because the default is neither. The
+          # runners resolve the archive through /etc/apt/apt-mirrors.txt
+          # with azure.archive.ubuntu.com first, and on 2026-08-18 that
+          # host stopped answering: run 32166657980 logged `Ign:` for
+          # every suite on it, fell back to archive.ubuntu.com, fetched
+          # the four InRelease files at 17:39:03-04 and then sat in
+          # silence until the step was killed at 17:46:37. Seven and a
+          # half minutes of nothing, in `update`, before a single package
+          # was downloaded. apt's default http timeout is 120s per
+          # connection with no retry, and a mirror that accepts a socket
+          # and then stops talking can hold each index for the full two
+          # minutes; the earlier runs 32160857598 and 32162479196 spent
+          # 15m27s here the same way and were read as "a slow download",
+          # which they were not.
+          #
+          # 15s and three tries turns a dead mirror into a fast failure
+          # and, where a mirror is merely unhealthy, into a retry that
+          # usually lands. It cannot make a genuinely absent archive
+          # work, and it is not meant to: the step cap above is what
+          # says so out loud.
+          sudo apt-get -o Acquire::Retries=3 \
+                       -o Acquire::http::Timeout=15 \
+                       -o Acquire::https::Timeout=15 update
           # cups for the print path; the rest is what the unit imports on a
           # real Pi, so the panel code can be exercised rather than skipped.
           sudo apt-get install -y --no-install-recommends \
@@ -376,16 +434,30 @@ jobs:
     # taking tty1 from getty is ever observed -- pi-gen never boots the
     # image it builds, and a container has no virtual terminals.
     runs-on: ubuntu-latest
-    # 15, not 45. The script's own timeout is 600s and MUST fire
-    # first: a job killed by GitHub's timeout skips its remaining
-    # steps, so the console dump and the verdict would never run and
-    # the diagnosis would be lost. This is the outer backstop only.
-    timeout-minutes: 15
+    # 20, not 45 and no longer 15. The script's own timeout is 600s and
+    # MUST fire first: a job killed by GitHub's timeout skips its
+    # remaining steps, so the console dump and the verdict would never
+    # run and the diagnosis would be lost. This is the outer backstop
+    # only. 15 held that invariant only while the QEMU install stayed
+    # near its usual 16s -- it reached 79s in the same window that took
+    # the hardware job's apt step to 15m27s, and this job was cancelled
+    # at 15m19s on run 32160857598 with its console dump skipped. Setup
+    # is capped separately below for the same reason it is there.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install QEMU
+        # See the hardware job: setup is not test time. 16s healthy, 79s
+        # in the slow window, 8 minutes before it is called a mirror
+        # problem rather than being taken out of the boot's budget.
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
+          # Retries and a timeout, for the reason spelled out against the
+          # hardware job's update above: this job was killed by the same
+          # stalled mirror in the same run.
+          sudo apt-get -o Acquire::Retries=3 \
+                       -o Acquire::http::Timeout=15 \
+                       -o Acquire::https::Timeout=15 update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 qemu-utils cloud-image-utils
           # KVM turns half an hour of emulation into a few minutes. Not
