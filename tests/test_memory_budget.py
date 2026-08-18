@@ -363,10 +363,18 @@ def measured():
 
     Module-scoped deliberately: a 1000-page pad is ~2.7 seconds, and three
     tests want the same number. Nothing here mutates the result.
+
+    The other two formats are measured at the SAME page count as a6-1000,
+    out of the same dict, because the only thing that makes them comparable
+    is that every argument except the format is identical -- and a page
+    count written twice is a page count that can drift apart. See
+    test_a6_is_still_the_worst_format for why it is 1000 and not 200.
     """
     return {
         "a6-250": pad(250),
         "a6-1000": pad(1000),
+        "a4-1000": pad(1000, paper="A4"),
+        "a7-1000": pad(1000, a7=True),
         "submit-1000": child(_SUBMIT_BODY.format(pages=1000)),
     }
 
@@ -479,20 +487,49 @@ def test_a6_is_still_the_worst_format(measured):
     the headline gets retargeted -- rather than quietly measuring the
     second-worst case for ever after.
 
-    200 pages, not 1000: the ORDER is what is being asserted, and it is
-    established well before the sizes stop being cheap.
+    1000 pages, not 200, AND THE REASON IS A RED RUN ON HEALTHY CODE.
+    This used to measure 200 pages, on the argument that the order is
+    established well before the sizes stop being cheap. The order is --
+    but not by enough to survive a noisy machine. Run 32160857598 failed
+    it on a GitHub runner with A6=31.56, A4=31.25: A6 still the worst
+    format, separation 0.31 MiB, against a margin of 0.5. Nothing in that
+    pull request touched the PDF path.
+
+    Peak RSS is the noisy part. What separates the formats is PDF page
+    objects -- A4 imposes four pad pages per sheet and A7 two, so the same
+    pad is a quarter or a half as many objects -- and that difference
+    scales with the page count while the noise does not. Measured on this
+    container, six repetitions at 200 and two at each of the others:
+
+        pages   A6 - runner-up          three pads cost
+          200   0.85 .. 1.20 MiB        2.4s
+          500   2.16 .. 2.77 MiB        4.3s
+         1000   5.60 .. 6.44 MiB        7.1s
+
+    So the fix is not a smaller margin, which would only make a real
+    narrowing invisible; it is a bigger signal. At 1000 pages -- which is
+    also max(config.PAGE_CHOICES), the case the headline is taken at --
+    the separation is ~6 MiB against a few tenths of noise, and A6 and
+    a6-1000 are the same measurement, so this costs two extra pads rather
+    than three.
+
+    If the ordering ever inverts, this goes red and the headline gets
+    retargeted -- rather than quietly measuring the second-worst case for
+    ever after.
     """
     peaks = {
-        "A6": pad(200, paper="A6")["peak"],
-        "A4": pad(200, paper="A4")["peak"],
-        "A7": pad(200, a7=True)["peak"],
+        "A6": measured["a6-1000"]["peak"],
+        "A4": measured["a4-1000"]["peak"],
+        "A7": measured["a7-1000"]["peak"],
     }
     runner_up = max(v for k, v in peaks.items() if k != "A6")
-    # STRICT, and by a stated margin. `==  max(...)` was satisfied by a
-    # tie, so the ordering could collapse to equality -- the point at
-    # which A6 stops being the worst case -- without going red. Measured
-    # separation is ~1.1 MiB against ~0.2 MiB of run-to-run noise.
-    assert peaks["A6"] > runner_up + 0.5, peaks
+    # STRICT, and by a stated margin. `== max(...)` was satisfied by a tie,
+    # so the ordering could collapse to equality -- the point at which A6
+    # stops being the worst case -- without going red. 2.0 MiB is a third
+    # of the measured separation: it still catches a collapse most of the
+    # way to equality, and it is an order of magnitude above the noise that
+    # produced the red run above.
+    assert peaks["A6"] > runner_up + 2.0, peaks
 
 
 def test_a_present_trng_does_not_change_the_shape_of_the_cost():
