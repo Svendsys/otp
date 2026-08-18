@@ -429,6 +429,17 @@ words, into the body of a tagged release. The concluding line is now
 conditional on the phases that actually ran as well, so the two guards
 have to fail together for the claim to be wrong.
 
+**And it may not reorder them either.** The guard used to check membership
+only, so `OTP_IMG_PHASES="boot1 release boot2"` was accepted — and the
+`release` phase deletes the probe's two records from the card *before* it
+boots, so boot 2 would then be reading records that were no longer there.
+No mis-ordering produces a green run; every one of them ends red. What the
+order check buys is *where* the red lands: without it a fault in an
+environment variable arrives forty minutes later as `boot2`'s machine-id
+failing to match, with a message pointing at the image. It is the relative
+order of the three demanded phases, so an extra phase nobody here has heard
+of still passes through exactly as it did before.
+
 **`release` is demanded for a different reason, and it is the ugliest one on
 that list: dropping it makes nothing go red.** `boot1` and `boot2` *report* —
 take one away and named guest checks go missing and the run says so. The
@@ -487,7 +498,7 @@ prints all produce exactly the silence a healthy release boot produces.
 | `probe-droppings-were-on-the-card` | the two records **were** there to delete | this is the control |
 | `probe-droppings-stayed-off-the-card` | they are gone before the boot and gone after it | the clause above |
 | `boot-partition-unchanged` | the FAT listing is identical either side, sorted | `boot-partition-listed` (kernel8.img) says the listing is a listing |
-| `identity-store-unchanged` | `otp-unit.conf`, the machine-id and the credential digest to the same 64 characters either side | `absent` on either side fails: two files that are not there have equal digests |
+| `identity-store-unchanged` | `otp-unit.conf`, the machine-id and the credential digest to the same 64 characters either side | `absent` **and** `empty` on either side fail: two files that are not there have equal digests, and so do two files truncated to nothing |
 | `release-boot-is-not-a-first-boot` | no `first-boot-complete.target`, so the persisted machine-id is still readable | `first-boot-really-was-a-first-boot` in boot 1 |
 
 **`imgcheck-unit-considered-and-skipped` is the clause the phase exists for.**
@@ -496,27 +507,58 @@ from it — no output, no tag, no queue, nothing on the card. Without this one,
 removing the probe would make the phase **greener**, which is the exact
 inversion of the decision it is here to back.
 
-Its wording comes out of systemd's source rather than out of anybody's memory.
-`src/core/job.c` in v257 (trixie's, and this image's) builds the message in
-`job_emit_done_message()`: a start job that finished `JOB_DONE` with
-`u->condition_result` false takes `"%s was skipped because of an unmet
-condition check (%s=%s%s)."` when `unit_find_failed_condition()` returns a
-non-trigger condition — which ours is, one `ConditionKernelCommandLine=` and no
-trigger — and the generic `"Condition check resulted in %s being skipped."`
-when it returns nothing. The same three strings are in the systemd 255 binary
-this was written against (`strings libsystemd-core-255.so`). The gate accepts
-either wording and requires the unit's **name** on the line, which is the part
-that is not a matter of prose: `%s` is `unit_status_string()`, and this image
-demonstrably runs the combined format — run 12's success line is `Started
-ESC[0;1;39motp-unit.serviceESC[0m - OTP pad print unit.` The exact line is
-quoted back as an `IMG-NOTE`, so the narrower form becomes promotable to a
-gate of its own once a real boot has printed it — the same report-then-gate
-ladder `multi-user.target` and the `hwrng` line came up.
+Its wording comes out of systemd's source rather than out of anybody's memory
+— and out of a **console**, which is not the same thing and is what corrected
+it. `src/core/job.c` builds the message in `job_emit_done_message()`: a start
+job that finished `JOB_DONE` with `u->condition_result` false takes the
+condition wording when `unit_find_failed_condition()` returns a non-trigger
+condition — which ours is, one `ConditionKernelCommandLine=` and no trigger —
+and the generic `"Condition check resulted in %s being skipped."` when it
+returns nothing.
 
-That same clause is why `journal-forwarding-alive` has anything to stand on.
-`job.c` sets `do_console = false` for a condition skip, so the sentence is
-*never* printed as a `[ INFO ]` status line: it reaches a serial port through
-the journal or not at all.
+**The condition wording changed after v258, and this image runs the newer
+one.** The gate was built against v257's `"%s was skipped because of an unmet
+condition check (%s=%s%s)."`, corroborated against the systemd 255 binary in
+the build container, and the claim that the image ran v257 was never checked
+against the image. Run 32180661689 — the release phase's first execution on a
+machine — failed this clause while every other release clause passed, and the
+diagnostic printed what was really on the console:
+
+```
+systemd[1]: otp-unit-imgcheck.service - Report the overlay root to the
+tier-3 image boot skipped, unmet condition check
+ConditionKernelCommandLine=otp.imgcheck
+```
+
+That is `main`'s wording, `"%s skipped, unmet condition check %s=%s%s"`. The
+gate accepts all **three** forms now — both condition wordings and the generic
+fallback — because pinning to any one of them is a gate that goes red the day
+the base image moves. What it requires is the unit's **name** on the line,
+which is the part that is not a matter of prose: `%s` is
+`unit_status_string()`, and this image demonstrably runs the combined format —
+run 12's success line is `Started ESC[0;1;39motp-unit.serviceESC[0m - OTP pad
+print unit.`
+
+**And the promotion happened.** The narrower parenthetical was reported as an
+`IMG-NOTE` rather than gated, on the report-then-gate ladder
+`multi-user.target` and the `hwrng` line came up; the run above printed it, so
+when the line names a condition that condition is now required to be
+`ConditionKernelCommandLine=otp.imgcheck` — the difference between "systemd
+skipped this unit" and "systemd skipped it because our token was absent". The
+requirement is conditional on the parameter being there at all, since the
+generic wording carries none. That makes the `IMG-NOTE` load-bearing, which is
+why its `cut` is 400 characters and not 200: the longest line this unit can
+produce measures 194, and a test re-derives both wordings from
+`device/systemd/otp-unit-imgcheck.service` and goes red while there is still
+room.
+
+This clause is **not** a second proof that journal forwarding works, and an
+earlier version of this paragraph said it was. `job.c` does set
+`do_console = false` for a condition skip, so the sentence is never printed as
+a `[ INFO ]` status line — but it speaks as `systemd[1]`, and PID 1 falls back
+to `/dev/kmsg` when journald is not up, which at this harness's `loglevel=7`
+reaches the console. `journal-forwarding-alive` is what says forwarding works,
+out of a speaker that is not PID 1, and it is not relieved of the job by this.
 
 **The deletion is what makes the file half falsifiable.** Both records are on
 the card when boot 2 ends, so *"no new file appeared"* would be true of a
@@ -525,6 +567,30 @@ to. The harness `mdel`s them off between boot 2 and this boot, takes a listing
 first as the control, and then requires them absent at both ends. If boots 1
 and 2 ever stop writing them, the phase goes red rather than quietly asserting
 an absence it was handed for free.
+
+**The four functions that read and write the card are driven against a real
+card.** `fat_listing`, `fat_digest_of`, `fat_digests` and
+`strip_probe_droppings` sit above the block `tests/test_img_verdict.py` slices
+the verdict out of, and the verdict tests write the listings and the digest
+files directly — so for as long as that was the whole story, nothing in the
+suite ever ran them. Rewriting `fat_digest_of` so that every file digested to
+the same sixty-four hex characters left the suite passing and would have
+reported `identity-store-unchanged PASS` at runtime forever. The tests now
+build a FAT partition with `mformat`/`mcopy` at a 1 MiB offset, run the
+shipped functions against it, and compare the digests with `sha256` taken in
+Python over the exact bytes. That needs **mtools**, which `ci.yml` installs in
+the `test` and `mutation` jobs; without it those tests skip and
+`mutation_gate.py` fails the rows that name them rather than passing them.
+
+**The digest is of the bytes, which it was not.** `body=$(mtype …)` strips
+every trailing newline, so `pages=137\n` and `pages=137\n\n\n` both digested
+to `e01a5660…` while `sha256` of the real bytes is `30efb6d3…` — two different
+files, one digest, under a release note saying these three came through the
+boot *unchanged byte for byte*. A present zero-length file read `absent`,
+which is the "there has never been a credential" misreading the sentinel
+exists to prevent, arriving in the detail line. `mtype` now writes to a file
+and its exit status separates the three cases: `absent` (rc 1), `empty` (rc 0,
+zero bytes) and a digest. Neither word is 64 characters, so both stay red.
 
 **One thing here is a fingerprint check and not a queue check, and it says so
 in the code.** The probe creates a CUPS queue called `otpimgcheck`, and
