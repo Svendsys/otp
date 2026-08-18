@@ -132,7 +132,13 @@ class UinputKeyboard:
                 continue
             try:
                 events = list(self.device.read())
-            except (OSError, BlockingIOError):
+            except BlockingIOError:
+                # select() can wake with nothing to hand over. Returning
+                # here would end the bridge on a spurious wakeup and every
+                # press after it would time out in press() below, blaming
+                # the kernel for a thread this loop killed itself.
+                continue
+            except OSError:                      # the device went away
                 return
             for event in events:
                 if event.type != ecodes.EV_KEY:
@@ -184,10 +190,15 @@ class UinputKeyboard:
             time.sleep(0.005)
 
     def close(self):
+        # Stop reading before closing what is being read: the loop above
+        # selects on this descriptor, and pulling it out from under a
+        # blocked select is how a teardown turns into a hang.
         self._stop.set()
         self._thread.join(timeout=2)
         try:
             self.device.close()
-        except OSError:
+        except Exception:                        # noqa: BLE001
+            # UInput.close() closes the device too, so a second close is
+            # expected to be a no-op and is allowed to be anything.
             pass
         self._uinput.close()
