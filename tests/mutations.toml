@@ -1573,6 +1573,230 @@ find = ''': > /etc/cloud/cloud-init.disabled'''
 replace = ''': > /etc/cloud/cloud-init.enabled'''
 
 
+# --- the provisioning agent that was on every image (issue #34) -----------
+#
+# ENABLE_CLOUD_INIT=0 guarded the seed files and nothing else, so cloud-init
+# and rpi-cloud-init-mods went onto every image this project built. The stage
+# purges them and install.sh still writes the kill switch. These rows are the
+# ways that can quietly stop being true: a purge that only simulated, a
+# refusal that cannot fire, an absence read through a tool that has stopped
+# answering, and a marker file nothing looks for.
+
+[[mutation]]
+name = "stage-cloud-init-only-simulated"
+tier = "fast"
+guard = """
+The purge itself. A build that ran the simulation and never the removal
+ships the packages -- with the console saying nothing, because the
+simulation is the quiet half -- and the image goes back to carrying a
+provisioning agent aimed at /boot/firmware. The stage's apt log is read for
+both calls and for which of them carried -s."""
+tests = [
+  "tests/test_overlay_root.py::test_the_stage_purges_both_cloud_init_packages",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''apt-get purge -y ${CLOUD_PACKAGES}'''
+replace = '''apt-get -s purge -y ${CLOUD_PACKAGES}'''
+
+
+[[mutation]]
+name = "stage-purge-refusal-cannot-fire"
+tier = "fast"
+guard = """
+`apt-get purge -y` removes reverse dependencies without a prompt. Nothing in
+either archive depends on these two today, but an index is not the rootfs,
+and a dependent deleted out of a key printer's image surfaces as a unit that
+no longer boots, two emulated boots later. The refusal is the only thing
+standing between those two facts."""
+tests = [
+  "tests/test_overlay_root.py::test_a_purge_that_would_take_something_else_stops_the_build",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''	if [ -n "\$unexpected" ]; then'''
+replace = '''	if false; then'''
+
+
+[[mutation]]
+name = "stage-purge-counts-only-the-purges"
+tier = "fast"
+guard = """
+`Remv` and `Purg` are different words in apt's simulation and both are a
+removal: apt prints the first for a package it takes out on the way to the
+ones it was asked about, which is precisely the dependent the refusal above
+exists for. A filter reading only `Purg` lets it through."""
+tests = [
+  "tests/test_overlay_root.py::test_a_package_apt_merely_removes_counts_too",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''	             | awk '\$1 == "Remv" || \$1 == "Purg" { print \$2 }' \'''
+replace = '''	             | awk '\$1 == "Purg" { print \$2 }' \'''
+
+
+[[mutation]]
+name = "guest-cloud-init-packages-not-asked"
+tier = "fast"
+guard = """
+dpkg is the purge's own gate, and the only clause that can tell a purge from
+a remove. `config-files` leaves rpi-cloud-init-mods'
+/etc/cloud/cloud.cfg.d/99_raspberry-pi.cfg on the card -- the file that
+points the NoCloud datasource at file:///boot/firmware -- so anything that
+brought the package back would come back already aimed at the partition an
+operator is told to write files on."""
+tests = [
+  "tests/test_overlay_root.py::test_a_cloud_init_still_installed_fails",
+  "tests/test_overlay_root.py::test_a_removed_but_not_purged_cloud_init_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ -z "$CI_INSTALLED" ] && [ "$CI_CONTROL_STATUS" = installed ] \'''
+replace = '''      "$(if [ "$CI_CONTROL_STATUS" = installed ] \'''
+
+
+[[mutation]]
+name = "guest-cloud-init-units-not-asked"
+tier = "fast"
+guard = """
+dpkg does not imply systemd. A unit file dropped into /etc/systemd/system by
+hand, or a package reinstalled from a local .deb, gives systemd a
+cloud-init.target that dpkg has no opinion about -- and cloud-init.target is
+what pulled network-online.target into the transaction that ended both boots
+of run 31968966879 with neither reaching multi-user.target."""
+tests = [
+  "tests/test_overlay_root.py::test_a_cloud_init_unit_systemd_still_knows_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''            && [ -z "$CI_LOADED" ] && [ "$CI_CONTROL_LOAD" = loaded ] \'''
+replace = '''            && [ "$CI_CONTROL_LOAD" = loaded ] \'''
+
+
+[[mutation]]
+name = "guest-cloud-init-generator-not-asked"
+tier = "fast"
+guard = """
+The generator is the thing that puts cloud-init.target into the boot
+transaction, it runs out of /usr/lib whether or not any unit is enabled, and
+it is what reads the kill switch by way of ds-identify. A purge that left it
+behind is a purge that did not happen."""
+tests = [
+  "tests/test_overlay_root.py::test_a_generator_left_behind_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''            && [ ! -e "$CI_GENERATOR" ] \
+'''
+replace = ''''''
+
+
+[[mutation]]
+name = "guest-cloud-init-dpkg-control-dropped"
+tier = "fast"
+guard = """
+Every clause of this check but one is an ABSENCE, and a dpkg-query that has
+stopped answering produces all of them at once on a machine with cloud-init
+installed -- on a machine, moreover, whose /usr the purge has just edited.
+The control is one package this appliance cannot boot without, asked through
+the same query and required to come back `installed`."""
+tests = [
+  "tests/test_overlay_root.py::test_the_absences_need_their_positive_controls",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ -z "$CI_INSTALLED" ] && [ "$CI_CONTROL_STATUS" = installed ] \'''
+replace = '''      "$(if [ -z "$CI_INSTALLED" ] \'''
+
+
+[[mutation]]
+name = "guest-cloud-init-systemd-control-dropped"
+tier = "fast"
+guard = """
+The same hole one tool over: a systemctl that answers nothing reports every
+cloud-init unit `not-found`, which is exactly what a purged machine reports.
+The control is otp-unit.service, the unit this whole tier is about, read
+through the same `systemctl show`."""
+tests = [
+  "tests/test_overlay_root.py::test_the_absences_need_their_positive_controls",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''            && [ -z "$CI_LOADED" ] && [ "$CI_CONTROL_LOAD" = loaded ] \'''
+replace = '''            && [ -z "$CI_LOADED" ] \'''
+
+
+[[mutation]]
+name = "guest-cloud-init-generator-control-dropped"
+tier = "fast"
+guard = """
+And once more for the filesystem read: a generator directory that is not
+there, or is not readable, holds no cloud-init-generator and no
+systemd-fstab-generator either. systemd's own generators live in it, so a
+listing that comes back empty is a wrong path rather than a purge."""
+tests = [
+  "tests/test_overlay_root.py::test_the_absences_need_their_positive_controls",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''            && [ "${CI_GENERATOR_SIBLINGS:-0}" -gt 0 ] 2>/dev/null; \'''
+replace = '''            ; \'''
+
+
+[[mutation]]
+name = "guest-kill-switch-accepts-anything-at-the-path"
+tier = "fast"
+guard = """
+The shape ds-identify requires, not merely the name. cloud-init 25.2's
+`is_disabled()` is `[ -f /etc/cloud/cloud-init.disabled ]`, so a directory of
+that name is not a kill switch at all while satisfying `-e` perfectly -- and
+a marker that disables nothing is worse than none, because the comment
+beside it says the machine is protected."""
+tests = [
+  "tests/test_overlay_root.py::test_a_kill_switch_that_is_not_a_regular_file_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''CI_DISABLED_IS_FILE=$(yesno test -f "$CI_DISABLED")'''
+replace = '''CI_DISABLED_IS_FILE=$(yesno test -e "$CI_DISABLED")'''
+
+
+[[mutation]]
+name = "guest-cloud-init-netplan-not-reported"
+tier = "fast"
+guard = """
+The one file rpi-cloud-init-mods ships that is not cloud-init's own is
+netplan's renderer default, and it goes with the purge. There is no property
+to gate on -- this appliance needs no network at all -- so the console line
+is the whole of the evidence that removing it broke nothing, and a report
+nobody asserts is a report that quietly stops being printed."""
+tests = [
+  "tests/test_overlay_root.py::test_the_probe_reports_what_the_purge_did_to_netplan",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = ''' | netplan-renderer=$(yesno test -e "$CI_NETPLAN_RENDERER") NetworkManager=$(systemctl is-active NetworkManager.service 2>&1 || true)"'''
+replace = '''"'''
+
+
+[[mutation]]
+name = "tier3-cloud-init-checks-not-required"
+tier = "fast"
+guard = """
+The named-check gate over the purge and the marker. Drop the names and both
+boots go on passing everything else while the image quietly carries a
+provisioning agent again -- the same shape as row 4 of issue #14, which is
+why the names are listed here as well as counted."""
+tests = [
+  "tests/test_img_verdict.py::test_the_harness_and_the_guest_agree_on_which_checks_exist",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''cloud-init-is-not-installed cloud-init-kill-switch-survives-the-purge \
+'''
+replace = ''''''
+
+
 [[mutation]]
 name = "install-summary-hides-a-machine-wide-change"
 tier = "fast"
