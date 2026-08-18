@@ -26,12 +26,31 @@ Before=shutdown.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/opt/otp-unit/persist-identity.sh
-# The journal is volatile and, under the tier-3 harness, forwarded to the
-# serial console -- so what this says about a failed restore is readable
-# where it matters. StandardError only: a healthy run's notes are worth
-# having, and it writes them all to stderr.
+# StandardError only: a healthy run's notes are worth having, and the script
+# writes them all to stderr.
+#
+# AND ON THE CONSOLE, WHICH IS THE HALF THAT WAS MISSING. The journal alone
+# reaches nobody on a shipped unit: device/install.sh sets Storage=volatile so
+# it dies with the power, and systemd.journald.forward_to_console=1 is on the
+# tier-3 harness's kernel command line and NOT in the image's cmdline.txt --
+# deliberately, because a device that prints one-time pads must not narrate
+# every unit's output to whoever is watching the serial header. So what this
+# script said about a refused restore was readable only under emulation, on
+# the one machine whose operator may be locked out of the shell that could
+# have read it.
+#
+# journal+console is the narrowest fix available: it puts THIS unit's stderr
+# on /dev/console and leaves every other unit quiet. It runs at sysinit,
+# before any getty and before otp-unit.service takes tty1, so the notes are on
+# the screen during the boot and nothing has to be logged in to see them. The
+# script prints no hash -- only lengths -- and strips the one card-controlled
+# string it quotes back, so there is nothing here a console must not carry.
+#
+# The screen is gone the moment the front panel starts, which is why
+# persist-identity.sh also leaves every refusal in a file on the boot
+# partition: see CRED_NOTE there.
 StandardOutput=journal
-StandardError=journal
+StandardError=journal+console
 
 [Install]
 WantedBy=sysinit.target

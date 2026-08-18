@@ -660,6 +660,43 @@ USERCONF_USER=otp
 USERCONF_SALT='$6$otpimgcheck$'
 USERCONF_SERVICE=/usr/lib/userconf-pi/userconf-service
 
+# --- and where that credential is kept, now that it is kept ---------------
+
+# WHAT CHANGED. The seed used to last exactly one boot: `chpasswd -e` writes
+# to /etc/shadow, /etc is inside the overlay, and userconf-service deletes the
+# seed from the FAT partition as the last step of applying it. The owner's
+# decision is to persist it, so device/persist-identity.sh records the applied
+# hash here from the wizard's own ExecStartPost and restores it at sysinit.
+# These are the checks that say whether any of that happened on the machine.
+CRED_STORE="$IDENTITY_STORE/credential"
+
+# A PROBE-OWNED RECORD, for the reason $MACHINE_ID_RECORD is one: the store is
+# the thing under test, and boot2 comparing the live hash against a store that
+# boot2 itself could have refilled is a comparison with no power cycle in it.
+# This file is written once, in boot1, before the power goes off.
+CRED_RECORD="$BOOTDIR/otp-imgcheck-credential"
+
+# THE HASH IS NEVER PRINTED AND NEVER COPIED. This console is uploaded as a CI
+# artifact and a password hash is offline-crackable at leisure, so what
+# travels between the boots is a sha256 of it: equal exactly when the hashes
+# are equal, and no use to anyone who reads it. The digest is not a new
+# exposure either -- the hash it covers is already on this same partition, in
+# full, in the store being audited.
+#
+# 64 CHARACTERS OR IT DID NOT HAPPEN. A missing sha256sum, an unreadable
+# /etc/shadow or an empty argument all produce the empty string, and two empty
+# strings compare equal -- which is exactly how "the credential survived"
+# would come to mean "there was never a credential". Every check below
+# requires the length as well as the match.
+cred_digest() {
+    [ -n "${1:-}" ] || return 0
+    printf '%s' "$1" | sha256sum 2>/dev/null | cut -d' ' -f1
+}
+
+cred_short() {
+    if [ "${#1}" = 64 ]; then printf '%s...' "${1:0:12}"; else printf 'nothing'; fi
+}
+
 # POLLED UNTIL SYSTEMD HAS DEALT WITH THE UNIT, not for a fixed few seconds.
 # Nothing orders this probe after userconfig.service -- the two run in the
 # same stretch of a boot -- and "systemd has not looked at it yet" and
@@ -823,6 +860,63 @@ if [ "$PHASE" = "boot1" ]; then
           "$(if [ "$PANEL" = active ] && [ "$TTY1" != active ] \
                 && [ "${TTY1_JOBS:-1}" = 0 ]; then echo yes; else echo no; fi)" \
           "otp-unit=$PANEL getty@tty1=$TTY1 getty-jobs=${TTY1_JOBS:-?}"
+
+    # AND THE APPLY WAS WRITTEN DOWN SOMEWHERE THE POWER CANNOT REACH.
+    #
+    # Everything in this phase so far is about the hash arriving in
+    # /etc/shadow, and /etc/shadow is inside the overlay -- so all of it was
+    # equally true of the image that lost the password at the power cycle.
+    # This is the check that tells the two apart from inside boot1, before
+    # boot2 exists to say anything.
+    #
+    # FOUR CLAUSES, and each one closes a way the store can look right while
+    # being useless:
+    #
+    #   - $UC_APPLIED, so the hash under discussion is the SEEDED one. Only
+    #     the harness's seed carries $USERCONF_SALT; pi-gen's FIRST_USER_PASS
+    #     is hashed with a random salt, so a store full of the build-time
+    #     password would satisfy every other clause here.
+    #   - the store names the account the seed named, because `chpasswd` takes
+    #     `user:hash` and a store naming somebody else restores nothing.
+    #   - the digests match AND are 64 characters, which is what makes this a
+    #     comparison rather than two absences agreeing.
+    #   - the store is not on the root's filesystem. Without that clause an
+    #     unmounted /boot/firmware gives a store in the overlay's tmpfs that
+    #     agrees with /etc/shadow perfectly, on every boot, while nothing
+    #     survives any of them. Same reasoning, same $STORE_SRC, as
+    #     machine-id-persisted-outside-the-overlay above.
+    CRED_KEPT=$(tr -d '\n\r' < "$CRED_STORE" 2>/dev/null)
+    CRED_KEPT_USER=${CRED_KEPT%%:*}
+    CRED_KEPT_HASH=${CRED_KEPT#*:}
+    # No colon at all means no hash, rather than the whole line being one.
+    [ "$CRED_KEPT_USER" != "$CRED_KEPT" ] || CRED_KEPT_HASH=""
+    CRED_LIVE_DIGEST=$(cred_digest "$UC_SHADOW")
+    CRED_KEPT_DIGEST=$(cred_digest "$CRED_KEPT_HASH")
+    check credential-recorded-outside-the-overlay \
+          "$(if [ "$UC_APPLIED" = yes ] \
+                && [ "$CRED_KEPT_USER" = "$USERCONF_USER" ] \
+                && [ "${#CRED_LIVE_DIGEST}" = 64 ] \
+                && [ "$CRED_KEPT_DIGEST" = "$CRED_LIVE_DIGEST" ] \
+                && [ "$STORE_SRC" != "?" ] && [ -n "$ROOT_SOURCE" ] \
+                && [ "$STORE_SRC" != "$ROOT_SOURCE" ]; \
+             then echo yes; else echo no; fi)" \
+          "$CRED_STORE user=${CRED_KEPT_USER:-none} kept=$(cred_short "$CRED_KEPT_DIGEST") live=$(cred_short "$CRED_LIVE_DIGEST") applied=$UC_APPLIED src=$STORE_SRC root-src=${ROOT_SOURCE:-?}"
+
+    # THE POSITIVE CONTROL boot2's claim rests on, written with the same
+    # variable boot2 will read. "the password is the same across the power
+    # cycle" is satisfied perfectly by a machine with no readable /etc/shadow
+    # in either boot and a record file that was never written -- the two-
+    # absence hole the review caught on the machine-id side, arriving here.
+    # So boot1 states, out of the hash it has just watched being applied:
+    # there WAS a credential, it was the seeded one, and this file holds a
+    # digest of it that reads back byte for byte.
+    printf '%s\n' "$CRED_LIVE_DIGEST" > "$CRED_RECORD" 2>/dev/null || true
+    CRED_READBACK=$(tr -d '\n\r' < "$CRED_RECORD" 2>/dev/null)
+    check credential-recorded-for-the-next-boot \
+          "$(if [ "$UC_APPLIED" = yes ] && [ "${#CRED_LIVE_DIGEST}" = 64 ] \
+                && [ "$CRED_READBACK" = "$CRED_LIVE_DIGEST" ]; \
+             then echo yes; else echo no; fi)" \
+          "this boot: $(cred_short "$CRED_LIVE_DIGEST") | read back from $CRED_RECORD: $(cred_short "$CRED_READBACK")"
 fi
 
 if [ "$PHASE" = "boot2" ]; then
@@ -862,6 +956,137 @@ if [ "$PHASE" = "boot2" ]; then
     check userconf-wizard-cannot-prompt \
           "$(if [ "$UC_STDIN" = null ]; then echo yes; else echo no; fi)" \
           "StandardInput=${UC_STDIN:-unset}"
+
+    # --- and the operator can still log in ---------------------------------
+    #
+    # THE PROPERTY THE WHOLE CHANGE IS FOR, and before it there was nothing
+    # here to check: boot1 applied the seed, boot2 came up with pi-gen's
+    # random FIRST_USER_PASS, and the file that could have reapplied it was
+    # deleted by the boot that consumed it. This device can be connected to a
+    # keyboard and a screen, so that is the difference between a recoverable
+    # unit and one nobody can get into.
+    #
+    # BEFORE THE MALFORMED-SEED EXPERIMENT BELOW, deliberately: that block
+    # writes a userconf.txt of its own onto the card, and one of the clauses
+    # here is that there is no seed on this boot for the password to have come
+    # from. Run them the other way round and the check reads its own fixture.
+    #
+    # FOUR CLAUSES AGAIN, and the same reasons:
+    #
+    #   - the salt marker, which is ATTRIBUTION. $USERCONF_SALT can only have
+    #     come from the seed boot1 consumed; pi-gen hashes FIRST_USER_PASS
+    #     with a random salt, so a machine that reverted cannot carry it.
+    #   - the digest matches boot1's record, which is INTEGRITY: a restore
+    #     that wrote a truncated or mangled hash would still start with the
+    #     salt.
+    #   - both digests are 64 characters, so this cannot be satisfied by two
+    #     absences. `credential-recorded-for-the-next-boot` in boot1 is what
+    #     rules out the recorded side with the same file and the same
+    #     variable.
+    #   - no seed is on the card, so the credential in force cannot be one
+    #     this boot was handed. That is the clause that makes it a statement
+    #     about a POWER CYCLE rather than about a wizard.
+    UC_SHADOW=$(awk -F: -v u="$USERCONF_USER" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
+    CRED_FROM_SEED=no
+    if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; then
+        CRED_FROM_SEED=yes
+    fi
+    CRED_LIVE_DIGEST=$(cred_digest "$UC_SHADOW")
+    CRED_BOOT1=$(tr -d '\n\r' < "$CRED_RECORD" 2>/dev/null)
+    check credential-survives-the-power-cycle \
+          "$(if [ "$CRED_FROM_SEED" = yes ] \
+                && [ "${#CRED_LIVE_DIGEST}" = 64 ] \
+                && [ "${#CRED_BOOT1}" = 64 ] \
+                && [ "$CRED_LIVE_DIGEST" = "$CRED_BOOT1" ] \
+                && [ ! -e "$BOOTDIR/userconf.txt" ] \
+                && [ ! -e "$BOOTDIR/userconf" ]; \
+             then echo yes; else echo no; fi)" \
+          "${USERCONF_USER}'s hash (${#UC_SHADOW} chars) begins $USERCONF_SALT: $CRED_FROM_SEED | boot1: $(cred_short "$CRED_BOOT1") | boot2: $(cred_short "$CRED_LIVE_DIGEST") | seed on the card: $(yesno test -e "$BOOTDIR/userconf.txt")"
+
+    # --- and a store that names the account the seed RENAMED ---------------
+    #
+    # THE ONE ARRANGEMENT THE SEEDED PATH ABOVE CANNOT PRODUCE, run as an
+    # experiment for exactly that reason.
+    #
+    # img-boot.sh seeds `otp`, which is image/build.sh's own FIRST_USER_NAME,
+    # and that is deliberate: it keeps userconf-pi's rename branch out of a
+    # boot whose subject is the apply. But an operator is told to write
+    # `username:hash` and is told nothing about which username, and
+    # /usr/lib/userconf-pi/userconf takes `getent passwd 1000`, RENAMES that
+    # account when the seed names another, and only then runs `chpasswd -e`.
+    # `rename_user` touches /etc/{passwd,shadow,group,gshadow,subuid,subgid,
+    # sudoers.d} and /home -- every one of them inside the read-only overlay
+    # -- so the rename dies with the power while the store on the FAT
+    # partition does not, and the next boot meets a store naming an account
+    # that no longer exists. Refusing it took the unit's only login away.
+    #
+    # WHAT IS SYNTHESISED AND WHAT IS NOT. The state after that power cycle
+    # is synthesised here -- the store is relabelled by hand -- because the
+    # alternative is seeding a different name in boot1, which would take the
+    # only end-to-end observation of the plain documented apply out of this
+    # tier to get it. Everything the state is then handed to is real: the
+    # shipped script this unit boots with, the real `chpasswd`, the real
+    # /etc/shadow, and the real store on the real FAT partition.
+    #
+    # NO HASH IS INVENTED AND NONE IS PRINTED. The "before" password is this
+    # unit's own hash with its last character changed, so the probe carries no
+    # credential of its own and the account is never given a password anyone
+    # holds; the mangled string is never printed, because it is the kept hash
+    # to within one byte. What travels to the console is sha256 digests, the
+    # way every other check in this block reports.
+    #
+    # AND THE EXPERIMENT PUTS THE CARD BACK BY ITSELF. Only the NAME in the
+    # store is changed, so a working restore rewrites it to the live account
+    # and re-applies the kept hash: both files end byte-for-byte as they were
+    # found. Nothing here needs undoing, and boot2's host-side
+    # credential-kept-on-the-card is looking at the same file afterwards.
+    # /etc/passwd read directly, and by UID, for the two reasons
+    # device/persist-identity.sh reads it that way: this appliance has no
+    # network and no NSS source but the file, and the account under discussion
+    # is the one holding UID 1000 whatever it is called.
+    CRED_LIVE_USER=$(awk -F: '$3 == 1000 { print $1; exit }' /etc/passwd 2>/dev/null)
+    # The name an operator following the Raspberry Pi documentation reaches
+    # for. This image is built with FIRST_USER_NAME='otp', so it is not an
+    # account here -- asserted below rather than assumed, because a fixture
+    # that names a real account is testing something else entirely.
+    CRED_OTHER_USER=pi
+    CRED_OTHER_EXISTS=$(awk -F: -v u="$CRED_OTHER_USER" \
+                        '$1 == u { print "yes"; exit }' /etc/passwd 2>/dev/null)
+    case "$UC_SHADOW" in
+        *Z) CRED_MANGLED="${UC_SHADOW%?}Y" ;;
+        *)  CRED_MANGLED="${UC_SHADOW%?}Z" ;;
+    esac
+    printf '%s:%s\n' "$CRED_LIVE_USER" "$CRED_MANGLED" | chpasswd -e 2>/dev/null || true
+    CRED_BEFORE=$(awk -F: -v u="$CRED_LIVE_USER" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
+    printf '%s:%s\n' "$CRED_OTHER_USER" "$UC_SHADOW" > "$CRED_STORE" 2>/dev/null || true
+    /opt/otp-unit/persist-identity.sh; CRED_RELABEL_RC=$?
+    CRED_AFTER=$(awk -F: -v u="$CRED_LIVE_USER" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
+    CRED_STORE_USER=$(cut -d: -f1 < "$CRED_STORE" 2>/dev/null | tr -d '\n\r')
+    #
+    # SIX CLAUSES, and the first three are about the fixture rather than the
+    # property -- without them "the password is the kept one" is satisfied by
+    # an experiment that never disturbed it:
+    #
+    #   - the name planted in the store is NOT an account on this machine, and
+    #     is not the UID-1000 account either, so this really is the mismatch;
+    #   - the password was DIFFERENT before the script ran, so the script is
+    #     what put it back and not the state it started in;
+    #   - the script exited 0, which is the half the refusal used to fail;
+    #   - the live UID-1000 account carries the kept hash, digest for digest
+    #     and 64 characters of it, which is the WORKING LOGIN;
+    #   - the store now names the live account, so the stale label does not
+    #     come back on every boot for the rest of the unit's life.
+    check credential-recovers-a-store-naming-another-account \
+          "$(if [ -n "$CRED_LIVE_USER" ] \
+                && [ -z "$CRED_OTHER_EXISTS" ] \
+                && [ "$CRED_OTHER_USER" != "$CRED_LIVE_USER" ] \
+                && [ -n "$CRED_BEFORE" ] && [ "$CRED_BEFORE" != "$UC_SHADOW" ] \
+                && [ "$CRED_RELABEL_RC" = 0 ] \
+                && [ "${#CRED_LIVE_DIGEST}" = 64 ] \
+                && [ "$(cred_digest "$CRED_AFTER")" = "$CRED_LIVE_DIGEST" ] \
+                && [ "$CRED_STORE_USER" = "$CRED_LIVE_USER" ]; \
+             then echo yes; else echo no; fi)" \
+          "store named $CRED_OTHER_USER (an account here: ${CRED_OTHER_EXISTS:-no}), uid-1000 is ${CRED_LIVE_USER:-none} | before: $(cred_short "$(cred_digest "$CRED_BEFORE")") | after: $(cred_short "$(cred_digest "$CRED_AFTER")") | kept: $(cred_short "$CRED_LIVE_DIGEST") | rc=$CRED_RELABEL_RC | store now names ${CRED_STORE_USER:-none}"
 
     # THE MALFORMED SEED, run by hand and not left on the card for the unit
     # to find at boot. Stock userconfig.service carries Restart=on-failure,

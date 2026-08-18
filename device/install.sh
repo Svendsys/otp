@@ -504,36 +504,67 @@ install -d /etc/cloud
 # userconf-service a malformed seed with stdin closed to see it end and
 # quarantine the file rather than hang. See harness/img-guest-check.sh.
 #
-# KNOWN, MEASURED, AND NOT YET DECIDED: THE SEED LASTS ONE BOOT. The apply
-# path is `chpasswd -e` into /etc/shadow. /etc is inside the read-only root
-# overlay this script installs below, so the new hash lives in the tmpfs and
-# dies with the power. The seed itself is on the FAT partition, which is
-# OUTSIDE the overlay, and userconf-service deletes it as the last step of a
-# successful apply -- so the one file that could reapply the credential is
-# destroyed by the boot that consumed it, and the account goes back to the
-# random FIRST_USER_PASS pi-gen generated at build time, which nobody has.
-# The operator gets a working password for exactly one boot.
+# THE SEED USED TO LAST ONE BOOT. MEASURED, THEN DECIDED, AND THE DECISION IS
+# "PERSIST IT". The apply path is `chpasswd -e` into /etc/shadow. /etc is
+# inside the read-only root overlay this script installs below, so the new
+# hash lived in the tmpfs and died with the power. The seed itself is on the
+# FAT partition, which is OUTSIDE the overlay, and userconf-service deletes
+# it as the last step of a successful apply -- so the one file that could
+# reapply the credential was destroyed by the boot that consumed it, and the
+# account went back to the random FIRST_USER_PASS image/build.sh generates at
+# build time, which nobody has. The operator got a working password for
+# exactly one boot. Tier 3 measured both halves and neither read as a
+# contradiction: boot1 found the seeded hash in /etc/shadow, boot2 found the
+# seed gone from the card.
 #
-# Tier 3 measures both halves of that already and neither reads as a
-# contradiction: boot1 finds the seeded hash in /etc/shadow, and boot2 finds
-# the seed gone from the card. What is missing is a DECISION, and it is not
-# one to make silently in a comment. The three candidates:
+# THE THREE CANDIDATES WERE refuse the seed loudly, persist the credential,
+# and keep the seed file. The repository owner chose the second, on the
+# ground that this device can be connected to a keyboard and a screen -- so
+# the login is a real recovery path and not a nicety, and an appliance that
+# accepts a documented credential file and then throws the credential away is
+# worse than one that never accepted it.
 #
-#   - refuse the seed loudly, so an operator is told the credential path
-#     does not work on an overlay root rather than discovering it at the
-#     second power-on;
-#   - persist the credential, which means writing outside the overlay (the
-#     boot partition, or a bind-mounted /etc/shadow) and deciding what a
-#     password hash sitting on a FAT partition costs on a key printer;
-#   - keep the seed file, so the wizard reapplies it every boot -- which
-#     leaves the operator's credential line readable in any card reader for
-#     the life of the device.
+# WHAT THAT COSTS, WRITTEN DOWN WHERE THE CODE IS RATHER THAN ARGUED
+# ELSEWHERE. The hash goes on the FAT partition, which is mounted `defaults`
+# and therefore 0755 root:root -- readable by every uid on this machine (the
+# `lp` uid CUPS runs filters as, and the operator's own account) as well as
+# by anyone who can mount the card. A password hash is offline-crackable at
+# leisure: measured on the build container, sha512crypt at the 5000 rounds
+# `openssl passwd -6` produces verifies in 2.111 ms, so 474 guesses per
+# second per core before any GPU is involved; yescrypt at $y$j9T$ took
+# 16.146 ms. Someone who can already read that partition can also either take
+# the card and edit the rootfs, or already has a shell here -- so the hash
+# buys them little on this device. What it can cost is a password the
+# operator uses somewhere else.
 #
-# Every one of those is a security trade on a machine that prints one-time
-# pads, so it belongs to the repository and not to this script. Until it is
-# made, the behaviour above is the behaviour, and it is stated here and in
-# the release note image.yml attaches to a tag rather than implied away. Do
-# NOT "fix" this by adding a persistence mechanism without the decision.
+# AND IT IS THE SAME EXPOSURE THE REJECTED "KEEP THE SEED FILE" HAD, which is
+# worth stating plainly because the two options are not distinguishable on
+# this axis: userconf.txt IS `username:hash`, so keeping it leaves the same
+# crypt string on the same partition at the same 0755. What persisting buys
+# over keeping is not secrecy. It is that userconf-pi's apply path -- which
+# ends in cancel-rename enabling and starting a getty on the front panel's
+# tty, disabling this very unit, and reloading sshd -- runs once rather than
+# on every boot; that the store gets the marker, the validation and the
+# outside-the-overlay refusal in device/persist-identity.sh; and that a NEW
+# userconf.txt still works, because the wizard is still the front door.
+#
+# THE ONE THING THAT IS WORSE THAN KEEPING THE SEED: deleting userconf.txt
+# from the card no longer takes the operator's hash off the card, because
+# there is now a second copy under a name they did not write. docs/IMAGE.md
+# and the closing summary of this script both say so, and both give the `rm`.
+#
+# NOT NARROWED WITH fmask=0077, and the reason recorded further down this
+# file for that is WRONG and should be reconsidered: it says a root-only
+# partition "would break settings persistence" because otp-unit.service
+# carries ReadWritePaths=-/boot/firmware, but that unit has no `User=` and
+# runs as root, as do all four units in device/systemd. Root writes through
+# 0700 vfat. The real costs of fmask are different ones -- this script would
+# have to rewrite /etc/fstab, which it deliberately does not; a bad fstab
+# entry costs the boot partition mount and takes the settings, the machine-id
+# and this credential with it; and otpunit/config.py's `mount -o remount,rw`
+# path would need checking, because vfat re-parses options on remount. That
+# is a separate decision with its own blast radius and it is not the one
+# being implemented here.
 #
 # $BOOT_DIR, not a hardcoded /boot/firmware, and the heredoc is UNQUOTED so
 # that it expands. The condition has to name the directory the firmware
@@ -825,15 +856,34 @@ systemctl mask ssh.socket
 # THE /boot/firmware LINE IS NOT TOUCHED EITHER, and that is a decision with
 # a cost worth naming. pi-gen mounts it `vfat ... defaults`, and vfat carries
 # no permission bits, so every file on the boot partition is 0755 root:root
-# -- readable by EVERY local account, the `otp` user the print unit runs as
-# included, not merely by someone who takes the card out. `fmask=0077,
-# dmask=0077` would fix that and was considered. It is not applied because
-# otp-unit.service carries ReadWritePaths=-/boot/firmware precisely so that
-# otpunit/config.py can save the operator's settings there, and a partition
-# only root could write would break settings persistence to protect a
-# machine-id and a page count -- neither of which is a secret. No pad byte
-# and no password is written to this partition; if that ever changes, this
-# is the line that has to change with it.
+# -- readable by EVERY local account, the `otp` user and the `lp` uid CUPS
+# runs filters as included, not merely by someone who takes the card out.
+#
+# "IF THAT EVER CHANGES, THIS IS THE LINE THAT HAS TO CHANGE WITH IT" is what
+# this comment used to end on, about the claim that no password is written
+# here. IT HAS CHANGED. The owner's decision above persists the operator's
+# login, so a crypt string now lives at
+# /boot/firmware/otp-identity/credential. No pad byte does, and none ever
+# may.
+#
+# `fmask=0077,dmask=0077` WOULD NARROW IT, and the reason recorded here for
+# declining it was wrong. It said a root-only partition would break settings
+# persistence because otp-unit.service carries ReadWritePaths=-/boot/firmware
+# so otpunit/config.py can save there. But that unit has no `User=` -- it
+# runs as root, and ReadWritePaths is a mount-namespace grant rather than a
+# uid drop. All four units in device/systemd run as root, and no non-root
+# writer to this partition exists in this repository. Root writes through
+# 0700 vfat, so the stated cost is zero.
+#
+# It is still not applied, for costs that are real: this script would have to
+# rewrite /etc/fstab, which the paragraph above says it deliberately does
+# not; an fstab entry that is wrong costs the boot-partition mount and takes
+# the settings, the machine-id store and this credential down with it, on a
+# device with no network to recover over; and config.py's `mount -o
+# remount,rw` fallback would have to be checked, because vfat re-parses its
+# options on remount and may not carry fmask forward. That is a decision for
+# the repository, like the one above, and it is the obvious next narrowing
+# for whoever wants one.
 CMDLINE_TXT="$BOOT_DIR/cmdline.txt"
 if [ ! -f "$CMDLINE_TXT" ]; then
     # The overlay is configured through the Raspberry Pi boot firmware, so
@@ -1180,6 +1230,66 @@ OVERLAY
         /etc/systemd/system/otp-unit-identity.service
     systemctl daemon-reload
     systemctl enable otp-unit-identity.service
+
+    # --- and the operator's login, recorded by the wizard that applies it --
+    #
+    # The other half of the owner's "persist it", and the reason it is an
+    # ExecStartPost on userconfig.service rather than a unit of its own.
+    #
+    # WHEN IT HAS TO RUN is after the wizard, not before: a boot where the
+    # store is restored at sysinit AND a fresh userconf.txt is on the card is
+    # a boot where the operator has just changed their password, and the
+    # store has to end up holding the NEW one or the next power cycle
+    # silently reverts them. Ordering it here -- inside the unit that does
+    # the applying -- makes that exact, with no ordering edge to get wrong.
+    #
+    # WHY NOT A UNIT ORDERED After=userconfig.service, which was the obvious
+    # alternative: such a unit runs on EVERY boot, including the boots of a
+    # machine whose operator never seeded anything. It would then have to
+    # decide for itself whether the hash in /etc/shadow is worth keeping, and
+    # on a fresh card the only thing there is pi-gen's random
+    # FIRST_USER_PASS -- so the first unseeded boot would copy a password
+    # hash onto the card of every unit ever built, for a password nobody has
+    # and nobody asked to keep. As an ExecStartPost it fires only on a boot
+    # where an operator's own userconf.txt was applied, which means the only
+    # hash this ever writes to the FAT partition is one the operator had
+    # already written to that same partition themselves. That is the whole of
+    # why persisting adds no exposure over the seed file it replaces.
+    #
+    # A MALFORMED SEED REACHES NEITHER. systemd skips ExecStartPost when
+    # ExecStart fails, so a seed userconf-pi rejects leaves the store holding
+    # the previous credential -- and the restore at sysinit has already put
+    # that one back, so the operator can still log in and try again. Tier 3's
+    # userconf-malformed-seed-fails-fast covers the other half of that.
+    #
+    # THE LEADING `-`, WHICH IS THE THING TO ARGUE WITH. It makes a failing
+    # record not fail the unit. That is deliberate: losing the RECORD must
+    # not cost the operator the boot that APPLIED their password, and stock
+    # userconfig.service carries Restart=on-failure, so a hard failure here
+    # would turn a full boot partition into a restart loop printing two of
+    # the strings harness/img-boot.sh fails a release on.
+    #
+    # IT IS ALSO EXACTLY WHAT MAKES THIS SILENTLY PASS, so the check has to
+    # live somewhere the `-` cannot reach. A missing script, a
+    # non-executable one, an ExecStartPost that does not survive the
+    # daemon-reload cancel-rename runs mid-ExecStart -- every one of those
+    # ends with a successful unit, an applied password, and an empty store,
+    # and nothing on the machine complains. What catches it is tier 3:
+    # boot1's credential-recorded-outside-the-overlay reads the store off the
+    # card after the apply, and boot2's credential-survives-the-power-cycle
+    # requires the password to still be there after the power went off. Both
+    # are in img-boot.sh's named-check list, so deleting them fails the run.
+    #
+    # A SECOND DROP-IN FILE, not a line added to otp-appliance.conf above:
+    # that one is written on every machine this script provisions, and
+    # persist-identity.sh is installed only on an overlay machine. A
+    # writable root keeps /etc/shadow by itself and has nothing to record.
+    install -d /etc/systemd/system/userconfig.service.d
+    cat > /etc/systemd/system/userconfig.service.d/otp-credential.conf <<'CRED'
+[Service]
+ExecStartPost=-/opt/otp-unit/persist-identity.sh --record-credential
+CRED
+    systemctl daemon-reload
 fi
 
 # WHAT THIS SCRIPT DID TO SOMEONE ELSE'S MACHINE, said out loud. The
@@ -1230,18 +1340,38 @@ script):
 All four are deliberate on an air-gapped key printer and all four outlive
 this script. tty1 is the front panel; the login prompt is on tty2 (Alt+F2).
 
-THIS UNIT'S MACHINE-ID IS ON THE BOOT PARTITION, in
-/boot/firmware/otp-identity. That is the one exception to "nothing survives a
-power cycle", and it exists because /etc is inside the overlay -- without it
-systemd calls every boot a first boot, runs preset-all every time, and
-re-enables units nobody chose. Nothing else is kept there: no SSH host key
-leaves the overlay, because this machine does not run sshd.
+TWO THINGS ARE ON THE BOOT PARTITION, in /boot/firmware/otp-identity, and
+they are the only exceptions to "nothing survives a power cycle".
 
-The boot partition is vfat mounted with `defaults`, so every file on it is
-0755 root:root -- readable by EVERY account on this machine, not only by
-someone holding the card. A machine-id is an identifier rather than a secret
-and no pad byte or password is written there, but that is worth knowing
-before you decide what else to put on that partition.
+  * machine-id, because /etc is inside the overlay -- without it systemd
+    calls every boot a first boot, runs preset-all every time, and re-enables
+    units nobody chose.
+  * credential, but ONLY once you have set a password with a userconf.txt of
+    your own. It is the same `user:hash` line that file carried. Without it
+    the password you set worked for exactly one boot: the hash goes to
+    /etc/shadow, which is inside the overlay, and the wizard deletes the seed
+    as the last step of applying it.
+
+No SSH host key leaves the overlay, because this machine does not run sshd,
+and no pad byte is written to that partition ever.
+
+THE CREDENTIAL IS A PASSWORD HASH ON A PARTITION ANYONE CAN READ, and you
+should decide that is acceptable rather than discover it. The boot partition
+is vfat mounted with `defaults`, so every file on it is 0755 root:root --
+readable by EVERY account on this machine and by anyone who can put the card
+in a reader. A hash is not a password, but it can be attacked offline for as
+long as somebody likes, so a weak or reused password there is a weak or
+reused password everywhere you use it. The bytes are the same ones your own
+userconf.txt already put on that same partition; what changed is that they
+are no longer deleted.
+
+Deleting userconf.txt does NOT take it off the card any more. This does:
+
+    sudo rm -f /boot/firmware/otp-identity/credential
+
+after which the account goes back to the random password the image was built
+with, and the login prompt on tty2 is no use to you. Set a new one by writing
+a fresh userconf.txt instead.
 
 To change the software afterwards, take `boot=overlay` back out of
 /boot/firmware/cmdline.txt, reboot, edit, and rerun this script.

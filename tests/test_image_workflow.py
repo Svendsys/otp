@@ -284,10 +284,43 @@ def test_the_release_notes_credential_claim_is_backed_by_the_harness():
     harness = (REPO / "harness" / "img-boot.sh").read_text()
     for name in ("userconf-seed-applied", "userconf-seeded-boot-ran-no-wizard",
                  "userconf-unseeded-boot-skips-the-wizard",
-                 "userconf-malformed-seed-fails-fast"):
+                 "userconf-malformed-seed-fails-fast",
+                 # And the three the note's STRONGEST clause rests on. It no
+                 # longer says the password lasts one boot; it says it is
+                 # still in force after the power cycle, which is a claim
+                 # about a machine rather than about a mechanism. Drop any of
+                 # these from the gate and the sentence attached to a tag is
+                 # a statement about nothing -- the worse direction, because
+                 # the old wording at least understated.
+                 "credential-recorded-outside-the-overlay",
+                 "credential-recorded-for-the-next-boot",
+                 "credential-survives-the-power-cycle",
+                 # And the one the note's USERNAME sentence rests on. A note
+                 # that promises the credential without saying the rename
+                 # does not survive sends an operator to a tty2 prompt to
+                 # type a name this machine does not have -- with no network
+                 # and no sshd behind it, which is the whole recovery path.
+                 "credential-recovers-a-store-naming-another-account"):
         assert name in harness, (
             f"the release note claims the credential path was checked, but "
             f"img-boot.sh no longer requires {name}")
+    # THE CAVEAT ITSELF, in the body. The check above says the harness proves
+    # it; this says the reader is told. `userconf-pi` renames the UID-1000
+    # account to whatever a seed names and the rename dies with the overlay,
+    # so the account is `otp` on every boot after the one that applied it.
+    assert "USERNAME does not survive" in body, (
+        "the release note promises a persistent login without saying the "
+        "username reverts: an operator would type a name that is not there")
+    assert "Log in as `otp`" in body, body
+    # AND IT SAYS WHAT KEEPING IT COSTS. A note that tells a reader their
+    # password now persists, without telling them it persists as an
+    # offline-crackable hash on a partition any card reader can mount, has
+    # told them the half that sounds like good news. This is the one place
+    # this project's claims reach someone who cannot check them.
+    for warning in ("world-readable", "offline"):
+        assert warning in body, (
+            f"the release note announces a persistent login without the word "
+            f"{warning!r}: the exposure is part of the claim, not a footnote")
     # And the harness has to plant one, or the seeded branch is untested and
     # every check above it passes on an empty boot partition. The COPY, not
     # the name: the log line next to it says ::userconf.txt as well.

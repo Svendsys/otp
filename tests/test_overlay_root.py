@@ -22,6 +22,7 @@ sliced at the boundary where its behaviour is still parameterised -- the
 boot directory and the command-line file are variables, and the verification
 that decides whether provisioning fails is entirely inside that boundary.
 """
+import hashlib
 import os
 import re
 import shutil
@@ -517,13 +518,57 @@ esac
 """
 
 
+# chpasswd, which is the one command the script runs that a test must not let
+# through: the real one edits the machine's own /etc/shadow, and --root would
+# make it chroot into a tmp_path. The stub does what chpasswd does to the tree
+# it is pointed at -- rewrites field 2 of the named account -- so the script's
+# read-back after the apply is a read-back of a file that really changed. It
+# also records its argv, because "--root reached it" is a claim about an
+# argument list and a stub that only exits 0 cannot support one.
+#
+# APPLY=no turns it into the failure this repository keeps finding: a command
+# that exits 0 having done nothing at all.
+CHPASSWD_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >> "$CHPASSWD_ARGV"
+line=$(cat)
+[ "${CHPASSWD_APPLY-yes}" = yes ] || exit "${CHPASSWD_RC-0}"
+user=${line%%:*}
+hash=${line#*:}
+awk -F: -v u="$user" -v h="$hash" 'BEGIN{OFS=":"} $1==u{$2=h} {print}' \
+    "$CHPASSWD_SHADOW" > "$CHPASSWD_SHADOW.new"
+mv "$CHPASSWD_SHADOW.new" "$CHPASSWD_SHADOW"
+exit "${CHPASSWD_RC-0}"
+"""
+
+# What pi-gen leaves in /etc/shadow before an operator ever seeds anything:
+# FIRST_USER_PASS, hashed with a random salt, and image/build.sh makes the
+# password itself random when OTP_USER_PASS_HASH is unset. Nobody has it.
+BUILD_TIME_HASH = "$6$aVJ7yQ2mKp0xRt4d$" + "B" * 43
+# The hash an operator's own userconf.txt carried, applied by the wizard.
+SEEDED_HASH = "$6$otpimgcheck$" + "A" * 86
+
+
 def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
-                         etc_keys=("ed25519",), store_src="/dev/mmcblk0p1"):
+                         etc_keys=("ed25519",), store_src="/dev/mmcblk0p1",
+                         credential=None, partial=None,
+                         live_hash=BUILD_TIME_HASH,
+                         first_user="otp", mode=None, chpasswd_env=None):
     """Run the shipped script against a fake boot partition and a fake /etc.
 
     `etc_keys` puts real-looking host keys in the fake /etc/ssh. They are not
     there to be persisted -- they are there so that "nothing copies them" is a
     statement about a tree that HAD them.
+
+    `credential` is what the card already holds; `live_hash` is what
+    /etc/shadow holds for the UID-1000 account this boot. The default pair is
+    the interesting one: a card with nothing on it and an account carrying the
+    random build-time password.
+
+    `partial` is a `credential.new` left on the card -- the fragment
+    `credential_record` writes beside the store before renaming it into place.
+    A card that still has one is a card whose record lost the power or the
+    room mid-write, and it is the one tell that tells that state apart from a
+    card nobody ever seeded.
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     boot = tmp_path / "boot"
@@ -534,20 +579,110 @@ def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
         (root / "etc" / "machine-id").write_text(machine_id + "\n")
     if stored_id is not None:
         (boot / "otp-identity" / "machine-id").write_text(stored_id + "\n")
+    if credential is not None:
+        (boot / "otp-identity" / "credential").write_text(credential)
+    if partial is not None:
+        (boot / "otp-identity" / "credential.new").write_text(partial)
     for name in etc_keys:
         (root / "etc" / "ssh" / f"ssh_host_{name}_key").write_text(f"live {name}\n")
         (root / "etc" / "ssh" / f"ssh_host_{name}_key.pub").write_text(f"pub {name}\n")
+
+    # A passwd/shadow pair with a root account in it as well, so that "the
+    # store may only name the UID-1000 user" is a statement about a tree that
+    # HAS another account to name.
+    (root / "etc" / "passwd").write_text(
+        "root:x:0:0:root:/root:/bin/bash\n"
+        "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+        + (f"{first_user}:x:1000:1000:,,,:/home/{first_user}:/bin/bash\n"
+           if first_user else ""))
+    (root / "etc" / "shadow").write_text(
+        "root:!:20088:0:99999:7:::\n"
+        "daemon:*:20088:0:99999:7:::\n"
+        + (f"{first_user}:{live_hash}:20088:0:99999:7:::\n"
+           if first_user else ""))
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "findmnt").write_text(IDENTITY_FINDMNT_STUB)
     (bin_dir / "findmnt").chmod(0o755)
-    proc = subprocess.run(
-        ["bash", str(IDENTITY_SH), "--boot-dir", str(boot), "--root", str(root)],
+    (bin_dir / "chpasswd").write_text(CHPASSWD_STUB)
+    (bin_dir / "chpasswd").chmod(0o755)
+    proc = invoke_persist_identity(tmp_path, mode=mode, store_src=store_src,
+                                   chpasswd_env=chpasswd_env)
+    return proc, boot, root
+
+
+def invoke_persist_identity(tmp_path, *, mode=None, store_src="/dev/mmcblk0p1",
+                            chpasswd_env=None):
+    """Run the script AGAINST A TREE THAT ALREADY EXISTS.
+
+    Split out of the builder above so that a test can boot the same fake unit
+    more than once. The ordering this change is about -- a restore at sysinit,
+    a fresh seed applied over it at multi-user, and the store replaced after
+    that -- is a sequence, and a fixture that rebuilt /etc between the steps
+    could not express it.
+    """
+    boot, root = tmp_path / "boot", tmp_path / "root"
+    return subprocess.run(
+        ["bash", str(IDENTITY_SH), "--boot-dir", str(boot), "--root", str(root)]
+        + ([mode] if mode else []),
         capture_output=True, text=True, timeout=60,
         env={**os.environ, "FAKE_STORE_SRC": store_src,
-             "PATH": f"{bin_dir}:{os.environ['PATH']}"})
-    return proc, boot, root
+             "CHPASSWD_SHADOW": str(root / "etc" / "shadow"),
+             "CHPASSWD_ARGV": str(tmp_path / "chpasswd-argv.log"),
+             **(chpasswd_env or {}),
+             "PATH": f"{tmp_path}/bin:{os.environ['PATH']}"})
+
+
+def set_shadow_hash(root, new_hash, user="otp"):
+    """What userconf-service's own `chpasswd -e` does, done by hand."""
+    out = []
+    for line in (root / "etc" / "shadow").read_text().splitlines():
+        fields = line.split(":")
+        if fields[0] == user:
+            fields[1] = new_hash
+        out.append(":".join(fields))
+    (root / "etc" / "shadow").write_text("\n".join(out) + "\n")
+
+
+def shadow_hash(root, user="otp") -> str:
+    """Field 2 of the account's line, as the machine would read it."""
+    for line in (root / "etc" / "shadow").read_text().splitlines():
+        fields = line.split(":")
+        if fields[0] == user:
+            return fields[1]
+    return ""
+
+
+def chpasswd_argv(tmp_path) -> list:
+    log = tmp_path / "chpasswd-argv.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def power_cycle(root, *, user="otp", live_hash=BUILD_TIME_HASH):
+    """WHAT THE OVERLAY HANDS THE NEXT BOOT: /etc back out of the image.
+
+    Not `set_shadow_hash`, which edits the tree in place. Everything under
+    /etc is inside the read-only overlay, so a power cycle throws away the
+    WHOLE of it -- the shadow entry the wizard wrote AND any rename
+    userconf-pi performed -- and the account comes back with the name and the
+    random FIRST_USER_PASS image/build.sh built in. Only the FAT partition
+    survives, which is the entire reason this store exists.
+    """
+    (root / "etc" / "passwd").write_text(
+        "root:x:0:0:root:/root:/bin/bash\n"
+        "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+        f"{user}:x:1000:1000:,,,:/home/{user}:/bin/bash\n")
+    (root / "etc" / "shadow").write_text(
+        "root:!:20088:0:99999:7:::\n"
+        "daemon:*:20088:0:99999:7:::\n"
+        f"{user}:{live_hash}:20088:0:99999:7:::\n")
+
+
+def card_note(boot) -> str:
+    """The refusal persist-identity.sh leaves where the card can carry it."""
+    note = boot / "otp-identity" / "credential-not-restored.txt"
+    return note.read_text() if note.exists() else ""
 
 
 def test_a_first_boot_records_what_it_has(tmp_path):
@@ -659,6 +794,680 @@ def test_a_kept_machine_id_is_not_overwritten_by_a_boot_that_lost_it(tmp_path):
     assert (boot / "otp-identity" / "machine-id").read_text().strip() == other
 
 
+# --- the operator's login, which used to last one boot --------------------
+#
+# WHAT WAS BROKEN. userconf-service applies /boot/firmware/userconf.txt with
+# `chpasswd -e` into /etc/shadow and then deletes the seed. /etc is inside
+# the overlay and the FAT partition is not, so the credential died with the
+# power while the only file that could reapply it was destroyed by the boot
+# that consumed it -- and the account reverted to the random FIRST_USER_PASS
+# image/build.sh:101 generates when OTP_USER_PASS_HASH is unset, which nobody
+# has. The owner's decision out of {refuse the seed loudly, persist it, keep
+# the seed file} is "persist it".
+#
+# WHAT THESE TESTS ARE FOR, and it is not only "the password comes back".
+# Every guard below exists because the failure it catches is silent: a store
+# that is a tmpfs file agreeing with itself, a truncated line that would make
+# the account PASSWORDLESS, a `chpasswd` that exits 0 having written nothing,
+# and a hash landing on the card of a unit whose operator never asked for
+# one. None of those produces a message on a running machine.
+
+
+def test_a_seeded_password_is_kept_and_comes_back_after_the_power_cycle(tmp_path):
+    """
+    The whole loop, and the positive control every negative below leans on.
+
+    Boot 1: the account carries the random build-time hash, the operator's
+    seed is applied by the wizard, and the wizard's ExecStartPost records it.
+    Boot 2 is a fresh /etc -- which is what the overlay gives you -- and the
+    restore has to put the seeded hash back before any login is possible.
+    """
+    proc, boot, root = run_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    # Nothing is kept until the wizard applies something.
+    assert not (boot / "otp-identity" / "credential").exists()
+
+    set_shadow_hash(root, SEEDED_HASH)                     # the wizard applies
+    proc = invoke_persist_identity(tmp_path, mode="--record-credential")
+    assert proc.returncode == 0, proc.stderr
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"otp:{SEEDED_HASH}\n"
+
+    set_shadow_hash(root, BUILD_TIME_HASH)                 # the power cycle
+    proc = invoke_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == SEEDED_HASH, \
+        "the operator's password did not survive the power cycle"
+    # Through chpasswd, and with the tree the script was pointed at. A restore
+    # that edited /etc/shadow by hand would pass the line above and corrupt a
+    # real one: chpasswd is what takes the lock and keeps the file consistent.
+    assert any(f"-e --root {tmp_path}/root" in line
+               for line in chpasswd_argv(tmp_path)), chpasswd_argv(tmp_path)
+
+
+def test_an_unseeded_boot_puts_no_password_hash_on_the_boot_partition(tmp_path):
+    """
+    THE EXPOSURE GUARD, and the reason persisting costs no more than the seed
+    file it replaces.
+
+    The store is written by --record-credential and by nothing else, and that
+    phase runs only as an ExecStartPost on the wizard -- so the only hash that
+    ever reaches the card is one the operator's own userconf.txt had already
+    put on that same card. A unit whose operator never seeded a credential
+    must never have a password hash on its boot partition, and the hash it
+    would leak is the worst possible one to leak by accident: pi-gen's random
+    FIRST_USER_PASS is the same on no two units, so its appearance on a card
+    would be pure loss with nothing gained.
+
+    THE POSITIVE CONTROL IS IN THIS TEST AND ON THIS FIXTURE, because "no hash
+    on the card" is satisfied perfectly by a script that writes nothing ever,
+    by a --boot-dir that does not exist, and by a chpasswd stub that is never
+    reached. The second half runs the recording phase over the identical tree
+    and requires the identical hash to land.
+    """
+    proc, boot, root = run_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    on_the_card = sorted(p.name for p in (boot / "otp-identity").iterdir())
+    assert on_the_card == ["machine-id"], on_the_card
+    assert BUILD_TIME_HASH not in "".join(
+        p.read_text() for p in boot.rglob("*") if p.is_file())
+
+    proc = invoke_persist_identity(tmp_path, mode="--record-credential")
+    assert proc.returncode == 0, proc.stderr
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"otp:{BUILD_TIME_HASH}\n", \
+        "the recording phase cannot write a hash either, so the absence " \
+        "above says nothing about the default phase"
+
+
+def test_a_truncated_store_does_not_leave_the_account_passwordless(tmp_path):
+    """
+    `chpasswd -e` writes its second field into /etc/shadow verbatim, and an
+    EMPTY second field is an account that logs in with NO PASSWORD -- on an
+    appliance that boots to a console with a keyboard and a screen attached.
+    A card pulled mid-write is all it takes to produce one.
+
+    The positive control is the same fixture with the line complete: the
+    refusal has to be about the truncation and not about the tree.
+    """
+    proc, _, root = run_persist_identity(tmp_path, credential="otp:\n")
+    assert proc.returncode != 0, proc.stdout
+    assert shadow_hash(root) == BUILD_TIME_HASH, \
+        "the account's password was replaced with the empty string"
+    assert chpasswd_argv(tmp_path) == [], \
+        "chpasswd was run at all, so only the stub's behaviour saved this"
+
+    whole = f"otp:{SEEDED_HASH}\n"
+    proc, _, root = run_persist_identity(tmp_path / "control",
+                                         credential=whole)
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == SEEDED_HASH
+
+
+@pytest.mark.parametrize("kept", ["!", "*", "!!", "$6$short$x", ""])
+def test_a_store_that_is_not_a_crypt_string_is_refused(tmp_path, kept):
+    """
+    The locked forms and the runts, all refused by one clause.
+
+    `!` and `*` are what /etc/shadow holds for an account that cannot log in,
+    and a store carrying one is a store that can TAKE AWAY the recovery path
+    this whole change exists to provide -- the mirror of the empty field
+    above, and just as quiet.
+    """
+    proc, _, root = run_persist_identity(tmp_path, credential=f"otp:{kept}\n")
+    assert proc.returncode != 0, proc.stdout
+    assert shadow_hash(root) == BUILD_TIME_HASH
+    # And it never says what it refused. This script's stderr is the journal,
+    # the journal is forwarded to the tier-3 serial console, and that console
+    # is uploaded as a CI artifact.
+    assert kept not in proc.stderr or kept == "", proc.stderr
+
+
+def test_a_zero_length_store_is_not_read_as_a_card_that_was_never_seeded(tmp_path):
+    """
+    THE ONE MALFORMED SHAPE THAT USED TO EXIT 0.
+
+    Every other bad store below fails the unit loudly. A zero-length one
+    returned 0 with a note that reads exactly like a fresh card -- and it is
+    not one. `credential_record` writes `credential.new` and renames it over
+    `credential`; vfat has no atomic rename, so a power cut mid-record or a
+    partition with no room left can leave a zero-length `credential` where a
+    working credential used to be. The operator then loses the login they had,
+    with nothing on the machine having failed and nothing in the journal to
+    read.
+
+    THE TELL IS THAT THE FILE IS THERE AT ALL. A card nobody has seeded has no
+    `credential` and no `credential.new`; this one has a `credential`. That
+    costs one `-e` and it is the difference between a failed unit somebody can
+    diagnose and a silent revert.
+    """
+    proc, boot, root = run_persist_identity(tmp_path, credential="")
+    assert proc.returncode != 0, proc.stdout
+    assert shadow_hash(root) == BUILD_TIME_HASH
+    assert chpasswd_argv(tmp_path) == [], chpasswd_argv(tmp_path)
+    # And it does NOT tell the operator their card was never seeded, which is
+    # the specific wrong answer this is about.
+    assert "no credential kept" not in proc.stderr, proc.stderr
+
+    # THE POSITIVE CONTROL, and it is the whole point: a card that really was
+    # never seeded still comes out quiet and green on the identical fixture.
+    # Without it this passes on a script that fails every unseeded unit ever
+    # built.
+    proc, boot, _ = run_persist_identity(tmp_path / "fresh")
+    assert proc.returncode == 0, proc.stderr
+    assert "no credential kept" in proc.stderr, proc.stderr
+    assert card_note(boot) == ""
+
+
+def test_a_record_fragment_with_no_store_beside_it_is_not_a_fresh_card(tmp_path):
+    """
+    The other half of the same interrupted write, and the half that leaves no
+    `credential` at all: the power went off between the redirect that creates
+    `credential.new` and the `mv` that puts it in place, on the very first
+    record a unit ever did. `credential` is absent -- which is exactly what a
+    fresh card looks like -- and `credential.new` is the only thing that says
+    otherwise.
+    """
+    proc, boot, root = run_persist_identity(
+        tmp_path, partial=f"otp:{SEEDED_HASH}\n")
+    assert proc.returncode != 0, proc.stdout
+    assert "no credential kept" not in proc.stderr, proc.stderr
+    # NOT applied out of the fragment, either. A file the record never
+    # committed is a file nothing checked, and the whole reason for writing
+    # beside and renaming is that its contents may be half a line.
+    assert chpasswd_argv(tmp_path) == [], chpasswd_argv(tmp_path)
+    assert shadow_hash(root) == BUILD_TIME_HASH
+
+
+def test_a_record_fragment_beside_a_good_store_is_cleared_and_the_store_wins(tmp_path):
+    """
+    The third arrangement the interrupted write can leave: the previous
+    credential intact and a fragment beside it. That is the outcome
+    write-beside-and-rename is FOR, so the restore has to be an ordinary one
+    -- and the fragment has to go, or every boot for the rest of the unit's
+    life reports an interruption that has already been dealt with.
+    """
+    proc, boot, root = run_persist_identity(
+        tmp_path, credential=f"otp:{SEEDED_HASH}\n",
+        partial="otp:$6$halfwritten$")
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == SEEDED_HASH, \
+        "the fragment cost the operator the credential that was committed"
+    assert not (boot / "otp-identity" / "credential.new").exists()
+    assert "credential.new" in proc.stderr, proc.stderr
+
+
+def test_every_refusal_is_left_on_the_card_a_locked_out_operator_can_read(tmp_path):
+    """
+    WHERE A REFUSAL GOES ON A MACHINE NOBODY CAN LOG IN TO.
+
+    Each note above goes to stderr, otp-unit-identity.service sends stderr to
+    the journal, device/install.sh sets `Storage=volatile`, and
+    `systemd.journald.forward_to_console=1` is on the tier-3 harness's
+    command line and NOT in the image's cmdline.txt. So on a shipped unit
+    every one of these reasons died with the power -- on the machine whose
+    operator is locked out of the only shell that could have read it. The unit
+    file now carries `StandardError=journal+console` so the notes reach the
+    screen while the boot is happening; this is the copy that is still there
+    afterwards.
+
+    THE CARD IS THE RIGHT PLACE because it is the only thing the locked-out
+    operator can still do: take it out and put it in another machine, which
+    they have to do anyway to write a new userconf.txt. The note carries no
+    hash -- nothing here ever prints one -- so it adds no exposure to a
+    partition that already holds the hash in full.
+    """
+    proc, boot, _ = run_persist_identity(tmp_path, credential="otp:!\n")
+    assert proc.returncode != 0, proc.stdout
+    note = card_note(boot)
+    assert "userconf.txt" in note, note
+    assert "crypt(3) string" in note, note
+    # The reason is the journal's own words rather than a summary that can
+    # drift away from them: a second channel saying something different from
+    # the first is one nobody can act on. The header above it is the part an
+    # operator holding a card in another machine needs and the journal does
+    # not.
+    header, _, reason = note.partition("\n\n")
+    assert len(header.splitlines()) == 3, note
+    assert reason.strip(), note
+    for line in reason.splitlines():
+        assert f"otp-identity: {line}" in proc.stderr, (line, proc.stderr)
+    # NEVER THE HASH, on a partition every local account can read and anyone
+    # with a card reader can mount.
+    assert SEEDED_HASH not in note and BUILD_TIME_HASH not in note
+
+    # AND IT IS CLEARED BY A RESTORE THAT WORKS. A stale "your login could not
+    # be restored" on the card of a unit that is fine is a fault report for a
+    # fault that is over, and this appliance has no clock to date it with.
+    (boot / "otp-identity" / "credential").write_text(f"otp:{SEEDED_HASH}\n")
+    proc = invoke_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert card_note(boot) == "", "the refusal outlived the fault"
+
+
+def test_the_operator_documentation_says_which_account_the_login_comes_back_on():
+    """
+    THE DOCUMENT IS WHERE THIS CHANGE REACHES SOMEBODY WHO CANNOT READ THE
+    CODE, and it was the last place still promising the old thing.
+
+    Its precedence table said "a kept credential only -> the kept one wins",
+    unconditionally, next to a paragraph telling an operator to write
+    `username:hash` with no word about which username. Follow both and
+    userconf-pi renames the UID-1000 account, the rename dies with the
+    overlay, and the operator stands in front of a tty2 prompt typing a name
+    the machine does not have -- on a unit with no network and no sshd.
+
+    Three claims held against the things that make them true: the account the
+    image really ships, the file persist-identity.sh really writes, and the
+    rule the script really applies.
+    """
+    doc = (REPO / "docs" / "IMAGE.md").read_text()
+    first_user = re.search(r"^FIRST_USER_NAME='([^']+)'",
+                           (REPO / "image" / "build.sh").read_text(), re.M)
+    assert first_user, "image/build.sh no longer sets FIRST_USER_NAME"
+    assert f"log in as `{first_user.group(1)}`" in doc, \
+        "docs/IMAGE.md does not say which account the kept password lands on"
+    # The table row itself, which is the sentence QA read and believed.
+    row = next((line for line in doc.splitlines()
+                if line.startswith("| a kept credential only")), "")
+    assert "UID-1000" in row, \
+        f"the precedence table still promises the kept credential " \
+        f"unconditionally: {row!r}"
+    # And the durable channel is named by the name the script writes, not by
+    # a description of it that can drift.
+    note = re.search(r'^CRED_NOTE="\$STORE/(\S+)"', IDENTITY_SH.read_text(), re.M)
+    assert note, "persist-identity.sh no longer leaves a refusal on the card"
+    assert note.group(1) in doc, \
+        f"docs/IMAGE.md does not tell an operator to read {note.group(1)}"
+
+
+def test_the_identity_units_notes_reach_the_console_and_not_only_the_journal():
+    """
+    The systemd half of the finding above, which no fake tree can show.
+
+    `StandardError=journal` plus `Storage=volatile` plus no forwarding in the
+    image's cmdline.txt is three settings in three files that add up to
+    "nothing this script says is readable on a shipped unit". `journal+console`
+    is the one of the three that can be changed for THIS UNIT ALONE: it puts
+    these notes on /dev/console at sysinit, before any getty exists, without
+    making the rest of the machine narrate itself to whoever is watching the
+    serial header.
+    """
+    unit = IDENTITY_UNIT.read_text()
+    assert "StandardError=journal+console" in unit, unit
+    # And it stays scoped to this unit: journald's machine-wide forwarding is
+    # a harness-only lever, and turning it on in the image would put every
+    # unit's output on the console of a device that prints key material.
+    for shipped in (REPO / "device" / "install.sh", REPO / "image" / "build.sh"):
+        assert "forward_to_console" not in shipped.read_text(), shipped
+
+
+def test_the_store_may_only_ever_set_the_uid_1000_accounts_password(tmp_path):
+    """
+    Whoever can write this store can already write userconf.txt, and this must
+    hand them no account the documented path would not. userconf-pi refuses
+    `root` outright and RENAMES the UID-1000 user to whatever a seed names, so
+    the only account /boot/firmware/userconf.txt can ever set a password on is
+    the UID-1000 one. Keying on the uid says exactly that, and says it without
+    re-transcribing three validation rules that could drift.
+
+    WHICH ACCOUNT THE RULE NAMES IS THE UID, NOT THE STRING IN THE STORE. A
+    card that says `root:` is a card whose LABEL is wrong; the hash still goes
+    to UID 1000 and nowhere else, so `root` here must come out of this
+    untouched while the operator's own account is set. Refusing instead was
+    the shape the lockout in the test below came in.
+    """
+    proc, boot, root = run_persist_identity(
+        tmp_path, credential=f"root:{SEEDED_HASH}\n")
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root, "root") == "!", "root's password was set"
+    assert shadow_hash(root) == SEEDED_HASH, \
+        "the kept hash did not reach the UID-1000 account"
+    # chpasswd was handed the UID-1000 account and only it: the store's own
+    # user field never reaches the command, which is what makes the line
+    # above a property of the script rather than of the stub.
+    assert chpasswd_argv(tmp_path), "chpasswd never ran"
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"otp:{SEEDED_HASH}\n", "the store kept the label it could not use"
+
+    # AND THE NAME IT QUOTES BACK IS STRIPPED FIRST. That field comes off a
+    # partition anyone with a card reader can write, and this script's stderr
+    # is the journal -- forwarded to the serial console under the tier-3
+    # harness, which uploads it, and now written to the console of the unit
+    # itself. An escape sequence there is one `tr` to refuse.
+    proc, _, _ = run_persist_identity(
+        tmp_path / "escape",
+        credential="ro\x1b[2Jot:" + SEEDED_HASH + "\n")
+    assert proc.returncode == 0, proc.stderr
+    for gone in ("\x1b", "["):
+        assert gone not in proc.stderr, repr(proc.stderr)
+    # The positive control for the stripping: what is left of the name IS
+    # reported, so "no escape in the output" is not satisfied by a note that
+    # says nothing about which account the card named. `2J` survives because
+    # digits and letters are not escapes -- the ESC byte and the bracket that
+    # made them a clear-screen sequence are what had to go.
+    assert "'ro2Jot'" in proc.stderr, proc.stderr
+
+    # The negative control the rule actually rests on: with no UID-1000 line
+    # in /etc/passwd there is no account this store may be applied to, and
+    # `root` is still sitting there to be picked instead. Refused, and
+    # chpasswd never runs.
+    proc, _, root = run_persist_identity(tmp_path / "nobody", first_user=None,
+                                         credential=f"root:{SEEDED_HASH}\n")
+    assert proc.returncode != 0, proc.stdout
+    assert shadow_hash(root, "root") == "!", "root's password was set"
+    assert chpasswd_argv(tmp_path / "nobody") == [], \
+        chpasswd_argv(tmp_path / "nobody")
+
+
+def test_a_store_naming_the_pre_rename_account_still_logs_the_operator_in(tmp_path):
+    """
+    THE LOCKOUT, DRIVEN AS THE DOCUMENTED HAPPY PATH THAT PRODUCES IT.
+
+    docs/IMAGE.md tells an operator to write `username:hash` to the boot
+    partition. Nothing tells them the username has to be `otp`, and
+    /usr/lib/userconf-pi/userconf does not require it either -- read out of
+    the real userconf-pi_0.19_all.deb:
+
+        FIRSTUSER="$(getent passwd 1000 | cut -d: -f1)"
+        ...
+        if [ "$FIRSTUSER" != "$NEWNAME" ]; then rename_user; fi
+        ...
+        echo "$NEWNAME:$NEWPASS" | chpasswd -e
+
+    so a seed naming `pi` RENAMES the UID-1000 account and then sets the
+    password on the new name. `rename_user` touches /etc/{passwd,shadow,group,
+    gshadow,subuid,subgid,sudoers.d} and /home -- every one of them inside the
+    read-only overlay. The rename therefore dies with the power. The store, on
+    the FAT partition, does not.
+
+    So the next boot found a store naming an account that no longer exists,
+    and the script REFUSED it: no network, no sshd, tty1 held by the front
+    panel, and a tty2 prompt that took neither the operator's chosen username
+    nor `otp`. A unit with one-time-pad key material on it, bricked by the
+    documented path, recoverable only by pulling the card. The same sequence
+    destroyed a WORKING persisted login if an operator later seeded
+    `alice:...` to rename themselves.
+
+    THE FIX IS THE FILE'S OWN RULE, APPLIED. Only the UID-1000 account may
+    ever be touched -- so the name in the store is a LABEL, not an
+    authorisation, and the hash belongs on whatever account holds UID 1000
+    this boot. That grants the store no account `userconf.txt` could not
+    already reach, which is the whole test above.
+    """
+    # Boot 1. The image ships FIRST_USER_NAME='otp'; the operator's seed names
+    # `pi`, so userconf-pi renames the account and applies the hash to it, and
+    # the wizard's own ExecStartPost records what it finds live.
+    proc, boot, root = run_persist_identity(tmp_path, first_user="pi",
+                                            live_hash=SEEDED_HASH)
+    assert proc.returncode == 0, proc.stderr
+    proc = invoke_persist_identity(tmp_path, mode="--record-credential")
+    assert proc.returncode == 0, proc.stderr
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"pi:{SEEDED_HASH}\n", "the record did not keep the renamed account"
+
+    # The power cycle. /etc comes back out of the image: the rename is gone,
+    # UID 1000 is `otp` again, and the password is the build-time one nobody
+    # has. The card still holds `pi:<hash>`.
+    power_cycle(root)
+    assert "pi:" not in (root / "etc" / "passwd").read_text()
+
+    proc = invoke_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    # THE PROPERTY, and it is a WORKING LOGIN rather than a tidy exit status:
+    # the operator's own hash is what /etc/shadow holds for the account they
+    # can actually type at the tty2 prompt.
+    assert shadow_hash(root) == SEEDED_HASH, \
+        "the operator is locked out: the kept password did not reach otp"
+    # Through chpasswd, and named for the LIVE account -- not the store's.
+    assert any(f"-e --root {tmp_path}/root" in line
+               for line in chpasswd_argv(tmp_path)), chpasswd_argv(tmp_path)
+    # And it SAYS so, because a unit that silently re-points a credential at
+    # another account is one nobody can audit afterwards.
+    assert "'pi'" in proc.stderr, proc.stderr
+
+    # THE STORE IS REWRITTEN, so the stale name does not persist: without this
+    # every boot for the rest of the unit's life repeats the mismatch, and the
+    # tier-3 check that the store names the live account could never be true.
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"otp:{SEEDED_HASH}\n"
+    assert not (boot / "otp-identity" / "credential.new").exists()
+    assert card_note(boot) == "", "a working restore left a refusal on the card"
+
+    # The boot after that is an ordinary one: the store now matches, so there
+    # is nothing to say and nothing to rewrite.
+    power_cycle(root)
+    proc = invoke_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == SEEDED_HASH
+    assert "'otp'" not in proc.stderr, proc.stderr
+
+
+def test_a_stale_label_is_rewritten_even_when_the_password_already_matches(tmp_path):
+    """
+    The other way into the rewrite, and the reason it is not enough to do it
+    only after a `chpasswd`.
+
+    This is the boot AFTER a rewrite that could not be written -- the card was
+    full, or an operator had it in a reader read-only. The hash is already on
+    the UID-1000 account, so there is nothing for chpasswd to do and the
+    restore takes its early exit; the label is still wrong. Skip the rewrite
+    here and a unit that once failed to relabel never gets another chance,
+    because from now on every boot lands on this branch.
+    """
+    proc, boot, root = run_persist_identity(
+        tmp_path, credential=f"pi:{SEEDED_HASH}\n", live_hash=SEEDED_HASH)
+    assert proc.returncode == 0, proc.stderr
+    assert chpasswd_argv(tmp_path) == [], "chpasswd ran for a password that was already right"
+    assert shadow_hash(root) == SEEDED_HASH
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"otp:{SEEDED_HASH}\n", "the stale label survived the boot"
+
+
+def test_a_rewrite_the_card_will_not_take_does_not_cost_the_login(tmp_path):
+    """
+    The rewrite above is a convenience; the login is the job.
+
+    A card that has gone read-only, or filled up, can take the `chpasswd` --
+    that lands in /etc/shadow, inside the overlay -- and refuse the store. If
+    that failed the restore, an operator whose password DID come back would be
+    handed a failed unit and, worse, a script that had already decided the
+    boot was lost. So the write is attempted, its failure is said out loud,
+    and the exit status still describes the login.
+
+    Driven by putting a DIRECTORY where the fragment goes, because this suite
+    runs as root and `chmod` on a directory root owns stops nothing. What the
+    script sees is what a full or read-only vfat gives it: the redirect into
+    `credential.new` fails, so the rename never happens and the store keeps
+    the bytes it had.
+    """
+    proc, boot, root = run_persist_identity(
+        tmp_path, credential=f"pi:{SEEDED_HASH}\n")
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == SEEDED_HASH
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"otp:{SEEDED_HASH}\n"
+
+    # Same tree, same mismatched store, with nothing able to write the store.
+    (boot / "otp-identity" / "credential").write_text(f"pi:{SEEDED_HASH}\n")
+    (boot / "otp-identity" / "credential.new").mkdir()
+    power_cycle(root)
+    proc = invoke_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == SEEDED_HASH, \
+        "a store that could not be rewritten cost the operator the login"
+    assert "could not rewrite" in proc.stderr, proc.stderr
+    # And the store still holds what it held: a rewrite that cannot finish
+    # must not be a rewrite that half-finished.
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"pi:{SEEDED_HASH}\n"
+
+
+def test_the_uid_1000_account_is_found_by_uid_and_not_by_name(tmp_path):
+    """
+    The other half of the rule above. `otp` is image/build.sh's
+    FIRST_USER_NAME today, and a script that matched that string would do the
+    right thing on this image and the wrong thing on a renamed one -- silently
+    refusing to restore anything, on the machine whose operator had customised
+    it most.
+    """
+    proc, boot, root = run_persist_identity(
+        tmp_path, first_user="keyprinter",
+        credential=f"keyprinter:{SEEDED_HASH}\n")
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root, "keyprinter") == SEEDED_HASH
+    proc = invoke_persist_identity(tmp_path, mode="--record-credential")
+    assert proc.returncode == 0, proc.stderr
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"keyprinter:{SEEDED_HASH}\n"
+
+
+def test_a_second_line_in_the_store_is_refused_rather_than_applied(tmp_path):
+    """
+    `chpasswd` reads EVERY line it is handed. A two-line store is a store that
+    sets two accounts' passwords, on a partition anyone with a card reader can
+    write -- and the first line being perfectly valid is what would make the
+    second one arrive unnoticed.
+    """
+    proc, _, root = run_persist_identity(
+        tmp_path, credential=f"otp:{SEEDED_HASH}\nroot:{SEEDED_HASH}\n")
+    assert proc.returncode != 0, proc.stdout
+    assert chpasswd_argv(tmp_path) == [], chpasswd_argv(tmp_path)
+    assert shadow_hash(root) == BUILD_TIME_HASH
+    assert shadow_hash(root, "root") == "!"
+
+
+def test_a_chpasswd_that_exits_zero_without_writing_is_caught(tmp_path):
+    """
+    The read-back, which is the difference between "the command ran" and "the
+    password is back".
+
+    chpasswd's exit status says the former. A chpasswd that is missing from
+    the image, that is a stub, or that was pointed at another tree gives a
+    boot where the restore reported success and the operator still cannot log
+    in -- and on this appliance nobody finds out until they are standing in
+    front of it with a keyboard.
+    """
+    proc, _, root = run_persist_identity(
+        tmp_path, credential=f"otp:{SEEDED_HASH}\n",
+        chpasswd_env={"CHPASSWD_APPLY": "no"})
+    assert proc.returncode != 0, proc.stdout
+    assert "does not hold the" in proc.stderr, proc.stderr
+    assert shadow_hash(root) == BUILD_TIME_HASH
+    # The positive control: the same store, the same fixture, a chpasswd that
+    # does its job. Without it this passes on a script that always fails.
+    proc, _, root = run_persist_identity(tmp_path / "control",
+                                         credential=f"otp:{SEEDED_HASH}\n")
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == SEEDED_HASH
+
+
+def test_a_chpasswd_that_fails_is_not_reported_as_a_restore(tmp_path):
+    """The other exit: a chpasswd that says so. `set -e` is not in force in
+    this script, so a pipeline whose status nobody read would sail past."""
+    proc, _, root = run_persist_identity(
+        tmp_path, credential=f"otp:{SEEDED_HASH}\n",
+        chpasswd_env={"CHPASSWD_APPLY": "no", "CHPASSWD_RC": "1"})
+    assert proc.returncode != 0, proc.stdout
+    assert "could not put" in proc.stderr, proc.stderr
+    assert shadow_hash(root) == BUILD_TIME_HASH
+
+
+def test_neither_phase_writes_a_credential_into_the_overlay(tmp_path):
+    """
+    #35's guard, asked of the phase that did not exist when it was written.
+
+    If /boot/firmware never mounted, $BOOT_DIR falls back to a directory on
+    the overlay's tmpfs: the record would write a hash into RAM, the restore
+    would read it back happily, and both would agree with each other on every
+    boot while nothing survived any of them. The recording phase is a separate
+    entry point into this script and has to honour the refusal on its own.
+    """
+    proc, boot, _ = run_persist_identity(tmp_path, store_src="overlay",
+                                         mode="--record-credential")
+    assert proc.returncode != 0, proc.stdout
+    assert not (boot / "otp-identity" / "credential").exists()
+    # The positive control, same fixture and same phase, with the store on the
+    # card: two absences are not a refusal.
+    proc, boot, _ = run_persist_identity(tmp_path / "control",
+                                         mode="--record-credential")
+    assert proc.returncode == 0, proc.stderr
+    assert (boot / "otp-identity" / "credential").exists()
+
+
+def test_a_locked_account_is_not_recorded_over_a_good_credential(tmp_path):
+    """
+    The recording phase's own refusal. An account whose /etc/shadow field is
+    `!` has no password to keep, and writing that to the store would replace a
+    working credential with one the restore must refuse -- costing the
+    operator the login on the next power cycle rather than this one.
+    """
+    kept = f"otp:{SEEDED_HASH}\n"
+    proc, boot, _ = run_persist_identity(tmp_path, credential=kept,
+                                         live_hash="!",
+                                         mode="--record-credential")
+    assert proc.returncode != 0, proc.stdout
+    assert (boot / "otp-identity" / "credential").read_text() == kept
+
+
+def test_a_fresh_seed_this_boot_beats_the_credential_that_was_restored(tmp_path):
+    """
+    THE ORDERING DECISION, run as the sequence it is.
+
+    A boot where the store is restored AND a fresh userconf.txt is on the card
+    is a boot where the operator is CHANGING their password. The restore
+    happens at sysinit and the wizard applies the new seed over it at
+    multi-user, so the new password is in force by the end of that boot -- and
+    the wizard's own ExecStartPost then replaces the store, so it is also the
+    one the NEXT boot puts back. Precedence: fresh seed, then store, then the
+    image's random build-time password.
+
+    Get the last step wrong and the failure is the nastiest kind: the operator
+    sets a new password, it works all session, and the next power cycle
+    silently reverts them to the old one.
+    """
+    old = "$6$oldoldold$" + "C" * 86
+    proc, boot, root = run_persist_identity(tmp_path, credential=f"otp:{old}\n")
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == old, "sysinit did not restore the kept one"
+
+    set_shadow_hash(root, SEEDED_HASH)          # the wizard, at multi-user
+    proc = invoke_persist_identity(tmp_path, mode="--record-credential")
+    assert proc.returncode == 0, proc.stderr
+    assert (boot / "otp-identity" / "credential").read_text() \
+        == f"otp:{SEEDED_HASH}\n", "the store still holds the old password"
+
+    set_shadow_hash(root, BUILD_TIME_HASH)      # the power cycle
+    proc = invoke_persist_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert shadow_hash(root) == SEEDED_HASH, \
+        "the next boot reverted the operator to the password they replaced"
+
+
+def test_the_restore_runs_before_any_login_is_possible():
+    """
+    The systemd half of the ordering above, which no fake tree can show.
+
+    The restore rides otp-unit-identity.service, which is Before=sysinit.target
+    -- and every getty on this machine is pulled in at multi-user, so there is
+    no window in which a login prompt exists and the password is still the
+    build-time one. Unlike the machine-id, this needs no initramfs: nothing
+    reads /etc/shadow before PID 1 has started units, which is the entire
+    reason the credential is not a second exception in the overlay script.
+    """
+    unit = IDENTITY_UNIT.read_text()
+    assert "Before=sysinit.target" in unit, unit
+    assert "ExecStart=/opt/otp-unit/persist-identity.sh" in unit
+    # And the RESTORE is the default phase, so the shipped ExecStart gets it
+    # without an argument. A unit that passed --record-credential here would
+    # write the build-time hash to the card on every unseeded boot and restore
+    # nothing, ever.
+    assert "--record-credential" not in unit, unit
+    code = IDENTITY_SH.read_text()
+    assert "/scripts/overlay" not in code
+    assert "shadow" in code, "the script no longer touches the credential"
+
+
 # --- and the four lines that put it on the machine ------------------------
 #
 # THE HALF NOTHING WATCHED. Everything above drives persist-identity.sh
@@ -723,6 +1532,86 @@ def test_the_identity_unit_is_enabled_and_not_merely_dropped_in_place(tmp_path):
     assert "daemon-reload" in calls, calls
     assert calls.index("daemon-reload") < calls.index(
         "enable otp-unit-identity.service"), calls
+
+
+# --- and the one line that makes the credential ever get recorded ---------
+
+CREDENTIAL_DROPIN_BLOCK = (
+    "    install -d /etc/systemd/system/userconfig.service.d",
+    "--record-credential\nCRED")
+CREDENTIAL_DROPIN_DIR = "/etc/systemd/system/userconfig.service.d"
+
+
+def run_credential_dropin(tmp_path):
+    """Write the shipped credential drop-in into a substituted unit directory.
+
+    Rewritten rather than stubbed, for the reason run_dropin gives: a test has
+    no business writing into the machine's own /etc/systemd/system, and
+    everything that decides what the file SAYS stays the shipped bytes.
+    """
+    etc = tmp_path / "etc"
+    block = slice_between(INSTALL.read_text(), *CREDENTIAL_DROPIN_BLOCK)
+    assert block.count(CREDENTIAL_DROPIN_DIR) == 2, block
+    block = block.replace(CREDENTIAL_DROPIN_DIR, f"{etc}/userconfig.service.d")
+    proc = run_block(block, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    return (etc / "userconfig.service.d" / "otp-credential.conf").read_text()
+
+
+def test_the_wizard_records_the_credential_it_just_applied(tmp_path):
+    """
+    The other half of "persist it", and the half with no other trigger.
+
+    Without this line the restore has nothing to restore, forever: the store
+    is written by --record-credential and by nothing else. The image would
+    then boot, apply an operator's seed, delete it, and lose the password at
+    the power cycle exactly as before -- with a persistence mechanism
+    installed, enabled, and reporting success every boot.
+    """
+    text = run_credential_dropin(tmp_path)
+    assert "ExecStartPost=" in text, text
+    assert "/opt/otp-unit/persist-identity.sh --record-credential" in text, text
+    # The path the identity install above really writes the script to. An
+    # ExecStartPost naming anything else is a line systemd cannot run -- and
+    # with the `-` below, cannot complain about either.
+    assert "ExecStartPost=-/opt/otp-unit/" in text, text
+
+
+def test_a_record_that_fails_does_not_cost_the_operator_the_apply(tmp_path):
+    """
+    The leading `-`, stated as a property rather than left to be noticed.
+
+    Stock userconfig.service carries Restart=on-failure. Without the `-` a
+    full boot partition -- or any other reason the record fails -- turns into
+    a restart loop printing `Failed with result` and `Scheduled restart job`,
+    two of the strings harness/img-boot.sh fails a release on, on the one boot
+    that was applying the operator's password successfully.
+    """
+    text = run_credential_dropin(tmp_path)
+    assert "ExecStartPost=-" in text, text
+
+
+def test_the_credential_is_recorded_only_on_an_overlay_machine():
+    """
+    The drop-in is inside install.sh's `if` on cmdline.txt, next to the unit
+    and the script it names -- not beside the wizard drop-in written on every
+    machine this script provisions.
+
+    A writable root keeps /etc/shadow by itself and has nothing to persist,
+    and persist-identity.sh is not installed there at all: an ExecStartPost
+    pointing at a script that does not exist is what the tier-2 Debian guest
+    would get, on a unit whose userconfig.service would then be carrying a
+    command it can never run.
+    """
+    text = INSTALL.read_text()
+    dropin = text.index("otp-credential.conf")
+    identity = text.index('install -m 0755 "$REPO_DIR/device/persist-identity.sh"')
+    overlay_branch = text.index('log "Enabling the read-only root overlay"')
+    # After the branch opens, and after the script it names is installed.
+    assert overlay_branch < identity < dropin, (overlay_branch, identity, dropin)
+    # And before the branch closes. The `fi` that ends it is the one directly
+    # ahead of the summary this script prints for the operator.
+    assert dropin < text.index("# WHAT THIS SCRIPT DID TO SOMEONE ELSE'S MACHINE")
 
 
 # --- ssh.socket, which turned a documented reload into a dead sshd --------
@@ -2440,8 +3329,31 @@ def userconf_block() -> str:
     return text[start:text.index("\nsync 2>/dev/null || true", start)]
 
 
+def shadow_field(shadow_text: str, user: str) -> str:
+    """Field 2 of an /etc/shadow line, as the probe's own awk reads it."""
+    for line in shadow_text.splitlines():
+        fields = line.split(":")
+        if fields[0] == user:
+            return fields[1]
+    return ""
+
+
+def sha256_of(text: str) -> str:
+    """What the probe's `sha256sum` answers for the same bytes.
+
+    The probe digests the hash rather than carrying it between the boots
+    because its console is uploaded as a CI artifact and a crypt string is
+    offline-crackable at leisure. Recomputed here rather than pasted, so the
+    fixture cannot drift away from the thing under test.
+    """
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
-                 executable=True, shadow=None, env=None):
+                 executable=True, shadow=None, passwd=None, env=None,
+                 credential="otp:$6$otpimgcheck$hashbytes",
+                 boot1_digest="auto", store_src="/dev/mmcblk0p1",
+                 root_source="overlay", sha256sum=True):
     """Run the shipped userconf block with a substituted systemd and shadow.
 
     Three absolute paths are rewritten rather than stubbed on the filesystem
@@ -2455,11 +3367,25 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
     """
     bootdir = tmp_path / "firmware"
     bootdir.mkdir(parents=True, exist_ok=True)
-    shadow_file = tmp_path / "shadow"
+    # A whole fake /etc rather than a lone shadow file, because boot2's
+    # relabel experiment runs the SHIPPED device/persist-identity.sh and that
+    # script reads passwd, shadow and machine-id out of one tree. Pointing the
+    # probe's reads and the script's --root at the same tree is what makes the
+    # experiment a sequence rather than two rigs agreeing with each other.
+    etc = tmp_path / "root" / "etc"
+    etc.mkdir(parents=True, exist_ok=True)
+    shadow_file = etc / "shadow"
     shadow_file.write_text(
         "root:!:20000:0:99999:7:::\n"
         + (shadow if shadow is not None
            else "otp:$6$otpimgcheck$hashbytes:20000:0:99999:7:::\n"))
+    # `pi` is deliberately NOT here: it is the name boot2's experiment plants
+    # in the store, and a fixture where it is a real account is testing
+    # something else. `otp` holds UID 1000, the way image/build.sh builds it.
+    (etc / "passwd").write_text(passwd if passwd is not None else (
+        "root:x:0:0:root:/root:/bin/bash\n"
+        "otp:x:1000:1000:,,,:/home/otp:/bin/bash\n"))
+    (etc / "machine-id").write_text(LIVE_ID + "\n")
     svc = tmp_path / "userconf-service"
     if service is not None:
         svc.write_text(service)
@@ -2470,26 +3396,103 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
     (bin_dir / "systemctl").chmod(0o755)
     (bin_dir / "journalctl").write_text(JOURNALCTL_STUB)
     (bin_dir / "journalctl").chmod(0o755)
+    if not sha256sum:
+        # THE MISSING COMMAND, which is the question every guard here has to
+        # answer: what exit code, empty output or absent binary makes this
+        # pass silently? `cred_digest` pipes into sha256sum and takes what
+        # comes back, so one that is absent or broken answers the empty
+        # string -- in BOTH boots, which is how "the password survived the
+        # power cycle" turns into "there was never a password". Exits 0, like
+        # a command that is not there behind a `2>/dev/null`.
+        (bin_dir / "sha256sum").write_text("#!/bin/sh\ncat >/dev/null\nexit 0\n")
+        (bin_dir / "sha256sum").chmod(0o755)
+
+    # The credential store the probe audits, and the record boot1 leaves for
+    # boot2. Supplied here rather than left to the block, because both are
+    # written by the IMAGE -- persist-identity.sh puts the store there from the
+    # wizard's ExecStartPost -- and this rig has no image.
+    store = bootdir / "otp-identity"
+    store.mkdir(parents=True, exist_ok=True)
+    if credential is not None:
+        (store / "credential").write_text(credential + "\n")
+    # The machine-id the shipped script would find already kept, so its own
+    # machine-id branch is quiet and the exit status boot2's experiment reads
+    # is a statement about the credential.
+    (store / "machine-id").write_text(LIVE_ID + "\n")
+
+    # The three commands the relabel experiment and the script it runs would
+    # otherwise reach for on the machine running this test: `chpasswd` really
+    # edits /etc/shadow, `findmnt` answers about the real root, and
+    # /opt/otp-unit/persist-identity.sh is not installed here.
+    (bin_dir / "chpasswd").write_text(CHPASSWD_STUB)
+    (bin_dir / "chpasswd").chmod(0o755)
+    (bin_dir / "findmnt").write_text(IDENTITY_FINDMNT_STUB)
+    (bin_dir / "findmnt").chmod(0o755)
+    # THE REAL SCRIPT, not a stub, pointed at this fixture's boot partition
+    # and /etc. The whole value of the experiment is that the guest block
+    # hands its synthesised state to the code that ships.
+    shipped = tmp_path / "persist-identity.sh"
+    shipped.write_text(
+        "#!/bin/sh\n"
+        f'exec bash {IDENTITY_SH} --boot-dir "{bootdir}" '
+        f'--root "{tmp_path / "root"}" "$@"\n')
+    shipped.chmod(0o755)
+    # "auto" is the healthy path: the digest boot1 would have written of the
+    # hash this fixture's own /etc/shadow holds. Computed from the fixture
+    # rather than pasted, so a test that changes the hash cannot leave a
+    # record describing the old one and call the mismatch a finding.
+    if boot1_digest == "auto":
+        boot1_digest = sha256_of(shadow_field(shadow_file.read_text(), "otp"))
+    if boot1_digest is not None:
+        (bootdir / "otp-imgcheck-credential").write_text(boot1_digest + "\n")
 
     block = userconf_block()
-    for original, replacement, why in (
-        ("/etc/shadow", str(shadow_file), "the shadow file"),
-        ("/usr/lib/userconf-pi/userconf-service", str(svc), "the service"),
-        ("timeout -k 5 60", "timeout -k 1 2", "the experiment's bound"),
-        ("sleep 2", "sleep 0", "the condition poll"),
+    for original, replacement, why, count in (
+        # THE READ, not the path: the comments in the block name /etc/shadow
+        # eight times over and rewriting those would prove nothing. TWICE,
+        # not once, because boot1 reads the account's hash to say the seed
+        # was applied and boot2 reads it again to say the hash outlived the
+        # power cycle -- a rewrite that patched one would leave the other
+        # reading the machine this test runs on.
+        # FOUR, not the two it was: boot1 reads the account's hash to say the
+        # seed was applied, boot2 reads it again to say the hash outlived the
+        # power cycle, and boot2's relabel experiment reads it either side of
+        # the shipped script it runs.
+        ("{print $2}' /etc/shadow", "{print $2}' " + str(shadow_file),
+         "the shadow read", 4),
+        # The awk, not the bare path: the comment above these two reads names
+        # /etc/passwd as well, and rewriting a comment proves nothing.
+        ("exit }' /etc/passwd", "exit }' " + str(etc / "passwd"),
+         "the passwd read", 2),
+        ("/opt/otp-unit/persist-identity.sh", str(shipped),
+         "the shipped identity script", 1),
+        ("/usr/lib/userconf-pi/userconf-service", str(svc), "the service", 1),
+        ("timeout -k 5 60", "timeout -k 1 2", "the experiment's bound", 1),
+        ("sleep 2", "sleep 0", "the condition poll", 1),
     ):
-        assert block.count(original) == 1, f"{why}: {original!r} in the block"
+        assert block.count(original) == count, \
+            f"{why}: {original!r} appears {block.count(original)}x, want {count}"
         block = block.replace(original, replacement)
 
     runner = tmp_path / "userconf.sh"
     runner.write_text(
         "set -uo pipefail\n"
         f'PHASE="{phase}"\nBOOTDIR="{bootdir}"\nPASS=0\nTOTAL=0\n'
+        # What the identity section above the block would have set. Named
+        # here for the same reason $BOOTDIR is: the credential checks compare
+        # the store's filesystem against the root's, and that comparison has
+        # to be steerable or the clause that catches an unmounted
+        # /boot/firmware can never be shown to work.
+        f'IDENTITY_STORE="{store}"\nSTORE_SRC="{store_src}"\n'
+        f'ROOT_SOURCE="{root_source}"\n'
         + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
         + block + '\nprintf "TOTALS %s/%s\\n" "$PASS" "$TOTAL"\n')
     proc = subprocess.run(
         ["bash", str(runner)], capture_output=True, text=True, timeout=120,
         env={**os.environ, **(env or {}), "BOOTDIR": str(bootdir),
+             "CHPASSWD_SHADOW": str(shadow_file),
+             "CHPASSWD_ARGV": str(tmp_path / "chpasswd-argv.log"),
+             "FAKE_STORE_SRC": store_src, "FAKE_ROOT_SRC": root_source,
              "PATH": f"{bin_dir}:{os.environ['PATH']}"})
     return proc, bootdir
 
@@ -2518,7 +3521,9 @@ def test_a_seeded_first_boot_reports_applied_credentials_and_no_wizard(tmp_path)
         "network-wait-cannot-hold-the-boot-open": "PASS",
         "userconf-seed-applied": "PASS",
         "userconf-seeded-boot-ran-no-wizard": "PASS",
-        "front-panel-survives-the-credential-apply": "PASS"}, proc.stdout
+        "front-panel-survives-the-credential-apply": "PASS",
+        "credential-recorded-outside-the-overlay": "PASS",
+        "credential-recorded-for-the-next-boot": "PASS"}, proc.stdout
 
 
 def test_a_boot_still_waiting_on_the_network_fails(tmp_path):
@@ -2792,9 +3797,331 @@ def test_an_unseeded_second_boot_is_quiet_and_leaves_evidence(tmp_path):
         "network-wait-cannot-hold-the-boot-open": "PASS",
         "userconf-unseeded-boot-skips-the-wizard": "PASS",
         "userconf-wizard-cannot-prompt": "PASS",
+        "credential-survives-the-power-cycle": "PASS",
+        "credential-recovers-a-store-naming-another-account": "PASS",
         "userconf-malformed-seed-fails-fast": "PASS"}, proc.stdout
     assert (bootdir / "failed_userconf.txt").exists()
     assert not (bootdir / "userconf.txt").exists()
+    # AND THE EXPERIMENT PUT THE CARD BACK, by the shipped script's own
+    # action rather than by a cleanup step: only the NAME in the store was
+    # changed, so a working restore rewrites it and re-applies the same hash.
+    # The host's own credential-kept-on-the-card is looking at this file after
+    # the guest has finished with it.
+    assert (bootdir / "otp-identity" / "credential").read_text() \
+        == "otp:$6$otpimgcheck$hashbytes\n"
+    assert shadow_field((tmp_path / "root" / "etc" / "shadow").read_text(),
+                        "otp") == "$6$otpimgcheck$hashbytes"
+
+
+def test_the_relabel_experiment_is_refused_a_name_this_machine_really_has(tmp_path):
+    """
+    The fixture clause, and it is not decoration.
+
+    The experiment's whole subject is a store naming an account that does NOT
+    exist -- that is what a power cycle leaves behind after userconf-pi's
+    rename. Point it at a name the machine really has and it is a different
+    experiment: the restore would then be applying a credential to an account
+    somebody could already be using, which is the thing the UID rule exists to
+    stop. So the probe reads /etc/passwd and refuses to draw a conclusion.
+    """
+    proc, _ = run_userconf(
+        tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+        passwd="root:x:0:0:root:/root:/bin/bash\n"
+               "pi:x:1001:1001:,,,:/home/pi:/bin/bash\n"
+               "otp:x:1000:1000:,,,:/home/otp:/bin/bash\n")
+    assert results(proc)["credential-recovers-a-store-naming-another-account"] \
+        == "FAIL", proc.stdout
+    # And it says which clause: an account named `pi` is on this machine.
+    assert "an account here: yes" in proc.stdout, proc.stdout
+
+
+def test_a_relabel_experiment_that_never_changed_the_password_proves_nothing(tmp_path):
+    """
+    THE TWO-ABSENCE HOLE, in the shape this experiment can take it.
+
+    "the live hash is the kept one afterwards" is satisfied perfectly by an
+    experiment that never disturbed it: the mangle silently fails, the shipped
+    script finds the password already right, takes its early exit, relabels
+    the store and exits 0 -- and every other clause here is true of a boot
+    that proved nothing about the apply at all.
+
+    Driven with the chpasswd stub told to exit 0 having written nothing, which
+    is what a chpasswd missing from the image does.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot2",
+                           env={**HEALTHY_BOOT2, "CHPASSWD_APPLY": "no"})
+    assert results(proc)["credential-recovers-a-store-naming-another-account"] \
+        == "FAIL", proc.stdout
+    # The state the clause caught: nothing moved, so before and after agree.
+    assert re.search(r"before: (\S+)\.\.\. \| after: \1\.\.\.", proc.stdout), \
+        proc.stdout
+
+
+# --- and the credential the seed used to lose ------------------------------
+#
+# These drive the SAME block through the same rig. The image the checks
+# describe is the one the owner's decision produced: the applied hash is kept
+# in /boot/firmware/otp-identity/credential, restored at sysinit, and still in
+# force after the power cycle. Every test below is a way for that to look
+# right while being false.
+
+
+def test_a_boot_that_applied_the_seed_but_kept_nothing_fails(tmp_path):
+    """
+    THE OLD BEHAVIOUR, stated as a failure.
+
+    Everything else in boot1 was equally true of the image that lost the
+    password: the hash reaches /etc/shadow, the wizard finishes, the panel
+    survives. /etc is inside the overlay, so all of it died with the power.
+    An empty store is that image, and it has to be red.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           credential=None)
+    assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
+        proc.stdout
+    # The other one still passes: boot1 watched the apply happen and wrote its
+    # own record. That is the point of splitting them -- the positive control
+    # must not go red for the thing it is controlling for.
+    assert results(proc)["credential-recorded-for-the-next-boot"] == "PASS"
+
+
+def test_a_store_holding_something_other_than_the_applied_hash_fails(tmp_path):
+    """
+    A store that exists is not a store that is right. This is the shape a
+    stale credential has: the operator seeded a NEW password, the wizard
+    applied it, and the recording phase never ran -- so the next power cycle
+    puts the OLD one back and the operator is locked out of a password they
+    believe they changed.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           credential="otp:$6$otpimgcheck$somethingelse")
+    assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_store_naming_another_account_fails(tmp_path):
+    """`chpasswd` takes `user:hash`, so a store naming somebody else restores
+    nothing -- and the digest of its hash field can still match perfectly."""
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           credential="pi:$6$otpimgcheck$hashbytes")
+    assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_credential_store_inside_the_overlay_is_not_persistence(tmp_path):
+    """
+    #35's hole, on the credential side. An unmounted /boot/firmware leaves the
+    store as a directory on the overlay's tmpfs: it agrees with /etc/shadow
+    perfectly, on every boot, while nothing survives any of them.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           store_src="overlay", root_source="overlay")
+    assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_root_nothing_could_describe_does_not_make_the_credential_kept(tmp_path):
+    """
+    The same clause from the other end. If findmnt could not describe `/`,
+    $ROOT_SOURCE is empty and "the store is not on the root's filesystem"
+    becomes true of every store there is -- a check that is only correct
+    because a different one failed.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           root_source="")
+    assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_first_boot_with_no_credential_at_all_records_nothing_and_says_so(tmp_path):
+    """
+    The positive control's own negative. A machine whose /etc/shadow has no
+    entry for the account has no credential to record, and a record file
+    written from an empty string would be a digest of nothing that boot2's
+    equally-empty read would match.
+    """
+    proc, bootdir = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                                 shadow="pi:$6$x$y:20000:0:99999:7:::\n")
+    assert results(proc)["credential-recorded-for-the-next-boot"] == "FAIL", \
+        proc.stdout
+    written = (bootdir / "otp-imgcheck-credential").read_text().strip()
+    assert written == "", written
+
+
+def test_a_record_that_never_reached_the_card_fails_boot1(tmp_path):
+    """
+    The read-back in the positive control, which is what makes it a control.
+
+    The record is the ONE thing boot2's claim rests on that the image did not
+    write, so boot1 has to say it landed rather than that it tried. A boot
+    partition that is full, read-only, or has something else at that path
+    leaves boot2 comparing against nothing -- and two nothings are equal.
+    """
+    bootdir = tmp_path / "firmware"
+    bootdir.mkdir(parents=True, exist_ok=True)
+    # Something at the path the record wants, which no `printf >` can write
+    # over. Cheaper than a full partition and the same failure from the
+    # probe's side.
+    (bootdir / "otp-imgcheck-credential").mkdir()
+    proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
+                           boot1_digest=None)
+    assert results(proc)["credential-recorded-for-the-next-boot"] == "FAIL", \
+        proc.stdout
+    # The apply itself is untouched: this is about the probe's own bookkeeping.
+    assert results(proc)["userconf-seed-applied"] == "PASS", proc.stdout
+
+
+def test_the_second_boot_accepts_the_password_that_outlived_the_power(tmp_path):
+    """The healthy boot2 path, spelled out: the hash carries the seed's salt
+    and digests to what boot1 recorded, with no seed on the card."""
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2)
+    assert results(proc)["credential-survives-the-power-cycle"] == "PASS", \
+        proc.stdout
+
+
+def test_a_second_boot_back_on_the_build_time_password_fails(tmp_path):
+    """
+    THE DEFECT, measured before this change and now a red line: boot2 came up
+    with pi-gen's random FIRST_USER_PASS, which nobody has, on a device whose
+    only other way in is the card.
+    """
+    proc, _ = run_userconf(
+        tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+        shadow="otp:$6$RaNdOmSaLt$buildtimebytes:20000:0:99999:7:::\n",
+        boot1_digest=sha256_of("$6$otpimgcheck$hashbytes"))
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+
+
+def test_two_absences_are_not_a_credential_that_survived(tmp_path):
+    """
+    The two-absence hole the review caught on the machine-id side, closed on
+    this one with the same shape of clause. No hash in /etc/shadow and no
+    record from boot1 compare equal, and both are empty.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+                           shadow="root:!:20000:0:99999:7:::\n",
+                           boot1_digest=None)
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_digest_nothing_could_compute_is_not_a_match(tmp_path):
+    """
+    THE MISSING COMMAND, which is what the length clauses are actually for and
+    what the mutation gate caught this test's absence with.
+
+    Every other clause survives a broken `sha256sum`: the salt is still in
+    /etc/shadow, so attribution passes, and both digests come back as the
+    empty string, so the equality passes too -- a boot2 certifying that the
+    password survived on the strength of two things nothing computed. It is
+    not a hypothetical shape either: boot1 writes whatever `cred_digest`
+    returned into the record, so ONE broken sha256sum makes both sides empty
+    on the same machine.
+
+    The positive control is the same fixture with sha256sum working.
+    """
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+                           boot1_digest="", sha256sum=False)
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+    proc, _ = run_userconf(tmp_path / "control", phase="boot2",
+                           env=HEALTHY_BOOT2)
+    assert results(proc)["credential-survives-the-power-cycle"] == "PASS", \
+        proc.stdout
+
+
+def test_the_same_password_in_both_boots_is_not_the_seeded_one(tmp_path):
+    """
+    ATTRIBUTION, which the digest comparison cannot supply.
+
+    A boot2 whose hash digests to exactly what boot1 recorded has proved that
+    the password did not CHANGE -- and pi-gen's build-time password does not
+    change either. It is the same on every boot of a unit whose credential was
+    never persisted at all, which is the image this check exists to fail. Only
+    the salt says the hash in force is the one the operator seeded.
+    """
+    build_time = "$6$RaNdOmSaLt$buildtimebytes"
+    proc, _ = run_userconf(
+        tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+        shadow=f"otp:{build_time}:20000:0:99999:7:::\n",
+        boot1_digest=sha256_of(build_time))
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+    # The positive control on the same fixture: swap in the seeded hash and
+    # its own digest, and the check passes. Without it this is satisfied by a
+    # clause that refuses everything.
+    seeded = "$6$otpimgcheck$hashbytes"
+    proc, _ = run_userconf(
+        tmp_path / "control", phase="boot2", env=HEALTHY_BOOT2,
+        shadow=f"otp:{seeded}:20000:0:99999:7:::\n",
+        boot1_digest=sha256_of(seeded))
+    assert results(proc)["credential-survives-the-power-cycle"] == "PASS", \
+        proc.stdout
+
+
+def test_a_second_boot_with_a_password_but_no_record_fails(tmp_path):
+    """Half of the pair above, on its own: boot1 never wrote a record, so
+    there is nothing this boot's hash can be held against."""
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+                           boot1_digest=None)
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_password_that_could_have_come_from_a_seed_this_boot_fails(tmp_path):
+    """
+    The clause that makes this a statement about a POWER CYCLE.
+
+    A userconf.txt still on the card is a boot where the wizard is armed --
+    the delete failed, or the operator left the file there -- so the hash in
+    /etc/shadow may have been applied a moment ago rather than restored. That
+    is also the rejected "keep the seed file" option arriving by accident,
+    with the operator's credential line readable in any card reader forever.
+    """
+    bootdir = tmp_path / "firmware"
+    bootdir.mkdir(parents=True, exist_ok=True)
+    (bootdir / "userconf.txt").write_text("otp:$6$otpimgcheck$hashbytes\n")
+    proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2)
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_restored_hash_that_was_mangled_on_the_way_back_fails(tmp_path):
+    """
+    Attribution is not integrity. A truncated restore still begins with the
+    seed's salt, so the salt clause alone would pass it -- and a truncated
+    crypt string is a password nobody can type.
+    """
+    proc, _ = run_userconf(
+        tmp_path, phase="boot2", env=HEALTHY_BOOT2,
+        shadow="otp:$6$otpimgcheck$hashbyt:20000:0:99999:7:::\n",
+        boot1_digest=sha256_of("$6$otpimgcheck$hashbytes"))
+    assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
+        proc.stdout
+
+
+def test_the_probe_never_writes_the_hash_where_the_console_can_see_it(tmp_path):
+    """
+    This console is uploaded as a CI artifact, and a crypt string on it is a
+    crypt string anyone who downloads the run can attack at leisure -- for as
+    long as they like, against a hash the operator may have reused elsewhere.
+    What travels between the boots is a sha256 of it, and what is printed is
+    twelve characters of that.
+    """
+    secret = "$6$otpimgcheck$hashbytes"
+    for phase, env in (("boot1", HEALTHY_BOOT1), ("boot2", HEALTHY_BOOT2)):
+        proc, bootdir = run_userconf(tmp_path / phase, phase=phase, env=env)
+        assert secret not in proc.stdout, proc.stdout
+        assert "hashbytes" not in proc.stdout, proc.stdout
+        # And the record the probe itself leaves on the card is the digest,
+        # not the hash. The store beside it holds the hash in full -- that is
+        # the thing under test -- so this file must add nothing to it.
+        record = (bootdir / "otp-imgcheck-credential").read_text().strip()
+        assert record == sha256_of(secret), record
+    # The positive control: the digest IS in the output, so "the hash is
+    # absent" is not satisfied by a probe that printed nothing at all.
+    assert sha256_of(secret)[:12] in proc.stdout, proc.stdout
 
 
 def test_a_masked_wizard_is_quiet_for_the_wrong_reason(tmp_path):

@@ -566,6 +566,17 @@ fi
 # leaves exactly the part under test: the decision not to prompt, the
 # `chpasswd -e`, and the delete. tests/test_img_verdict.py holds this name
 # against image/build.sh so the two cannot drift.
+#
+# WHAT THAT NARROWING USED TO HIDE, and where it is covered now. The rename
+# is not a curiosity: it is what an operator gets for writing any username
+# but `otp`, it lives entirely inside the overlay, and the store on this
+# partition outlives it -- so the next boot met a credential naming an
+# account that no longer existed, and refusing it took the unit's only login
+# away. Seeding a different name here would exercise that and would cost this
+# tier its only end-to-end look at the plain apply, so the state that power
+# cycle leaves is synthesised in boot2 instead and handed to the real shipped
+# script: see credential-recovers-a-store-naming-another-account in
+# harness/img-guest-check.sh.
 USERCONF_USER="otp"
 # sha512-crypt, generated with
 #
@@ -595,6 +606,30 @@ mcopy -o -n -i "$IMG@@$BOOT_OFFSET" "$WORK/userconf.txt" ::userconf.txt || true
 # only the before-listing tells them apart.
 fat_listing() {
     mdir -b -i "$IMG@@$BOOT_OFFSET" :: > "$1" 2>/dev/null || : > "$1"
+    # AND ONE LEVEL DOWN, INTO THE STORE, because `mdir -b` is NOT recursive.
+    # MEASURED, with mtools on a FAT image built by hand rather than reasoned
+    # about, because a wrong answer here is red on a healthy card -- the
+    # sign-flipped failure CI would blame on the image. `mdir -b -i IMG ::`
+    # over a card holding otp-identity/{machine-id,credential} prints
+    #
+    #   ::/kernel8.img
+    #   ::/otp-identity/
+    #
+    # and nothing else: the directory as one line, its contents nowhere. With
+    # this second call the same listing gains
+    #
+    #   ::/otp-identity/machine-id
+    #   ::/otp-identity/credential
+    #
+    # as whole lines, in the `::/path` form `fat_lists` greps for.
+    #
+    # APPENDED, and failure is not fatal: a card with no store yet -- which is
+    # every card before its first boot -- has no such directory, mdir answers
+    # non-zero and prints nothing, and the listing is just the root. Measured
+    # on the same image before the directory was made. That absence is a
+    # finding for the check below to report, not a reason to produce no
+    # verdict at all.
+    mdir -b -i "$IMG@@$BOOT_OFFSET" ::/otp-identity >> "$1" 2>/dev/null || true
 }
 
 # root=/dev/mmcblk0p2 rather than cmdline.txt's root=PARTUUID=..., but not
@@ -1147,11 +1182,14 @@ network-wait-cannot-hold-the-boot-open \
 machine-id-persisted-outside-the-overlay"
 GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \
 front-panel-survives-the-credential-apply diagnostic-sheet-renders \
-diagnostic-sheet-reaches-cups machine-id-recorded-for-the-next-boot"
+diagnostic-sheet-reaches-cups machine-id-recorded-for-the-next-boot \
+credential-recorded-outside-the-overlay credential-recorded-for-the-next-boot"
 GUEST_CHECKS_BOOT2="root-writes-discarded-by-the-power-cycle \
 settings-survive-the-power-cycle userconf-unseeded-boot-skips-the-wizard \
 userconf-wizard-cannot-prompt userconf-malformed-seed-fails-fast \
-machine-id-identical-across-the-power-cycle"
+machine-id-identical-across-the-power-cycle \
+credential-survives-the-power-cycle \
+credential-recovers-a-store-naming-another-account"
 
 guest_gate() {
     local phase="$1" count counts passed total missing want name
@@ -1281,6 +1319,33 @@ userconf_gate() {
                        "$(fat_lists "$after" userconf.txt && printf ' userconf.txt')" \
                        "$(fat_lists "$after" failed_userconf.txt && printf ' failed_userconf.txt')"
             fi
+            # AND THE CREDENTIAL WAS KEPT, SEEN FROM OUTSIDE THE MACHINE.
+            #
+            # This is the only statement about the persistence that owes
+            # nothing to the guest probe. Everything the guest says about the
+            # store it reads through its own findmnt and its own mount table;
+            # this is the file, on the card, listed by mtools from the host,
+            # with no running system involved. A guest that lied, a probe that
+            # was never started, or a store that was written into the
+            # overlay's tmpfs instead of onto the partition all produce
+            # nothing here.
+            #
+            # BOTH SIDES, which is what makes it evidence rather than a
+            # coincidence. The image ships no credential -- nothing writes one
+            # before an operator seeds a userconf.txt -- so the file must be
+            # ABSENT before this boot and PRESENT after it. "Present after" on
+            # its own would be equally true of an image that shipped one, and
+            # `boot-partition-listed` above is what rules out a listing that
+            # is empty because mtools failed.
+            if ! fat_lists "$before" otp-identity/credential \
+               && fat_lists "$after" otp-identity/credential; then
+                printf 'IMG-CHECK %s credential-kept-on-the-card PASS\n' "$phase"
+            else
+                printf 'IMG-CHECK %s credential-kept-on-the-card FAIL before:%s after:%s\n' \
+                       "$phase" \
+                       "$(fat_lists "$before" otp-identity/credential && printf yes || printf no)" \
+                       "$(fat_lists "$after" otp-identity/credential && printf yes || printf no)"
+            fi
             ;;
         boot2)
             # The other end of the guest's malformed-seed experiment, from
@@ -1295,6 +1360,26 @@ userconf_gate() {
                        "$phase" \
                        "$(fat_lists "$after" failed_userconf.txt && printf yes || printf no)" \
                        "$(fat_lists "$after" userconf.txt && printf yes || printf no)"
+            fi
+            # STILL THERE AFTER THE POWER CYCLE, from the host. boot1's
+            # version of this check says the file appeared; this one says a
+            # power cycle and a whole second boot did not take it away --
+            # which is the property an operator is relying on when they plug
+            # a keyboard into a unit that has been off for a month.
+            #
+            # BOTH SIDES AGAIN, and here they are both `present`: the file has
+            # to be on the card BEFORE boot2 -- that is the power cycle -- and
+            # still there after. A file that only appeared during boot2 would
+            # mean something rewrote it on a boot with no seed, which is the
+            # exposure this design refuses.
+            if fat_lists "$before" otp-identity/credential \
+               && fat_lists "$after" otp-identity/credential; then
+                printf 'IMG-CHECK %s credential-kept-on-the-card PASS\n' "$phase"
+            else
+                printf 'IMG-CHECK %s credential-kept-on-the-card FAIL before:%s after:%s\n' \
+                       "$phase" \
+                       "$(fat_lists "$before" otp-identity/credential && printf yes || printf no)" \
+                       "$(fat_lists "$after" otp-identity/credential && printf yes || printf no)"
             fi
             ;;
     esac

@@ -89,9 +89,24 @@ grep -vE '^\s*(#|$)' "$REPO_DIR/device/packages.txt" | tr '\n' ' ' \
 # *inside* the container, so pointing it at a host path just writes the
 # image somewhere the container's own `docker cp` never looks.
 # FIRST_USER_PASS is required whenever DISABLE_FIRST_BOOT_USER_RENAME is
-# set; pi-gen refuses to start without it. The account has no SSH and no
-# console use -- the unit boots straight into the panel -- but set
-# OTP_USER_PASS_HASH if you want a known one.
+# set; pi-gen refuses to start without it, and unset it is RANDOM -- eighteen
+# bytes of /dev/urandom, base64, discarded the moment the build finishes.
+# Nobody has it, including whoever built the image.
+#
+# "THE ACCOUNT HAS NO SSH AND NO CONSOLE USE" is what this comment used to
+# say, and the console half was never true: device/install.sh puts a login
+# getty on tty2 precisely so a unit with a keyboard and a screen can be
+# recovered. That random password was the credential on that prompt on every
+# unit whose operator had not seeded a userconf.txt, and until the credential
+# was persisted it was the credential again from the second boot onwards even
+# on units whose operator HAD.
+#
+# So set OTP_USER_PASS_HASH if you want the image itself to ship a password
+# you know -- the value is a crypt(3) string, not a password, and it goes
+# into the built image where anyone with the .img.xz can read it. The
+# supported way is the other one: write a userconf.txt to the boot partition
+# of the flashed card. See docs/IMAGE.md, which also says what keeping it
+# costs.
 cat > "$PI_GEN_DIR/config" <<EOF
 IMG_NAME='otp'
 RELEASE='trixie'

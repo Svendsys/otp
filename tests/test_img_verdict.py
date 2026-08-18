@@ -179,17 +179,34 @@ FAT_ROOT = ["::/kernel8.img", "::/bcm2710-rpi-3-b.dtb", "::/config.txt",
             "::/cmdline.txt", "::/initramfs8", "::/otp-unit.conf"]
 
 
+# The store, one level down, and the two lines the harness's second `mdir`
+# call is there to produce. `mdir -b` is NOT recursive -- measured with mtools
+# on a hand-built FAT image: a directory shows up as `::/otp-identity/` alone
+# and none of its contents appear -- so a fixture without these would describe
+# a listing the harness cannot take and let a check that can never pass look
+# healthy here.
+FAT_STORE = ["::/otp-identity/machine-id", "::/otp-identity/credential"]
+
+
 def healthy_listings(phase):
     """The boot partition either side of a healthy phase.
 
     boot1 goes in with the harness's seed and comes out without it; boot2
     goes in clean and comes out holding the quarantined malformed seed the
     guest fed to userconf-service by hand.
+
+    THE CREDENTIAL IS NOT THERE BEFORE boot1 and is afterwards, because the
+    image ships none: it is written by the wizard's own ExecStartPost on the
+    boot that applies an operator's seed, and by nothing else. From boot2 on
+    it is on the card at both ends, which is what a power cycle keeping it
+    looks like from outside the machine.
     """
     if phase == "boot1":
-        return FAT_ROOT + ["::/userconf.txt"], list(FAT_ROOT)
+        return (FAT_ROOT + ["::/userconf.txt", "::/otp-identity/machine-id"],
+                FAT_ROOT + FAT_STORE)
     if phase == "boot2":
-        return list(FAT_ROOT), FAT_ROOT + ["::/failed_userconf.txt"]
+        return (FAT_ROOT + FAT_STORE,
+                FAT_ROOT + FAT_STORE + ["::/failed_userconf.txt"])
     return list(FAT_ROOT), list(FAT_ROOT)
 
 
@@ -496,10 +513,22 @@ def test_the_seed_names_the_account_the_image_actually_ships(tmp_path):
     would be running by accident. Naming the image's own first user keeps the
     rename branch out of it -- so if image/build.sh ever changes
     FIRST_USER_NAME, this seed silently starts testing something else.
+
+    WHAT THAT NARROWING NO LONGER HIDES. The rename is exactly what an
+    operator gets for writing any other username, it lives entirely inside
+    the overlay, and the store outlives it -- so the next boot met a
+    credential naming an account that was gone, and refusing it took the
+    unit's only login away. The state that leaves is synthesised in boot2 and
+    handed to the real shipped script instead of being seeded here, so this
+    agreement stays a narrowing rather than a blind spot: see
+    credential-recovers-a-store-naming-another-account.
     """
     first_user = shell_value(BUILD_SH, "FIRST_USER_NAME")
     assert shell_value(IMG_BOOT, "USERCONF_USER") == first_user
     assert shell_value(GUEST_CHECK, "USERCONF_USER") == first_user
+    assert "credential-recovers-a-store-naming-another-account" \
+        in GUEST_CHECK.read_text(), \
+        "nothing in tier 3 exercises the rename branch this seed avoids"
 
 
 def test_the_guest_looks_for_the_salt_the_harness_actually_planted():
@@ -636,9 +665,113 @@ def test_a_healthy_run_reports_the_credential_file_too(tmp_path):
     for line in ("IMG-CHECK boot1 boot-partition-listed PASS",
                  "IMG-CHECK boot1 userconf-seed-planted PASS",
                  "IMG-CHECK boot1 userconf-seed-consumed PASS",
+                 "IMG-CHECK boot1 credential-kept-on-the-card PASS",
+                 "IMG-CHECK boot2 credential-kept-on-the-card PASS",
                  "IMG-CHECK boot2 userconf-malformed-seed-quarantined PASS"):
         assert line in verdict, verdict
     assert proc.returncode == 0, proc.stderr + verdict
+
+
+def test_a_credential_that_never_reached_the_card_fails(tmp_path):
+    """
+    THE DEFECT, from the one vantage point that owes nothing to the guest.
+
+    Before this change the seed was applied to /etc/shadow -- inside the
+    overlay -- and deleted from the card, so the card came out of boot1
+    holding nothing and the operator's password was gone at the power cycle.
+    That is this fixture: a healthy boot1 in every other respect, with no
+    credential in the listing afterwards.
+    """
+    before, after = healthy_listings("boot1")
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1")},
+        boot_files={"boot1": (before,
+                              [x for x in after if "credential" not in x])})
+    assert "IMG-CHECK boot1 credential-kept-on-the-card FAIL" in verdict, verdict
+    assert proc.returncode == 1
+    # The seed checks are untouched by it, which is the whole reason this one
+    # had to be added: applied-and-consumed was always true of the broken
+    # image too.
+    assert "IMG-CHECK boot1 userconf-seed-consumed PASS" in verdict, verdict
+
+
+def test_a_credential_the_image_shipped_is_not_one_this_boot_kept(tmp_path):
+    """
+    The before-half of boot1's check, which is what makes it evidence.
+
+    "the file is on the card afterwards" is equally true of an image that was
+    built with one -- and a credential baked into a public .img.xz is the same
+    hash on every unit ever flashed from it, which is worse than the defect
+    this replaces rather than better.
+    """
+    before, after = healthy_listings("boot1")
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1")},
+        boot_files={"boot1": (before + ["::/otp-identity/credential"], after)})
+    assert "IMG-CHECK boot1 credential-kept-on-the-card FAIL" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_a_credential_that_did_not_outlive_the_power_cycle_fails(tmp_path):
+    """
+    boot2's half: the file has to be on the card BEFORE the second boot. A
+    listing that only shows it afterwards is a boot that wrote one on a boot
+    with no seed -- which is the exposure this design refuses, not the
+    persistence it promises.
+    """
+    before, after = healthy_listings("boot2")
+    proc, verdict = run_verdict(
+        tmp_path, {"boot1": healthy("boot1"), "boot2": healthy("boot2")},
+        phases=("boot1", "boot2"),
+        boot_files={"boot1": healthy_listings("boot1"),
+                    "boot2": ([x for x in before if "credential" not in x],
+                              after)})
+    assert "IMG-CHECK boot2 credential-kept-on-the-card FAIL" in verdict, verdict
+    assert proc.returncode == 1
+
+
+def test_the_readme_counts_the_checks_this_tier_actually_requires():
+    """
+    The floor, held against the list rather than restated beside it.
+
+    `harness/README.md` tells a reader how many guest checks each boot has to
+    report, and that number is the only summary of what tier 3 proves that
+    anybody reads before trusting a green run. Written by hand it goes stale
+    on the first commit that adds a check -- silently, in the direction that
+    overstates, because a reader takes the larger number for the older list.
+    Counted from `img-boot.sh` here, the way `required_checks` counts
+    everything else in this file.
+    """
+    readme = (REPO / "harness" / "README.md").read_text()
+    counts = {"boot 1": len(required_checks("boot1")),
+              "boot 2": len(required_checks("boot2"))}
+    match = re.search(
+        r"\*\*(\d+) guest checks in boot 1 and (\d+) in boot 2\*\*", readme)
+    assert match, \
+        "harness/README.md no longer states how many guest checks a boot owes"
+    assert (int(match.group(1)), int(match.group(2))) \
+        == (counts["boot 1"], counts["boot 2"]), (
+            f"harness/README.md says {match.group(1)}/{match.group(2)} guest "
+            f"checks, img-boot.sh requires {counts['boot 1']}/{counts['boot 2']}")
+
+
+def test_the_host_reads_the_store_a_level_below_the_root(tmp_path):
+    """
+    The harness's own listing, held against what mtools actually does.
+
+    `mdir -b -i IMG ::` is NOT recursive: measured on a FAT image built by
+    hand, a directory appears as the single line `::/otp-identity/` and none
+    of its contents appear at all. The credential lives one level down, so
+    without a second call naming that directory this check could never pass
+    on any card -- the sign-flipped failure, red on a healthy image, which is
+    the one CI would have blamed on the image.
+    """
+    text = IMG_BOOT.read_text()
+    assert re.search(r"^\s*mdir -b -i \"\$IMG@@\$BOOT_OFFSET\" ::/otp-identity",
+                     text, re.M), \
+        "the host lists only the FAT root, so nothing in the store is visible"
+    # Appended, not overwriting the root listing it follows.
+    assert ">> \"$1\"" in text, text
 
 
 def test_a_seed_that_never_reached_the_card_fails(tmp_path):
