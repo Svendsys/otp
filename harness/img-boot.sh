@@ -1815,6 +1815,9 @@ release_gate() {
     local after="$WORK/$phase/boot-files-after.txt"
     local prestrip="$WORK/$phase/boot-files-before-strip.txt"
     local here control name missing changed dbefore dafter
+    # Guarded the way $CONSOLE_TXT reads are: an evidence directory that is
+    # missing a file must produce an empty result and a red check, never a
+    # dead script -- this function runs while verdict.txt is being written.
 
     # 1. THE PROBE PRINTED NOTHING.
     #
@@ -1968,15 +1971,28 @@ release_gate() {
     # survived" would come to mean "there has never been a credential". The
     # digests are printed twelve characters wide -- these are sha256 of a
     # password hash and of a machine-id, and this directory is a CI artifact.
+    #
+    # DRIVEN BY $FAT_CONTENTS AND NOT BY THE DIGEST FILE, for two reasons and
+    # the second was a bug in this loop's first draft. Reading the file with
+    # `while read ... done < "$file"` dies under errexit when the file is not
+    # there -- measured, rc 1, `No such file or directory` -- and it dies HERE,
+    # in the middle of writing verdict.txt, which is the no-evidence failure
+    # this block already carries two `|| true`s to avoid. Iterating the list
+    # instead has no redirect to fail. And it closes the larger hole: a loop
+    # over an EMPTY digest file compares nothing and reports PASS, so a phase
+    # whose digests were never taken would announce that three files it never
+    # looked at came through the boot unchanged. Every name in the list has to
+    # produce 64 characters on both sides, or the clause is red.
     missing=""
-    while read -r name dbefore; do
-        [ -n "$name" ] || continue
+    for name in $FAT_CONTENTS; do
+        dbefore=$(awk -v n="$name" '$1 == n {print $2}' \
+                  "$WORK/$phase/boot-digests-before.txt" 2>/dev/null || true)
         dafter=$(awk -v n="$name" '$1 == n {print $2}' \
                  "$WORK/$phase/boot-digests-after.txt" 2>/dev/null || true)
         if [ "${#dbefore}" != 64 ] || [ "$dbefore" != "${dafter:-nothing}" ]; then
             missing="$missing $name(${dbefore:0:12}../${dafter:0:12}..)"
         fi
-    done < "$WORK/$phase/boot-digests-before.txt"
+    done
     if [ -z "$missing" ]; then
         printf 'IMG-CHECK %s identity-store-unchanged PASS %s\n' "$phase" "$FAT_CONTENTS"
     else

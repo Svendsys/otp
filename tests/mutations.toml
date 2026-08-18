@@ -5600,6 +5600,35 @@ replace = '''        if [ "$dbefore" != "${dafter:-nothing}" ]; then'''
 
 
 [[mutation]]
+name = "tier3-release-content-check-reads-the-file-instead-of-the-list"
+tier = "fast"
+guard = """
+The content clause iterates $FAT_CONTENTS, not the digest file, and it was
+written the other way round first. Two defects came with that:
+
+  - an EMPTY digest file compares nothing and reports PASS, so a phase whose
+    digests were never taken announces that three files it never looked at
+    came through the boot unchanged;
+  - `while read ... done < "$file"` dies under errexit on a file that is not
+    there -- measured, rc 1 -- and it dies while verdict.txt is being
+    written, which is the no-evidence failure this block already carries two
+    `|| true`s to avoid.
+
+The mutation restores the first of those, which is the silent one."""
+tests = [
+  "tests/test_img_verdict.py::test_digests_that_were_never_taken_fail_and_still_produce_a_verdict",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    for name in $FAT_CONTENTS; do
+        dbefore=$(awk -v n="$name" '$1 == n {print $2}' \
+                  "$WORK/$phase/boot-digests-before.txt" 2>/dev/null || true)'''
+replace = '''    for name in $(awk '{print $1}' "$WORK/$phase/boot-digests-before.txt" 2>/dev/null || true); do
+        dbefore=$(awk -v n="$name" '$1 == n {print $2}' \
+                  "$WORK/$phase/boot-digests-before.txt" 2>/dev/null || true)'''
+
+
+[[mutation]]
 name = "tier3-release-boot-may-be-a-first-boot"
 tier = "fast"
 guard = """

@@ -2303,6 +2303,36 @@ def test_two_files_that_are_not_there_are_not_an_unchanged_store(tmp_path):
     assert proc.returncode == 1
 
 
+def test_digests_that_were_never_taken_fail_and_still_produce_a_verdict(tmp_path):
+    """
+    TWO FAILURES IN ONE FIXTURE, and the first draft of this clause had both.
+
+    A phase whose digest files are missing must not read as three files that
+    came through the boot unchanged -- an empty comparison compares nothing
+    and reports success, which is row 4 of issue #14 arriving in a new place.
+    The clause is driven by the list of names rather than by the file, so
+    every name has to produce 64 characters or the clause is red.
+
+    And it must still produce a verdict at all. The loop was written as
+    `while read ... done < "$file"`, which under errexit dies on a file that
+    is not there -- measured, rc 1 -- and dies in the middle of writing
+    verdict.txt, in exactly the case where there is least other evidence.
+    """
+    proc, verdict = run_release(
+        tmp_path, digests={"release": ({}, {})})
+    assert verdict is not None, "the verdict file was never written"
+    assert check_state(verdict, "release",
+                       "identity-store-unchanged") == "FAIL", verdict
+    # The rest of the phase still reported, which is what says the block ran
+    # to the end rather than dying part way through it.
+    assert check_state(verdict, "release",
+                       "boot-partition-unchanged") == "PASS", verdict
+    assert proc.returncode == 1
+    # Every name is accounted for in the failure, not just the first.
+    for name in FAT_CONTENTS:
+        assert name in verdict, (name, verdict)
+
+
 # --- the harness structure the phase depends on ---------------------------
 
 def test_the_strip_happens_before_the_listing_the_boot_is_judged_against():
