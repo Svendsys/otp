@@ -1541,11 +1541,57 @@ per_boot_verdict() {
             # the narrower `(ConditionKernelCommandLine=otp.imgcheck)` form
             # promotable to a gate of its own, which is the report-then-gate
             # ladder multi-user.target and the hwrng line both came up.
+            # THREE WORDINGS, AND THE REASON IS A RED RUN ON A HEALTHY
+            # IMAGE. This grep was built from systemd v257's job.c, which
+            # emits "%s was skipped because of an unmet condition check
+            # (%s=%s%s)." -- and run 32180661689 failed the clause on a boot
+            # where the probe demonstrably did not act. The diagnostic below
+            # printed what was actually there:
+            #
+            #   systemd[1]: otp-unit-imgcheck.service - Report the overlay
+            #   root to the tier-3 image boot skipped, unmet condition check
+            #   ConditionKernelCommandLine=otp.imgcheck
+            #
+            # systemd reworded it after v258. Measured against the source of
+            # each: v257 and v258 both carry "was skipped because of an unmet
+            # condition check (X=Y)."; main carries "skipped, unmet condition
+            # check X=Y". So the image runs a systemd newer than the one this
+            # pattern was written against, and pinning to either wording is a
+            # gate that goes red when the base image moves. All three forms
+            # are accepted -- the two condition wordings and the generic
+            # "Condition check resulted in %s being skipped." that
+            # job_done_message_format() falls back to when
+            # unit_find_failed_condition() finds nothing.
+            #
+            # What does NOT vary is that the unit is named, so that is what
+            # the pattern anchors on.
             SKIPLINE=$(grep -m1 -E \
-                'otp-unit-imgcheck\.service.*(was skipped because|being skipped)|(was skipped because|being skipped).*otp-unit-imgcheck\.service' \
+                'otp-unit-imgcheck\.service.*(unmet condition check|was skipped because|being skipped)|(unmet condition check|was skipped because|being skipped).*otp-unit-imgcheck\.service' \
                 "$CONSOLE_TXT" 2>/dev/null || true)
             if [ -n "$SKIPLINE" ]; then
-                printf 'IMG-CHECK %s imgcheck-unit-considered-and-skipped PASS\n' "$phase"
+                # AND IF THE LINE NAMES THE CONDITION, IT HAD BETTER BE OURS.
+                # Two of the three wordings carry `Type=parameter`, and the
+                # real console proves this image is one of them. When it is
+                # there it is the strongest evidence this phase can get -- it
+                # is the difference between "systemd skipped this unit" and
+                # "systemd skipped it because our token was absent" -- so it
+                # is required to name ConditionKernelCommandLine=otp.imgcheck
+                # rather than some other condition that happened to fail.
+                # Conditional, not unconditional, because the generic wording
+                # carries no parameter at all and a version that emits it
+                # must not fail for saying less.
+                case "$SKIPLINE" in
+                    *ConditionKernelCommandLine=otp.imgcheck*|*[Cc]ondition*check*resulted*)
+                        printf 'IMG-CHECK %s imgcheck-unit-considered-and-skipped PASS\n' "$phase"
+                        ;;
+                    *Condition*=*)
+                        printf 'IMG-CHECK %s imgcheck-unit-considered-and-skipped FAIL the unit was skipped for a condition that is not ConditionKernelCommandLine=otp.imgcheck\n' \
+                               "$phase"
+                        ;;
+                    *)
+                        printf 'IMG-CHECK %s imgcheck-unit-considered-and-skipped PASS\n' "$phase"
+                        ;;
+                esac
                 printf 'IMG-NOTE %s imgcheck-skip-line: %s\n' \
                        "$phase" "$(printf '%s' "$SKIPLINE" | cut -c1-200)"
             else

@@ -1902,6 +1902,54 @@ def test_either_wording_systemd_uses_for_a_condition_skip_is_accepted(tmp_path):
     assert proc.returncode == 0, proc.stderr + verdict
 
 
+def test_the_wording_a_real_image_actually_printed_is_accepted(tmp_path):
+    """
+    The wording this gate was first written against is not the wording the
+    image prints. Run 32180661689 -- the release phase's first execution on
+    a machine -- failed the clause while every other release clause passed,
+    and the diagnostic quoted what was really on the console:
+
+        systemd[1]: otp-unit-imgcheck.service - Report the overlay root to
+        the tier-3 image boot skipped, unmet condition check
+        ConditionKernelCommandLine=otp.imgcheck
+
+    systemd reworded it after v258. Both v257 and v258 carry "was skipped
+    because of an unmet condition check (X=Y)."; main carries "skipped,
+    unmet condition check X=Y". So the source read behind this gate was
+    accurate for a systemd this image does not run, which is the whole
+    reason the pattern now spans the change instead of pinning to one side
+    of it.
+    """
+    observed = ("[  102.043301] systemd[1]: otp-unit-imgcheck.service - "
+                "Report the overlay root to the tier-3 image boot skipped, "
+                "unmet condition check ConditionKernelCommandLine=otp.imgcheck")
+    proc, verdict = run_release(
+        tmp_path, release_console(skip_line=False, probe_said=[observed]))
+    assert check_state(verdict, "release",
+                       "imgcheck-unit-considered-and-skipped") == "PASS", verdict
+    assert proc.returncode == 0, proc.stderr + verdict
+
+
+def test_a_unit_skipped_for_someone_elses_condition_is_not_our_evidence(tmp_path):
+    """
+    The two condition wordings name the condition that failed, and that is
+    the strongest thing this phase can be handed: it separates "systemd
+    skipped this unit" from "systemd skipped it because our token was
+    absent". A unit skipped for ConditionPathExists, say, would satisfy a
+    gate that only looked for the name and the word skipped -- and would say
+    nothing at all about the token.
+    """
+    other = ("[  102.043301] systemd[1]: otp-unit-imgcheck.service - Report "
+             "the overlay root to the tier-3 image boot skipped, unmet "
+             "condition check ConditionPathExists=/some/other/thing")
+    proc, verdict = run_release(
+        tmp_path, release_console(skip_line=False, probe_said=[other]))
+    assert check_state(verdict, "release",
+                       "imgcheck-unit-considered-and-skipped") == "FAIL", verdict
+    assert "not ConditionKernelCommandLine=otp.imgcheck" in verdict, verdict
+    assert proc.returncode == 1
+
+
 def test_the_skip_line_is_quoted_into_the_evidence(tmp_path):
     """
     Reported as well as gated, so the exact wording this image's systemd
