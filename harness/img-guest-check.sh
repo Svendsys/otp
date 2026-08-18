@@ -628,15 +628,47 @@ CI_GENERATOR="$CI_GENERATOR_DIR/cloud-init-generator"
 CI_GENERATOR_SIBLINGS=$(find "$CI_GENERATOR_DIR" -mindepth 1 -maxdepth 1 \
                         2>/dev/null | wc -l)
 
-# NETPLAN AND NetworkManager ARE REPORTED AND NOT GATED, and the reason is
-# the reverse-dependency question the purge had to answer. rpi-cloud-init-mods
-# is the only package in the Raspberry Pi archive that depends on cloud-init,
-# and nothing in either archive depends on IT -- but it ships
-# /usr/lib/netplan/00-network-manager-all.yaml, which sets netplan's renderer
-# to NetworkManager, and that file goes with the purge. This appliance needs
-# no network and install.sh masks networkd's wait, so there is no property
-# here to gate on; what tier 3 owes the next reader is the state of both on
-# the machine that actually booted without them.
+# NETPLAN AND NetworkManager: THE ARGUMENT IS IN THIS COMMENT, AND THE
+# CONSOLE LINE IS ONLY A REPORT. rpi-cloud-init-mods ships one file that is
+# not cloud-init's own -- /usr/lib/netplan/00-network-manager-all.yaml,
+# `renderer: NetworkManager` -- and the purge takes it. This check was first
+# written as though the detail line below answered whether that mattered. It
+# does not and cannot: on a correctly purged unit that line reads
+# `netplan-renderer=no NetworkManager=active` on every boot, two constants,
+# which cannot tell "removing the renderer default broke nothing" apart from
+# "removing it broke the link". The question is settled off the archives and
+# off netplan's own source instead, read on 2026-08-18:
+#
+#   - NETPLAN STAYS INSTALLED, so the purge cannot take it. The Raspberry Pi
+#     archive's own network-manager -- 1.52.1-1+rpt4, not Debian's plain
+#     1.52.1-1, which does not -- carries `Depends: netplan.io (>= 0.106~)`.
+#     rpi-cloud-init-mods depends on netplan.io too, and this is why that
+#     does not matter.
+#   - AFTER THE PURGE NETPLAN HAS NO CONFIGURATION AT ALL. Searching
+#     Contents-arm64 for both trixie archives, that yaml is the only netplan
+#     config file any package ships; netplan-generator's own entry under
+#     /usr/lib/netplan is a file called PLACEHOLDER. With no netdefs parsed,
+#     netplan 1.1.2 writes no backend configuration and never reaches
+#     enable_networkd() (src/generate.c:314-317) -- so nothing here can
+#     re-arm the networkd wait that ended both boots of run 31968966879.
+#   - AND THE FILE'S ONE REAL EFFECT DOES NOT EXIST ON THIS DISTRIBUTION.
+#     What `renderer: NetworkManager` buys is src/generate.c:305-308, which
+#     shadows /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf
+#     with an empty file in /run; netplan's own comment beside it says that
+#     is the point. No package in either archive ships that conf file -- the
+#     three that exist are wpasupplicant's no-mac-addr-change.conf,
+#     network-manager-config-connectivity-debian's 20-connectivity-debian.conf
+#     and raspberrypi-net-mods' rpi-no-scan-rand-mac-address.conf. It is an
+#     Ubuntu convention. The override was a no-op on Raspberry Pi OS before
+#     the purge and is a no-op after it.
+#   - install.sh masks systemd-networkd-wait-online.service regardless of
+#     any of this, and network-wait-cannot-hold-the-boot-open below reads
+#     that back off the same boot.
+#
+# The detail line stays because the state of both is the first thing a
+# reader wants off the machine that booted without them, and because a
+# report costs nothing. It is a report. The evidence is the four bullets
+# above, and nothing should cite the line in their place.
 check cloud-init-is-not-installed \
       "$(if [ -z "$CI_INSTALLED" ] && [ "$CI_CONTROL_STATUS" = installed ] \
             && [ -z "$CI_LOADED" ] && [ "$CI_CONTROL_LOAD" = loaded ] \

@@ -1624,20 +1624,107 @@ replace = '''	if false; then'''
 
 
 [[mutation]]
-name = "stage-purge-counts-only-the-purges"
+name = "stage-purge-filter-drops-its-remv-arm"
 tier = "fast"
 guard = """
-`Remv` and `Purg` are different words in apt's simulation and both are a
-removal: apt prints the first for a package it takes out on the way to the
-ones it was asked about, which is precisely the dependent the refusal above
-exists for. A filter reading only `Purg` lets it through."""
+DEFENCE IN DEPTH, NOT THE LOAD-BEARING BRANCH -- which is what this row used
+to claim, in these words: "apt prints [Remv] for a package it takes out on
+the way to the ones it was asked about, which is precisely the dependent the
+refusal above exists for". It is the opposite. `apt-get purge` re-marks every
+scheduled deletion as a purge before it prints (apt 3.0.3,
+apt-private/private-install.cc:222-225; measured on 2.8.3 against a package
+with nine reverse dependencies -- ten `Purg` lines, no `Remv`), so a
+dependent arrives as `Purg` and the `Remv` arm cannot fire under this
+command. The arm is kept for the apt that stops re-marking and for the edit
+that turns `purge` into `remove`, and this row is what keeps it in the awk.
+The refusal itself is guarded by stage-purge-refusal-cannot-fire."""
 tests = [
-  "tests/test_overlay_root.py::test_a_package_apt_merely_removes_counts_too",
+  "tests/test_overlay_root.py::test_the_filter_reads_a_remv_apt_would_not_print_here",
 ]
 [[mutation.edit]]
 file = "image/stage-otpunit/01-otpunit/00-run.sh"
-find = '''| awk '\$1 == "Remv" || \$1 == "Purg" { print \$2 }' |'''
-replace = '''| awk '\$1 == "Purg" { print \$2 }' |'''
+find = '''| awk '\$1 == "Remv" || \$1 == "Purg" { print \$2 }')'''
+replace = '''| awk '\$1 == "Purg" { print \$2 }')'''
+
+
+[[mutation]]
+name = "stage-purge-simulation-status-discarded"
+tier = "fast"
+guard = """
+apt's exit status, which the first version of this block threw away. The
+whole plan was read through one pipeline ending in `|| true`, so an apt that
+FAILED reached the refusal as an empty string and was passed as clean, with
+the unguarded real purge on the next line. Not hypothetical: `apt-get -s
+purge -y <name in no index>` exits 100 with `E: Unable to locate package` and
+prints no plan (measured, apt 2.8.3), which is precisely the day either
+package leaves the Raspberry Pi archive."""
+tests = [
+  "tests/test_overlay_root.py::test_a_simulation_that_fails_stops_the_build",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''	if ! sim=\$(apt-get -s purge -y ${CLOUD_PACKAGES}); then'''
+replace = '''	if ! sim=\$(apt-get -s purge -y ${CLOUD_PACKAGES} || true); then'''
+
+
+[[mutation]]
+name = "stage-purge-simulation-not-proved-to-have-run"
+tier = "fast"
+guard = """
+THE POSITIVE CONTROL ON THE REFUSAL. Everything the refusal reads is an
+absence -- names apt did NOT print -- so an apt that printed nothing at all
+satisfies it perfectly and the real purge runs. Requiring the plan to name
+both packages first is what separates "apt said only cloud-init" from "apt
+said nothing", and those were the same answer until this landed. Issue #14's
+defect class, on the guard whose job is to stop a silent deletion."""
+tests = [
+  "tests/test_overlay_root.py::test_a_simulation_that_names_nothing_stops_the_build",
+  "tests/test_overlay_root.py::test_a_simulation_that_names_only_one_of_the_two_stops_the_build",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''		if ! echo "\$scheduled" | grep -qxF "\$want"; then'''
+replace = '''		if false; then'''
+
+
+[[mutation]]
+name = "stage-purge-refusal-accepts-a-lookalike-name"
+tier = "fast"
+guard = """
+The `-x` on the refusal's filter. CLOUD_PACKAGES_RE carries no `^` and no
+`$`, so without `-x` the match is a substring test and any package apt
+schedules whose name merely CONTAINS one of ours is read as expected and
+waved through -- Debian trixie/main ships cloud-initramfs-growroot,
+cloud-initramfs-dyn-netconf and cloud-initramfs-rescuevol. None of them
+depends on cloud-init today, which is exactly why an unguarded anchor here
+would rot without anyone noticing."""
+tests = [
+  "tests/test_overlay_root.py::test_a_removal_whose_name_merely_contains_cloud_init_stops_the_build",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''| grep -vxE '${CLOUD_PACKAGES_RE}' || true)'''
+replace = '''| grep -vE '${CLOUD_PACKAGES_RE}' || true)'''
+
+
+[[mutation]]
+name = "stage-purge-failure-swallowed"
+tier = "fast"
+guard = """
+The removal's own exit status. A purge that fails leaves both packages
+installed, and a stage that then exits 0 ships the provisioning agent with
+the build log green -- the state issue #34 describes, arrived at a second
+way. It holds today only because that call is the last command in the
+heredoc; `set -e` above it is inert in a block where every other failure is
+caught by name, so the property is pinned by a test rather than by the
+block's shape."""
+tests = [
+  "tests/test_overlay_root.py::test_a_purge_that_fails_fails_the_build",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''	apt-get purge -y ${CLOUD_PACKAGES}'''
+replace = '''	apt-get purge -y ${CLOUD_PACKAGES} || true'''
 
 
 [[mutation]]
@@ -1770,11 +1857,17 @@ replace = '''CI_DISABLED_IS_FILE=$(yesno test -e "$CI_DISABLED")'''
 name = "guest-cloud-init-netplan-not-reported"
 tier = "fast"
 guard = """
-The one file rpi-cloud-init-mods ships that is not cloud-init's own is
-netplan's renderer default, and it goes with the purge. There is no property
-to gate on -- this appliance needs no network at all -- so the console line
-is the whole of the evidence that removing it broke nothing, and a report
-nobody asserts is a report that quietly stops being printed."""
+A REPORT, KEPT AS A REPORT. The sentence this row used to carry -- "the
+console line is the whole of the evidence that removing it broke nothing" --
+was wrong twice over: the line reads `netplan-renderer=no
+NetworkManager=active` on every healthy boot, so it distinguishes nothing,
+and the evidence is elsewhere. It is in the comment beside the check:
+network-manager depends on netplan.io so the purge cannot take netplan, that
+yaml is the only netplan config file any package in either trixie archive
+ships so netplan then renders nothing, and the NetworkManager conf file the
+renderer default exists to shadow is Ubuntu-only. What this row protects is
+that the two facts a reader wants off the booted machine keep reaching the
+console, and nothing more than that."""
 tests = [
   "tests/test_overlay_root.py::test_the_probe_reports_what_the_purge_did_to_netplan",
 ]

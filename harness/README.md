@@ -1033,17 +1033,35 @@ names anything but the two packages. Off the archives on 2026-08-18 there is
 nothing to name: no package in the Raspberry Pi archive's `trixie/main`
 declares any relationship on `rpi-cloud-init-mods`, and in Debian
 `trixie/main` only `debian-cloud-images-packages` — which Raspberry Pi OS
-Lite does not carry — depends on `cloud-init`. An index is not a rootfs,
-which is why the refusal is in the build rather than in this paragraph.
+Lite does not carry — *depends* on `cloud-init` (three packages *suggest* it
+and one *breaks* it; none of the four can cause a removal). An index is not a
+rootfs, which is why the refusal is in the build rather than in this
+paragraph.
+
+**And the simulation has to prove it ran.** Everything the refusal reads is
+an absence — names apt did *not* print — so the first version of it passed
+for an apt that printed nothing, an apt that exited 100, and an apt that
+wrote its plan to stderr, running the real purge in all three cases. The
+middle one is what `apt-get -s purge -y <name in no index>` does. The stage
+now checks the simulation's exit status and requires the plan to name **both**
+packages before its silence about everything else means anything.
 
 The one file `rpi-cloud-init-mods` ships that is not cloud-init's own is
 `/usr/lib/netplan/00-network-manager-all.yaml`, which sets netplan's renderer
-to NetworkManager. It goes with the purge. This appliance has no network by
-design, `install.sh` masks networkd's wait, and no other netplan
-configuration exists on it — so there is no property to gate on, and both
-that file and `NetworkManager.service`'s state are **reported** in the check
-line instead, which is what makes the question answerable off a tier-3
-console rather than off reasoning.
+to NetworkManager. It goes with the purge, and the argument that this is
+harmless is in the comment beside the guest check rather than on the console:
+the Raspberry Pi archive's `network-manager` (`1.52.1-1+rpt4`) **depends** on
+`netplan.io`, so netplan itself cannot go with the purge; searching
+`Contents-arm64` for both archives, that yaml is the **only** netplan config
+file any package ships, so afterwards netplan has nothing to render and never
+reaches `enable_networkd()`; and the `10-globally-managed-devices.conf` the
+renderer default exists to shadow is shipped by no package in either archive
+— it is an Ubuntu convention, so the override was a no-op here before the
+purge as well. That file's presence and `NetworkManager.service`'s state are
+**reported** in the check line, which is worth having on the console and is
+not the evidence above: on a healthy unit that line reads
+`netplan-renderer=no NetworkManager=active` every time, so by itself it
+distinguishes nothing.
 
 Two named guest checks, in both boots, and they are deliberately two:
 

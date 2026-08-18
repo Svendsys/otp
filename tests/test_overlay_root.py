@@ -1965,21 +1965,42 @@ PURGE_SIM_CLEAN = ("Reading package lists...\n"
 # build did not purge anything" and "the build purged and the stub said
 # nothing" are different runs and only the log can tell them apart -- the
 # same reason run_block's systemctl records rather than merely exiting 0.
+#
+# It can also FAIL, on either call, and that is not decoration. The block's
+# first version read apt's plan through a pipeline ending in `|| true`, so a
+# simulation that exited 100 having printed nothing -- what real apt does
+# for a package name that is in no index -- reached the refusal as an empty
+# string and was passed as clean. A stub that could only succeed could not
+# have told anyone.
 APT_GET_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$APT_LOG"
 case " $* " in
-    *" -s "*) printf '%s' "$APT_SIM" ;;
+    *" -s "*)
+        printf '%s' "$APT_SIM"
+        if [ -n "$APT_SIM_ERR" ]; then printf '%s\\n' "$APT_SIM_ERR" >&2; fi
+        exit "${APT_SIM_RC:-0}"
+        ;;
 esac
+exit "${APT_PURGE_RC:-0}"
 """
 
 
-def run_stage_purge(tmp_path, *, simulation=PURGE_SIM_CLEAN):
+def run_stage_purge(tmp_path, *, simulation=PURGE_SIM_CLEAN, sim_rc=0,
+                    sim_stderr="", purge_rc=0):
     """Run the pi-gen stage's cloud-init purge against a simulated apt.
 
     `on_chroot` is a shell function here rather than pi-gen's capsh: what
-    the block puts on its stdin is the thing under test, and pi-gen's own
-    wrapper ends in `sh -e` reading exactly that -- so the function is `sh`
-    and the heredoc reaches it untouched.
+    the block puts on its stdin is the thing under test, and the heredoc
+    has to reach the interpreter untouched.
+
+    THE INTERPRETER IS `sh` ON PURPOSE, and this docstring used to say `sh`
+    because it believed pi-gen's was. pi-gen's is not: scripts/common:107
+    ends on_chroot in a capsh call whose `--` execs /bin/bash unless
+    `--shell=` overrides it, and pi-gen passes no `--shell`, so the real
+    thing is `bash -e`. The block is POSIX, so both accept it; dash is the
+    stricter of the two and catches a bashism the day somebody adds one,
+    which is why the choice stands after the correction rather than being
+    reversed by it.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -1993,8 +2014,21 @@ def run_stage_purge(tmp_path, *, simulation=PURGE_SIM_CLEAN):
     proc = subprocess.run(
         ["bash", str(runner)], capture_output=True, text=True, timeout=60,
         env={**os.environ, "APT_LOG": str(log), "APT_SIM": simulation,
+             "APT_SIM_RC": str(sim_rc), "APT_SIM_ERR": sim_stderr,
+             "APT_PURGE_RC": str(purge_rc),
              "PATH": f"{bin_dir}:{os.environ['PATH']}"})
     return proc, log.read_text()
+
+
+def assert_nothing_was_removed(log):
+    """Every apt call in this log carried -s, so the rootfs is untouched.
+
+    A refusal that fires after the purge has run is a build that stops with
+    the packages already gone. Each refusal below asserts this rather than
+    only its exit status.
+    """
+    assert "-s" in log, log
+    assert [ln for ln in log.splitlines() if "-s" not in ln.split()] == [], log
 
 
 def test_the_stage_purges_both_cloud_init_packages(tmp_path):
@@ -2036,23 +2070,137 @@ def test_a_purge_that_would_take_something_else_stops_the_build(tmp_path):
         PURGE_SIM_CLEAN + "Remv raspberrypi-sys-mods [20260101]\n"))
     assert proc.returncode != 0, proc.stdout
     assert "raspberrypi-sys-mods" in proc.stderr, proc.stderr
-    # And nothing was removed. A refusal that fires after the purge has run
-    # is a build that stops with the packages already gone.
-    assert "-s" in log, log
-    assert [ln for ln in log.splitlines() if "-s" not in ln.split()] == [], log
+    assert_nothing_was_removed(log)
 
 
-def test_a_package_apt_merely_removes_counts_too(tmp_path):
+def test_the_filter_reads_a_remv_apt_would_not_print_here(tmp_path):
     """
-    `Remv` and `Purg` are different words in apt's simulation and both are
-    a removal. apt prints the first for a package it takes out on the way to
-    the ones it was asked about, which is exactly the case this refusal is
-    for, so a filter reading only `Purg` would let the dependent through.
+    A SHAPE TODAY'S APT CANNOT PRODUCE UNDER `purge`, kept as cheap defence,
+    and this test used to claim the opposite.
+
+    It said `Remv` was the word apt prints for a package taken out on the
+    way to the named ones, and therefore the branch that catches a
+    dependent. The stage script's comment said it too. Both were wrong.
+    `apt-get purge` re-marks EVERY scheduled deletion as a purge before it
+    prints -- apt 3.0.3, apt-private/private-install.cc:222-225 -- so under
+    `purge` the `Remv` arm is unreachable. Measured on apt 2.8.3 against a
+    package with nine reverse dependencies, none named on the command line:
+    `apt-get -s purge` printed ten `Purg` lines and no `Remv`, and the same
+    command as `remove` printed ten `Remv` lines. The fixture below is
+    output apt would not give us.
+
+    The arm stays: it is one awk clause, and it is what would still read the
+    plan if a later apt stopped re-marking or if that line were ever edited
+    to `remove`. What it is not is the reason the refusal works -- that is
+    test_a_purge_that_would_take_something_else_stops_the_build, whose
+    fixture is the one apt actually prints.
     """
-    proc, _ = run_stage_purge(tmp_path, simulation=(
+    proc, log = run_stage_purge(tmp_path, simulation=(
         "Remv netplan.io [1.1.2-7]\n" + PURGE_SIM_CLEAN))
     assert proc.returncode != 0, proc.stdout
     assert "netplan.io" in proc.stderr, proc.stderr
+    assert_nothing_was_removed(log)
+
+
+def test_a_simulation_that_names_nothing_stops_the_build(tmp_path):
+    """
+    THE POSITIVE CONTROL THE REFUSAL DID NOT HAVE, and the reason it needed
+    one.
+
+    The refusal reads apt's plan for names it did not expect. An apt that
+    printed no plan at all satisfies that perfectly, and the first version
+    of this block ran the real purge on the strength of it -- the whole
+    pipeline ended in `|| true`, so silence about everything else was
+    indistinguishable from silence about everything. An absence with no
+    positive control, on the one guard whose job is to stop a silent
+    deletion. Issue #14's defect class, inside the fix for #34.
+    """
+    proc, log = run_stage_purge(tmp_path, simulation="")
+    assert proc.returncode != 0, proc.stdout
+    assert "did not schedule" in proc.stderr, proc.stderr
+    assert_nothing_was_removed(log)
+
+
+def test_a_simulation_that_fails_stops_the_build(tmp_path):
+    """
+    apt's exit status, which the first version of this block discarded.
+
+    This is the case that is not hypothetical. `apt-get -s purge -y <name in
+    no index>` exits 100 with `E: Unable to locate package` and prints no
+    plan -- measured on apt 2.8.3 -- which is exactly what the day either
+    package leaves the Raspberry Pi archive looks like, and that day is the
+    outcome one would hope for. Through a pipeline ending in `|| true` it
+    read as a clean plan, the gate passed, and the build then died on apt's
+    raw error from the unguarded real purge instead of on the refusal
+    somebody had carefully written.
+    """
+    proc, log = run_stage_purge(
+        tmp_path, simulation="Reading package lists...\n", sim_rc=100,
+        sim_stderr="E: Unable to locate package rpi-cloud-init-mods")
+    assert proc.returncode != 0, proc.stdout
+    assert "failed in the chroot" in proc.stderr, proc.stderr
+    assert_nothing_was_removed(log)
+
+
+def test_a_simulation_that_names_only_one_of_the_two_stops_the_build(tmp_path):
+    """
+    Half a plan is not a plan, and this one is reachable without any fault.
+
+    A pi-gen that stopped installing rpi-cloud-init-mods leaves apt with
+    nothing to say about it: the plan names cloud-init alone and apt exits
+    0. Under the old gate that passed -- correctly, as it happens, but for
+    no reason anybody could read off it, since a plan naming neither package
+    passed identically. The stage refuses instead, loudly and with the name
+    in the message, because the alternative is not being able to tell the
+    two apart.
+    """
+    proc, log = run_stage_purge(tmp_path, simulation=(
+        "Reading package lists...\n"
+        "Building dependency tree...\n"
+        "Purg cloud-init [25.2-1~bpo13+1+rpt20]\n"))
+    assert proc.returncode != 0, proc.stdout
+    assert "rpi-cloud-init-mods" in proc.stderr, proc.stderr
+    assert "did not schedule" in proc.stderr, proc.stderr
+    assert_nothing_was_removed(log)
+
+
+def test_a_removal_whose_name_merely_contains_cloud_init_stops_the_build(tmp_path):
+    """
+    `-vxE`, WHOLE LINE, and the anchor is doing all of the work.
+
+    CLOUD_PACKAGES_RE carries no `^` and no `$` -- `-x` is what makes it an
+    exact match. Drop the `x` and the filter is a substring test, so any
+    package apt schedules whose name merely CONTAINS one of ours reads as
+    expected and is passed through. Debian trixie/main really ships
+    cloud-initramfs-growroot, cloud-initramfs-dyn-netconf and
+    cloud-initramfs-rescuevol. None of the three depends on cloud-init
+    today, which is the point: the anchor holds against a live archive
+    rather than against a live bug, and a guard like that rots unnoticed.
+    """
+    proc, log = run_stage_purge(tmp_path, simulation=(
+        PURGE_SIM_CLEAN + "Purg cloud-initramfs-growroot [0.18.debian8]\n"))
+    assert proc.returncode != 0, proc.stdout
+    assert "cloud-initramfs-growroot" in proc.stderr, proc.stderr
+    assert_nothing_was_removed(log)
+
+
+def test_a_purge_that_fails_fails_the_build(tmp_path):
+    """
+    The real purge's own exit status.
+
+    It reaches the build today because that call is the last command in the
+    heredoc and a shell returns its status -- not because of the `set -e`
+    above it, which is inert in a block where every other failure is caught
+    by name. Append one line after the purge and that stops being true, so
+    the property is pinned here rather than left to the block's shape: a
+    purge that fails must fail the build, and must not leave a stage that
+    exits 0 with the provisioning agent still installed.
+    """
+    proc, log = run_stage_purge(tmp_path, purge_rc=1)
+    assert proc.returncode != 0, proc.stdout
+    # It got as far as trying: this is the purge failing, not a refusal
+    # before it, and those are different bugs.
+    assert [ln for ln in log.splitlines() if "-s" not in ln.split()] != [], log
 
 
 def test_the_purge_runs_before_install_sh_writes_the_kill_switch():
@@ -4608,6 +4756,7 @@ HEALTHY_PURGE = {}
 
 
 def run_cloud_init(tmp_path, *, env=None, marker="file", generator=False,
+                   renderer=False,
                    siblings=("systemd-fstab-generator", "systemd-gpt-auto-generator")):
     """Run the shipped cloud-init block against a substituted /usr and /etc.
 
@@ -4627,6 +4776,8 @@ def run_cloud_init(tmp_path, *, env=None, marker="file", generator=False,
         (gen_dir / "cloud-init-generator").write_text("#!/bin/sh\n")
     netplan = root / "usr" / "lib" / "netplan" / "00-network-manager-all.yaml"
     netplan.parent.mkdir(parents=True, exist_ok=True)
+    if renderer:
+        netplan.write_text("network:\n  version: 2\n  renderer: NetworkManager\n")
     disabled = root / "etc" / "cloud" / "cloud-init.disabled"
     disabled.parent.mkdir(parents=True, exist_ok=True)
     if marker == "file":
@@ -4804,20 +4955,39 @@ def test_a_purge_that_took_etc_cloud_with_it_fails(tmp_path):
     assert "dir=no" in proc.stdout, proc.stdout
 
 
-def test_the_probe_reports_what_the_purge_did_to_netplan(tmp_path):
-    """
-    The one file rpi-cloud-init-mods ships that is not cloud-init's own:
-    /usr/lib/netplan/00-network-manager-all.yaml, netplan's renderer
-    default. Nothing in either archive depends on the package, so the purge
-    has no reverse dependency to break, but that file and NetworkManager are
-    what a reader would want to see on the machine that booted without it.
-    Reported rather than gated -- this appliance needs no network at all,
-    so there is no property here to fail a release on -- and a report that
-    stopped being printed is a report nobody would miss, which is why it is
-    asserted.
-    """
-    proc = run_cloud_init(tmp_path, env={"NM_ACTIVE": "active"})
+def netplan_report(proc):
+    """The netplan half of the first check's detail line."""
     line = [ln for ln in proc.stdout.splitlines()
             if "cloud-init-is-not-installed" in ln][0]
-    assert "netplan-renderer=no" in line, line
-    assert "NetworkManager=active" in line, line
+    return line[line.index("netplan-renderer="):]
+
+
+def test_the_probe_reports_what_the_purge_did_to_netplan(tmp_path):
+    """
+    A REPORT, ASSERTED AS A REPORT, and this test used to be worth less than
+    it looked.
+
+    /usr/lib/netplan/00-network-manager-all.yaml is the one file
+    rpi-cloud-init-mods ships that is not cloud-init's own, and the purge
+    takes it. Whether that matters is settled in the comment beside the
+    check, off the archives and netplan's source -- not here, and not by the
+    console. What this asserts is only that the two facts a reader would
+    look for first are still printed, and that they are read off the machine
+    rather than baked in: the earlier version created the netplan DIRECTORY
+    and never the file, so `netplan-renderer=yes` was unreachable and the
+    assertion could not have told a live `test -e` from the literal string
+    `no`. Both branches are exercised now.
+    """
+    purged = run_cloud_init(tmp_path / "purged", env={"NM_ACTIVE": "active"})
+    assert netplan_report(purged) == \
+        "netplan-renderer=no NetworkManager=active", purged.stdout
+
+    # The same probe on a machine where the file survived -- a purge that
+    # did not happen, or a package that came back. The check itself is not
+    # gated on it, so this stays a PASS with a different report, and that
+    # difference is the whole of what the line is good for.
+    kept = run_cloud_init(tmp_path / "kept", renderer=True,
+                          env={"NM_ACTIVE": "inactive"})
+    assert netplan_report(kept) == \
+        "netplan-renderer=yes NetworkManager=inactive", kept.stdout
+    assert results(kept)["cloud-init-is-not-installed"] == "PASS", kept.stdout
