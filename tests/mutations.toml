@@ -5336,17 +5336,27 @@ replace = '''            if true; then'''
 name = "tier3-skip-line-need-not-name-the-unit"
 tier = "fast"
 guard = """
-A boot of Raspberry Pi OS skips a dozen units on conditions. "was skipped
-because" anywhere on the console is satisfied by any one of them and says
-nothing whatever about the probe -- the unit's NAME on the line is the part
-that is not a matter of systemd's prose."""
+A boot of Raspberry Pi OS skips a dozen units on conditions. A skip wording
+anywhere on the console is satisfied by any one of them and says nothing
+whatever about the probe -- the unit's NAME on the line is the part that is
+not a matter of systemd's prose, which is exactly why the pattern anchors on
+it and accepts three wordings around it.
+
+RE-DERIVED once. The first version of this row broke a pattern that matched
+only v257's "was skipped because of an unmet condition check". Run
+32180661689 showed the image prints main's wording instead -- "skipped,
+unmet condition check ConditionKernelCommandLine=otp.imgcheck" -- so the
+pattern grew the third alternative and this find string stopped matching.
+test_every_row_in_the_shipped_table_still_applies caught that, and its
+message is the instruction followed here: the break was re-derived to strip
+the unit name from the new pattern, not edited until it matched."""
 tests = [
   "tests/test_img_verdict.py::test_a_skip_line_about_some_other_unit_is_not_this_one",
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
-find = """                'otp-unit-imgcheck\\.service.*(was skipped because|being skipped)|(was skipped because|being skipped).*otp-unit-imgcheck\\.service' \\"""
-replace = """                '(was skipped because|being skipped)' \\"""
+find = """                'otp-unit-imgcheck\\.service.*(unmet condition check|was skipped because|being skipped)|(unmet condition check|was skipped because|being skipped).*otp-unit-imgcheck\\.service' \\"""
+replace = """                '(unmet condition check|was skipped because|being skipped)' \\"""
 
 
 [[mutation]]
