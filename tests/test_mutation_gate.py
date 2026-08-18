@@ -338,7 +338,8 @@ class TestTheTreeIsPutBack:
         one = gate.Gate(repo=scratch, tiers={"fast": FAST}, runner=fake(red()))
         one._baselines[("fast", CAUGHT)] = ""
         one.apply_and_judge(mutation("same-length", edits=[
-            gate.Edit(path="verdict.py", find="return 17", replace="return 18")]))
+            gate.Edit(path="verdict.py", find="return 17",
+                      replace="return 18")]))
 
         assert target.read_bytes() == original, "the source was not restored"
         assert not cached.exists(), (

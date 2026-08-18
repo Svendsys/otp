@@ -47,12 +47,16 @@ REPORT_MAX_CHARS = 3500
 #: how long an operator will keep pressing before deciding the unit is
 #: broken, not for what the check costs. See GpioButtons._watch.
 WATCH_SECONDS = 2.0
-#: And how long a revival that FAILED waits before it is tried again.
-#: Starting a thread allocates, and the fault this is expected to meet is
-#: MemoryError, so a failure means retrying is likely to fail too -- a
-#: bound is what keeps a panel that cannot be revived from spending the
+#: The least time between two attempts at a revival, whatever the first
+#: one did. Starting a thread allocates, and the fault this is expected to
+#: meet is MemoryError, so a failure means retrying is likely to fail too:
+#: the bound is what keeps a panel that cannot be revived from spending the
 #: unit's remaining memory finding that out, and keeps its report to one
-#: line per interval. See GpioButtons._watch.
+#: line per interval. It applies to a SUCCESS as well, deliberately -- a
+#: dispatcher dying twice inside half a minute is something raising over
+#: and over, and a thread started per death would be the same runaway with
+#: an extra thread on the end of it. The price is that a second death is
+#: not answered for up to this long. See GpioButtons._watch.
 REVIVE_SECONDS = 30.0
 #: The most banked-up notification traffic _discard_backlog will read
 #: before it stops trying to empty the pipe. A Linux pipe holds 64 KiB by

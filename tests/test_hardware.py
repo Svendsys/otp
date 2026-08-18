@@ -1679,8 +1679,8 @@ class TestTheReplacementDispatchThread:
                 # the time the thread began is a question about ORDER, and
                 # asking it from inside the new thread would answer it
                 # whenever the scheduler got round to it.
-                module.order.append(
-                    "published" if module._notify_thread is self else "started")
+                found = module._notify_thread is self
+                module.order.append("published" if found else "started")
                 super().start()
 
             def run(self):
@@ -1906,8 +1906,9 @@ class TestRevivingLgpiosOwnDispatchThread:
         while not arrived and time.monotonic() < deadline:
             time.sleep(0.01)
         assert arrived == [0], (
-            "no edge arrived after the revival: the panel is still deaf "
-            f"and the journal would say otherwise (alive={revived.is_alive()})")
+            f"no edge arrived after the revival: the panel is still deaf "
+            f"and the journal would be saying otherwise "
+            f"(alive={revived.is_alive()})")
 
     def test_edges_banked_while_the_dispatcher_was_dead_are_not_replayed(
             self, dispatcher, unhandled):
