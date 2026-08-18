@@ -214,6 +214,15 @@ jobs:
                        -o Acquire::https::Timeout=15 update
           # cups for the print path; the rest is what the unit imports on a
           # real Pi, so the panel code can be exercised rather than skipped.
+          #
+          # python3-evdev here is for kernel-sim.sh, which is run as
+          # `sudo ./harness/kernel-sim.sh up` with no PATH of its own and
+          # so gets /usr/bin/python3. It is NOT the interpreter the tests
+          # run on -- that is setup-python's, reached through
+          # `env "PATH=$PATH"`, and apt installs into
+          # /usr/lib/python3/dist-packages which that one does not read.
+          # So evdev is installed twice, on purpose, and the second time
+          # is in the pip line below.
           sudo apt-get install -y --no-install-recommends \
             cups cups-client cups-filters printer-driver-cups-pdf \
             i2c-tools python3-evdev
@@ -225,7 +234,11 @@ jobs:
           sudo apt-get install -y "linux-modules-extra-$(uname -r)" \
             || echo "no modules-extra for $(uname -r); some simulators will be absent"
           pip install -r requirements-dev.txt
-          pip install smbus2 luma.oled gpiozero lgpio
+          # evdev is what the console panel's tests type with -- a uinput
+          # device and a read back through the kernel. Without it in THIS
+          # interpreter the whole monitor-and-keyboard pairing skips, and
+          # the named floor at the end of this job then fails on purpose.
+          pip install smbus2 luma.oled gpiozero lgpio evdev
       - name: The panel tests that need gpiozero and lgpio
         # tests/test_hardware.py is nobody's job otherwise. It carries no
         # `hardware` marker, so the harness step below (`pytest -m
@@ -371,30 +384,36 @@ jobs:
           # not to police the exact count, which every new test changes.
           PASSED=$(grep -oE '[0-9]+ passed' /tmp/harness.log | tail -1 | cut -d' ' -f1)
           echo "harness tests passed: ${PASSED:-0}"
-          # 55, and derived from a count rather than from the tail of an
+          # 58, and derived from a count rather than from the tail of an
           # old run -- the last three numbers here were all wrong, in
           # both directions, because they were carried forward by hand
           # while the harness kept growing. `pytest -m hardware
-          # --collect-only` on this tree collects 61.
+          # --collect-only` on this tree collects 64.
           #
           # Measured on a kernel with NO simulators at all (this
-          # container: CONFIG_GPIOLIB and CONFIG_CONFIGFS_FS unset):
-          # 50 passed, 11 skipped -- the 7 gpio-sim tests, 2 i2c-stub,
-          # 1 vkms, 1 uinput. A runner with modules-extra runs all
-          # eleven, so 61 is what this job should see.
+          # container: CONFIG_GPIOLIB and CONFIG_CONFIGFS_FS unset, and
+          # no uinput): 52 passed, 12 skipped -- the 7 gpio-sim tests,
+          # 2 i2c-stub, 1 vkms, 1 uinput probe and the console panel's
+          # end-to-end, which needs /dev/uinput. The two connector tests
+          # pass there, because forging a connector state needs nothing
+          # but root. A runner with modules-extra runs all twelve, so 64
+          # is what this job should see.
           #
-          # 55 leaves six free to skip for a reason already seen and
-          # accepted, and no more: the debounce test on a box too slow
-          # to bounce a line inside the window, the unaided-chip-number
-          # test when gpio-sim does not land on gpiochip0, luma refusing
-          # the i2c stub, and a runner kernel without modules-extra
-          # losing i2c-stub, vkms and uinput together.
+          # 58 leaves the same six free to skip as 55 did, and no more:
+          # the debounce test on a box too slow to bounce a line inside
+          # the window, the unaided-chip-number test when gpio-sim does
+          # not land on gpiochip0, luma refusing the i2c stub, and a
+          # runner kernel without modules-extra losing i2c-stub, vkms
+          # and uinput together. A runner that lost uinput would take
+          # the console panel's end-to-end with it, which is a seventh
+          # -- and that one is named below rather than left to this
+          # count, so it goes red by name and says which.
           #
           # If this number needs changing again, COUNT -- do not adjust
           # it to match whatever the last run happened to print, which
           # is how it came to claim the CUPS rig was 37 tests.
-          if [ "${PASSED:-0}" -lt 55 ]; then
-            echo "expected at least 55 passing harness tests (the CUPS rig" >&2
+          if [ "${PASSED:-0}" -lt 58 ]; then
+            echo "expected at least 58 passing harness tests (the CUPS rig" >&2
             echo "alone is 13); got ${PASSED:-0}. Something skipped silently." >&2
             grep -E "^SKIPPED" /tmp/harness.log >&2 || true
             exit 1
@@ -431,6 +450,31 @@ jobs:
               echo "job is not testing the panel at all." >&2
               grep -E "TestTheRealButtonPath|^SKIPPED" /tmp/harness.log >&2 \
                 || true
+              exit 1
+            fi
+          done
+          # The OTHER supported panel, by name for the same reason. A
+          # monitor and a USB keyboard is a configuration the owner runs,
+          # and until these three there was no test anywhere that chose it
+          # from real evidence or drove it. Every part of them that can be
+          # absent -- /dev/uinput, evdev in THIS interpreter, root for the
+          # mount namespace, a cupsd -- makes them skip rather than fail,
+          # and a skip is invisible in a count that the CUPS half can
+          # carry on its own. So they are required by name.
+          #
+          # The last one is the whole thing end to end: a real key event
+          # out of the kernel, through a real terminal, into the shipped
+          # menu, and two copies of one pad reaching the print backend.
+          for named in \
+            "TestChoosingTheConsoleDisplay::test_a_connected_screen_selects_the_console_and_draws_on_it" \
+            "TestChoosingTheConsoleDisplay::test_a_disconnected_screen_selects_no_display_at_all" \
+            "TestTheWholeMenuOnAScreenAndAKeyboard::test_a_pad_pair_is_printed_from_the_menu_on_a_screen_and_a_keyboard"; do
+            if ! grep -q "${named} PASSED" /tmp/harness.log; then
+              echo "${named} did not pass. A monitor and a USB keyboard" >&2
+              echo "is a supported unit and this job is the only place it" >&2
+              echo "is ever chosen from real evidence and driven." >&2
+              grep -E "TestChoosingTheConsoleDisplay|TestTheWholeMenu|^SKIPPED" \
+                /tmp/harness.log >&2 || true
               exit 1
             fi
           done
