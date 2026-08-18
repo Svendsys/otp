@@ -389,16 +389,33 @@ class Gate:
         originals = {edit.path: (self.repo / edit.path).read_bytes()
                      for edit in mutation.edits}
         started = time.monotonic()
+        shadowed = ""
         try:
             for edit in mutation.edits:
                 target = self.repo / edit.path
                 self._write(target, target.read_bytes().replace(
                     edit.find.encode(), edit.replace.encode()))
-            result = self.runner(self.repo, tier, mutation.tests)
+            # Asked BEFORE the run, because afterwards there is no way to
+            # tell. See _write: a cache entry left over from the original
+            # is one CPython will believe, since the source's (mtime, size)
+            # are all it compares and a length-preserving mutation changes
+            # neither -- so the subprocess below would execute the
+            # ORIGINAL, the row would survive, and the report would say the
+            # guard is fine. That is the direction of this failure that
+            # costs something: the other way round leaves a dirty tree,
+            # which the run notices at the end. Not a verdict of SURVIVED
+            # either, which would send someone to write a test that already
+            # exists; the gate could not measure this row, and says so.
+            shadowed = self._shadowed_by_cache(mutation)
+            result = (None if shadowed
+                      else self.runner(self.repo, tier, mutation.tests))
         finally:
             for path, original in originals.items():
                 self._restore(self.repo / path, original)
         elapsed = time.monotonic() - started
+
+        if shadowed:
+            return Outcome(mutation, "BROKEN", shadowed, seconds=elapsed)
 
         if result.returncode == TIMED_OUT:
             # A hang is not a red test. It might mean the mutation wedged
@@ -429,8 +446,44 @@ class Gate:
                 seconds=elapsed)
         return Outcome(mutation, "caught", "", red=result.failed, seconds=elapsed)
 
+    def _shadowed_by_cache(self, mutation: Mutation) -> str:
+        """
+        Name any mutated file the interpreter might read out of the cache.
+
+        The check `_write` cannot make about itself. `_write` drops the
+        `__pycache__` entry on both writes; this asks, once the mutation is
+        on disk and before anything runs against it, whether that actually
+        happened -- an unwritable `__pycache__`, a second process compiling
+        the file in the window, or the deletion being dropped from the
+        apply side alone, which is a one-line edit and which the restore
+        side's own test cannot see.
+
+        It is cheap (one `stat` per mutated file) and it is the only moment
+        the question can be answered: after the run, a row that executed
+        the original looks exactly like a row whose guard is missing.
+        """
+        for edit in mutation.edits:
+            cached = self._cache_entry(self.repo / edit.path)
+            if cached is not None and cached.exists():
+                return (f"{edit.path} was mutated with {cached} still in "
+                        f"place, and CPython compares only the source's "
+                        f"mtime in whole seconds and its size -- so this "
+                        f"run may have executed the ORIGINAL and the "
+                        f"verdict would mean nothing. Delete it and re-run.")
+        return ""
+
     @staticmethod
-    def _write(target: Path, data: bytes) -> None:
+    def _cache_entry(target: Path):
+        """The `__pycache__` file CPython would believe for `target`."""
+        if target.suffix != ".py":
+            return None                              # nothing compiles it
+        try:
+            return Path(importlib.util.cache_from_source(str(target)))
+        except (NotImplementedError, ValueError):    # pragma: no cover
+            return None                              # no cache to poison
+
+    @classmethod
+    def _write(cls, target: Path, data: bytes) -> None:
         """
         Write `data`, and make sure the interpreter will actually read it.
 
@@ -461,14 +514,23 @@ class Gate:
 
         So the cache entry goes with every write, in both directions.
         Deleting it is enough: the next import compiles what is there.
+
+        The two directions need separate checks and did not have them: a
+        test that plants an entry, calls `apply_and_judge` and finds the
+        entry gone afterwards is satisfied by the RESTORE side alone, and
+        a row that mutates the line below disables both sides at once.
+        Measured: reverting only the apply side -- `self._write(target,
+        ...)` back to `target.write_bytes(...)` in `apply_and_judge` --
+        left the gate's own suite green and its row still reported caught,
+        while the direction that can execute a mutation as the original
+        was wide open. `_shadowed_by_cache` is the apply side's own check;
+        `test_the_mutated_run_never_starts_with_a_cache_entry_to_believe`
+        is the test that can only see that side.
         """
         target.write_bytes(data)
-        if target.suffix != ".py":
+        cached = cls._cache_entry(target)
+        if cached is None:
             return
-        try:
-            cached = Path(importlib.util.cache_from_source(str(target)))
-        except (NotImplementedError, ValueError):    # pragma: no cover
-            return                                   # no cache to poison
         try:
             cached.unlink()
         except OSError:
