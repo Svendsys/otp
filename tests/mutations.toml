@@ -387,6 +387,25 @@ replace = "            ./harness/img-boot.sh image/deploy/*.img.xz || true"
 
 
 [[mutation]]
+name = "release-job-cap-loses-to-a-third-boot"
+tier = "fast"
+guard = """
+The job cap must always LOSE the race to the script's own timeout. A GitHub
+cap firing is a cancellation, and a cancelled job skips the verdict and the
+evidence upload -- failure() is false on cancellation -- so hitting it costs
+the diagnosis as well as the run. 40 minutes covered two boots at a 600s
+backstop; a third does not fit, and the arithmetic is derived from the phase
+list and the backstop rather than restated."""
+tests = [
+  "tests/test_image_workflow.py::test_the_job_cap_clears_every_boots_backstop",
+]
+[[mutation.edit]]
+file = ".github/workflows/image.yml"
+find = "    timeout-minutes: 55"
+replace = "    timeout-minutes: 40"
+
+
+[[mutation]]
 name = "release-artifact-upload-shrugs-at-a-missing-image"
 tier = "fast"
 guard = """

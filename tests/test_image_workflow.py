@@ -270,6 +270,47 @@ def test_the_release_notes_two_boot_claim_is_backed_by_the_harness():
                  f"not run {boot}, but the release note claims all three")
 
 
+def test_the_job_cap_clears_every_boots_backstop():
+    """
+    The job cap has to LOSE the race to the script's own timeout, always.
+
+    A GitHub job cap firing is a cancellation, and a cancelled job skips the
+    verdict and the evidence upload -- `failure()` is false on cancellation --
+    so a run that hit the cap costs the diagnosis as well as the run. That was
+    learned the hard way at fifteen minutes, and it is why the number has
+    moved twice since.
+
+    ARITHMETIC, NOT A HABIT, and derived from the two shipped files that
+    decide it: how many boots the harness refuses to run without, and what
+    backstop this workflow gives each one. `timeout -k 30` means a boot can
+    take the backstop plus a thirty-second kill grace before the wrapper
+    returns. A fourth phase, or a raised backstop, has to move this key --
+    and until it does, this test is what says so, in seconds rather than in
+    a cancelled arm64 run three quarters of an hour later.
+    """
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    phases = re.search(r"^for want in ([a-z0-9 ]+); do$", harness, re.M)
+    assert phases, "img-boot.sh no longer names the phases it demands"
+    boots = len(phases.group(1).split())
+    assert boots == 3, phases.group(1)
+
+    backstop = int((step_named(build_steps(), BOOT)["env"])["OTP_IMG_TIMEOUT"])
+    grace = int(re.search(r"timeout -k (\d+) \"\$TIMEOUT\"", harness).group(1))
+    cap = int(workflow()["jobs"]["build"]["timeout-minutes"])
+    worst_boots = boots * (backstop + grace) / 60
+    assert cap > worst_boots, (
+        f"timeout-minutes: {cap} does not even cover {boots} boots at "
+        f"{backstop}s + {grace}s of kill grace ({worst_boots:.1f} min), so a "
+        f"run that lost every boot would be cancelled instead of reported")
+    # And the rest of the job has to fit as well: pi-gen on a cache miss was
+    # 6m58s on run 31752321387, and everything else on that run (checkout,
+    # apt, cache save, artifact upload, decompress, verdict) was 1m19s.
+    # Doubling both leaves the margin this key is supposed to carry.
+    assert cap >= worst_boots + 2 * (6 + 58 / 60) + 2 * (1 + 19 / 60), (
+        f"timeout-minutes: {cap} leaves no room for a slow pi-gen on top of "
+        f"{worst_boots:.1f} minutes of worst-case boots")
+
+
 def test_the_release_notes_inert_probe_claim_is_backed_by_the_harness():
     """
     THE NOTE ADMITS THE IMAGE CONTAINS A TEST PROBE, and that admission is
