@@ -172,7 +172,29 @@ jobs:
         # job twenty minutes later with the diagnostics skipped.
         timeout-minutes: 8
         run: |
-          sudo apt-get update
+          # RETRIES AND A TIMEOUT, because the default is neither. The
+          # runners resolve the archive through /etc/apt/apt-mirrors.txt
+          # with azure.archive.ubuntu.com first, and on 2026-08-18 that
+          # host stopped answering: run 32166657980 logged `Ign:` for
+          # every suite on it, fell back to archive.ubuntu.com, fetched
+          # the four InRelease files at 17:39:03-04 and then sat in
+          # silence until the step was killed at 17:46:37. Seven and a
+          # half minutes of nothing, in `update`, before a single package
+          # was downloaded. apt's default http timeout is 120s per
+          # connection with no retry, and a mirror that accepts a socket
+          # and then stops talking can hold each index for the full two
+          # minutes; the earlier runs 32160857598 and 32162479196 spent
+          # 15m27s here the same way and were read as "a slow download",
+          # which they were not.
+          #
+          # 15s and three tries turns a dead mirror into a fast failure
+          # and, where a mirror is merely unhealthy, into a retry that
+          # usually lands. It cannot make a genuinely absent archive
+          # work, and it is not meant to: the step cap above is what
+          # says so out loud.
+          sudo apt-get -o Acquire::Retries=3 \
+                       -o Acquire::http::Timeout=15 \
+                       -o Acquire::https::Timeout=15 update
           # cups for the print path; the rest is what the unit imports on a
           # real Pi, so the panel code can be exercised rather than skipped.
           sudo apt-get install -y --no-install-recommends \
@@ -420,7 +442,12 @@ jobs:
         # problem rather than being taken out of the boot's budget.
         timeout-minutes: 8
         run: |
-          sudo apt-get update
+          # Retries and a timeout, for the reason spelled out against the
+          # hardware job's update above: this job was killed by the same
+          # stalled mirror in the same run.
+          sudo apt-get -o Acquire::Retries=3 \
+                       -o Acquire::http::Timeout=15 \
+                       -o Acquire::https::Timeout=15 update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 qemu-utils cloud-image-utils
           # KVM turns half an hour of emulation into a few minutes. Not
