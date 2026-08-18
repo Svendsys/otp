@@ -1749,7 +1749,6 @@ class TestTheRealKeyboardProbe:
         assert hmi.keyboard_connected() is True
 
 
-
 # --- the other supported panel: a monitor and a USB keyboard -------------
 #
 # hmi.py chooses display and input independently so that a monitor and a
@@ -1888,8 +1887,9 @@ class TestChoosingTheConsoleDisplay:
                 "stdin/stdout are not a terminal, so this proves nothing"
             display, kind = hmi.open_display(log=refused.append)
 
-        assert display is None, \
-            "a unit with nothing plugged in was handed a display anyway"
+        assert display is None, (
+            f"a unit with nothing plugged in was handed a {kind!r} anyway; "
+            f"what open_display said on the way: {refused}")
         assert kind == "none", kind
         assert "+-----" not in terminal.text, (
             "a panel was drawn on a terminal that should not have been "
