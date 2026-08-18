@@ -167,8 +167,13 @@ gpiozero. `_callback_thread.run` dispatches with no guard around the call
             cb.func(chip, gpio, level, tick)
 
 so an exception out of `cb.func` ends the thread — and because the thread
-is process-wide and never restarted, **no button anywhere in the process
-fires again**, including a panel built afterwards. gpiozero adds nothing on
+is process-wide, **no button anywhere in the process fires again**,
+including a panel built afterwards, for as long as nothing puts a reader
+back on that handle. Nothing did until `GpioButtons._watch`, which notices
+the death on the next `wait()` and starts a replacement over the same
+handle, file object and callbacks list; that covers the lgpio factory and
+no other, and which factory the shipped unit runs on is issue #43.
+gpiozero adds nothing on
 the way in: `LGPIOPin._call_when_changed` → `PiPin._call_when_changed` →
 `Button._pin_changed` → `_fire_events` → `_fire_activated` contains no
 `try` at all. The only report is a `PytestUnhandledThreadExceptionWarning`
@@ -196,8 +201,10 @@ Three places, and for a while only two of them ran anywhere. `pytest -m
 hardware` deselects `tests/test_hardware.py` wholesale — nothing in it is
 marked `hardware` — and the `test` job installs `requirements-dev.txt`,
 which has neither gpiozero nor lgpio, so in a venv with only that in it the
-file measures **27 passed, 10 skipped**: the six `[lgpio]` parametrisations
-and all four `TestRealGpiozero` tests, the control among them. This job runs
+file measures **52 passed, 13 skipped**: the six `[lgpio]` parametrisations,
+all four `TestRealGpiozero` tests — the control among them — and the three
+in `TestRevivingLgpiosOwnDispatchThread`, which need a real lgpio to kill
+and revive. This job runs
 the file by name as well, in a step that treats a skip as a failure —
 `gpiozero` and `lgpio` are installed here, so nothing in it has a reason to
 skip, and a skipped test in a summary line looks exactly like a passing
@@ -1306,12 +1313,12 @@ stayed green.
 
 ```sh
 python3 tests/mutation_gate.py --list
-python3 tests/mutation_gate.py --tier fast       # 164 rows, 196s
+python3 tests/mutation_gate.py --tier fast       # 219 rows, 240s
 sudo python3 tests/mutation_gate.py --tier hardware   # 3 rows, 36s, needs cupsd
 ```
 
 **Runtime decided the trigger.** The issue expected nightly or
-label-triggered; measured, the fast tier is about three minutes at 164 rows
+label-triggered; measured, the fast tier is about four minutes at 219 rows
 — still cheaper than the suite it audits — so it runs per pull
 request as its own `mutation` job, and the ordinary suite's wall clock does
 not move. The three CUPS-rig rows run in the existing `hardware` job, the

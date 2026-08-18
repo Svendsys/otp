@@ -232,12 +232,12 @@ jobs:
         # hardware`) deselects the whole file; and the `test` job installs
         # requirements-dev.txt, which deliberately has neither gpiozero nor
         # lgpio. Measured in a venv with only requirements-dev.txt in it:
-        # 27 passed, 10 skipped -- the six [lgpio] parametrisations and all
-        # four TestRealGpiozero tests, eight of them added by the panel-guard
-        # change. Among them is the control that proves real gpiozero lets a
-        # callback exception straight out, which is the only thing keeping
-        # the stand-in dispatcher honest, and lgpio's own `run`. This step is
-        # the one place they run.
+        # 52 passed, 13 skipped -- the six [lgpio] parametrisations, all
+        # four TestRealGpiozero tests, and the three that need a real lgpio
+        # to kill and revive. Among them is the control that proves real
+        # gpiozero lets a callback exception straight out, which is the only
+        # thing keeping the stand-in dispatcher honest, and lgpio's own
+        # `run`. This step is the one place they run.
         #
         # Both libraries are installed above, so nothing in the file has a
         # reason to skip -- and a skip is failed here rather than printed,
