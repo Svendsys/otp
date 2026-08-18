@@ -131,11 +131,14 @@ CLOUD_PACKAGES_RE="$(echo "$CLOUD_PACKAGES" | tr ' ' '|')"
 #
 # `set -e` ON THE FIRST LINE IS INERT HERE, and is kept regardless. Every
 # command below that can fail is either caught by name or is the last one in
-# the block, whose status the shell returns anyway: dropping the line
-# changes nothing observable, which is why deleting it survives the suite
-# and why there is no mutation row pretending otherwise. It stays because
-# the second heredoc needs its own and consistency is cheap, and because the
-# day a line is appended after the purge it stops being inert.
+# the block, whose status the shell returns anyway -- and pi-gen's on_chroot
+# is already `bash -e` besides. Deleting the line changes nothing
+# observable, which is why deleting it survives the suite and why no
+# mutation row claims otherwise; the row that does exist,
+# stage-purge-failure-swallowed, is about the purge's own exit status
+# reaching the build. It stays because the second heredoc needs its own and
+# consistency is cheap, and because the day a line is appended after the
+# purge it stops being inert.
 #
 # `Purg` AND `Remv`, AND THIS COMMENT HAD IT BACKWARDS. It used to say apt
 # prints `Remv` for a package taken out on the way to the named ones and
