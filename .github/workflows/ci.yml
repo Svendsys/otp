@@ -128,8 +128,15 @@ jobs:
           # debugging tool with no CI wiring by design (issue #22), and
           # running it would put a network fetch and an emulated boot on
           # every push -- which is the cost it exists to remove.
+          #
+          # The pi-gen stage script is in the list because it stopped being
+          # a copy loop: it purges cloud-init and refuses the build if apt
+          # says the purge would take a reverse dependency with it (issue
+          # #34), and that logic reaches the image without any of it ever
+          # running here. It is `-s bash` by its own shebang.
           ./shellcheck device/install.sh device/persist-identity.sh \
                        image/build.sh image/render-manual.sh \
+                       image/stage-otpunit/01-otpunit/00-run.sh \
                        harness/kernel-sim.sh harness/vm-check.sh \
                        harness/vm-guest-check.sh harness/img-boot.sh \
                        harness/img-guest-check.sh harness/img-local-rig.sh

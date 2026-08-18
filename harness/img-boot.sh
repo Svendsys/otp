@@ -1178,6 +1178,7 @@ GUEST_CHECKS_COMMON="root-is-overlay root-write-lands-and-is-readable \
 unit-active unit-not-restart-looping journal-marker-accepted \
 unit-detects-no-panel etc-cups-is-its-own-tmpfs cups-running \
 cupsd-config-valid boot-partition-separate setting-saved-to-the-boot-partition \
+cloud-init-is-not-installed cloud-init-kill-switch-survives-the-purge \
 network-wait-cannot-hold-the-boot-open \
 machine-id-persisted-outside-the-overlay"
 GUEST_CHECKS_BOOT1="userconf-seed-applied userconf-seeded-boot-ran-no-wizard \

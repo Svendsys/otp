@@ -1561,9 +1561,14 @@ cloud-init is what pulls network-online.target into this image's boot, it
 spends a minute of every boot finding no datasource, and it takes user-data
 off the boot partition -- the partition an operator is told to write files
 on -- on a device that prints one-time pads and has no network by design.
-The kill switch is read by its generator before cloud-init.target is linked
-into multi-user.target, which is what takes cloud-config.service out of the
-transaction and voids the wizard's `After=` on it."""
+The packages are purged out of the image now (issue #34) and this line is
+the belt to that purge's braces: it is what disables a cloud-init some later
+dependency drags back in, and it is the whole of the defence on the
+hand-provisioned Pi this script is mostly run on. ds-identify reads the
+marker before any datasource search and answers 2, which is what leaves
+cloud-init.target out of multi-user.target's wants -- taking
+cloud-config.service out of the transaction and voiding the wizard's
+`After=` on it."""
 tests = [
   "tests/test_overlay_root.py::test_cloud_init_is_switched_off_on_an_air_gapped_printer",
 ]
@@ -1571,6 +1576,323 @@ tests = [
 file = "device/install.sh"
 find = ''': > /etc/cloud/cloud-init.disabled'''
 replace = ''': > /etc/cloud/cloud-init.enabled'''
+
+
+# --- the provisioning agent that was on every image (issue #34) -----------
+#
+# ENABLE_CLOUD_INIT=0 guarded the seed files and nothing else, so cloud-init
+# and rpi-cloud-init-mods went onto every image this project built. The stage
+# purges them and install.sh still writes the kill switch. These rows are the
+# ways that can quietly stop being true: a purge that only simulated, a
+# refusal that cannot fire, an absence read through a tool that has stopped
+# answering, and a marker file nothing looks for.
+
+[[mutation]]
+name = "stage-cloud-init-only-simulated"
+tier = "fast"
+guard = """
+The purge itself. A build that ran the simulation and never the removal
+ships the packages -- with the console saying nothing, because the
+simulation is the quiet half -- and the image goes back to carrying a
+provisioning agent aimed at /boot/firmware. The stage's apt log is read for
+both calls and for which of them carried -s."""
+tests = [
+  "tests/test_overlay_root.py::test_the_stage_purges_both_cloud_init_packages",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''apt-get purge -y ${CLOUD_PACKAGES}'''
+replace = '''apt-get -s purge -y ${CLOUD_PACKAGES}'''
+
+
+[[mutation]]
+name = "stage-purge-refusal-cannot-fire"
+tier = "fast"
+guard = """
+`apt-get purge -y` removes reverse dependencies without a prompt. Nothing in
+either archive depends on these two today, but an index is not the rootfs,
+and a dependent deleted out of a key printer's image surfaces as a unit that
+no longer boots, two emulated boots later. The refusal is the only thing
+standing between those two facts."""
+tests = [
+  "tests/test_overlay_root.py::test_a_purge_that_would_take_something_else_stops_the_build",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''	if [ -n "\$unexpected" ]; then'''
+replace = '''	if false; then'''
+
+
+[[mutation]]
+name = "stage-purge-filter-drops-its-remv-arm"
+tier = "fast"
+guard = """
+DEFENCE IN DEPTH, NOT THE LOAD-BEARING BRANCH -- which is what this row used
+to claim, in these words: "apt prints [Remv] for a package it takes out on
+the way to the ones it was asked about, which is precisely the dependent the
+refusal above exists for". It is the opposite. `apt-get purge` re-marks every
+scheduled deletion as a purge before it prints (apt 3.0.3,
+apt-private/private-install.cc:222-225; measured on 2.8.3 against a package
+with nine reverse dependencies -- ten `Purg` lines, no `Remv`), so a
+dependent arrives as `Purg` and the `Remv` arm cannot fire under this
+command. The arm is kept for the apt that stops re-marking and for the edit
+that turns `purge` into `remove`, and this row is what keeps it in the awk.
+The refusal itself is guarded by stage-purge-refusal-cannot-fire."""
+tests = [
+  "tests/test_overlay_root.py::test_the_filter_reads_a_remv_apt_would_not_print_here",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''| awk '\$1 == "Remv" || \$1 == "Purg" { print \$2 }')'''
+replace = '''| awk '\$1 == "Purg" { print \$2 }')'''
+
+
+[[mutation]]
+name = "stage-purge-simulation-status-discarded"
+tier = "fast"
+guard = """
+apt's exit status, which the first version of this block threw away. The
+whole plan was read through one pipeline ending in `|| true`, so an apt that
+FAILED reached the refusal as an empty string and was passed as clean, with
+the unguarded real purge on the next line. Not hypothetical: `apt-get -s
+purge -y <name in no index>` exits 100 with `E: Unable to locate package` and
+prints no plan (measured, apt 2.8.3), which is precisely the day either
+package leaves the Raspberry Pi archive."""
+tests = [
+  "tests/test_overlay_root.py::test_a_simulation_that_fails_stops_the_build",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''	if ! sim=\$(apt-get -s purge -y ${CLOUD_PACKAGES}); then'''
+replace = '''	if ! sim=\$(apt-get -s purge -y ${CLOUD_PACKAGES} || true); then'''
+
+
+[[mutation]]
+name = "stage-purge-simulation-not-proved-to-have-run"
+tier = "fast"
+guard = """
+THE POSITIVE CONTROL ON THE REFUSAL. Everything the refusal reads is an
+absence -- names apt did NOT print -- so an apt that printed nothing at all
+satisfies it perfectly and the real purge runs. Requiring the plan to name
+both packages first is what separates "apt said only cloud-init" from "apt
+said nothing", and those were the same answer until this landed. Issue #14's
+defect class, on the guard whose job is to stop a silent deletion."""
+tests = [
+  "tests/test_overlay_root.py::test_a_simulation_that_names_nothing_stops_the_build",
+  "tests/test_overlay_root.py::test_a_simulation_that_names_only_one_of_the_two_stops_the_build",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''		if ! echo "\$scheduled" | grep -qxF "\$want"; then'''
+replace = '''		if false; then'''
+
+
+[[mutation]]
+name = "stage-purge-refusal-accepts-a-lookalike-name"
+tier = "fast"
+guard = """
+The `-x` on the refusal's filter. CLOUD_PACKAGES_RE carries no `^` and no
+`$`, so without `-x` the match is a substring test and any package apt
+schedules whose name merely CONTAINS one of ours is read as expected and
+waved through -- Debian trixie/main ships cloud-initramfs-growroot,
+cloud-initramfs-dyn-netconf and cloud-initramfs-rescuevol. None of them
+depends on cloud-init today, which is exactly why an unguarded anchor here
+would rot without anyone noticing."""
+tests = [
+  "tests/test_overlay_root.py::test_a_removal_whose_name_merely_contains_cloud_init_stops_the_build",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''| grep -vxE '${CLOUD_PACKAGES_RE}' || true)'''
+replace = '''| grep -vE '${CLOUD_PACKAGES_RE}' || true)'''
+
+
+[[mutation]]
+name = "stage-purge-failure-swallowed"
+tier = "fast"
+guard = """
+The removal's own exit status. A purge that fails leaves both packages
+installed, and a stage that then exits 0 ships the provisioning agent with
+the build log green -- the state issue #34 describes, arrived at a second
+way. It holds today only because that call is the last command in the
+heredoc; `set -e` above it is inert in a block where every other failure is
+caught by name, so the property is pinned by a test rather than by the
+block's shape."""
+tests = [
+  "tests/test_overlay_root.py::test_a_purge_that_fails_fails_the_build",
+]
+[[mutation.edit]]
+file = "image/stage-otpunit/01-otpunit/00-run.sh"
+find = '''	apt-get purge -y ${CLOUD_PACKAGES}'''
+replace = '''	apt-get purge -y ${CLOUD_PACKAGES} || true'''
+
+
+[[mutation]]
+name = "guest-cloud-init-packages-not-asked"
+tier = "fast"
+guard = """
+dpkg is the purge's own gate, and the only clause that can tell a purge from
+a remove. `config-files` leaves rpi-cloud-init-mods'
+/etc/cloud/cloud.cfg.d/99_raspberry-pi.cfg on the card -- the file that
+points the NoCloud datasource at file:///boot/firmware -- so anything that
+brought the package back would come back already aimed at the partition an
+operator is told to write files on."""
+tests = [
+  "tests/test_overlay_root.py::test_a_cloud_init_still_installed_fails",
+  "tests/test_overlay_root.py::test_a_removed_but_not_purged_cloud_init_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ -z "$CI_INSTALLED" ] && [ "$CI_CONTROL_STATUS" = installed ] \'''
+replace = '''      "$(if [ "$CI_CONTROL_STATUS" = installed ] \'''
+
+
+[[mutation]]
+name = "guest-cloud-init-units-not-asked"
+tier = "fast"
+guard = """
+dpkg does not imply systemd. A unit file dropped into /etc/systemd/system by
+hand, or a package reinstalled from a local .deb, gives systemd a
+cloud-init.target that dpkg has no opinion about -- and cloud-init.target is
+what pulled network-online.target into the transaction that ended both boots
+of run 31968966879 with neither reaching multi-user.target."""
+tests = [
+  "tests/test_overlay_root.py::test_a_cloud_init_unit_systemd_still_knows_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''            && [ -z "$CI_LOADED" ] && [ "$CI_CONTROL_LOAD" = loaded ] \'''
+replace = '''            && [ "$CI_CONTROL_LOAD" = loaded ] \'''
+
+
+[[mutation]]
+name = "guest-cloud-init-generator-not-asked"
+tier = "fast"
+guard = """
+The generator is the thing that puts cloud-init.target into the boot
+transaction, it runs out of /usr/lib whether or not any unit is enabled, and
+it is what reads the kill switch by way of ds-identify. A purge that left it
+behind is a purge that did not happen."""
+tests = [
+  "tests/test_overlay_root.py::test_a_generator_left_behind_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''            && [ ! -e "$CI_GENERATOR" ] \
+'''
+replace = ''''''
+
+
+[[mutation]]
+name = "guest-cloud-init-dpkg-control-dropped"
+tier = "fast"
+guard = """
+Every clause of this check but one is an ABSENCE, and a dpkg-query that has
+stopped answering produces all of them at once on a machine with cloud-init
+installed -- on a machine, moreover, whose /usr the purge has just edited.
+The control is one package this appliance cannot boot without, asked through
+the same query and required to come back `installed`."""
+tests = [
+  "tests/test_overlay_root.py::test_the_absences_need_their_positive_controls",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ -z "$CI_INSTALLED" ] && [ "$CI_CONTROL_STATUS" = installed ] \'''
+replace = '''      "$(if [ -z "$CI_INSTALLED" ] \'''
+
+
+[[mutation]]
+name = "guest-cloud-init-systemd-control-dropped"
+tier = "fast"
+guard = """
+The same hole one tool over: a systemctl that answers nothing reports every
+cloud-init unit `not-found`, which is exactly what a purged machine reports.
+The control is otp-unit.service, the unit this whole tier is about, read
+through the same `systemctl show`."""
+tests = [
+  "tests/test_overlay_root.py::test_the_absences_need_their_positive_controls",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''            && [ -z "$CI_LOADED" ] && [ "$CI_CONTROL_LOAD" = loaded ] \'''
+replace = '''            && [ -z "$CI_LOADED" ] \'''
+
+
+[[mutation]]
+name = "guest-cloud-init-generator-control-dropped"
+tier = "fast"
+guard = """
+And once more for the filesystem read: a generator directory that is not
+there, or is not readable, holds no cloud-init-generator and no
+systemd-fstab-generator either. systemd's own generators live in it, so a
+listing that comes back empty is a wrong path rather than a purge."""
+tests = [
+  "tests/test_overlay_root.py::test_the_absences_need_their_positive_controls",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''            && [ "${CI_GENERATOR_SIBLINGS:-0}" -gt 0 ] 2>/dev/null; \'''
+replace = '''            ; \'''
+
+
+[[mutation]]
+name = "guest-kill-switch-accepts-anything-at-the-path"
+tier = "fast"
+guard = """
+The shape ds-identify requires, not merely the name. cloud-init 25.2's
+`is_disabled()` is `[ -f /etc/cloud/cloud-init.disabled ]`, so a directory of
+that name is not a kill switch at all while satisfying `-e` perfectly -- and
+a marker that disables nothing is worse than none, because the comment
+beside it says the machine is protected."""
+tests = [
+  "tests/test_overlay_root.py::test_a_kill_switch_that_is_not_a_regular_file_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''CI_DISABLED_IS_FILE=$(yesno test -f "$CI_DISABLED")'''
+replace = '''CI_DISABLED_IS_FILE=$(yesno test -e "$CI_DISABLED")'''
+
+
+[[mutation]]
+name = "guest-cloud-init-netplan-not-reported"
+tier = "fast"
+guard = """
+A REPORT, KEPT AS A REPORT. The sentence this row used to carry -- "the
+console line is the whole of the evidence that removing it broke nothing" --
+was wrong twice over: the line reads `netplan-renderer=no
+NetworkManager=active` on every healthy boot, so it distinguishes nothing,
+and the evidence is elsewhere. It is in the comment beside the check:
+network-manager depends on netplan.io so the purge cannot take netplan, that
+yaml is the only netplan config file any package in either trixie archive
+ships so netplan then renders nothing, and the NetworkManager conf file the
+renderer default exists to shadow is Ubuntu-only. What this row protects is
+that the two facts a reader wants off the booted machine keep reaching the
+console, and nothing more than that."""
+tests = [
+  "tests/test_overlay_root.py::test_the_probe_reports_what_the_purge_did_to_netplan",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = ''' | netplan-renderer=$(yesno test -e "$CI_NETPLAN_RENDERER") NetworkManager=$(systemctl is-active NetworkManager.service 2>&1 || true)"'''
+replace = '''"'''
+
+
+[[mutation]]
+name = "tier3-cloud-init-checks-not-required"
+tier = "fast"
+guard = """
+The named-check gate over the purge and the marker. Drop the names and both
+boots go on passing everything else while the image quietly carries a
+provisioning agent again -- the same shape as row 4 of issue #14, which is
+why the names are listed here as well as counted."""
+tests = [
+  "tests/test_img_verdict.py::test_the_harness_and_the_guest_agree_on_which_checks_exist",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''cloud-init-is-not-installed cloud-init-kill-switch-survives-the-purge \
+'''
+replace = ''''''
 
 
 [[mutation]]
@@ -1594,7 +1916,12 @@ find = '''  * systemd-networkd-wait-online.service is MASKED. Nothing on this ma
     `sudo systemctl unmask systemd-networkd-wait-online.service`.
   * cloud-init is switched off permanently, via /etc/cloud/cloud-init.disabled.
     This machine will not run any cloud-init datasource again -- including
-    user-data written to the boot partition. Undo by deleting that file.'''
+    user-data written to the boot partition, which is what Raspberry Pi OS
+    points it at. Undo by deleting that file. The PACKAGES are still
+    installed here: they are purged out of the image this project builds,
+    but this script does not remove software from a Pi you already had. So
+    that one file is the whole of it, and cloud-init runs again on the next
+    boot after anybody deletes it.'''
 replace = '''  * Some system services were adjusted.'''
 
 
@@ -4237,8 +4564,8 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/README.md"
-find = "**21 guest checks in boot 1 and 21 in boot 2**"
-replace = "**19 guest checks in boot 1 and 19 in boot 2**"
+find = "**23 guest checks in boot 1 and 23 in boot 2**"
+replace = "**21 guest checks in boot 1 and 21 in boot 2**"
 
 
 [[mutation]]
