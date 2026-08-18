@@ -1551,6 +1551,41 @@ per_boot_verdict() {
             else
                 printf 'IMG-CHECK %s imgcheck-unit-considered-and-skipped FAIL systemd never named otp-unit-imgcheck.service as skipped: either the unit is not in this image, or it was not enabled, or it RAN\n' \
                        "$phase"
+                # AND SAY WHAT WAS THERE INSTEAD. Run 32180661689 failed this
+                # clause on a boot where every other release clause passed:
+                # the probe was silent, left no journal tag, named no queue
+                # and put nothing back on the card, so it demonstrably did
+                # not act -- systemd simply never said so in the words this
+                # grep expects. A failure naming three possible causes and
+                # distinguishing none of them sends the next reader to
+                # download an artifact, and this console IS the artifact.
+                #
+                # NO `head` IN THESE PIPELINES. The first version of this
+                # block piped grep into `head -5`, which closes the pipe,
+                # kills grep with SIGPIPE, and under `set -o pipefail` fails
+                # the whole pipeline -- ending the function before the
+                # remaining release clauses printed. Caught by
+                # test_a_release_boot_whose_probe_unit_is_missing_fails,
+                # whose entire job is to assert those clauses still PASS
+                # when this one fails, so the diagnostic silenced the very
+                # control that makes this clause load-bearing. Captured
+                # first, trimmed with sed, which reads to EOF.
+                MENTIONS=$(grep -E 'otp-unit-imgcheck' "$CONSOLE_TXT" 2>/dev/null || true)
+                SKIPS=$(grep -E '(was skipped because|being skipped)' "$CONSOLE_TXT" 2>/dev/null || true)
+                printf 'IMG-NOTE %s imgcheck-unit-mentioned: %s line(s)\n' \
+                       "$phase" "$(printf '%s' "$MENTIONS" | grep -c . || true)"
+                printf 'IMG-NOTE %s skip-lines-seen: %s line(s)\n' \
+                       "$phase" "$(printf '%s' "$SKIPS" | grep -c . || true)"
+                printf '%s\n' "$MENTIONS" | sed -n '1,5p' | cut -c1-200 \
+                    | while IFS= read -r line; do
+                          [ -n "$line" ] || continue
+                          printf 'IMG-NOTE %s imgcheck-unit-line: %s\n' "$phase" "$line"
+                      done
+                printf '%s\n' "$SKIPS" | sed -n '1,5p' | cut -c1-200 \
+                    | while IFS= read -r line; do
+                          [ -n "$line" ] || continue
+                          printf 'IMG-NOTE %s skip-line-seen: %s\n' "$phase" "$line"
+                      done
             fi
             ;;
     esac
