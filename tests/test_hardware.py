@@ -288,12 +288,70 @@ class FakeButton:
         self.closed = True
 
 
+class FakeDispatcher:
+    """
+    The one thing `GpioButtons._watch` asks of lgpio's thread: is it alive.
+
+    Counting the probes is not decoration. Most of what is asserted about
+    the supervisor is that NOTHING happened -- no revival, no journal line
+    -- and a panel that never looked at the dispatcher at all would satisfy
+    every one of those. `probes` is what tells the two apart.
+    """
+
+    def __init__(self, alive=True):
+        self._alive = alive
+        self.probes = 0
+
+    def is_alive(self):
+        self.probes += 1
+        return self._alive
+
+    def die(self):
+        self._alive = False
+
+
+class Reviver:
+    """A stand-in for `revive_dispatch`: records, then answers as told."""
+
+    def __init__(self, discarded=0, raises=None):
+        self.called = []
+        self.discarded = discarded
+        self.raises = raises
+
+    def __call__(self, dead):
+        self.called.append(dead)
+        if self.raises is not None:
+            raise self.raises
+        return self.discarded
+
+
 def build_panel(monkeypatch, **injected):
-    """A real `GpioButtons`, with `FakeButton` standing in for gpiozero."""
+    """
+    A real `GpioButtons`, with `FakeButton` standing in for gpiozero.
+
+    The dispatch probe is stood in for as well, unless the caller names its
+    own, and that is not only convenience. The shipped default reaches into
+    lgpio's module globals for a thread this process shares with everything
+    else in it -- which is right on the unit, where that thread is the one
+    delivering the panel's edges, and wrong here, where it belongs to
+    whatever imported lgpio first. Left as it comes, every `revived == 0`
+    in this file would be a statement about a library that CI does not even
+    install (requirements-dev.txt leaves lgpio out), and so could not fail.
+    A healthy stand-in makes those assertions mean something everywhere.
+    """
     module = types.ModuleType("gpiozero")
     module.Button = FakeButton
     monkeypatch.setitem(sys.modules, "gpiozero", module)
-    return GpioButtons(**injected)
+    thread = FakeDispatcher(alive=True)
+    injected.setdefault("dispatcher", lambda: thread)
+    injected.setdefault("reviver", Reviver())
+    panel = GpioButtons(**injected)
+    # What the panel was given, where a test can read it back. The panel
+    # keeps these as `_dispatcher`/`_reviver`, which are callables rather
+    # than the objects an assertion wants to look at.
+    panel.stand_in_dispatcher = thread
+    panel.stand_in_reviver = injected["reviver"]
+    return panel
 
 
 class MemoryStarvedQueue(queue.Queue):
@@ -789,6 +847,10 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
         assert panel.wait(timeout=2) is Press.DOWN
         assert panel.dropped == 20
         assert notifier.alive()
+        assert panel.stand_in_dispatcher.probes, (
+            "the panel never looked at its dispatcher at all, so the two "
+            "assertions below hold for a supervisor that does not run")
+        assert panel.stand_in_reviver.called == []
         assert panel.revived == 0, (
             "twenty caught exceptions made the panel restart something. "
             "The guard catching is the panel WORKING; a revival is for a "
@@ -1062,43 +1124,6 @@ class TestALostPressIsSaidOutLoud:
 # threshold -- on a device that sits untouched between pads there is no
 # defensible number of quiet seconds, and every candidate fires on a healthy
 # unit.
-
-
-class FakeDispatcher:
-    """
-    The one thing `_watch` asks of lgpio's thread: whether it is alive.
-
-    Counting the probes is not decoration. Most of the assertions below are
-    that NOTHING happened -- no revival, no journal line -- and a panel that
-    never looked at the dispatcher at all would satisfy every one of them.
-    `probes` is what tells those two apart.
-    """
-
-    def __init__(self, alive=True):
-        self._alive = alive
-        self.probes = 0
-
-    def is_alive(self):
-        self.probes += 1
-        return self._alive
-
-    def die(self):
-        self._alive = False
-
-
-class Reviver:
-    """A stand-in for `revive_dispatch`: records, then answers as told."""
-
-    def __init__(self, discarded=0, raises=None):
-        self.called = []
-        self.discarded = discarded
-        self.raises = raises
-
-    def __call__(self, dead):
-        self.called.append(dead)
-        if self.raises is not None:
-            raise self.raises
-        return self.discarded
 
 
 class TestTheDispatchThreadIsWatched:

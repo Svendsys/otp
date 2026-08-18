@@ -4309,6 +4309,44 @@ find = """    lgpio._notify_thread = fresh
 replace = """    fresh.start()
     lgpio._notify_thread = fresh"""
 
+[[mutation]]
+name = "mutation-gate-leaves-the-mutation-in-the-bytecode-cache"
+tier = "fast"
+guard = """
+The gate's own restore, and the half of it that putting the bytes back does
+not cover.
+
+CPython decides a `__pycache__` entry is still valid from the source's mtime
+in whole seconds and its size, and nothing else. A row whose `replace` is
+the same length as its `find` -- a swapped pair of lines -- changes neither,
+and a mutated run that finishes inside a second leaves a cache entry the
+RESTORED file matches exactly. The interpreter then goes on executing the
+mutation, in a tree `git diff --exit-code` reports as clean, for every run
+in that checkout until something else touches the file.
+
+Found the hard way while adding the panel rows above: the fast tier reported
+214/214 caught, the tree was verified clean, and the next ordinary `pytest`
+in the same checkout failed on the swapped-line mutation from
+panel-replacement-runs-before-anything-can-find-it. Measured:
+
+    pyc records mtime 1787071573 size 41074
+    src has      mtime 1787071573 size 41074
+
+It runs the other way too, and that way is worse: a mutation written within
+a second of the original's cache entry can be executed AS THE ORIGINAL, and
+the row survives for a reason that has nothing to do with its guard -- a
+green line in a report, which is what this whole mechanism exists to refuse.
+
+The mutation drops the cache invalidation and keeps the byte-for-byte
+restore, which is the version that was shipped."""
+tests = [
+  "tests/test_mutation_gate.py::TestTheTreeIsPutBack::test_a_same_length_mutation_does_not_outlive_itself_in_the_cache",
+]
+[[mutation.edit]]
+file = "tests/mutation_gate.py"
+find = "            cached.unlink()"
+replace = "            pass  # mutation: the cache entry outlives the restore"
+
 
 # --- the operator's login, which used to last one boot --------------------
 #

@@ -24,6 +24,9 @@ is a failure in the ordinary suite and not only in the gate job.
 """
 from __future__ import annotations
 
+import importlib.util
+import os
+import pathlib
 import sys
 from pathlib import Path
 
@@ -297,6 +300,52 @@ class TestTheTreeIsPutBack:
         with pytest.raises(RuntimeError):
             one.apply_and_judge(mutation())
         assert (scratch / "verdict.py").read_bytes() == before
+
+    def test_a_same_length_mutation_does_not_outlive_itself_in_the_cache(
+            self, scratch):
+        """
+        Putting the BYTES back is not the same as putting the tree back.
+
+        CPython decides a `__pycache__` entry is still valid by comparing
+        the source's mtime in whole seconds and its size, and nothing else.
+        A mutation whose replacement is the same length as what it replaced
+        -- a swapped pair of lines -- changes neither, so a mutated run
+        that finishes inside a second leaves a cache entry the RESTORED
+        file matches exactly, and the interpreter goes on running the
+        mutation out of a tree that `git diff --exit-code` calls clean.
+
+        Found the hard way: after a fast-tier run in which every row was
+        reported caught and the tree was verified clean, the next ordinary
+        `pytest` in the same checkout failed on the swapped-line mutation
+        from `panel-replacement-runs-before-anything-can-find-it`.
+
+        The mutation here is written and restored inside one call, which is
+        well inside one second, and it is length-preserving by
+        construction: `return 17` for `return 18`.
+        """
+        target = scratch / "verdict.py"
+        cached = pathlib.Path(importlib.util.cache_from_source(str(target)))
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        original = target.read_bytes()
+        stamp = target.stat().st_mtime
+
+        # A cache entry that claims to be for the file as it stands now,
+        # exactly as a mutated run leaves behind. The contents do not
+        # matter -- what is asserted is whether it is still believed.
+        cached.write_bytes(b"the mutated bytecode")
+        os.utime(cached, (stamp, stamp))
+
+        one = gate.Gate(repo=scratch, tiers={"fast": FAST}, runner=fake(red()))
+        one._baselines[("fast", CAUGHT)] = ""
+        one.apply_and_judge(mutation("same-length", edits=[
+            gate.Edit(path="verdict.py", find="return 17", replace="return 18")]))
+
+        assert target.read_bytes() == original, "the source was not restored"
+        assert not cached.exists(), (
+            "the restored file still has its cache entry, and the source's "
+            "(mtime, size) are what they were -- so every later run in this "
+            "checkout executes the mutation out of a tree that git calls "
+            "clean")
 
     def test_every_file_of_a_multi_edit_mutation_is_restored(self, scratch):
         before = {name: (scratch / name).read_bytes()

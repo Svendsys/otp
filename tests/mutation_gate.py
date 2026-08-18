@@ -69,6 +69,7 @@ on most machines or a run that silently covers less than the table.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import re
 import signal
 import subprocess
@@ -391,7 +392,7 @@ class Gate:
         try:
             for edit in mutation.edits:
                 target = self.repo / edit.path
-                target.write_bytes(target.read_bytes().replace(
+                self._write(target, target.read_bytes().replace(
                     edit.find.encode(), edit.replace.encode()))
             result = self.runner(self.repo, tier, mutation.tests)
         finally:
@@ -429,8 +430,53 @@ class Gate:
         return Outcome(mutation, "caught", "", red=result.failed, seconds=elapsed)
 
     @staticmethod
-    def _restore(target: Path, original: bytes) -> None:
-        target.write_bytes(original)
+    def _write(target: Path, data: bytes) -> None:
+        """
+        Write `data`, and make sure the interpreter will actually read it.
+
+        CPython decides whether a `__pycache__` entry is still good by
+        comparing the source's mtime IN WHOLE SECONDS and its size --
+        nothing about its contents. A mutation whose `replace` is the same
+        length as its `find`, which a swapped pair of lines is, changes
+        neither; and a mutated run that finishes inside a second leaves a
+        cache entry the RESTORED file matches exactly. Python then goes on
+        executing the mutation, in a tree `git diff` calls clean, for every
+        run in that checkout until something else touches the file.
+
+        Measured here, restoring
+        panel-replacement-runs-before-anything-can-find-it -- which swaps
+        two lines and so preserves the length. The row was reported caught,
+        `git diff --exit-code` was clean, and the next ordinary pytest run
+        in the same checkout failed on the mutated behaviour:
+
+            pyc records mtime 1787071573 size 41074
+            src has      mtime 1787071573 size 41074
+
+        It runs the other way too, and that way is worse: a mutation
+        written within a second of the original's cache entry can be
+        executed AS THE ORIGINAL, and the row then survives for a reason
+        that has nothing to do with the guard it is meant to test -- a
+        green line in a report, which is the one thing this whole mechanism
+        exists to refuse.
+
+        So the cache entry goes with every write, in both directions.
+        Deleting it is enough: the next import compiles what is there.
+        """
+        target.write_bytes(data)
+        if target.suffix != ".py":
+            return
+        try:
+            cached = Path(importlib.util.cache_from_source(str(target)))
+        except (NotImplementedError, ValueError):    # pragma: no cover
+            return                                   # no cache to poison
+        try:
+            cached.unlink()
+        except OSError:
+            pass                                     # never written, or gone
+
+    @classmethod
+    def _restore(cls, target: Path, original: bytes) -> None:
+        cls._write(target, original)
         if target.read_bytes() != original:
             raise Destroyed(
                 f"{target} could not be restored to its pre-mutation bytes. "
