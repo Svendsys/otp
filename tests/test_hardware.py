@@ -708,6 +708,23 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
             panel._events.failures = 1
             notifier.fire(buttons_mod.PIN_UP)
             written = journal.take(timeout=2)
+            # Wait for the reporter to have STAMPED, not merely written.
+            # `_note_lost` records `_said_at` AFTER `_report` returns, so a
+            # clock advanced the instant the bytes appear can get in first
+            # -- the stamp is then taken from the ALREADY ADVANCED clock,
+            # the second loss falls inside the interval after all, and
+            # nothing ever tries to write to the wedged pipe this test is
+            # about. Measured on this container with the machine
+            # deliberately saturated (12 busy loops on 4 cores): 7 of 15
+            # runs of this module failed exactly that way, on `assert
+            # len(attempts) == 2`, before this wait was here.
+            stamped = time.monotonic() + 5
+            while panel._said_at is None and time.monotonic() < stamped:
+                time.sleep(0.01)
+            assert panel._said_at is not None, (
+                "the first loss was never stamped, so advancing the clock "
+                "cannot make the second one due and the wedge below would "
+                "be tested against a report that is never attempted")
 
             # Due again, so the loss below is one the reporter really does
             # try to write rather than one the interval swallows.
