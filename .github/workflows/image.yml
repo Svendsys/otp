@@ -233,7 +233,7 @@ jobs:
       - name: Install the qemu interpreter on the host PATH
         if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
           sudo apt-get install -y --no-install-recommends qemu-user
           which qemu-aarch64
           dpkg -l | grep -q qemu-user-binfmt && {
@@ -276,7 +276,7 @@ jobs:
 
       - name: Install manual rendering tools
         if: steps.imgcache.outputs.cache-hit != 'true'
-        run: sudo apt-get update && sudo apt-get install -y pandoc weasyprint
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update && sudo apt-get install -y pandoc weasyprint
 
       - name: Build
         if: steps.imgcache.outputs.cache-hit != 'true'
@@ -349,13 +349,24 @@ jobs:
         env:
           OTP_IMG_TIMEOUT: 600
         run: |
+          # RETRIES AND A TIMEOUT, for the reason ci.yml's two update calls
+          # carry them: on 2026-08-18 azure.archive.ubuntu.com stopped
+          # answering, apt fell back through the mirrorlist, fetched the
+          # InRelease files and then sat silent for seven and a half
+          # minutes inside `update`, before a single package was fetched.
+          # apt's default is a 120s per-connection timeout with no retry,
+          # so a mirror that accepts a socket and then stops talking holds
+          # every index for two minutes each. That change went into ci.yml
+          # and missed this file, which is the workflow with the 600s
+          # per-boot backstop and the longest job in the repository.
+          #
           # apt-get update FIRST. The runner image ships an apt index that
           # is days stale, and qemu had moved 8.2.2-0ubuntu1.17 -> .18, so
           # the install 404'd and the boot step died in two seconds. On the
           # x86 path this was free -- the binfmt step ran `apt-get update`
           # on the way past -- and making that step skip on arm64 took the
           # update with it.
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
           # device-tree-compiler is for fdtput: QEMU is not the Pi firmware
           # and supplies no board revision, so harness/img-boot.sh writes
           # /system/linux,revision into a copy of the image's own DTB. Without
