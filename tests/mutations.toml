@@ -5172,3 +5172,231 @@ tests = [
 file = "tests/test_memory_budget.py"
 find = "a7={a7!r}"
 replace = "a7=False"
+
+
+# --- the other supported panel: a monitor and a USB keyboard --------------
+#
+# hmi.py chooses display and input independently so that a screen and a USB
+# keyboard are a unit, and the owner runs one. Until these rows nothing
+# audited that pairing at all: tests/test_hmi.py monkeypatches the probes it
+# tests, and the reader had never been driven against a terminal -- which is
+# how the arrow keys came to be silently unreadable on the one input where
+# the panel's own footer advertises them.
+#
+# The first five are fast, because a pty needs no privileges. The last four
+# are tier 1: they need root, a kernel with uinput, and a cupsd, so on a
+# machine without them they score BROKEN here rather than being quietly
+# dropped -- the same bargain the CUPS rig's rows already make.
+
+[[mutation]]
+name = "keyboard-arrow-read-through-the-buffered-reader"
+tier = "fast"
+guard = """
+The defect these tests were written for, restated as the code that had it.
+
+`sys.stdin` is a TextIOWrapper over a BufferedReader, so `read(1)` asks for
+one CHARACTER and issues one raw read of up to 8192 bytes to get it. An
+arrow key is three bytes delivered together, so the first read returned
+"\\x1b" and kept "[A" in Python's buffer, where the select() looking for the
+rest of the sequence cannot see it. Measured on a pty:
+
+    select before first read: True
+    first read(1): '\\x1b'
+    bytes still in the OS queue (select): False
+
+Both halves matter and the second is the worse one. The arrow was lost, and
+the two orphaned bytes were then handed out as the NEXT TWO presses -- so on
+the job screen, where OK and BACK mean opposite things, a press could arrive
+two presses late. Red in 0.3s on each of the tests below."""
+tests = [
+  "tests/test_hardware.py::TestTheKeyboardOnARealTerminal::test_every_key_the_panel_maps_arrives_as_its_press",
+  "tests/test_hardware.py::TestTheKeyboardOnARealTerminal::test_an_arrow_leaves_nothing_behind_for_the_next_press_to_misread",
+  "tests/test_hardware.py::TestTheKeyboardOnARealTerminal::test_two_arrows_sent_together_are_two_presses",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = '    return os.read(fd, 1).decode("latin-1")'
+replace = "    return sys.stdin.read(1)"
+
+
+[[mutation]]
+name = "keyboard-raw-mode-flushes-the-key-typed-during-a-redraw"
+tier = "fast"
+guard = """
+TCSANOW rather than setraw's TCSAFLUSH default, which DISCARDS the pending
+input queue. wait() enters raw mode on EVERY call, so with the default every
+key pressed while a frame was being drawn was thrown away by the terminal
+driver -- measured at 27% loss from panel redraws alone and approaching 100%
+while a pad generates. The clause has been in the code with a comment on it
+and no test: nothing in this suite had a line discipline to flush."""
+tests = [
+  "tests/test_hardware.py::TestTheKeyboardOnARealTerminal::test_a_press_typed_while_the_panel_was_drawing_is_not_discarded",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "            tty.setraw(fd, termios.TCSANOW)"
+replace = "            tty.setraw(fd)"
+
+
+[[mutation]]
+name = "keyboard-leaves-the-terminal-in-raw-mode"
+tier = "fast"
+guard = """
+The restore, which is the only thing standing between an operator and a
+console with no echo and no line editing. This unit binds tty1, so that
+console is the one shell they have; on the simulator it is the developer's
+own terminal. A `finally` that stopped running would leave every session
+that ever pressed a key in that state until `stty sane`."""
+tests = [
+  "tests/test_hardware.py::TestTheKeyboardOnARealTerminal::test_the_terminal_is_left_exactly_as_it_was_found",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)"""
+replace = """        finally:
+            pass"""
+
+
+[[mutation]]
+name = "keyboard-quit-offered-to-a-real-unit"
+tier = "fast"
+guard = """
+On a unit QUIT is fatal in a way that looks like success: App.run() breaks,
+main() returns 0, and `Restart=on-failure` reads a zero exit as success and
+does NOT restart. One `q` -- a key the footer used to advertise -- turned the
+appliance off until somebody power-cycled it.
+
+`allow_quit` was already tested through `_map`. What had never been asked is
+whether the key survives the trip through a real terminal to get there,
+which is the only way it arrives on the configuration this defends."""
+tests = [
+  "tests/test_hardware.py::TestTheKeyboardOnARealTerminal::test_quit_is_refused_on_a_unit_and_offered_to_the_simulator",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """        if key in self.QUIT_KEYS:
+            return Press.QUIT if self.allow_quit else None"""
+replace = """        if key in self.QUIT_KEYS:
+            return Press.QUIT"""
+
+
+[[mutation]]
+name = "console-panel-row-wider-than-the-panel"
+tier = "fast"
+guard = """
+The console renderer's geometry, on the far side of a terminal.
+tests/test_panel_pixels.py holds the OLED to 128x64; nothing held the
+console to 21 columns, and it is the same Frame feeding both. A row that
+grew by one character is invisible on a developer's 120-column terminal and
+is a wrapped, unreadable panel on the 21-column budget the UI is written to.
+
+Aimed at ConsoleDisplay.show rather than at Frame.rendered because the
+rendered() rows are already pinned elsewhere; what was not pinned is the box
+this draws around them. Two neighbouring mutations were measured against
+this same test and are caught by it too -- widening the caret row's ljust,
+and dropping the caret -- so the row's blast radius is stated honestly:
+one edit, and the test sees more than the one edit."""
+tests = [
+  "tests/test_hardware.py::TestTheKeyboardOnARealTerminal::test_the_panel_it_draws_is_the_panel_that_reaches_the_terminal",
+]
+[[mutation.edit]]
+file = "otpunit/hw/display.py"
+find = '            print(f"{pad}| {row} |", file=self.stream)'
+replace = '            print(f"{pad}| {row}  |", file=self.stream)'
+
+
+[[mutation]]
+name = "screen-probe-keeps-the-trailing-newline"
+tier = "hardware"
+guard = """
+sysfs writes `connected\\n`, and the strip is the whole of what turns that
+into an answer. Without it every connector on every machine compares unequal
+and the unit decides it has no screen -- which is not a visible failure on a
+unit that also has no screen, and is a menu that never appears on one that
+does.
+
+Deliberately aimed at a tier-1 test and not at the vkms probe alone: what
+this defends is the DECISION, and a probe that says no makes open_display
+fall through to `none` with no display for the menu to draw on."""
+tests = [
+  "tests/test_simulated_hardware.py::TestChoosingTheConsoleDisplay::test_a_connected_screen_selects_the_console_and_draws_on_it",
+]
+[[mutation.edit]]
+file = "otpunit/hmi.py"
+find = '            if _read(status).strip() == "connected":'
+replace = '            if _read(status) == "connected":'
+
+
+[[mutation]]
+name = "screen-probe-says-yes-to-a-disconnected-screen"
+tier = "hardware"
+guard = """
+The half of the probe that had never been observable. vkms reports
+`connected` and cannot be unplugged, so until the forged connector tree
+there was no machine anywhere on which this branch could be asked to say NO.
+
+It is the branch that matters most. A display the unit did not really find
+makes Interface.interactive true, and on a unit with no buttons that walks
+into a menu whose first wait() blocks on an empty queue for ever: no pad, no
+log line, no timeout. Interface.prove exists to contain that; this is what
+is supposed to stop it happening."""
+tests = [
+  "tests/test_simulated_hardware.py::TestChoosingTheConsoleDisplay::test_a_disconnected_screen_selects_no_display_at_all",
+]
+[[mutation.edit]]
+file = "otpunit/hmi.py"
+find = '            if _read(status).strip() == "connected":'
+replace = '            if _read(status).strip() != "connected":'
+
+
+[[mutation]]
+name = "keyboard-branch-in-open-buttons-never-taken"
+tier = "hardware"
+guard = """
+The branch hmi.py's own docstring records as having been UNREACHABLE: while
+GpioButtons could not fail, nothing ever reached the keyboard, and a monitor
+plus no buttons became a menu that blocked for ever instead of printing.
+It is reachable now, and this is the only test anywhere that goes down it
+with a real input device on the other end.
+
+The mutation is the branch not being taken at all, because that is the shape
+the defect had -- not a wrong answer from the probe, but a probe whose
+answer nothing consulted."""
+tests = [
+  "tests/test_simulated_hardware.py::TestTheWholeMenuOnAScreenAndAKeyboard::test_a_pad_pair_is_printed_from_the_menu_on_a_screen_and_a_keyboard",
+]
+[[mutation.edit]]
+file = "otpunit/hmi.py"
+find = "    if keyboard_connected() and console_usable():"
+replace = "    if False and keyboard_connected() and console_usable():"
+
+
+[[mutation]]
+name = "prove-declares-the-panel-drivable-without-a-press"
+tier = "hardware"
+guard = """
+The anti-tautology row for the prove step, and it is here because the
+obvious assertions do not carry it. `prove() returned True` is satisfied by
+a prove() that returns True unconditionally, and so is `it returned before
+the window elapsed` -- both are MORE true, not less, for a prove() that
+never waits for anything.
+
+What is not satisfied is the reader being asked afterwards whether the key
+is still sitting on the terminal unread. Measured against this mutation:
+
+    AssertionError: prove() called the panel drivable with the key press
+    still unread on the terminal
+
+Which is also the real consequence: the orphaned keystroke is then read by
+the first menu screen instead, so the panel acts on a press the operator
+made to answer a different question."""
+tests = [
+  "tests/test_simulated_hardware.py::TestTheWholeMenuOnAScreenAndAKeyboard::test_a_pad_pair_is_printed_from_the_menu_on_a_screen_and_a_keyboard",
+]
+[[mutation.edit]]
+file = "otpunit/hmi.py"
+find = """        if not self.interactive:
+            return False"""
+replace = """        if self.interactive:
+            return True"""
