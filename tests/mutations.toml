@@ -656,7 +656,7 @@ read-only overlay" whatever ran. It is the sentence a reader takes away and
 the sentence image.yml's release note restates, so it states only what the
 phases that ran support."""
 tests = [
-  "tests/test_img_verdict.py::test_the_two_boot_claim_is_only_made_by_a_run_that_booted_twice",
+  "tests/test_img_verdict.py::test_the_full_claim_is_only_made_by_a_run_that_booted_every_phase",
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
@@ -5551,8 +5551,7 @@ tests = [
 [[mutation.edit]]
 file = "harness/img-boot.sh"
 find = '''        if [ "${#dbefore}" != 64 ] || [ "$dbefore" != "${dafter:-nothing}" ]; then'''
-replace = '''        if [ "$dbefore" != "${dafter:-nothing}" ]; then
-            : # the length clause is what stops two absences comparing equal'''
+replace = '''        if [ "${#dbefore}" != 64 ]; then'''
 
 
 [[mutation]]
@@ -5562,15 +5561,23 @@ guard = """
 The absence trap, in the one release clause that compares values. `absent`
 equals `absent`, and so does the sha256 of nothing to the sha256 of nothing --
 which is exactly how "the credential survived this boot" comes to mean "there
-has never been a credential". The row above removes the length clause; this
-one is the reading it lets through."""
+has never been a credential". The row above drops the equality half of the
+same condition; this one drops the length half, which is the clause that
+stops two files that are not there reading as one that survived.
+
+FOUND BY THIS GATE RATHER THAN BY WRITING IT. The first version of these two
+rows mutated the wrong things -- one took the length clause off and named the
+rewrite test, which still went green because the rewrite test trips the
+EQUALITY half; the other rewrote fat_digest_of(), which the verdict block
+never calls, so it could not have changed any outcome at all. Both survived,
+and the pairing below is what the survivors corrected."""
 tests = [
   "tests/test_img_verdict.py::test_two_files_that_are_not_there_are_not_an_unchanged_store",
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
-find = '''    if [ -z "$body" ]; then printf 'absent'; return 0; fi'''
-replace = '''    if [ -z "$body" ]; then printf '%s' "absent-but-64-characters-long-0000000000000000000000000000000000000000" | cut -c1-64; return 0; fi'''
+find = '''        if [ "${#dbefore}" != 64 ] || [ "$dbefore" != "${dafter:-nothing}" ]; then'''
+replace = '''        if [ "$dbefore" != "${dafter:-nothing}" ]; then'''
 
 
 [[mutation]]
