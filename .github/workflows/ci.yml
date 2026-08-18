@@ -40,8 +40,19 @@ jobs:
       # line is what stops the coverage silently reverting;
       # tests/test_image_workflow.py asserts the line is here.
       - name: Install mtools for the tier-3 card tests
+        # Capped and retried like every other apt call in this file. The
+        # flags are not decoration: on 2026-08-18 azure.archive.ubuntu.com
+        # stopped answering and apt sat silent for seven and a half minutes
+        # inside `update`, because its default is a 120s per-connection
+        # timeout with no retry. This step is in the two quickest jobs in
+        # the repository -- `test` finishes in about ninety seconds -- so an
+        # unbounded install here is the difference between a fast suite and
+        # a job that reports nothing for a quarter of an hour.
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 \
+                       -o Acquire::http::Timeout=15 \
+                       -o Acquire::https::Timeout=15 update
           sudo apt-get install -y --no-install-recommends mtools
       # Bounded: a UI regression can make the suite spin rather than fail
       # -- FakeButtons returns None forever at poll_seconds=0, so a screen
@@ -105,8 +116,19 @@ jobs:
       # quietly pass, they fail the job by name. That is the right direction
       # and it is still a job nobody can read, hence the line.
       - name: Install mtools for the tier-3 card rows
+        # Capped and retried like every other apt call in this file. The
+        # flags are not decoration: on 2026-08-18 azure.archive.ubuntu.com
+        # stopped answering and apt sat silent for seven and a half minutes
+        # inside `update`, because its default is a 120s per-connection
+        # timeout with no retry. This step is in the two quickest jobs in
+        # the repository -- `test` finishes in about ninety seconds -- so an
+        # unbounded install here is the difference between a fast suite and
+        # a job that reports nothing for a quarter of an hour.
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 \
+                       -o Acquire::http::Timeout=15 \
+                       -o Acquire::https::Timeout=15 update
           sudo apt-get install -y --no-install-recommends mtools
       # Bounded like the suite above, and this one has a second way to hang:
       # a mutation can wedge a test rather than fail it. The runner caps each
