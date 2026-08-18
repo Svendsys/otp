@@ -4257,3 +4257,37 @@ tests = [
 file = "device/persist-identity.sh"
 find = "    printf '%s' \"$1\" | tr -cd 'a-zA-Z0-9._-' | cut -c1-32"
 replace = "    printf '%s' \"$1\""
+
+[[mutation]]
+name = "memory-paper-argument-ignored"
+tier = "fast"
+guard = """
+A6 is asserted to be the worst-case format because the headline measures A6
+and nothing else. That assertion is only worth anything if the three
+measurements really are three different formats: `pad()` builds the child's
+source by formatting the paper size into a template, and a template that
+stopped interpolating it would compare A6 against A6 and report a healthy
+ordering for ever after. Observed red with A6=44.86 A4=44.98."""
+tests = [
+  "tests/test_memory_budget.py::test_a6_is_still_the_worst_format",
+]
+[[mutation.edit]]
+file = "tests/test_memory_budget.py"
+find = "paper={paper!r}"
+replace = 'paper="A6"'
+
+[[mutation]]
+name = "memory-a7-argument-ignored"
+tier = "fast"
+guard = """
+The other half of the same statement. A7 is not a paper size in this
+codebase -- it is a flag that puts two pad pages on an A6 sheet -- so it is
+interpolated separately and can go missing separately. Observed red with
+A6=44.71 A7=44.99."""
+tests = [
+  "tests/test_memory_budget.py::test_a6_is_still_the_worst_format",
+]
+[[mutation.edit]]
+file = "tests/test_memory_budget.py"
+find = "a7={a7!r}"
+replace = "a7=False"
