@@ -2142,3 +2142,253 @@ class TestRealGpiozero:
         finally:
             Device.pin_factory.reset()
             Device.pin_factory = None
+
+
+class RealTerminal:
+    """
+    A pty pair with the slave installed as this process's stdin and stdout.
+
+    Not a stand-in for a terminal: it IS one. openpty() gives a real line
+    discipline with a real input queue, real termios state and a real
+    select()able descriptor, which is every part of the machinery
+    KeyboardButtons.wait() drives and the only part no test in this
+    repository had ever run. The suite reaches `_map` directly and the
+    line-mode branch through a pipe; the raw-mode branch -- tcgetattr,
+    setraw(TCSANOW), select, read, tcsetattr -- needed a tty on the other
+    end and got one nowhere. That is how an arrow key came to be silently
+    unreadable on the one configuration where arrows are what the panel's
+    own footer tells the operator to press. See buttons._read_key_byte.
+
+    The master end is drained by a thread. Without it the pty's output
+    buffer fills at a few kilobytes and the next ConsoleDisplay.show()
+    blocks forever inside print(), with the test parked on a screen that
+    was half drawn.
+    """
+
+    def __init__(self):
+        import pty
+
+        self.master, slave = pty.openpty()
+        # Two objects over dup()s of the one slave descriptor, because
+        # sys.stdin and sys.stdout are closed independently and a single
+        # shared file object would take the other down with it.
+        self.stdin = os.fdopen(os.dup(slave), "r")
+        self.stdout = os.fdopen(os.dup(slave), "w")
+        os.close(slave)
+        self.seen = bytearray()
+        self._stop = threading.Event()
+        self._reader = threading.Thread(target=self._drain, daemon=True)
+        self._reader.start()
+
+    def _drain(self):
+        while not self._stop.is_set():
+            try:
+                chunk = os.read(self.master, 4096)
+            except OSError:                      # the master was closed
+                return
+            if not chunk:
+                return
+            self.seen.extend(chunk)
+
+    def install(self, monkeypatch):
+        """Become the process's terminal for the rest of the test."""
+        monkeypatch.setattr(sys, "stdin", self.stdin)
+        monkeypatch.setattr(sys, "stdout", self.stdout)
+        return self
+
+    def type(self, data: bytes):
+        """Put bytes on the terminal exactly as a keyboard driver would."""
+        os.write(self.master, data)
+
+    def close(self):
+        self._stop.set()
+        for handle in (self.stdin, self.stdout):
+            try:
+                handle.close()
+            except OSError:
+                pass
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+        self._reader.join(timeout=2)
+
+
+@pytest.fixture
+def terminal(monkeypatch):
+    console = RealTerminal()
+    try:
+        yield console.install(monkeypatch)
+    finally:
+        console.close()
+
+
+class TestTheKeyboardOnARealTerminal:
+    """
+    KeyboardButtons against a pty, which is the shape a monitor and a USB
+    keyboard put it in.
+
+    hmi.py chooses display and input separately precisely so that this
+    pairing works, and the repository's stated reason for believing it does
+    is that `--sim` uses the same reader. It does -- but `--sim` in CI
+    pipes its stdin, which takes the readline branch and never touches raw
+    mode. Everything below is the other branch.
+    """
+
+    def press(self, terminal, data: bytes, timeout=2.0):
+        from otpunit.hw.buttons import KeyboardButtons
+
+        terminal.type(data)
+        return KeyboardButtons(allow_quit=False).wait(timeout=timeout)
+
+    def test_every_key_the_panel_maps_arrives_as_its_press(self, terminal):
+        """
+        The whole shipped mapping, one key at a time, through the terminal.
+
+        The two arrows are the reason this test exists: they were the only
+        multi-byte entries, and they were the only two that did not work.
+        """
+        from otpunit.hw.buttons import Press
+
+        for keys, expected in ((b"u", Press.UP), (b"d", Press.DOWN),
+                               (b"k", Press.OK), (b"K", Press.BACK),
+                               (b"\r", Press.OK), (b"\n", Press.OK),
+                               (b"\x1b[A", Press.UP), (b"\x1b[B", Press.DOWN)):
+            got = self.press(terminal, keys)
+            assert got is expected, f"{keys!r} read as {got!r}, not {expected}"
+
+    def test_an_arrow_leaves_nothing_behind_for_the_next_press_to_misread(
+            self, terminal):
+        """
+        The defect itself, stated as the thing that must not happen.
+
+        Losing the arrow was only half of it. `sys.stdin.read(1)` pulled
+        all three bytes into Python's buffer and returned one, so "[" and
+        "A" were still queued INSIDE the reader -- handed out as the next
+        two presses, ahead of whatever the operator pressed next. On the
+        job screen, where OK and BACK mean opposite things, a press
+        arriving two presses late is worse than a press that never
+        arrived at all.
+        """
+        from otpunit.hw.buttons import Press
+
+        assert self.press(terminal, b"\x1b[B") is Press.DOWN
+        # If the sequence was consumed a byte at a time, this next read is
+        # "[" and the one after it is "A" -- both unmapped, both None.
+        assert self.press(terminal, b"k") is Press.OK
+        assert self.press(terminal, b"k") is Press.OK
+
+    def test_two_arrows_sent_together_are_two_presses(self, terminal):
+        """
+        Six bytes in one write, which is what holding an arrow down does.
+
+        A reader that took only the first sequence would leave the second
+        in the queue and the caret would lag one press behind the
+        operator's thumb for the rest of the session.
+        """
+        from otpunit.hw.buttons import KeyboardButtons, Press
+
+        reader = KeyboardButtons(allow_quit=False)
+        terminal.type(b"\x1b[A\x1b[B")
+        assert reader.wait(timeout=2.0) is Press.UP
+        assert reader.wait(timeout=2.0) is Press.DOWN
+        assert reader.wait(timeout=0.3) is None
+
+    def test_a_lone_escape_answers_rather_than_parking_the_panel(self, terminal):
+        """
+        Esc is the most natural key to press at a prompt, and in raw mode
+        nothing but time distinguishes it from the start of an arrow. A
+        blocking read here hung the unit inside Interface.prove() -- the
+        very thing prove() exists to prevent.
+        """
+        started = time.monotonic()
+        assert self.press(terminal, b"\x1b") is None
+        assert time.monotonic() - started < 1.0, \
+            "a lone Esc took a whole second; the panel is parked on it"
+
+    def test_quit_is_refused_on_a_unit_and_offered_to_the_simulator(
+            self, terminal):
+        """
+        On a real unit QUIT ends the process with status 0, and
+        Restart=on-failure reads that as success and does not restart. The
+        footer used to advertise the key that did it.
+        """
+        from otpunit.hw.buttons import KeyboardButtons, Press
+
+        terminal.type(b"q")
+        assert KeyboardButtons(allow_quit=False).wait(timeout=2.0) is None
+        terminal.type(b"q")
+        assert KeyboardButtons(allow_quit=True).wait(timeout=2.0) is Press.QUIT
+
+    def test_a_key_nobody_mapped_is_nothing_rather_than_a_press(self, terminal):
+        assert self.press(terminal, b"z") is None
+
+    def test_the_terminal_is_left_exactly_as_it_was_found(self, terminal):
+        """
+        wait() puts the tty into raw mode on every call. A restore that
+        did not run would leave the console with no echo and no line
+        editing for whoever gets it next -- on this unit, the operator's
+        only shell.
+        """
+        from otpunit.hw.buttons import KeyboardButtons
+
+        fd = terminal.stdin.fileno()
+        before = termios.tcgetattr(fd)
+        terminal.type(b"k")
+        KeyboardButtons(allow_quit=False).wait(timeout=2.0)
+        assert termios.tcgetattr(fd) == before
+        # And after a call that times out with nothing to read, which
+        # returns through a different branch.
+        KeyboardButtons(allow_quit=False).wait(timeout=0.1)
+        assert termios.tcgetattr(fd) == before
+
+    def test_a_press_typed_while_the_panel_was_drawing_is_not_discarded(
+            self, terminal):
+        """
+        The TCSANOW clause, held to account on a real line discipline.
+
+        setraw() defaults to TCSAFLUSH, which DISCARDS the pending input
+        queue -- and wait() enters raw mode on every call, so with the
+        default every key pressed while a frame was being drawn was thrown
+        away by the driver. Here the key is typed while the terminal is
+        still in its cooked state, exactly as it is when the app is
+        rendering rather than waiting.
+        """
+        from otpunit.hw.buttons import KeyboardButtons, Press
+        from otpunit.hw.display import ConsoleDisplay, Frame
+
+        terminal.type(b"k")                      # typed before we ever read
+        ConsoleDisplay(stream=terminal.stdout, hint=False).show(
+            Frame(title="OTP PRINT UNIT", lines=["PRINT PAD PAIR"]))
+        assert KeyboardButtons(allow_quit=False).wait(timeout=2.0) is Press.OK
+
+    def test_the_panel_it_draws_is_the_panel_that_reaches_the_terminal(
+            self, terminal):
+        """
+        The other half of this pairing, over the same real terminal: what
+        ConsoleDisplay writes has to arrive as the 21-column panel the
+        21x8 grid promises, not as something a terminal reflowed.
+        """
+        from otpunit.hw.display import COLS, ROWS, ConsoleDisplay, Frame
+
+        ConsoleDisplay(stream=terminal.stdout, hint=False).show(
+            Frame(title="OTP PRINT UNIT",
+                  lines=["PRINT PAD PAIR", "SETTINGS"], selected=0,
+                  footer="OK SELECT"))
+        deadline = time.monotonic() + 2
+        while b"OK SELECT" not in terminal.seen and time.monotonic() < deadline:
+            time.sleep(0.01)
+        text = terminal.seen.decode("latin-1")
+        assert "OTP PRINT UNIT" in text
+        assert ">PRINT PAD PAIR" in text, "the selection caret never arrived"
+        # Stripped first: show() centres the box in the terminal's width,
+        # so every row carries a run of leading spaces that has nothing to
+        # do with the panel. Matching on the raw line found no rows at all
+        # and the assertion below never ran -- caught by its own message.
+        body = [line.strip() for line in text.splitlines()
+                if line.strip().startswith("| ")]
+        assert len(body) == ROWS, \
+            f"{len(body)} of the panel's {ROWS} rows reached the terminal: {text!r}"
+        for line in body:
+            assert len(line) == COLS + 4, \
+                f"a {len(line) - 4}-column row reached a 21-column panel: {line!r}"

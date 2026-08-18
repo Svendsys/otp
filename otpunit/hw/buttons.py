@@ -385,6 +385,55 @@ class FakeButtons(Buttons):
         return self._script.pop(0)
 
 
+def _read_key_byte(fd: int) -> str:
+    """
+    One byte off the terminal, taking nothing else with it.
+
+    os.read and NOT sys.stdin.read(1), which is what this used to be, and
+    the difference is the whole of why the arrow keys did not work on a
+    real terminal.
+
+    sys.stdin is a TextIOWrapper over a BufferedReader. `read(1)` asks for
+    one CHARACTER, and to produce it the buffered layer issues one raw
+    read of up to 8192 bytes and keeps whatever else came back. An arrow
+    key is three bytes -- ESC [ A -- delivered together, so the first
+    read(1) returned "\\x1b" and swallowed "[A" into Python's buffer,
+    where select() cannot see it. Measured on a pty, with the three bytes
+    written before the read:
+
+        select before first read: True
+        first read(1): '\\x1b'
+        bytes still in the OS queue (select): False
+
+    So the loop below timed out twice at 0.05s, `_map("\\x1b")` returned
+    None, and the two orphaned bytes were handed out as the next two
+    presses -- "[" and "A", both unmapped, both None. Every arrow press
+    was silently lost, on the one input path where they are the keys the
+    unit's own footer advertises: ConsoleDisplay draws "arrows move
+    ENTER select SHIFT+K back" on a real unit. Measured over a pty
+    against the shipped mapping, one key per fresh process:
+
+        b'k'      -> Press.OK       b'u'       -> Press.UP
+        b'\\r'     -> Press.OK       b'd'       -> Press.DOWN
+        b'K'      -> Press.BACK     b'\\x1b[A'  -> None
+                                    b'\\x1b[B'  -> None
+
+    Nothing noticed because the only two ways this reader had ever been
+    exercised both avoid the branch: the fast suite drives `_map` and the
+    line-mode path directly, and `--sim` in CI pipes its stdin, which
+    takes the readline branch above. It needed a real terminal, which is
+    what tests/test_hardware.py's TestTheKeyboardOnARealTerminal is.
+
+    Reading the descriptor directly leaves the rest of the sequence in
+    the kernel's queue, where the select() below is looking for it.
+    latin-1 because these are control bytes and key codes rather than
+    text: it maps every byte to a character and cannot raise, and a
+    multi-byte UTF-8 key decodes to something `_map` does not know --
+    which is None, exactly as it was before.
+    """
+    return os.read(fd, 1).decode("latin-1")
+
+
 class KeyboardButtons(Buttons):
     """
     Maps terminal keys to presses.
@@ -449,10 +498,10 @@ class KeyboardButtons(Buttons):
             # loss just from panel redraws, approaching 100% while a pad is
             # generating.
             tty.setraw(fd, termios.TCSANOW)
-            ready, _, _ = select.select([sys.stdin], [], [], timeout)
+            ready, _, _ = select.select([fd], [], [], timeout)
             if not ready:
                 return None
-            ch = sys.stdin.read(1)
+            ch = _read_key_byte(fd)
             if ch == "\x1b":
                 # An escape byte may be a lone Esc or the start of an arrow
                 # sequence, and in raw mode nothing distinguishes them but
@@ -461,10 +510,10 @@ class KeyboardButtons(Buttons):
                 # recreated the exact hang that Interface.prove() exists to
                 # prevent, inside prove() itself.
                 for _ in range(2):
-                    ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    ready, _, _ = select.select([fd], [], [], 0.05)
                     if not ready:
                         break
-                    ch += sys.stdin.read(1)
+                    ch += _read_key_byte(fd)
             return self._map(ch)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
