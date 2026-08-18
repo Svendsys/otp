@@ -251,12 +251,21 @@ def revive_dispatch(dead) -> int:
     already had. Two consequences, both of them the reason this shape was
     chosen over constructing a fresh `_callback_thread()`:
 
-      * every alert already claimed keeps delivering, because the kernel
-        is still writing to the same notification handle. Nothing has to
-        be re-claimed, no line is freed and re-taken, and a panel that is
-        mid-press does not lose its `Button`s. Measured: the same
-        registration that went quiet delivered again with nothing else
-        touched.
+      * nothing has to be re-claimed. No line is freed and re-taken, no
+        `Button` is closed and rebuilt, and a panel mid-press keeps the
+        objects it had. Measured, against lgpio's own dispatch loop: the
+        registration that went quiet delivered again, on the same pipe,
+        with nothing else touched.
+
+        What that measurement does NOT cover, and cannot in a container
+        with no gpiochip in it (no gpio-sim, no /dev/gpiochip*), is the
+        far side: that lgpio's C alert thread goes on writing into this
+        notification handle while nothing is reading it, and that a claim
+        made before the death is still routed here afterwards. Both are
+        read off the source rather than run -- see gpio_claim_alert's
+        `notify_handle = _notify_thread._notify` (lgpio.py:1293), which is
+        resolved once, at claim time. `pytest -m hardware` on a kernel
+        with gpio-sim is where that becomes a measurement.
       * nothing is created on disk. A fresh `_callback_thread()` calls
         `_notify_open()`, which makes another `.lgd-nfy*` FIFO in the
         directory lgpio recorded at import -- measured: the C side keeps
