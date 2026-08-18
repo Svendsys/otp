@@ -39,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -48,6 +49,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 
+import consolerig                                # noqa: E402
 import cupsrig                                   # noqa: E402
 import pirig                                     # noqa: E402
 # One definition, shared with the fast tier that first used it: a queue
@@ -1746,6 +1748,332 @@ class TestTheRealKeyboardProbe:
     def test_a_uinput_keyboard_is_seen(self):
         assert hmi.keyboard_connected() is True
 
+
+
+# --- the other supported panel: a monitor and a USB keyboard -------------
+#
+# hmi.py chooses display and input independently so that a monitor and a
+# USB keyboard -- two things that turn up in ordinary houses -- are a
+# supported unit, and the owner confirms this device is used that way. It
+# had no end-to-end coverage of any kind. tests/test_hmi.py has two dozen
+# tests and every one of them monkeypatches the detection it is testing,
+# so nothing had ever chosen this pairing from real evidence, and nothing
+# had ever driven the menu through it.
+#
+# What is real below, since that is the only part worth anything:
+#
+#   the display probe   a real glob over a real directory in a real
+#                       filesystem, reading real files. The connector
+#                       STATES are the test's (see pirig.ForgedConnectors
+#                       for why they must be, and what it costs).
+#   the input probe     a real uinput device, found in the kernel's own
+#                       /proc/bus/input/devices, nothing patched.
+#   the presses         real key events, written to uinput and read back
+#                       out of the kernel through evdev before they are
+#                       typed. See consolerig for the one lookup that is
+#                       a fixture -- the VT keymap -- and why.
+#   the terminal        a pty: real line discipline, real termios, real
+#                       raw mode, real select.
+#   the printer         a real cupsd, the same rig every test above uses.
+#
+# What is asserted is what came out: the bytes drawn on the terminal, and
+# the bytes the print backend received.
+
+WHY_NO_CONNECTORS = pirig.connectors_available()
+needs_connectors = pytest.mark.skipif(
+    bool(WHY_NO_CONNECTORS),
+    reason=WHY_NO_CONNECTORS or "cannot forge a DRM connector state")
+
+WHY_NO_KEYBOARD = consolerig.available()
+needs_keyboard = pytest.mark.skipif(
+    bool(WHY_NO_KEYBOARD),
+    reason=WHY_NO_KEYBOARD or "cannot make a virtual keyboard")
+
+
+@pytest.fixture
+def terminal():
+    """
+    A pty standing in as this process's console, for the whole test.
+
+    RealTerminal is imported rather than rewritten for the same reason
+    MemoryStarvedQueue is: the fast tier drives KeyboardButtons through
+    exactly this object, and two terminals that drifted apart would mean
+    the two tiers stopped testing the same reader.
+
+    It is handed over UNINSTALLED, and every test below installs it as its
+    first statement. Doing it here instead would put sys.stdin in place and
+    quietly lose sys.stdout -- see RealTerminal.install for the
+    measurement -- and sys.stdout is exactly what hmi.open_display picks up
+    and hands to ConsoleDisplay.
+    """
+    from test_hardware import RealTerminal
+
+    console = RealTerminal()
+    try:
+        yield console
+    finally:
+        console.close()
+
+
+@pytest.fixture
+def keyboard(terminal):
+    board = consolerig.UinputKeyboard(terminal)
+    try:
+        yield board
+    finally:
+        board.close()
+
+
+@needs_connectors
+class TestChoosingTheConsoleDisplay:
+    """
+    hmi.open_display, deciding from evidence rather than from a patch.
+
+    Both answers matter and only one of them has ever been observable.
+    A unit with nothing in its HDMI socket must NOT be handed a display:
+    a non-None display makes Interface.interactive true, and on a unit
+    with no buttons that walks into a menu whose first wait() blocks on an
+    empty queue forever -- no pad, no log line, no timeout. That is the
+    defect Interface.prove exists to contain, and the probe below is what
+    is supposed to stop it happening in the first place.
+    """
+
+    def test_a_connected_screen_selects_the_console_and_draws_on_it(
+            self, terminal, monkeypatch):
+        from otpunit.hw.display import ConsoleDisplay, Frame
+
+        terminal.install(monkeypatch)
+        refused = []
+        with pirig.ForgedConnectors("connected") as forged:
+            assert not forged.host_sees_connectors(), (
+                "the forged /sys/class/drm escaped into the namespace this "
+                "process came from, so it is on the host as well")
+            # The two halves of the decision, asked separately, so that a
+            # console chosen for the wrong reason cannot read as a pass.
+            assert hmi.screen_connected() is True, (
+                "the probe read the forged tree and still said no; the "
+                "connected connector is "
+                + str(pirig.ForgedConnectors.PRIMARY))
+            assert hmi.console_usable() is True, \
+                "stdin/stdout are not a terminal, so this proves nothing"
+            display, kind = hmi.open_display(log=refused.append)
+
+        assert kind == "HDMI console", (
+            f"open_display chose {kind!r}. It prefers the OLED and only "
+            f"falls through to the console when luma cannot open one; "
+            f"what it said about the OLED: {refused}")
+        assert isinstance(display, ConsoleDisplay)
+
+        # And the thing it chose really does draw on THIS terminal, which
+        # a type check does not establish: ConsoleDisplay captures the
+        # stream at construction, and hmi hands it sys.stdout.
+        mark = terminal.mark()
+        display.show(Frame(title="OTP PRINT UNIT",
+                           lines=["PRINT PAD PAIR"], selected=0))
+        terminal.wait_for(">PRINT PAD PAIR", since=mark)
+        display.close()
+
+    def test_a_disconnected_screen_selects_no_display_at_all(
+            self, terminal, monkeypatch):
+        terminal.install(monkeypatch)
+        refused = []
+        with pirig.ForgedConnectors("disconnected"):
+            assert hmi.screen_connected() is False, (
+                "every connector in the forged tree is disconnected and "
+                "the probe still found a screen")
+            # The control. Without it "no display" would also be the
+            # answer on a machine where stdin simply is not a terminal,
+            # and this test would pass on a pipe.
+            assert hmi.console_usable() is True, \
+                "stdin/stdout are not a terminal, so this proves nothing"
+            display, kind = hmi.open_display(log=refused.append)
+
+        assert display is None, \
+            "a unit with nothing plugged in was handed a display anyway"
+        assert kind == "none", kind
+        assert "+-----" not in terminal.text, (
+            "a panel was drawn on a terminal that should not have been "
+            "chosen at all:\n" + terminal.text[-600:])
+
+
+@needs_cups
+@needs_connectors
+@needs_keyboard
+class TestTheWholeMenuOnAScreenAndAKeyboard:
+    """
+    Boot to a printed pad pair, on a monitor and a keyboard, end to end.
+
+    Nothing here is told what the interface is: hmi.detect() finds it, the
+    shipped _prove() asks somebody to confirm it, a real key event answers,
+    and the shipped App drives the shipped menu from there. The only
+    assertions are on what came out of the terminal and what reached the
+    print backend.
+    """
+
+    def then(self, terminal, keyboard, key, needle, seconds=30.0):
+        """
+        Press one key, and wait for the frame it is supposed to bring up.
+
+        The mark is taken BEFORE the press, so what is waited for is a
+        frame drawn in answer to this key rather than the identical one
+        that was already on the screen. Every menu redraws the same text
+        each time it is entered, so without that every wait after the
+        first would return on the frame before its own press and the
+        drive would run ahead of the panel.
+        """
+        mark = terminal.mark()
+        keyboard.press(key)
+        return terminal.wait_for(needle, seconds=seconds, since=mark)
+
+    def test_a_pad_pair_is_printed_from_the_menu_on_a_screen_and_a_keyboard(
+            self, rig, terminal, keyboard, tmp_path, monkeypatch):
+        from evdev import ecodes
+        from otpunit import __main__ as entry
+        from otpunit.codewords import Vocabulary
+        from otpunit.hw.buttons import KeyboardButtons
+        from otpunit.hw.display import ConsoleDisplay
+        from otpunit.ui import App
+
+        terminal.install(monkeypatch)
+        notes = []
+
+        # 1. What is attached, decided by the shipped probe from real
+        #    evidence. The forgery is held open across detect() and
+        #    dropped straight afterwards: the handles it returns outlive
+        #    it, and nothing below reads /sys/class again.
+        with pirig.ForgedConnectors("connected"):
+            interface = hmi.detect(log=notes.append)
+        try:
+            assert interface.display_kind == "HDMI console", (
+                f"detect() chose {interface.describe()}; it said {notes}")
+            assert interface.input_kind == "USB keyboard", (
+                f"detect() chose {interface.describe()}. GPIO buttons come "
+                f"first and gpiozero will open a pin on any machine it "
+                f"thinks is a Pi, so this is not the pairing under test. "
+                f"It said {notes}")
+            assert isinstance(interface.display, ConsoleDisplay)
+            assert isinstance(interface.buttons, KeyboardButtons)
+            assert interface.interactive
+
+            # 2. The prove window, answered by a real key. prove() returns
+            #    False on a timeout, so True cannot be the timeout branch
+            #    -- but it is asserted to have taken a fraction of the
+            #    window as well, because a green test that spent twenty
+            #    seconds proving nothing is the failure this repository
+            #    keeps having.
+            answered = []
+
+            def prove():
+                answered.append(entry._prove(interface, notes.append))
+
+            prover = threading.Thread(target=prove, daemon=True)
+            started = time.monotonic()
+            prover.start()
+            terminal.wait_for("PRESS ANY BUTTON", seconds=10)
+            keyboard.press(ecodes.KEY_ENTER)
+            prover.join(timeout=entry.PROVE_SECONDS + 10)
+            took = time.monotonic() - started
+            said = answered[0] if answered else "nothing; it is still waiting"
+            assert answered == [True], (
+                f"the panel was not proven drivable by a real key press. "
+                f"prove() said {said}; the log says {notes}")
+            assert took < entry.PROVE_SECONDS, (
+                f"prove() took {took:.1f}s of its {entry.PROVE_SECONDS}s "
+                f"window, so the press did not end it")
+            assert keyboard.delivered == 1, keyboard.delivered
+            # And prove() ANSWERED that press rather than merely coming
+            # back true while it was still sitting unread on the terminal.
+            # Without this the whole prove step is satisfied by a prove()
+            # that returns true unconditionally, which is the shape of
+            # the defect it exists to prevent -- and the orphaned key
+            # would then be read by the first menu screen instead.
+            assert interface.buttons.wait(timeout=0) is None, (
+                "prove() called the panel drivable with the key press "
+                "still unread on the terminal")
+
+            # 3. The menu, on the real thing.
+            cups = rig.cups()
+            app = App(display=interface.display, buttons=interface.buttons,
+                      cups=cups, settings=config.Settings(pages=2),
+                      vocabulary=Vocabulary(),
+                      config_path=str(tmp_path / "otp-unit.conf"))
+            crashed = []
+
+            def run():
+                try:
+                    app.run()
+                except BaseException as exc:     # noqa: BLE001
+                    crashed.append(exc)
+
+            panel = threading.Thread(target=run, daemon=True)
+            panel.start()
+            try:
+                self.drive(app, cups, terminal, keyboard, ecodes)
+            finally:
+                panel.join(timeout=30)
+            assert not crashed, f"the menu died: {crashed[0]!r}"
+            assert not panel.is_alive(), \
+                "the menu never returned after SHUT DOWN was confirmed"
+            assert app.shutdown_requested
+            assert app.display_failures == 0, (
+                f"{app.display_failures} frames could not be drawn on the "
+                f"console the unit had just chosen")
+        finally:
+            interface.close()
+
+        # 4. What actually reached the printer. Two copies of one pad,
+        #    carrying the same key -- which is the whole point of the
+        #    device and the only thing worth calling an end to end.
+        printed = dict(rig.printed())
+        assert sorted(printed) == ["OTP A", "OTP B"], sorted(printed)
+        assert to_printer(printed["OTP A"]) == to_printer(printed["OTP B"]), \
+            "the two copies of the pair do not carry the same key"
+
+    def drive(self, app, cups, terminal, keyboard, ecodes):
+        """PRINT PAD PAIR, both copies, then SHUT DOWN -- all by keystroke."""
+        enter, up, down = ecodes.KEY_ENTER, ecodes.KEY_UP, ecodes.KEY_DOWN
+
+        # The main menu, moved with both arrows -- which is what the
+        # console footer tells the operator to use ("arrows move  ENTER
+        # select") and what, until buttons._read_key_byte, did nothing at
+        # all on a real terminal. The footer counts the caret's position,
+        # so "2/7" is the panel stating where it thinks the caret is
+        # rather than the test inferring it from a line of text.
+        terminal.wait_for(">PRINT PAD PAIR")
+        assert "2/7" in self.then(terminal, keyboard, down, ">PRINT WORKSHEETS")
+        assert "1/7" in self.then(terminal, keyboard, up, ">PRINT PAD PAIR")
+
+        self.then(terminal, keyboard, enter, ">ROLL RANDOM")
+        self.then(terminal, keyboard, enter, "OK ACCEPT")
+        self.then(terminal, keyboard, enter, "PAD PAIR: A AND B")
+
+        # Two pages of key material, generated and spooled for real. The
+        # window is wide because this is a real pad on whatever the runner
+        # gives us, and a tight one would make a slow box look like a
+        # broken panel.
+        self.then(terminal, keyboard, enter, "COPY A", seconds=180)
+        self.hand_over(app, cups, terminal, keyboard, ecodes, "COPY A DONE")
+        self.then(terminal, keyboard, enter, "COPY B", seconds=180)
+        self.hand_over(app, cups, terminal, keyboard, ecodes, "PAIR COMPLETE")
+
+        self.then(terminal, keyboard, enter, ">PRINT PAD PAIR")
+        self.then(terminal, keyboard, up, ">SHUT DOWN")
+        self.then(terminal, keyboard, enter, "POWER OFF THE UNIT?")
+        keyboard.press(enter)                    # confirmed; run() returns
+
+    def hand_over(self, app, cups, terminal, keyboard, ecodes, expected):
+        """
+        Wait for the tray to be clear, then press OK, as the footer says.
+
+        The wait is on the QUEUE and not on a sleep: OK on the printing
+        screen means "the tray is clear", and pressing it while the job is
+        still spooled sends the panel to STILL PRINTING instead -- a
+        different, also-correct screen that this drive is not testing.
+        """
+        assert settle(cups, app.queue, seconds=90), \
+            f"the queue never drained, so {expected} was never reachable"
+        return self.then(terminal, keyboard, ecodes.KEY_ENTER, expected,
+                         seconds=60)
 
 # --- what the harness itself must not get wrong --------------------------
 

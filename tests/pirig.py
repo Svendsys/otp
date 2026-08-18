@@ -1,4 +1,14 @@
-"""A Raspberry Pi board identity, faked in a private mount namespace.
+"""Hardware identity forged in a private mount namespace, for this
+process and nothing else.
+
+Two forgeries live here, both the same shape and both for the same
+reason -- a real kernel interface exists, and the one thing it will not
+give us is the state we need to test against. `PiIdentity` lends the
+process a Raspberry Pi board revision so gpiozero will open the
+simulated gpiochip; `ForgedConnectors` lends it a /sys/class/drm so the
+display probe can be asked both of its questions instead of only the
+one a virtual DRM device happens to answer. Everything below is about
+the first; the second is documented at the bottom of the file.
 
 `gpio-sim` hands us a real gpiochip whose lines are driven from sysfs, and
 that is everything the button code needs -- except that gpiozero will not
@@ -163,9 +173,11 @@ def _checked(result: int, what: str) -> None:
         raise OSError(err, f"{what}: {os.strerror(err)}")
 
 
-def _mount(source, target, flags, what):
+def _mount(source, target, flags, what, fstype=None):
     _checked(_libc.mount(source.encode() if source else None,
-                         str(target).encode(), None, flags, None), what)
+                         str(target).encode(),
+                         fstype.encode() if fstype else None,
+                         flags, None), what)
 
 
 def available() -> str:
@@ -567,3 +579,175 @@ def release_gpiozero() -> None:
     # than in a warning nobody reads. The cache is emptied either way, so
     # a raise here cannot spread to the next test -- it only ends this
     # one loudly, which is the trade this repository always takes.
+
+
+# --- DRM connectors, forged the same way and for the same reason ---------
+
+
+SYS_CLASS = Path("/sys/class")
+DRM_CLASS = SYS_CLASS / "drm"
+
+
+def connectors_available() -> str:
+    """Why a connector state cannot be forged here, or "" if it can."""
+    if os.geteuid() != 0:
+        return ("forging a DRM connector state needs root: it is a mount "
+                "namespace with a tmpfs over /sys/class")
+    if not SYS_CLASS.is_dir():
+        return "there is no /sys/class here to mount a forged one over"
+    if shutil.which("nsenter") is None:
+        return "nsenter (util-linux) is not installed"
+    return ""
+
+
+class ForgedConnectors:
+    """
+    A /sys/class/drm this process alone can see, saying what we choose.
+
+    ## Why forge it at all when vkms is right there
+
+    vkms gives a real connector whose status a kernel wrote, and
+    TestTheRealScreenProbe reads exactly that -- it stays, and it is the
+    evidence that the file `screen_connected()` globs is a file a kernel
+    produces. What it cannot give is the OTHER answer. A virtual DRM
+    device reports `connected` and has no way to be unplugged, so the
+    half of the probe that has to say NO -- the half that decides whether
+    a unit with nothing in its HDMI socket walks into a menu or prints
+    unattended -- was unreachable on any machine.
+
+    It also cannot give a STABLE answer. `screen_connected()` is true if
+    ANY connector anywhere reports connected, so on a runner with a
+    virtual GPU of its own, or a developer's laptop with a monitor
+    plugged in, the answer belongs to the host rather than to the test.
+    A test whose verdict depends on whether somebody's second screen is
+    switched on is not a test.
+
+    So the connector states are the test's, and everything the unit does
+    with them is real: `screen_connected()` runs its own glob over a real
+    directory in a real filesystem, opens real files and reads real
+    bytes. Nothing in otpunit is patched, and nothing in it knows.
+
+    ## A tmpfs over /sys/class, and not a bind over /sys/class/drm
+
+    The obvious minimal forgery is a bind mount over /sys/class/drm, and
+    it was not chosen because it only works where that directory already
+    exists -- which is to say, only where some DRM driver is already
+    loaded. sysfs will not let you make one:
+
+        # unshare -m
+        # mkdir /sys/class/drm
+        mkdir: cannot create directory '/sys/class/drm': Operation not
+        permitted
+
+    That would leave two code paths -- a bind where DRM is present, a
+    tmpfs where it is not -- and the one CI takes would be the one that
+    never ran anywhere else. One path instead: a tmpfs over /sys/class
+    with a single `drm` directory in it, on every machine, whether or not
+    the host has any DRM at all.
+
+    The cost is stated rather than hidden: while this is entered, the
+    other entries under /sys/class are not visible to this process. It is
+    held open across `hmi`'s probe and nothing else -- the display and
+    input handles the probe returns outlive it -- and nothing on that
+    path reads /sys/class: gpiozero reads /proc/cpuinfo and
+    /proc/device-tree, smbus2 opens /dev/i2c-N, and the keyboard probe
+    reads /dev/input and /proc/bus/input/devices.
+
+    ## Containment and teardown
+
+    Both are PiIdentity's, for PiIdentity's reasons -- see the teardown
+    contract at the top of this file. The namespace is made private
+    before anything is mounted, because a new mount namespace inherits
+    the propagation of the one it was copied from and on any systemd host
+    `/` is shared; and leaving unmounts what was mounted but stays in the
+    namespace, because a process with a thread in it -- which lgpio gives
+    this one at import -- cannot setns back.
+    """
+
+    #: A card and two connectors, which is the shape a real machine has:
+    #: `card0` itself carries no status file, and a box with two heads
+    #: usually has something in one of them. Two connectors also mean the
+    #: positive case is only positive because the loop kept looking past
+    #: a disconnected one, rather than because there was only ever one
+    #: file and it happened to say the right thing.
+    OTHER = "card0-DP-1"
+    PRIMARY = "card0-HDMI-A-1"
+
+    def __init__(self, status: str = "connected"):
+        self.status = status
+        self.mounted: list[str] = []
+        self._home = None
+
+    def _write_tree(self) -> None:
+        (DRM_CLASS / "card0").mkdir(parents=True)
+        for name, state in ((self.PRIMARY, self.status),
+                            (self.OTHER, "disconnected")):
+            connector = DRM_CLASS / name
+            connector.mkdir()
+            # A trailing newline, because that is what sysfs writes and
+            # `screen_connected()` strips. A fixture that omitted it would
+            # let a strip() go missing without anything noticing.
+            (connector / "status").write_text(state + "\n")
+
+    def __enter__(self) -> "ForgedConnectors":
+        self._home = os.open("/proc/self/ns/mnt", os.O_RDONLY)
+        try:
+            _checked(_libc.unshare(CLONE_NEWNS), "unshare(CLONE_NEWNS)")
+            _mount("none", "/", MS_REC | MS_PRIVATE, "make / private")
+            _mount("none", SYS_CLASS, 0, f"tmpfs over {SYS_CLASS}",
+                   fstype="tmpfs")
+            self.mounted.append(str(SYS_CLASS))
+            self._write_tree()
+            # The forgery is worth nothing if the thing under test cannot
+            # see it, and "cannot see it" and "saw it and said no" are the
+            # same answer from screen_connected(). Asked here, where the
+            # difference is still visible.
+            present = sorted(path.name for path in DRM_CLASS.iterdir())
+            if present != sorted((self.OTHER, self.PRIMARY, "card0")):
+                raise AssertionError(
+                    f"the forged /sys/class/drm holds {present}, not the "
+                    f"three entries just written to it")
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def host_sees_connectors(self) -> bool:
+        """
+        Whether the namespace we came from can see the forgery too.
+
+        Asked while it is still mounted, for the reason
+        PiIdentity.host_sees_a_pi gives: after teardown a leak that was
+        cleaned up behind itself looks exactly like no leak at all.
+        """
+        probe = subprocess.run(
+            ["nsenter", f"--mount=/proc/self/fd/{self._home}",
+             "cat", str(DRM_CLASS / self.PRIMARY / "status")],
+            pass_fds=(self._home,), capture_output=True, text=True,
+            check=False)
+        if probe.returncode == 0:
+            return True
+        # `cat` says 1 for a file that is not there, which is the healthy
+        # answer, and nsenter says 1 for "could not get in", which means
+        # nothing was asked. They are told apart by what came out on
+        # stderr rather than by the status they share.
+        if "nsenter" in probe.stderr.lower():
+            raise AssertionError(
+                f"could not look at {DRM_CLASS} from outside the "
+                f"namespace, so nothing was checked: "
+                f"{probe.stderr.strip() or probe.returncode}")
+        return False
+
+    def __exit__(self, *_exc) -> None:
+        # No try/except around the umount, and a try/FINALLY around the
+        # descriptor -- both for the reasons PiIdentity.__exit__ spells
+        # out. A /sys/class this process could not put back would leave
+        # every later test reading a class tree with one directory in it.
+        try:
+            while self.mounted:
+                _checked(_libc.umount(self.mounted[-1].encode()), "umount")
+                self.mounted.pop()
+        finally:
+            if self._home is not None:
+                os.close(self._home)
+                self._home = None

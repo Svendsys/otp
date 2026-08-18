@@ -2191,7 +2191,31 @@ class RealTerminal:
             self.seen.extend(chunk)
 
     def install(self, monkeypatch):
-        """Become the process's terminal for the rest of the test."""
+        """
+        Become the process's terminal, and MIND WHERE THIS IS CALLED FROM.
+
+        Only half of it survives being done in a fixture. pytest resumes
+        global capture at the start of every phase, and resuming reassigns
+        `sys.stdout` to the capture file -- after fixture setup has
+        finished, so it lands on top of anything a fixture monkeypatched
+        there. `sys.stdin` is not reassigned the same way. Measured, from
+        the body of a test whose fixture had installed both:
+
+            stdin  = TextIOWrapper name=13   isatty True
+            stdout = TextIOWrapper <FileIO name=6 'rb+'>  isatty False
+            hmi.console_usable() = False
+
+        `capsys.disabled()` held open across the yield does not help --
+        the resume happens after it too, measured the same way.
+
+        So a fixture may install this for the sake of stdin, which is what
+        the keyboard reader uses, and anything that needs the unit to
+        CHOOSE sys.stdout -- hmi.open_display hands it to ConsoleDisplay
+        -- has to call this again from the test body. Forgetting is loud
+        rather than silent: console_usable() goes false and the display
+        probe refuses the console, which is what the tier-1 tests assert
+        about before they assert about anything else.
+        """
         monkeypatch.setattr(sys, "stdin", self.stdin)
         monkeypatch.setattr(sys, "stdout", self.stdout)
         return self
@@ -2199,6 +2223,53 @@ class RealTerminal:
     def type(self, data: bytes):
         """Put bytes on the terminal exactly as a keyboard driver would."""
         os.write(self.master, data)
+
+    @property
+    def text(self) -> str:
+        """Everything that has reached the terminal so far.
+
+        latin-1 because the stream carries escape sequences as well as
+        text and every byte has to map to something: a decode that could
+        raise would turn a rendering assertion into a UnicodeDecodeError
+        pointing at the wrong thing.
+        """
+        return bytes(self.seen).decode("latin-1")
+
+    def mark(self) -> int:
+        """How much has arrived so far, to search onwards from."""
+        return len(self.seen)
+
+    def wait_for(self, needle: str, seconds: float = 10.0,
+                 since: int = 0) -> str:
+        """
+        Block until `needle` has been drawn, and say so if it never is.
+
+        The synchronisation the whole interactive drive rests on. The app
+        renders and then blocks on a read, so waiting for the frame is how
+        a test knows the next key will be read rather than typed into a
+        screen that has already moved on.
+
+        `since` is a mark taken BEFORE the key was pressed, and it has to
+        be the caller's rather than "wherever the buffer was when this
+        call started": a menu redraws the same text every time it is
+        entered, so searching the whole buffer would match the frame
+        before the press and every wait after the first would return
+        immediately. Taking the mark inside this method is the opposite
+        mistake, and was the first version of it -- a frame drawn between
+        the press and the wait was already behind the mark, so a single
+        show() followed by wait_for() searched an empty window and timed
+        out with the panel plainly on the screen.
+        """
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            fresh = bytes(self.seen[since:]).decode("latin-1")
+            if needle in fresh:
+                return fresh
+            time.sleep(0.02)
+        raise AssertionError(
+            f"{needle!r} was never drawn on the terminal in {seconds}s. "
+            f"What arrived instead:\n"
+            + bytes(self.seen[since:]).decode("latin-1")[-1200:])
 
     def close(self):
         self._stop.set()
