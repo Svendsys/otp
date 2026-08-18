@@ -437,37 +437,65 @@ systemctl enable getty@tty2.service 2>/dev/null || true
 #   - The wait is masked. An unbounded wait for a network this appliance
 #     does not have must not be able to hold a boot open, whatever pulls
 #     network-online.target in next.
-#   - cloud-init is switched off with its own documented kill switch. It is
-#     what pulls network-online.target in here, it cost 57 seconds of every
-#     boot doing nothing, and a provisioning agent that takes user-data off
-#     the boot partition -- the partition an operator is told to write files
-#     on -- has no business on an air-gapped key printer. Its generator
-#     reads this file before it links cloud-init.target into
-#     multi-user.target, so cloud-config.service is not in the transaction
-#     at all and the wizard's `After=` on it is void rather than waiting.
+#   - cloud-init is switched off with its own documented kill switch. The
+#     packages are GONE from the built image now -- image/stage-otpunit
+#     purges cloud-init and rpi-cloud-init-mods, which is the decision
+#     issue #34 records -- and this line stays anyway, because there are two
+#     machines a purge cannot reach and on both of them it is the whole of
+#     the defence:
+#       * a unit that gets cloud-init BACK, as a dependency of something
+#         installed later or by somebody's `apt-get install`. A purge
+#         happens once, at build time; a marker file in /etc is read on
+#         every boot after that one.
+#       * the documented path this script is mostly run on -- "run this on
+#         a Pi you already have" -- where no pi-gen stage has ever run and
+#         the packages are exactly where Raspberry Pi OS put them.
+#     WHAT IT COSTS WHEN IT DOES FIRE: cloud-init is what pulls
+#     network-online.target in here, it cost 57 seconds of every boot doing
+#     nothing, and rpi-cloud-init-mods configures its NoCloud datasource
+#     with `seedfrom: file:///boot/firmware` -- so it is a provisioning
+#     agent reading user-data off the one partition an operator is told to
+#     write files on, on a device that prints one-time pads.
+#     /usr/lib/cloud-init/ds-identify is the thing that reads this file, not
+#     the generator directly: `is_disabled()` returns 0 on
+#     `[ -f /etc/cloud/cloud-init.disabled ]` before any datasource search,
+#     `_main` returns 2 at that, and the generator's rc=2 branch is what
+#     leaves cloud-init.target out of multi-user.target's wants -- so
+#     cloud-config.service is not in the transaction at all and the wizard's
+#     `After=` on it is void rather than waiting. Quoted from cloud-init
+#     25.2-1~bpo13+1+rpt20, the build the Raspberry Pi archive would put on
+#     this image.
 #
-# THE TWO LOCKS ARE NOT EQUALLY WELL MEASURED, and the difference is worth
-# knowing before anyone trusts a green tier 3 here.
+# WHAT IS MEASURED HERE AND WHAT IS NOT, because the difference is worth
+# knowing before anyone trusts a green tier 3.
 #
 #   - The mask IS measured on the booted image:
 #     harness/img-guest-check.sh reads is-enabled back off the running
 #     machine and asks the job queue for its job
 #     (network-wait-cannot-hold-the-boot-open).
-#   - The kill switch is NOT. Its only coverage is that install.sh writes
-#     the file -- tests/test_overlay_root.py runs this block into a fake
-#     /etc and looks for it. An earlier version of this comment claimed it
-#     was "measured by what it unblocks, which is the wizard's job count in
-#     the same probe", and that is false: once the wait above is masked,
-#     network-online.target is satisfied by NetworkManager-wait-online in
-#     about thirty seconds, so a cloud-init that came back would let every
-#     guest check pass, just more slowly. No probe here can tell the two
-#     apart, and no check goes red if this line stops working.
-#
-# It stays for the reasons in its bullet -- 57 wasted seconds, and a
-# provisioning agent reading user-data off an operator's partition on an
-# air-gapped key printer -- not because anything is watching it. A check
-# that could tell would have to read the boot's own timing or ask systemd
-# whether cloud-init.target is in the transaction; neither exists yet.
+#   - The PURGE is measured on the booted image, as
+#     cloud-init-is-not-installed: dpkg is asked for both packages, systemd
+#     for three cloud-init units and /usr/lib for the generator, each with a
+#     positive control beside it. An absence read through a tool that has
+#     stopped answering is the failure that check is written around, and on
+#     a machine whose /usr the purge has just edited it is not a theoretical
+#     one.
+#   - THE FILE REACHING AN IMAGE is measured, as
+#     cloud-init-kill-switch-survives-the-purge, in both boots, requiring a
+#     regular file because `[ -f ]` is the test ds-identify makes. Until
+#     issue #34 the only coverage this line had was
+#     tests/test_overlay_root.py running this block into a fake /etc, which
+#     says the script writes a file and never that a file reached a card.
+#   - ITS RUNTIME BEHAVIOUR IS STILL NOT MEASURED, and cannot be from here:
+#     the machine that would honour the marker no longer carries the code
+#     that reads it. Nothing in this repository runs ds-identify or the
+#     generator on any tier, so what is quoted above is upstream's source
+#     and not a measurement. An earlier version of this comment claimed the
+#     kill switch was "measured by what it unblocks, which is the wizard's
+#     job count in the same probe"; that was false then and would be false
+#     now -- with the wait above masked, network-online.target is satisfied
+#     by NetworkManager-wait-online in about thirty seconds, so a cloud-init
+#     that came back would let every guest check pass, just more slowly.
 systemctl mask systemd-networkd-wait-online.service
 install -d /etc/cloud
 : > /etc/cloud/cloud-init.disabled
@@ -1319,7 +1347,12 @@ script):
     `sudo systemctl unmask systemd-networkd-wait-online.service`.
   * cloud-init is switched off permanently, via /etc/cloud/cloud-init.disabled.
     This machine will not run any cloud-init datasource again -- including
-    user-data written to the boot partition. Undo by deleting that file.
+    user-data written to the boot partition, which is what Raspberry Pi OS
+    points it at. Undo by deleting that file. The PACKAGES are still
+    installed here: they are purged out of the image this project builds,
+    but this script does not remove software from a Pi you already had. So
+    that one file is the whole of it, and cloud-init runs again on the next
+    boot after anybody deletes it.
   * ssh.socket is MASKED, so sshd is never socket-activated here. It had to
     be: with the socket holding port 22, the reload that userconf-pi runs at
     the end of a seeded first boot left sshd unable to bind and

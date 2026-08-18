@@ -1948,6 +1948,129 @@ def test_the_assets_directory_stays_optional(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "manual PDFs missing" in proc.stderr, proc.stderr
 
+# --- and the build refuses to purge more than it meant to ----------------
+
+STAGE_PURGE_BLOCK = ("# --- cloud-init, removed rather than left switched off",
+                     "apt-get purge -y ${CLOUD_PACKAGES}\nEOF")
+
+# What `apt-get -s purge` prints for the two packages alone: `Purg` for what
+# it purges, one line each, in apt's own format. Anything else in that
+# listing is a package this image depends on that would have gone with them.
+PURGE_SIM_CLEAN = ("Reading package lists...\n"
+                   "Building dependency tree...\n"
+                   "Purg cloud-init [25.2-1~bpo13+1+rpt20]\n"
+                   "Purg rpi-cloud-init-mods [1:20260119]\n")
+
+# The apt-get every case here runs. It RECORDS its arguments, because "the
+# build did not purge anything" and "the build purged and the stub said
+# nothing" are different runs and only the log can tell them apart -- the
+# same reason run_block's systemctl records rather than merely exiting 0.
+APT_GET_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >> "$APT_LOG"
+case " $* " in
+    *" -s "*) printf '%s' "$APT_SIM" ;;
+esac
+"""
+
+
+def run_stage_purge(tmp_path, *, simulation=PURGE_SIM_CLEAN):
+    """Run the pi-gen stage's cloud-init purge against a simulated apt.
+
+    `on_chroot` is a shell function here rather than pi-gen's capsh: what
+    the block puts on its stdin is the thing under test, and pi-gen's own
+    wrapper ends in `sh -e` reading exactly that -- so the function is `sh`
+    and the heredoc reaches it untouched.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / "apt-get").write_text(APT_GET_STUB)
+    (bin_dir / "apt-get").chmod(0o755)
+    log = tmp_path / "apt.log"
+    log.write_text("")
+    block = slice_between(STAGE_RUN.read_text(), *STAGE_PURGE_BLOCK)
+    runner = tmp_path / "purge.sh"
+    runner.write_text("set -e\non_chroot() { sh; }\n" + block)
+    proc = subprocess.run(
+        ["bash", str(runner)], capture_output=True, text=True, timeout=60,
+        env={**os.environ, "APT_LOG": str(log), "APT_SIM": simulation,
+             "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    return proc, log.read_text()
+
+
+def test_the_stage_purges_both_cloud_init_packages(tmp_path):
+    """
+    The positive control for the two refusals below, and the change itself.
+
+    ENABLE_CLOUD_INIT=0 in image/build.sh only skips pi-gen's seed files;
+    stage2/04-cloud-init/00-packages installs cloud-init and
+    rpi-cloud-init-mods with no condition on that variable anywhere in the
+    path, so every image this project built carried a provisioning agent
+    whose Raspberry Pi datasource config reads user-data out of
+    /boot/firmware. See issue #34.
+    """
+    proc, log = run_stage_purge(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "purge -y cloud-init rpi-cloud-init-mods" in log, log
+    # The simulation and then the real removal, both of them and in that
+    # order: a build that only simulated would ship the packages, and one
+    # that only purged would ship whatever apt took with them.
+    lines = [line for line in log.splitlines() if "purge" in line]
+    assert len(lines) == 2, log
+    assert "-s" in lines[0].split(), log
+    assert "-s" not in lines[1].split(), log
+
+
+def test_a_purge_that_would_take_something_else_stops_the_build(tmp_path):
+    """
+    `apt-get purge -y` removes reverse dependencies without a prompt.
+
+    The one thing issue #34 said had to be confirmed before the packages
+    went is that nothing in Raspberry Pi OS Lite depends on them. Read off
+    the archives that holds -- nothing declares any relationship on
+    rpi-cloud-init-mods, and only debian-cloud-images-packages depends on
+    cloud-init in Debian -- but an index is not the rootfs, and the rootfs
+    is what would lose the dependent. Silently: the deletion would surface
+    as a unit that no longer boots, two emulated boots later.
+    """
+    proc, log = run_stage_purge(tmp_path, simulation=(
+        PURGE_SIM_CLEAN + "Remv raspberrypi-sys-mods [20260101]\n"))
+    assert proc.returncode != 0, proc.stdout
+    assert "raspberrypi-sys-mods" in proc.stderr, proc.stderr
+    # And nothing was removed. A refusal that fires after the purge has run
+    # is a build that stops with the packages already gone.
+    assert "-s" in log, log
+    assert [ln for ln in log.splitlines() if "-s" not in ln.split()] == [], log
+
+
+def test_a_package_apt_merely_removes_counts_too(tmp_path):
+    """
+    `Remv` and `Purg` are different words in apt's simulation and both are
+    a removal. apt prints the first for a package it takes out on the way to
+    the ones it was asked about, which is exactly the case this refusal is
+    for, so a filter reading only `Purg` would let the dependent through.
+    """
+    proc, _ = run_stage_purge(tmp_path, simulation=(
+        "Remv netplan.io [1.1.2-7]\n" + PURGE_SIM_CLEAN))
+    assert proc.returncode != 0, proc.stdout
+    assert "netplan.io" in proc.stderr, proc.stderr
+
+
+def test_the_purge_runs_before_install_sh_writes_the_kill_switch():
+    """
+    Ordering, because dpkg's purge sweeps the directories a package owned.
+
+    /etc/cloud is cloud-init's and install.sh's kill switch lives in it.
+    dpkg will not delete a directory still holding a file it does not own,
+    so the marker survives a purge that runs afterwards -- but that is
+    upstream behaviour standing between an air-gapped printer and a
+    re-armed provisioning agent, and the ordering that does not lean on it
+    costs nothing.
+    """
+    text = STAGE_RUN.read_text()
+    assert text.index("apt-get purge -y ${CLOUD_PACKAGES}") \
+        < text.index("./device/install.sh --image-build"), \
+        "the purge must run before install.sh writes /etc/cloud/cloud-init.disabled"
+
 
 # --- the probe refuses to run on anything but a harness boot -------------
 
@@ -4403,3 +4526,285 @@ def test_the_probe_states_two_presences_before_it_asserts_an_absence():
     for control in ("check root-write-lands-and-is-readable",
                     "check settings-survive-the-power-cycle"):
         assert text.index(control) < absence, control
+
+
+# --- the provisioning agent that is no longer on the image ---------------
+#
+# Issue #34: pi-gen's ENABLE_CLOUD_INIT=0 guards only the sub-stage that
+# preseeds a NoCloud datasource, so cloud-init and rpi-cloud-init-mods went
+# onto every image this project built. The stage purges them now and
+# install.sh still writes the kill switch, and tier 3 asks the booted machine
+# about both -- separately, because after a purge nearly every piece of
+# cloud-init evidence is absent for a reason that has nothing to do with the
+# kill switch. These run the shipped block against a dpkg and a systemd that
+# say whatever the case needs.
+
+CLOUD_INIT_BLOCK = ("# --- the provisioning agent this image no longer carries",
+                    'dir=$(yesno test -d "${CI_DISABLED%/*}")"')
+
+# Answers the two questions the probe asks and refuses everything else, for
+# the reason SYSTEMCTL_STUB does: a stub that returned "" for a question
+# nobody expected would make an absence check pass by accident, which is the
+# whole failure mode this block was written around.
+#
+# `-W -f <fmt> <pkg>` puts the package name in $4. An unknown package is an
+# EMPTY answer and rc 1 -- that is what dpkg-query does, and the block's
+# `2>/dev/null || true` is written for it.
+DPKG_QUERY_STUB = """#!/bin/sh
+case "$1 $2" in
+    "-W -f") ;;
+    *) echo "stub: unexpected dpkg-query $*" >&2; exit 64 ;;
+esac
+case "$4" in
+    cloud-init)           ANSWER="${PKG_CLOUD_INIT-}" ;;
+    rpi-cloud-init-mods)  ANSWER="${PKG_RPI_MODS-}" ;;
+    systemd)              ANSWER="${PKG_SYSTEMD-installed}" ;;
+    *) echo "stub: unexpected package $4" >&2; exit 64 ;;
+esac
+printf '%s' "$ANSWER"
+# Nothing on stdout and rc 1 is what dpkg-query answers for a package it has
+# never heard of, which is what a purged one is. The block's `|| true` is
+# written for that, and modelling it here is what makes the exit status
+# irrelevant on purpose rather than by luck.
+[ -n "$ANSWER" ] || exit 1
+"""
+
+# The same shape for systemd. LoadState is the property the probe reads, and
+# `not-found` is what a unit systemd has never heard of answers.
+CLOUD_SYSTEMCTL_STUB = """#!/bin/sh
+case "$1 $2 $3 $4" in
+    "show -p LoadState --value")
+        case "$5" in
+            cloud-init.target)        printf '%s\\n' "${LOAD_TARGET-not-found}" ;;
+            cloud-init-local.service) printf '%s\\n' "${LOAD_LOCAL-not-found}" ;;
+            cloud-config.service)     printf '%s\\n' "${LOAD_CONFIG-not-found}" ;;
+            otp-unit.service)         printf '%s\\n' "${LOAD_UNIT-loaded}" ;;
+            *) echo "stub: unexpected unit $5" >&2; exit 64 ;;
+        esac ;;
+    *)
+        case "$1 $2" in
+            "is-active NetworkManager.service") printf '%s\\n' "${NM_ACTIVE-active}" ;;
+            *) echo "stub: unexpected systemctl $*" >&2; exit 64 ;;
+        esac ;;
+esac
+"""
+
+# A purged machine with the kill switch still on it: no package, no unit, no
+# generator, and /etc/cloud/cloud-init.disabled a regular file.
+HEALTHY_PURGE = {}
+
+
+def run_cloud_init(tmp_path, *, env=None, marker="file", generator=False,
+                   siblings=("systemd-fstab-generator", "systemd-gpt-auto-generator")):
+    """Run the shipped cloud-init block against a substituted /usr and /etc.
+
+    Three absolute paths are rewritten and nothing else is: the block's two
+    `check` calls, their conditions and every word they print are the code
+    that ships. The paths are rewritten at their ASSIGNMENTS, which appear
+    once each -- the comments around them name /etc/cloud and the generator
+    directory several times over and rewriting a comment would prove
+    nothing.
+    """
+    root = tmp_path / "root"
+    gen_dir = root / "usr" / "lib" / "systemd" / "system-generators"
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    for name in siblings:
+        (gen_dir / name).write_text("#!/bin/sh\n")
+    if generator:
+        (gen_dir / "cloud-init-generator").write_text("#!/bin/sh\n")
+    netplan = root / "usr" / "lib" / "netplan" / "00-network-manager-all.yaml"
+    netplan.parent.mkdir(parents=True, exist_ok=True)
+    disabled = root / "etc" / "cloud" / "cloud-init.disabled"
+    disabled.parent.mkdir(parents=True, exist_ok=True)
+    if marker == "file":
+        disabled.write_text("")
+    elif marker == "directory":
+        disabled.mkdir()
+    elif marker == "dangling-symlink":
+        disabled.symlink_to(tmp_path / "no-such-file")
+    elif marker == "no-etc-cloud":
+        disabled.parent.rmdir()
+    elif marker != "missing":
+        raise AssertionError(f"unknown marker case {marker!r}")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "dpkg-query").write_text(DPKG_QUERY_STUB)
+    (bin_dir / "dpkg-query").chmod(0o755)
+    (bin_dir / "systemctl").write_text(CLOUD_SYSTEMCTL_STUB)
+    (bin_dir / "systemctl").chmod(0o755)
+
+    block = slice_between(GUEST_CHECK.read_text(), *CLOUD_INIT_BLOCK)
+    for original, replacement, why in (
+        ("CI_GENERATOR_DIR=/usr/lib/systemd/system-generators",
+         f"CI_GENERATOR_DIR={gen_dir}", "the generator directory"),
+        ("CI_NETPLAN_RENDERER=/usr/lib/netplan/00-network-manager-all.yaml",
+         f"CI_NETPLAN_RENDERER={netplan}", "netplan's renderer default"),
+        ("CI_DISABLED=/etc/cloud/cloud-init.disabled",
+         f"CI_DISABLED={disabled}", "the kill switch"),
+    ):
+        assert block.count(original) == 1, \
+            f"{why}: {original!r} appears {block.count(original)}x, want 1"
+        block = block.replace(original, replacement)
+
+    runner = tmp_path / "cloud-init.sh"
+    runner.write_text(
+        "set -uo pipefail\n"
+        'PHASE="boot1"\nPASS=0\nTOTAL=0\n'
+        + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
+        + block + '\nprintf "TOTALS %s/%s\\n" "$PASS" "$TOTAL"\n')
+    proc = subprocess.run(
+        ["bash", str(runner)], capture_output=True, text=True, timeout=60,
+        env={**os.environ, **(env or {}),
+             "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+    return proc
+
+
+def test_a_purged_machine_with_its_kill_switch_reports_both(tmp_path):
+    # The positive control for everything below: every other test here
+    # asserts a FAIL, and a block that failed unconditionally would satisfy
+    # all of them.
+    proc = run_cloud_init(tmp_path, env=HEALTHY_PURGE)
+    assert proc.returncode == 0, proc.stderr
+    assert results(proc) == {
+        "cloud-init-is-not-installed": "PASS",
+        "cloud-init-kill-switch-survives-the-purge": "PASS"}, proc.stdout
+
+
+def test_a_cloud_init_still_installed_fails(tmp_path):
+    """
+    The state every image this project built shipped in, stated as a check.
+
+    ENABLE_CLOUD_INIT=0 said cloud-init was off and the packages were on the
+    card the whole time -- which is why nobody went looking for a cloud-init
+    problem when a boot stopped finishing. dpkg is the purge's own gate.
+    """
+    for var in ("PKG_CLOUD_INIT", "PKG_RPI_MODS"):
+        proc = run_cloud_init(tmp_path / var, env={var: "installed"})
+        assert results(proc)["cloud-init-is-not-installed"] == "FAIL", proc.stdout
+
+
+def test_a_removed_but_not_purged_cloud_init_fails(tmp_path):
+    """
+    `remove` leaves `config-files`, and on this device that is not enough.
+
+    The units and the generator go, but rpi-cloud-init-mods'
+    /etc/cloud/cloud.cfg.d/99_raspberry-pi.cfg stays -- and that file is what
+    points the NoCloud datasource at file:///boot/firmware. Anything that
+    brought the package back would come back already aimed at the partition
+    an operator is told to write files on.
+    """
+    proc = run_cloud_init(tmp_path, env={"PKG_CLOUD_INIT": "config-files"})
+    assert results(proc)["cloud-init-is-not-installed"] == "FAIL", proc.stdout
+
+
+def test_a_cloud_init_unit_systemd_still_knows_fails(tmp_path):
+    """
+    The other half, and it is not implied by dpkg.
+
+    A unit file dropped into /etc/systemd/system by hand, or a package
+    reinstalled from a local .deb, gives systemd a cloud-init.target that
+    dpkg has no opinion about. `masked` counts as knowing it: a masked unit
+    is a unit whose file is on the machine.
+    """
+    for var, state in (("LOAD_TARGET", "loaded"), ("LOAD_LOCAL", "masked"),
+                       ("LOAD_CONFIG", "loaded")):
+        proc = run_cloud_init(tmp_path / var, env={var: state})
+        assert results(proc)["cloud-init-is-not-installed"] == "FAIL", proc.stdout
+
+
+def test_a_generator_left_behind_fails(tmp_path):
+    """
+    The generator is the thing that puts cloud-init.target into the boot
+    transaction, and it runs from /usr/lib whether or not any unit is
+    enabled. A purge that left it is a purge that did not happen.
+    """
+    proc = run_cloud_init(tmp_path, generator=True)
+    assert results(proc)["cloud-init-is-not-installed"] == "FAIL", proc.stdout
+
+
+def test_the_absences_need_their_positive_controls(tmp_path):
+    """
+    THE FAILURE THIS CHECK EXISTS TO NOT HAVE.
+
+    Every clause but one is an absence, and a probe whose dpkg-query answers
+    nothing, whose systemctl answers nothing, or which is looking at a
+    directory that is not there produces all of them at once -- on a machine
+    with cloud-init running. So each mechanism is asked one question it must
+    answer in the affirmative, and each of those three is broken here on a
+    machine that is otherwise perfectly purged.
+    """
+    for case, kwargs in (
+            ("dpkg-query says nothing", {"env": {"PKG_SYSTEMD": ""}}),
+            ("systemctl says nothing", {"env": {"LOAD_UNIT": ""}}),
+            ("the generator directory is empty", {"siblings": ()})):
+        proc = run_cloud_init(tmp_path / case.split()[0], **kwargs)
+        assert results(proc)["cloud-init-is-not-installed"] == "FAIL", \
+            f"{case}: {proc.stdout}"
+
+
+def test_a_missing_kill_switch_fails_with_the_purge_still_green(tmp_path):
+    """
+    THE DISTINCTION THE SECOND CHECK EXISTS FOR, and the trap issue #34
+    named: after a purge almost every cloud-init absence is explained by the
+    purge, so a check over the absences alone would go on passing if
+    install.sh stopped writing /etc/cloud/cloud-init.disabled tomorrow. It
+    is the belt to the purge's braces -- what disables a cloud-init a later
+    dependency drags back in -- so it gets a check of its own, and this is
+    the machine where the two disagree.
+    """
+    proc = run_cloud_init(tmp_path, marker="missing")
+    assert results(proc)["cloud-init-is-not-installed"] == "PASS", proc.stdout
+    assert results(proc)["cloud-init-kill-switch-survives-the-purge"] == "FAIL", \
+        proc.stdout
+
+
+def test_a_kill_switch_that_is_not_a_regular_file_fails(tmp_path):
+    """
+    The shape ds-identify requires, not merely the name.
+
+    cloud-init 25.2's `is_disabled()` is `[ -f /etc/cloud/cloud-init.disabled ]`,
+    so a directory of that name and a symlink pointing at nothing are both
+    not a kill switch at all while satisfying every looser test. `-e` would
+    accept the first; `-e` and `-f` both reject the second, which is why the
+    check reports them separately.
+    """
+    for case in ("directory", "dangling-symlink"):
+        proc = run_cloud_init(tmp_path / case, marker=case)
+        assert results(proc)["cloud-init-kill-switch-survives-the-purge"] == "FAIL", \
+            f"{case}: {proc.stdout}"
+
+
+def test_a_purge_that_took_etc_cloud_with_it_fails(tmp_path):
+    """
+    Why the stage purges BEFORE install.sh runs.
+
+    dpkg removes a package's conffiles on purge and then removes the
+    directories it owned once they are empty, and /etc/cloud is cloud-init's.
+    The marker survives a purge ordered after it only because dpkg will not
+    delete a directory holding a file it does not own -- so this is the shape
+    of the mistake, read off the machine rather than argued about.
+    """
+    proc = run_cloud_init(tmp_path, marker="no-etc-cloud")
+    assert results(proc)["cloud-init-kill-switch-survives-the-purge"] == "FAIL", \
+        proc.stdout
+    assert "dir=no" in proc.stdout, proc.stdout
+
+
+def test_the_probe_reports_what_the_purge_did_to_netplan(tmp_path):
+    """
+    The one file rpi-cloud-init-mods ships that is not cloud-init's own:
+    /usr/lib/netplan/00-network-manager-all.yaml, netplan's renderer
+    default. Nothing in either archive depends on the package, so the purge
+    has no reverse dependency to break, but that file and NetworkManager are
+    what a reader would want to see on the machine that booted without it.
+    Reported rather than gated -- this appliance needs no network at all,
+    so there is no property here to fail a release on -- and a report that
+    stopped being printed is a report nobody would miss, which is why it is
+    asserted.
+    """
+    proc = run_cloud_init(tmp_path, env={"NM_ACTIVE": "active"})
+    line = [ln for ln in proc.stdout.splitlines()
+            if "cloud-init-is-not-installed" in ln][0]
+    assert "netplan-renderer=no" in line, line
+    assert "NetworkManager=active" in line, line

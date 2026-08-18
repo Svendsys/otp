@@ -1594,7 +1594,12 @@ find = '''  * systemd-networkd-wait-online.service is MASKED. Nothing on this ma
     `sudo systemctl unmask systemd-networkd-wait-online.service`.
   * cloud-init is switched off permanently, via /etc/cloud/cloud-init.disabled.
     This machine will not run any cloud-init datasource again -- including
-    user-data written to the boot partition. Undo by deleting that file.'''
+    user-data written to the boot partition, which is what Raspberry Pi OS
+    points it at. Undo by deleting that file. The PACKAGES are still
+    installed here: they are purged out of the image this project builds,
+    but this script does not remove software from a Pi you already had. So
+    that one file is the whole of it, and cloud-init runs again on the next
+    boot after anybody deletes it.'''
 replace = '''  * Some system services were adjusted.'''
 
 
@@ -4237,8 +4242,8 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/README.md"
-find = "**21 guest checks in boot 1 and 21 in boot 2**"
-replace = "**19 guest checks in boot 1 and 19 in boot 2**"
+find = "**23 guest checks in boot 1 and 23 in boot 2**"
+replace = "**21 guest checks in boot 1 and 21 in boot 2**"
 
 
 [[mutation]]

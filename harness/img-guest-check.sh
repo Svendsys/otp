@@ -532,6 +532,145 @@ check setting-saved-to-the-boot-partition \
       "$(if [ "${SAVED#*save=True}" != "$SAVED" ]; then echo yes; else echo no; fi)" \
       "$SAVED"
 
+# --- the provisioning agent this image no longer carries ------------------
+
+# TWO CHECKS, because neither claim can stand in for the other.
+#
+# Until issue #34 this image shipped cloud-init. pi-gen's ENABLE_CLOUD_INIT=0
+# -- which image/build.sh sets -- guards only stage2/04-cloud-init/01-run.sh,
+# the half that preseeds a NoCloud datasource; the sibling 00-packages file
+# that installs the packages is unguarded, and pi-gen installs every
+# *-packages file it finds. So `cloud-init` and `rpi-cloud-init-mods` went
+# onto every image this project has ever built, with their units enabled and
+# their generator in place, while the build config said cloud-init was off.
+# rpi-cloud-init-mods then ships a datasource pointed at
+# `seedfrom: file:///boot/firmware` -- the one partition an operator is told
+# to write files on, on a device whose threat model is somebody holding the
+# card. image/stage-otpunit/01-otpunit/00-run.sh purges both packages now;
+# device/install.sh goes on writing cloud-init's own kill switch, because a
+# reintroduced dependency must not be able to re-arm it silently and because
+# a hand-provisioned Pi never met the purge at all.
+#
+# THE TRAP THESE ARE WRITTEN AROUND. After a purge, nearly every piece of
+# cloud-init evidence is absent for a reason that has nothing to do with the
+# kill switch: no units, no generator, no datasource, no minute spent looking
+# for one. One check over all of it would pass for the wrong reason, and
+# would go on passing if install.sh stopped writing
+# /etc/cloud/cloud-init.disabled tomorrow. So the absences are one check and
+# the marker file is another, and either can go red with the other green.
+#
+# WHAT IS STILL NOT MEASURED, said plainly, because a comment that glossed
+# over exactly this is what issue #34 had to correct. Neither check runs
+# cloud-init's own code -- there is none left on the machine to run. The kill
+# switch is read by /usr/lib/cloud-init/ds-identify, not by the generator
+# directly: `is_disabled()` returns 0 on `[ -f /etc/cloud/cloud-init.disabled ]`
+# before any datasource search, `_main` returns 2 at that, and the generator's
+# rc=2 branch is what removes the multi-user.target.wants link for
+# cloud-init.target. Quoted from cloud-init 25.2-1~bpo13+1+rpt20, the build
+# the Raspberry Pi archive would have put on this image. That the RUNTIME
+# honours the file is upstream's property and nothing in this repository
+# tests it. What these check is that the packages are gone and that the file
+# is on the booted image in the shape ds-identify requires: a regular file,
+# at that path.
+
+# EVERY ABSENCE WITH A POSITIVE CONTROL BESIDE IT. A dpkg-query that answers
+# nothing, a systemctl that answers nothing and an empty generator directory
+# are each indistinguishable from a probe whose tools are broken -- and this
+# probe runs on a machine whose /usr the same purge has just edited. So all
+# three mechanisms are asked one question they must answer in the affirmative
+# in the same breath.
+CI_PACKAGES="cloud-init rpi-cloud-init-mods"
+# The three the issue names. cloud-init.target is the one the generator
+# links; the other two are what run out of it, and userconfig.service's
+# `After=cloud-config.service` is the ordering that held run 31968966879's
+# credential wizard for the life of both boots.
+CI_UNITS="cloud-init.target cloud-init-local.service cloud-config.service"
+CI_GENERATOR_DIR=/usr/lib/systemd/system-generators
+# The one file rpi-cloud-init-mods ships that is not cloud-init's own:
+# netplan's renderer default. Reported, not gated -- see below.
+CI_NETPLAN_RENDERER=/usr/lib/netplan/00-network-manager-all.yaml
+CI_DISABLED=/etc/cloud/cloud-init.disabled
+
+CI_INSTALLED=""
+for pkg in $CI_PACKAGES; do
+    # shellcheck disable=SC2016  # a dpkg-query field name, not a shell expansion
+    CI_ST=$(dpkg-query -W -f '${db:Status-Status}' "$pkg" 2>/dev/null || true)
+    # `config-files` is a REMOVE and not a purge, and the difference matters
+    # on this device: the units and the generator are gone, but
+    # /etc/cloud/cloud.cfg.d/99_raspberry-pi.cfg is not, so anything that
+    # brought the package back would come back already pointed at the boot
+    # partition. Only gone passes.
+    case "$CI_ST" in
+        ""|not-installed) ;;
+        *) CI_INSTALLED="$CI_INSTALLED $pkg=$CI_ST" ;;
+    esac
+done
+# The control, through the same query: a package this appliance cannot boot
+# without, which must come back `installed`.
+CI_CONTROL_PKG=systemd
+# shellcheck disable=SC2016  # a dpkg-query field name, not a shell expansion
+CI_CONTROL_STATUS=$(dpkg-query -W -f '${db:Status-Status}' "$CI_CONTROL_PKG" 2>/dev/null || true)
+
+CI_LOADED=""
+for unit in $CI_UNITS; do
+    CI_LS=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
+    [ "$CI_LS" = not-found ] || CI_LOADED="$CI_LOADED $unit=${CI_LS:-?}"
+done
+# The control for the same reading, and it is the unit this whole tier is
+# about: a systemctl that had stopped answering would report every cloud-init
+# unit not-found and this one too.
+CI_CONTROL_UNIT=otp-unit.service
+CI_CONTROL_LOAD=$(systemctl show -p LoadState --value "$CI_CONTROL_UNIT" 2>/dev/null || true)
+
+CI_GENERATOR="$CI_GENERATOR_DIR/cloud-init-generator"
+# systemd's own generators live in that directory, so a listing that comes
+# back empty is a wrong path or an unreadable /usr rather than a purge.
+CI_GENERATOR_SIBLINGS=$(find "$CI_GENERATOR_DIR" -mindepth 1 -maxdepth 1 \
+                        2>/dev/null | wc -l)
+
+# NETPLAN AND NetworkManager ARE REPORTED AND NOT GATED, and the reason is
+# the reverse-dependency question the purge had to answer. rpi-cloud-init-mods
+# is the only package in the Raspberry Pi archive that depends on cloud-init,
+# and nothing in either archive depends on IT -- but it ships
+# /usr/lib/netplan/00-network-manager-all.yaml, which sets netplan's renderer
+# to NetworkManager, and that file goes with the purge. This appliance needs
+# no network and install.sh masks networkd's wait, so there is no property
+# here to gate on; what tier 3 owes the next reader is the state of both on
+# the machine that actually booted without them.
+check cloud-init-is-not-installed \
+      "$(if [ -z "$CI_INSTALLED" ] && [ "$CI_CONTROL_STATUS" = installed ] \
+            && [ -z "$CI_LOADED" ] && [ "$CI_CONTROL_LOAD" = loaded ] \
+            && [ ! -e "$CI_GENERATOR" ] \
+            && [ "${CI_GENERATOR_SIBLINGS:-0}" -gt 0 ] 2>/dev/null; \
+         then echo yes; else echo no; fi)" \
+      "dpkg:${CI_INSTALLED:- none} (control $CI_CONTROL_PKG=${CI_CONTROL_STATUS:-?}) | units:${CI_LOADED:- none} (control $CI_CONTROL_UNIT=${CI_CONTROL_LOAD:-?}) | generator=$(yesno test -e "$CI_GENERATOR") siblings=${CI_GENERATOR_SIBLINGS:-?} | netplan-renderer=$(yesno test -e "$CI_NETPLAN_RENDERER") NetworkManager=$(systemctl is-active NetworkManager.service 2>&1 || true)"
+
+# THE BELT, READ BACK OFF THE MACHINE RATHER THAN OFF THE LINE THAT WRITES
+# IT. Until now the kill switch's only coverage was
+# tests/test_overlay_root.py running install.sh's block into a fake /etc: it
+# said the script writes the file, never that the file reached an image. Two
+# ways it might not have. dpkg removes a package's own conffiles on purge and
+# then removes the directories it owned once they are empty, so a purge
+# ordered after install.sh puts the marker's own directory in the way of that
+# sweep -- it survives today only because dpkg will not delete a directory
+# holding a file it does not own. And install.sh is one `install -d` away
+# from writing it somewhere the image build discards.
+#
+# `-f`, NOT `-e`, and that is the shape ds-identify requires: `is_disabled()`
+# is `[ -f /etc/cloud/cloud-init.disabled ]`, so a directory of that name or
+# a symlink pointing at nothing is not a kill switch at all while satisfying
+# every looser test. Both are reported so the console can tell those apart
+# from an absence.
+#
+# IN BOTH PHASES, and boot2 is the one that says the file SHIPPED. /etc is
+# inside the read-only overlay, whose discard boot2 establishes with the
+# sentinel before anything else runs, so a marker still there after the power
+# cycle is one the image was built with rather than one this boot made.
+CI_DISABLED_IS_FILE=$(yesno test -f "$CI_DISABLED")
+check cloud-init-kill-switch-survives-the-purge \
+      "$CI_DISABLED_IS_FILE" \
+      "$CI_DISABLED regular-file=$CI_DISABLED_IS_FILE exists=$(yesno test -e "$CI_DISABLED") dir=$(yesno test -d "${CI_DISABLED%/*}")"
+
 if [ "$PHASE" = "boot1" ]; then
     # --- the diagnostic sheet, and how far the print path really gets -----
 

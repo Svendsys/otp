@@ -459,6 +459,8 @@ so it blocks `network-online.target`, which blocks cloud-init's
 avoid, arriving through the ordering instead of the condition.
 `install.sh` masks the wait and switches cloud-init off, and the probe reads
 the mask back with its job queue rather than trusting the line that wrote it.
+The packages themselves are purged out of the image now — see *The
+provisioning agent that was on every image, and is not now* below.
 
 The apply's own tail came out of the same reading. It ends in
 `/usr/lib/userconf-pi/userconf` → `cancel-rename` → `systemctl --no-block
@@ -997,8 +999,92 @@ files end byte-for-byte as they were found and nothing needs undoing. No hash
 is invented and none is printed: the "before" password is this unit's own,
 one character changed, and only digests reach the console.
 
-The counts move with it: **21 guest checks in boot 1 and 21 in boot 2**, up
-from 19 and 19. The run recorded below predates all of it.
+The counts move with it: **23 guest checks in boot 1 and 23 in boot 2**, up
+from 19 and 19 — the credential work added two to each and the cloud-init
+purge below two more. The run recorded below predates all of it.
+
+### The provisioning agent that was on every image, and is not now
+
+`image/build.sh` sets `ENABLE_CLOUD_INIT=0`, and reading that line it looks
+as though the image has no cloud-init on it. It had. pi-gen's
+`stage2/04-cloud-init` has two halves and the variable guards one:
+`01-run.sh`, which preseeds a NoCloud datasource, checks it; the sibling
+`00-packages`, which lists `cloud-init` and `rpi-cloud-init-mods`, is
+collected and installed with no condition anywhere in that path. So the knob
+means *do not preseed a datasource* and nothing more — issue #34 — and this
+is how tier 3 ended up with a `TimeoutStartSec=infinity` networkd wait on a
+NetworkManager machine, because `cloud-init.target` is what pulled
+`network-online.target` into the transaction that ended both boots of run
+31968966879 without either reaching `multi-user.target`. Nobody went looking
+for a cloud-init problem, because the build config said cloud-init was off.
+
+**The owner's decision out of *leave it*, *purge it* and *both* is both.**
+`image/stage-otpunit/01-otpunit/00-run.sh` purges the two packages, and
+`device/install.sh` goes on writing cloud-init's own kill switch
+`/etc/cloud/cloud-init.disabled` — the belt to the purge's braces, so a
+reintroduced dependency cannot re-arm it silently, and because the
+documented *run this on a Pi you already have* path never meets a pi-gen
+stage at all.
+
+**The purge asks what it would take with it before it takes anything.**
+`apt-get purge -y` removes reverse dependencies without a prompt, so the
+stage runs `apt-get -s purge` first and refuses to build if the simulation
+names anything but the two packages. Off the archives on 2026-08-18 there is
+nothing to name: no package in the Raspberry Pi archive's `trixie/main`
+declares any relationship on `rpi-cloud-init-mods`, and in Debian
+`trixie/main` only `debian-cloud-images-packages` — which Raspberry Pi OS
+Lite does not carry — depends on `cloud-init`. An index is not a rootfs,
+which is why the refusal is in the build rather than in this paragraph.
+
+The one file `rpi-cloud-init-mods` ships that is not cloud-init's own is
+`/usr/lib/netplan/00-network-manager-all.yaml`, which sets netplan's renderer
+to NetworkManager. It goes with the purge. This appliance has no network by
+design, `install.sh` masks networkd's wait, and no other netplan
+configuration exists on it — so there is no property to gate on, and both
+that file and `NetworkManager.service`'s state are **reported** in the check
+line instead, which is what makes the question answerable off a tier-3
+console rather than off reasoning.
+
+Two named guest checks, in both boots, and they are deliberately two:
+
+| check | what it says |
+|---|---|
+| `cloud-init-is-not-installed` | `dpkg-query` has neither package (`config-files` fails too — a *remove* leaves the Raspberry Pi datasource config behind), systemd's `LoadState` is `not-found` for `cloud-init.target`, `cloud-init-local.service` and `cloud-config.service`, and `/usr/lib/systemd/system-generators/cloud-init-generator` is gone |
+| `cloud-init-kill-switch-survives-the-purge` | `/etc/cloud/cloud-init.disabled` is a **regular file** on the booted machine |
+
+**Every absence has a positive control beside it**, because a `dpkg-query`
+that answers nothing, a `systemctl` that answers nothing and a generator
+directory that is not there produce all of those absences at once, on a
+machine with cloud-init running — and this probe runs on a machine whose
+`/usr` the purge has just edited. So `systemd` must come back `installed`
+through the same query, `otp-unit.service` must come back `loaded` through
+the same `systemctl show`, and the generator directory must list its
+siblings.
+
+**Why two checks and not one.** After a purge nearly every piece of
+cloud-init evidence is absent for a reason that has nothing to do with the
+kill switch. One check over all of it would pass for the wrong reason and
+would go on passing if `install.sh` stopped writing the marker tomorrow.
+Split, the second goes red on exactly that machine while the first stays
+green. It is also the check that would catch the ordering mistake: `dpkg`
+sweeps the directories a package owned once they are empty, and `/etc/cloud`
+is cloud-init's, so the stage purges **before** `install.sh` runs rather
+than relying on dpkg declining to delete a directory that still holds a file
+it does not own.
+
+**What is still not measured, said plainly.** Neither check runs
+cloud-init's own code — there is none left on the machine to run. The kill
+switch is read by `/usr/lib/cloud-init/ds-identify`, not by the generator
+directly: `is_disabled()` returns 0 on
+`[ -f /etc/cloud/cloud-init.disabled ]` before any datasource search,
+`_main` returns 2 at that, and the generator's `rc=2` branch is what leaves
+`cloud-init.target` out of `multi-user.target`'s wants (cloud-init
+`25.2-1~bpo13+1+rpt20`, the build the Raspberry Pi archive would put on this
+image). That the **runtime** honours the marker is upstream's property,
+quoted from upstream's source and tested by nothing in this repository, on
+any tier. `-f` rather than `-e` is where that reading shows up in the check:
+a directory of that name, or a symlink pointing at nothing, is not a kill
+switch while satisfying every looser test.
 
 ### Run 32020772161: what stopping the first-boot loop uncovered
 

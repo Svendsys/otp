@@ -45,6 +45,81 @@ if [ ! -f "${ROOTFS_DIR}${STAGING}/assets/otp-manual-a5.pdf" ]; then
 	echo "         Run image/render-manual.sh before building." >&2
 fi
 
+# --- cloud-init, removed rather than left switched off --------------------
+#
+# WHAT THE BUILD KNOB DOES NOT DO. image/build.sh sets ENABLE_CLOUD_INIT=0,
+# and reading that line it looks as though the image has no cloud-init on it.
+# It has. pi-gen's stage2/04-cloud-init has two halves and the variable
+# guards one: 01-run.sh, which preseeds a NoCloud datasource, checks it;
+# 00-packages, which lists `cloud-init` and `rpi-cloud-init-mods`, is
+# collected and installed with no condition anywhere in that path. So every
+# image this project has built shipped a provisioning agent, its units and
+# its generator, and nobody went looking for a cloud-init problem because the
+# build config said cloud-init was off. Issue #34.
+#
+# WHY REMOVE IT RATHER THAN DISABLE IT. rpi-cloud-init-mods ships
+# /etc/cloud/cloud.cfg.d/99_raspberry-pi.cfg, which is
+#
+#     datasource_list: [ NoCloud, None ]
+#     datasource:
+#       NoCloud:
+#         seedfrom: file:///boot/firmware
+#
+# -- a provisioning agent that reads user-data off the one partition an
+# operator is told to write files on, on an air-gapped one-time-pad printer
+# whose threat model is somebody holding the card. It also cost 57 seconds of
+# every boot finding nothing there, and it is what pulled network-online.target
+# into the transaction that ended both boots of run 31968966879 without either
+# reaching multi-user.target.
+#
+# BEFORE install.sh, deliberately, and the ordering is the point rather than
+# tidiness. install.sh writes cloud-init's own kill switch,
+# /etc/cloud/cloud-init.disabled, and that file is the belt to this purge's
+# braces: it is what disables a cloud-init that some later dependency drags
+# back in, and it is what a hand-provisioned Pi gets, where no purge ever
+# ran. dpkg removes a package's conffiles on purge and then removes the
+# directories it owned once they are empty -- /etc/cloud is one of those --
+# so a purge ordered after the write would leave the marker standing only
+# because dpkg will not delete a directory holding a file it does not own.
+# Ordering it first does not depend on that.
+# harness/img-guest-check.sh reads the outcome back off the booted image
+# either way, as cloud-init-kill-switch-survives-the-purge.
+#
+# WHAT APT WOULD TAKE WITH IT, asked before it takes anything. `apt-get purge
+# -y` removes every package that depends on the named ones, without a
+# prompt, so a Raspberry Pi OS that had grown a dependency on either would
+# have the dependent silently deleted out of a key printer's image and the
+# first anyone heard of it would be a unit that no longer boots. Checked
+# against the archives on 2026-08-18: nothing in the Raspberry Pi archive's
+# trixie/main declares any relationship on rpi-cloud-init-mods, and in Debian
+# trixie/main only debian-cloud-images-packages -- which Raspberry Pi OS Lite
+# does not carry -- depends on cloud-init. That is a claim about two Packages
+# indexes, not about the rootfs in front of us, so the rootfs is asked
+# directly and the build stops rather than shipping the difference.
+CLOUD_PACKAGES="cloud-init rpi-cloud-init-mods"
+CLOUD_PACKAGES_RE="$(echo "$CLOUD_PACKAGES" | tr ' ' '|')"
+
+# The simulation reads the chroot's own dpkg state and needs no network,
+# which is the same reason install.sh runs below with --skip-apt. `Purg` and
+# `Remv` both count: apt prints the first for the packages it purges and the
+# second for anything it removes on the way, and it is the second that would
+# be the finding.
+on_chroot <<-EOF
+	set -e
+	unexpected=\$(apt-get -s purge -y ${CLOUD_PACKAGES} \
+	             | awk '\$1 == "Remv" || \$1 == "Purg" { print \$2 }' \
+	             | grep -vxE '${CLOUD_PACKAGES_RE}' || true)
+	if [ -n "\$unexpected" ]; then
+		echo "ERROR: purging cloud-init would also remove:" >&2
+		echo "\$unexpected" | sed 's/^/         /' >&2
+		echo "       Something in this image depends on it, which is the" >&2
+		echo "       one thing issue #34 said had to be confirmed before" >&2
+		echo "       the packages went. Refusing to build." >&2
+		exit 1
+	fi
+	apt-get purge -y ${CLOUD_PACKAGES}
+EOF
+
 # Packages are already installed from 00-packages, so skip apt in the
 # chroot: it has no network and does not need one.
 on_chroot <<-EOF

@@ -116,10 +116,23 @@ FIRST_USER_NAME='otp'
 FIRST_USER_PASS='${OTP_USER_PASS_HASH:-$(head -c 18 /dev/urandom | base64)}'
 DISABLE_FIRST_BOOT_USER_RENAME=1
 ENABLE_SSH=0
-# Does NOT remove the packages: stage2/04-cloud-init/00-packages installs
-# cloud-init unconditionally and this knob only skips the seed files, so
-# the image ships a cloud-init that runs. device/install.sh is what
-# actually switches it off. See issue #34.
+# Does NOT remove the packages, whatever the name says.
+# stage2/04-cloud-init has two halves and this knob guards one:
+# 01-run.sh, which preseeds a NoCloud datasource, checks it; the sibling
+# 00-packages, which lists cloud-init and rpi-cloud-init-mods, is collected
+# and installed with no condition anywhere in that path. So the line means
+# "do not preseed a datasource" and nothing more, and every image this
+# project built before issue #34 shipped a cloud-init that ran.
+# stage-otpunit/01-otpunit/00-run.sh is what removes them now -- an
+# apt-get purge there, guarded by a simulation that refuses to take a
+# reverse dependency with them (backticks are left out of this comment on
+# purpose: pi-gen's config is written from an unquoted heredoc, so a pair
+# of them here would be command substitution running on the build host)
+# -- and device/install.sh still writes
+# cloud-init's own kill switch afterwards, for a machine that gets the
+# package back and for the hand-provisioned Pis no purge ever ran on.
+# The knob stays because leaving the seed files off is still what is
+# wanted; it is simply not the thing that does the work.
 ENABLE_CLOUD_INIT=0
 LOCALE_DEFAULT='en_GB.UTF-8'
 KEYBOARD_KEYMAP='gb'
