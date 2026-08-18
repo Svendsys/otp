@@ -517,7 +517,8 @@ jobs:
           # credential.
           body: >
             This image passed the tier-3 boot gate: it was booted under
-            QEMU twice, `otp-unit.service` reached `Started` on both, the
+            QEMU three times, `otp-unit.service` reached `Started` on all
+            three, the
             root filesystem was a RAM overlay over a read-only card, a file
             written to `/` in the first boot was gone in the second, and a
             setting written to `/boot/firmware` was still there. A
@@ -611,7 +612,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The job log shows the last eighty console lines per boot; this
-      # carries everything -- both UARTs of both boots in full, the verdict,
+      # carries everything -- both UARTs of every boot in full, the verdict,
       # and the boot partition's own cmdline.txt and config.txt, so the
       # divergence between what the device would boot and what this harness
       # booted is part of the record. Two diagnoses this week were built on
@@ -619,6 +620,39 @@ jobs:
       #
       # The consoles moved into a directory per boot when tier 3 grew a
       # second one, so the glob has a level in it that the old path did not.
+      #
+      # AND THE CARD EVIDENCE, WHICH THIS GLOB DID NOT MATCH. The release
+      # phase's entire new claim is about the boot partition -- what the
+      # probe had left on it, what the harness deleted, what came back, and
+      # whether the three files whose contents are the point survived -- and
+      # every one of those is decided from a file in $WORK/<phase>/ that
+      # nothing here collected: boot-files-before-strip.txt,
+      # boot-files-before.txt, boot-files-after.txt, boot-digests-before.txt
+      # and boot-digests-after.txt. A `boot-partition-unchanged FAIL` printed
+      # ten differing entries and the listings they came out of could not be
+      # retrieved after the run. `*/boot-*.txt` takes all five for all three
+      # phases and cannot collide with the `boot/` directory below it, which
+      # is a directory and not a `boot-`-prefixed file.
+      #
+      # Truncating the digest in verdict.txt is still right and is NOT
+      # softened by this: verdict.txt travels too, so the twelve characters
+      # are the trade harness/img-boot.sh describes rather than a limit on
+      # what a reader can get at. The digest files carry sha256 of a password
+      # hash, never the hash.
+      #
+      # `if: failure()` -- this is the diagnosis path. A green run publishes
+      # no card evidence, which is deliberate and is why img-boot.sh prints
+      # the twelve characters into the verdict at all.
+      #
+      # EVERY FILE A PHASE LEAVES BEHIND, and that is now held as a rule
+      # rather than as a list somebody remembered to extend.
+      # tests/test_image_workflow.py reads the per-phase filenames out of
+      # img-boot.sh and requires each one to match a glob here, so the next
+      # evidence file the harness starts writing is red in the fast suite
+      # instead of missing from an artifact sixteen minutes into an arm64
+      # run. `qemu-rc` and `early-stop` are one line each and are what
+      # separate "the emulator was killed at the backstop" from "the harness
+      # stopped it on its marker".
       - name: Upload the boot evidence
         if: failure()
         uses: actions/upload-artifact@v4
@@ -626,6 +660,9 @@ jobs:
           name: tier3-boot-evidence
           path: |
             ${{ runner.temp }}/otp-img/*/console*.log
+            ${{ runner.temp }}/otp-img/*/boot-*.txt
+            ${{ runner.temp }}/otp-img/*/qemu-rc
+            ${{ runner.temp }}/otp-img/*/early-stop
             ${{ runner.temp }}/otp-img/verdict.txt
             ${{ runner.temp }}/otp-img/boot/cmdline.txt
             ${{ runner.temp }}/otp-img/boot/config.txt

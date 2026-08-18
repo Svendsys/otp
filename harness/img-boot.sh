@@ -353,7 +353,12 @@ PHASES="${OTP_IMG_PHASES:-boot1 boot2 release}"
 # delete and no control saying so -- which the guard above already prevents,
 # and which is a second reason the three move together.
 PHASES_MISSING=""
+PHASES_EXPECTED=""
 for want in boot1 boot2 release; do
+    # The same loop builds the order the check below compares against, so
+    # the demanded set and the demanded order are one list and cannot drift
+    # apart the way two copies of it would.
+    PHASES_EXPECTED="${PHASES_EXPECTED:+$PHASES_EXPECTED }$want"
     case " $PHASES " in
         *" $want "*) ;;
         *) PHASES_MISSING="$PHASES_MISSING $want" ;;
@@ -378,6 +383,56 @@ if [ -n "$PHASES_MISSING" ]; then
     echo "       phases report, this one asserts a silence. Drop it and the" >&2
     echo "       run still prints a green verdict for an image nobody" >&2
     echo "       checked the probe was quiet on." >&2
+    exit 1
+fi
+
+# AND IN THIS ORDER, WHICH MEMBERSHIP DOES NOT SAY. The guard above accepts
+# OTP_IMG_PHASES="boot1 release boot2" and every other permutation of the
+# three, and this loop is what stopped it.
+#
+# NO MIS-ORDERING TRACED SO FAR PRODUCES A GREEN RUN -- they all end red, and
+# that was checked before writing this rather than assumed. `release boot2`
+# strips the probe's two records off the card before boot2 is the boot that
+# reads them, so boot2 fails machine-id-matches-the-previous-boot and the
+# credential comparison; `boot2 boot1` hands a seeded card to the unseeded
+# checks. So this is not a false-green hole and is not claimed as one.
+#
+# It is here for the other reason, and it is the reason the missing-boot1
+# paragraph above gives for its own existence: those failures land in the
+# WRONG PHASE, with messages about the image, for a fault in the phase list.
+# A debugging switch whose one-boot setting produces a confusing red is a
+# switch people learn to distrust the harness over, and a switch whose
+# re-ordered setting does the same is no different. One string comparison
+# turns a forty-minute arm64 run ending in "boot2's machine-id did not match"
+# into a line printed before the first boot starts.
+#
+# RELATIVE ORDER, NOT EQUALITY, so this stays a check on the three boots
+# that mean something rather than a second membership rule. $PHASES is
+# filtered down to the demanded names in the order they appear and compared
+# against the order they are demanded in: an extra phase nobody here has
+# heard of passes straight through, exactly as it did before this loop
+# existed (test_a_phase_list_that_keeps_every_boot_is_accepted is the
+# positive control that says so), and a repeat of a demanded one does not,
+# because booting the seeded card twice as boot1 is the same confusing red
+# in a different costume.
+PHASES_SEEN=""
+for got in $PHASES; do
+    case " $PHASES_EXPECTED " in
+        *" $got "*) PHASES_SEEN="${PHASES_SEEN:+$PHASES_SEEN }$got" ;;
+    esac
+done
+if [ "$PHASES_SEEN" != "$PHASES_EXPECTED" ]; then
+    echo "ERROR: OTP_IMG_PHASES='$PHASES' runs '$PHASES_SEEN'," >&2
+    echo "       not '$PHASES_EXPECTED'." >&2
+    echo "       The three boots are the same card in sequence, so the" >&2
+    echo "       order is part of what each one means:" >&2
+    echo "       boot1 seeds and writes, boot2 is the power-cycle that" >&2
+    echo "       reads what boot1 left, and release is booted last because" >&2
+    echo "       it DELETES the probe's two records from the card first." >&2
+    echo "       Run release before boot2 and boot2 fails the machine-id" >&2
+    echo "       and credential checks those records exist for -- red, but" >&2
+    echo "       red in the wrong phase, with a message pointing at the" >&2
+    echo "       image for a fault in this variable." >&2
     exit 1
 fi
 
@@ -728,22 +783,65 @@ PROBE_DROPPINGS="otp-imgcheck-machine-id otp-imgcheck-credential"
 FAT_CONTENTS="otp-unit.conf otp-identity/machine-id otp-identity/credential"
 
 # A digest, never the bytes. ::/otp-identity/credential is a sha512-crypt hash
-# and this console and this work directory both travel as CI artifacts, so the
-# comparison is over sha256 and the report prints twelve characters of it --
-# the same trade harness/img-guest-check.sh makes for the same file, for the
-# same reason: equal exactly when the contents are equal, and no use to anyone
-# who reads it.
+# and both this console and the per-phase listings and digests below travel as
+# CI artifacts (.github/workflows/image.yml uploads $WORK/*/console*.log,
+# $WORK/*/boot-*.txt and $WORK/verdict.txt on a failed run), so the comparison
+# is over sha256 and the report prints twelve characters of it -- the same
+# trade harness/img-guest-check.sh makes for the same file, for the same
+# reason: equal exactly when the contents are equal, and no use to anyone who
+# reads it.
 #
 # THE WORD `absent` RATHER THAN THE DIGEST OF NOTHING, because the empty
 # string hashes to a perfectly good 64-character value and two of those
 # compare equal -- which is precisely how "the credential survived this boot"
 # would come to mean "there has never been a credential". The gate below
-# requires 64 hex characters on both sides as well as a match.
+# requires 64 hex characters on both sides as well as a match, so `absent` and
+# `empty` are both red there.
 fat_digest_of() {
-    local body
-    body=$(mtype -n -i "$IMG@@$BOOT_OFFSET" "::$1" 2>/dev/null || true)
-    if [ -z "$body" ]; then printf 'absent'; return 0; fi
-    printf '%s' "$body" | sha256sum 2>/dev/null | cut -d' ' -f1
+    # THE BYTES AS THEY SIT ON THE CARD, THROUGH A FILE AND NOT A VARIABLE.
+    # `body=$(mtype ...)` was wrong twice and both were MEASURED here, on a
+    # FAT image built with mformat/mcopy rather than reasoned about:
+    #
+    #   content 'pages=137\n'      -> e01a56608c694a3e...
+    #   content 'pages=137\n\n\n'  -> e01a56608c694a3e...   same digest
+    #   sha256 of the real bytes   -> 30efb6d3bb0b349f...
+    #   a present zero-length file -> absent
+    #
+    # Command substitution strips EVERY trailing newline, so two files that
+    # differ produced one digest -- under a release note that says these
+    # three came through the boot "unchanged byte for byte" -- and a file
+    # truncated to nothing was indistinguishable from one that had been
+    # deleted, which puts the "there has never been a credential" misreading
+    # the sentinel above exists to prevent straight back into the detail
+    # line. A redirection into a file has neither problem: mtype writes what
+    # is in the cluster chain and sha256sum reads it back.
+    #
+    # THREE OUTCOMES, NOT TWO, and mtype's exit status is what separates the
+    # last two. Measured: a file that is not there gives rc 1 and prints
+    # `mtype: File "::x" not found` on stderr; a file that is there and empty
+    # gives rc 0 and zero bytes. Neither is 64 characters, so the gate stays
+    # red for both -- what changes is that the failure says which happened,
+    # and `empty` never reads as `absent`.
+    local body digest
+    body="$WORK/.fat-digest-body"
+    if ! mtype -n -i "$IMG@@$BOOT_OFFSET" "::$1" > "$body" 2>/dev/null; then
+        rm -f "$body"
+        printf 'absent'
+        return 0
+    fi
+    if [ ! -s "$body" ]; then
+        rm -f "$body"
+        printf 'empty'
+        return 0
+    fi
+    # Redirected in rather than named, so sha256sum prints `<digest>  -` and
+    # the cut takes the digest without a path to strip. `|| true` for the
+    # reason every other tool call in this file carries one: a missing
+    # sha256sum must leave an unusable value the gate goes red on, not kill
+    # the run before any verdict is written.
+    digest=$(sha256sum < "$body" 2>/dev/null | cut -d' ' -f1 || true)
+    rm -f "$body"
+    printf '%s' "$digest"
 }
 
 # Taken beside fat_listing, at both of the two moments it is taken. mtype and
@@ -837,9 +935,21 @@ boot_phase() {
     # phase guard would stop it. A release phase booted like that tests
     # nothing: it would be watching the probe's second lock, not the first.
     #
-    # An empty variable expanding to nothing is the way to leave a word off a
-    # command line that is built by word splitting. It is unquoted for exactly
-    # that reason, which is also why $OVERLAY_TOKENS above is unquoted.
+    # AN EMPTY VARIABLE IS HOW THE WORD IS LEFT OFF, AND NOT BY WORD
+    # SPLITTING. An earlier version of this paragraph said the expansion was
+    # unquoted so that an empty value would split away, and said the same of
+    # $OVERLAY_TOKENS. Neither is unquoted: the whole -append value below is
+    # ONE double-quoted argument, both variables expand inside it, and no
+    # word splitting happens to either. What actually happens is that an
+    # empty expansion leaves a run of spaces in the middle of the string and
+    # the KERNEL's own tokenizer skips it -- the command line is split by the
+    # kernel, not by this shell. The behaviour and the measurement are
+    # unchanged (12 words with the token, 11 without; see
+    # test_the_release_phase_is_handed_no_token_and_the_others_are, which
+    # counts them off the shipped line); only the explanation was wrong.
+    #
+    # Quoted is also the only correct form here. Unquoting the -append value
+    # would hand qemu one argument per word instead of one command line.
     local imgcheck_token=""
     case "$phase" in
         release) ;;
@@ -1529,12 +1639,20 @@ per_boot_verdict() {
             # this one is keyed on systemd having named the unit while saying
             # it skipped something.
             #
-            # AND IT IS THE POSITIVE CONTROL FOR journal-forwarding-alive'S
-            # SUBJECT MATTER TOO. job.c sets do_console = false for precisely
-            # this case -- a condition skip is deliberately NOT printed as a
-            # `[ INFO ]` status line -- so the only way this sentence reaches
-            # a serial port is the journal. Its presence is a second, narrower
-            # statement that forwarding works on this boot.
+            # IT IS NOT A SECOND PROOF THAT FORWARDING WORKS, and an earlier
+            # revision of this paragraph said it was. job.c does set
+            # do_console = false for precisely this case -- a condition skip
+            # is deliberately NOT printed as a `[ INFO ]` status line -- but
+            # "not a status line" is not "the journal or nothing". This is a
+            # `systemd[1]:` line, and the note on journal-forwarding-alive
+            # below gives PID 1's second route as the reason that clause
+            # subtracts PID 1 from its count: PID 1 falls back to /dev/kmsg
+            # when journald is not up, and at the loglevel=7 this harness
+            # boots with, kmsg reaches the console. So a console carrying
+            # this line has been told the unit was skipped; it has not
+            # thereby been told how the sentence got there.
+            # journal-forwarding-alive is what says that, out of a
+            # non-PID-1 speaker, and it is not relieved of the job by this.
             #
             # The line itself is quoted into an IMG-NOTE below so the exact
             # wording enters the evidence. The first run that prints it makes
@@ -1592,8 +1710,27 @@ per_boot_verdict() {
                         printf 'IMG-CHECK %s imgcheck-unit-considered-and-skipped PASS\n' "$phase"
                         ;;
                 esac
+                # 400, NOT 200, AND THE OLD NUMBER HAD SIX CHARACTERS LEFT.
+                # This note is no longer only decoration: the case above
+                # gates on the condition parameter when the line carries one,
+                # so a clip that cuts the parameter off cuts the strongest
+                # evidence this phase can produce out of the record while the
+                # gate that read it goes on passing. Measured, with the
+                # shipped Description= and the two condition wordings:
+                #
+                #   main's  "skipped, unmet condition check X=Y"     174 chars
+                #   v257's  "was skipped because ... (X=Y)."         194 chars
+                #
+                # -- so `cut -c1-200` cleared the wording this image prints by
+                # twenty-six characters and the wording it may print again by
+                # six. Seven more characters of Description= and the note
+                # would have started clipping the parameter silently.
+                # tests/test_img_verdict.py re-derives both lengths from
+                # device/systemd/otp-unit-imgcheck.service on every run and
+                # goes red while there is still room, so the next reader gets
+                # a failing test rather than a truncated note.
                 printf 'IMG-NOTE %s imgcheck-skip-line: %s\n' \
-                       "$phase" "$(printf '%s' "$SKIPLINE" | cut -c1-200)"
+                       "$phase" "$(printf '%s' "$SKIPLINE" | cut -c1-400)"
             else
                 printf 'IMG-CHECK %s imgcheck-unit-considered-and-skipped FAIL systemd never named otp-unit-imgcheck.service as skipped: either the unit is not in this image, or it was not enabled, or it RAN\n' \
                        "$phase"
@@ -1622,12 +1759,17 @@ per_boot_verdict() {
                        "$phase" "$(printf '%s' "$MENTIONS" | grep -c . || true)"
                 printf 'IMG-NOTE %s skip-lines-seen: %s line(s)\n' \
                        "$phase" "$(printf '%s' "$SKIPS" | grep -c . || true)"
-                printf '%s\n' "$MENTIONS" | sed -n '1,5p' | cut -c1-200 \
+                # 400 for the same reason the note above carries it: these
+                # quote lines of exactly the same shape, and this block is
+                # the one a reader falls back on when the gate above found
+                # nothing -- clipping the part that would have explained why
+                # is the worst place to save eighty columns.
+                printf '%s\n' "$MENTIONS" | sed -n '1,5p' | cut -c1-400 \
                     | while IFS= read -r line; do
                           [ -n "$line" ] || continue
                           printf 'IMG-NOTE %s imgcheck-unit-line: %s\n' "$phase" "$line"
                       done
-                printf '%s\n' "$SKIPS" | sed -n '1,5p' | cut -c1-200 \
+                printf '%s\n' "$SKIPS" | sed -n '1,5p' | cut -c1-400 \
                     | while IFS= read -r line; do
                           [ -n "$line" ] || continue
                           printf 'IMG-NOTE %s skip-line-seen: %s\n' "$phase" "$line"
@@ -2047,11 +2189,15 @@ release_gate() {
     # otp-identity/credential is the only login this unit has. A boot that
     # rewrote any of them keeps the name and the listing above sees nothing.
     #
-    # `absent` on either side fails, and that is the control: two files that
-    # are not there have identical digests, which is how "the credential
-    # survived" would come to mean "there has never been a credential". The
-    # digests are printed twelve characters wide -- these are sha256 of a
-    # password hash and of a machine-id, and this directory is a CI artifact.
+    # `absent` on either side fails, and so does `empty`, and that is the
+    # control: two files that are not there have identical digests, and so do
+    # two files truncated to nothing, which is how "the credential survived"
+    # would come to mean "there has never been a credential". Neither word is
+    # 64 characters, so the length test below is what rejects them, and
+    # fat_digest_of keeps them as two different words so the detail line says
+    # which of the two happened. The digests are printed twelve characters
+    # wide -- these are sha256 of a password hash and of a machine-id, and
+    # this directory is a CI artifact.
     #
     # DRIVEN BY $FAT_CONTENTS AND NOT BY THE DIGEST FILE, for two reasons and
     # the second was a bug in this loop's first draft. Reading the file with

@@ -659,9 +659,18 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
-find = '''PHASES_MISSING=""
+# RE-DERIVED once. The anchor used to be `PHASES_MISSING=""` on the line
+# above the loop; the order check added `PHASES_EXPECTED=""` between them and
+# this find stopped matching. test_every_row_in_the_shipped_table_still_applies
+# caught it and its instruction is followed here: the break is re-derived
+# against the file as it now stands rather than edited until it matches. The
+# anchor moved to the line that is now directly above the loop, and the break
+# is the same one -- the demanded list loses boot1. It loses it for the order
+# check too, because one loop now drives both, which is what "boot1 is not
+# required" has to mean when there is only one list of demanded phases.
+find = '''PHASES_EXPECTED=""
 for want in boot1 boot2 release; do'''
-replace = '''PHASES_MISSING=""
+replace = '''PHASES_EXPECTED=""
 for want in boot2 release; do'''
 
 
@@ -5109,13 +5118,21 @@ in that directory, so without the second `mdir` naming it the host-side check
 can never pass on ANY card -- red on a healthy image, which is the failure CI
 would blame on the image rather than on the harness.
 
-WHAT CATCHES IT IS A TEXT ASSERTION, and that is worth stating rather than
-leaving to be discovered: no test in the fast tier runs `fat_listing`,
-because the verdict tests inject their listings directly and mtools is not
-installed in the `test` job. The named test reads the command out of the
-shipped harness. It would not catch an mdir that ran and returned nothing."""
+WHAT CATCHES IT WAS ONLY A TEXT ASSERTION, and that disclosure is no longer
+the whole story. It used to read: "no test in the fast tier runs
+`fat_listing`, because the verdict tests inject their listings directly and
+mtools is not installed in the `test` job. The named test reads the command
+out of the shipped harness. It would not catch an mdir that ran and returned
+nothing." The first half of that is now false. The second test named below
+builds a FAT partition with mformat/mcopy, puts a store on it, RUNS
+fat_listing against it and requires both files in the store to appear -- so an
+mdir that ran and returned nothing is caught as well, which is exactly what
+the old guard said it could not do. .github/workflows/ci.yml installs mtools
+in both the `test` and the `mutation` job for that reason; without it the
+behavioural test skips and this row fails loudly rather than passing."""
 tests = [
   "tests/test_img_verdict.py::test_the_host_reads_the_store_a_level_below_the_root",
+  "tests/test_img_verdict.py::test_the_listing_the_harness_takes_reaches_into_the_store",
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
@@ -5223,9 +5240,13 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
-find = '''PHASES_MISSING=""
+# RE-DERIVED once, for the reason tier3-boot1-not-required above was: the
+# order check put `PHASES_EXPECTED=""` between the old anchor and the loop.
+# Same break, re-derived against the file as it stands -- the demanded list
+# loses the release phase, in both of the two places one loop now feeds.
+find = '''PHASES_EXPECTED=""
 for want in boot1 boot2 release; do'''
-replace = '''PHASES_MISSING=""
+replace = '''PHASES_EXPECTED=""
 for want in boot1 boot2; do'''
 
 
@@ -5573,7 +5594,13 @@ guard = """
 The listing cannot see this one: a file rewritten in place keeps its name. The
 credential is the only login this unit has and the machine-id is what keeps a
 power-cycled appliance the same machine, so both are compared by content --
-as digests, because this work directory is uploaded as a CI artifact."""
+as digests, because this work directory is uploaded as a CI artifact.
+
+THIS ROW SURVIVED ITS FIRST RUN, and so did the one below it; both were
+mis-paired and the pairing is what the survivors corrected. This one removed
+the LENGTH clause while naming the rewrite test, and the rewrite test trips
+the EQUALITY half, so nothing went red. It now removes the equality half and
+names the test that half is the only thing standing between."""
 tests = [
   "tests/test_img_verdict.py::test_a_release_boot_that_rewrote_a_kept_file_fails",
 ]
@@ -5734,3 +5761,342 @@ find = '''CLAIM_MISSING=""
 for want in boot1 boot2 release; do'''
 replace = '''CLAIM_MISSING=""
 for want in boot1 boot2; do'''
+
+
+# --- the card functions, which nothing could reach until now ---------------
+#
+# THE HOLE THESE CLOSE. fat_listing, fat_digest_of, fat_digests and
+# strip_probe_droppings all sit ABOVE the marker tests/test_img_verdict.py
+# slices the verdict block from, and the verdict tests write
+# boot-digests-{before,after}.txt directly. `grep -rn
+# "fat_digest_of\|fat_digests\|mtype" tests/*.py` returned nothing, and no
+# row's `find` touched them. Demonstrated rather than argued: rewriting
+# fat_digest_of so that every file digested to the same sixty-four hex
+# characters left the fast suite at 1050 passed, unchanged -- and would have
+# reported `identity-store-unchanged PASS` at runtime forever too, since both
+# sides are then always 64 characters and always equal. That clause is the one
+# .github/workflows/image.yml names as backing the only login this appliance
+# has.
+#
+# The repository's precedent for an unreachable function is a text assertion
+# with the limitation stated in the guard -- tier3-host-lists-only-the-fat-root
+# above. These rows do better. The tests they name build a real FAT partition
+# with mformat/mcopy at a real offset and run the SHIPPED functions against
+# it, comparing the digests with sha256 taken in Python over the exact bytes.
+# The cost is that they need mtools: .github/workflows/ci.yml installs it in
+# the `mutation` job for that reason, and a machine without it fails these
+# rows loudly ("a skipped test cannot go red") rather than passing them.
+
+[[mutation]]
+name = "tier3-card-digest-is-not-of-the-file"
+tier = "fast"
+guard = """
+THE ROW THE REVIEW ASKED FOR, and the exact mutation that was demonstrated to
+survive: make every file digest to the same sixty-four hex characters. Before
+the tests named below existed, this left the fast suite at 1050 passed and
+unchanged, because nothing in the suite ever called this function -- and it
+would have gone on reporting `identity-store-unchanged PASS` on a real card
+forever, since both sides are then 64 characters and always equal.
+
+The clause that rests on it is the one the release note names as backing the
+operator's only login. The test builds a FAT partition with mformat/mcopy and
+compares the harness's answer against sha256 of the bytes it wrote, so a
+digest of anything other than the file's contents is red."""
+tests = [
+  "tests/test_img_verdict.py::test_the_digest_is_the_bytes_on_the_card",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    digest=$(sha256sum < "$body" 2>/dev/null | cut -d' ' -f1 || true)'''
+replace = '''    digest=$(printf 'otp' | sha256sum 2>/dev/null | cut -d' ' -f1 || true)'''
+
+
+[[mutation]]
+name = "tier3-card-digest-drops-trailing-bytes"
+tier = "fast"
+guard = """
+The defect this function actually shipped with, restored. `body=$(mtype ...)`
+strips every trailing newline before hashing, so
+
+  content 'pages=137\\n'      -> e01a56608c694a3e...
+  content 'pages=137\\n\\n\\n'  -> e01a56608c694a3e...
+  sha256 of the real bytes   -> 30efb6d3bb0b349f...
+
+-- two different files with one digest, under a release note that tells the
+reader these three came through the boot "unchanged byte for byte". The
+mutation reintroduces exactly that shape with `$(cat "$body")`. A boot that
+appended to the operator's settings would read as having changed nothing."""
+tests = [
+  "tests/test_img_verdict.py::test_two_files_that_differ_only_in_trailing_newlines_differ",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    digest=$(sha256sum < "$body" 2>/dev/null | cut -d' ' -f1 || true)'''
+replace = '''    digest=$(printf '%s' "$(cat "$body")" | sha256sum 2>/dev/null | cut -d' ' -f1 || true)'''
+
+
+[[mutation]]
+name = "tier3-card-empty-file-reads-as-deleted"
+tier = "fast"
+guard = """
+The word `absent` exists so that "the credential survived this boot" cannot
+come to mean "there has never been a credential" -- two hashes of the empty
+string compare equal. A present, zero-length file reporting `absent` puts that
+same misreading straight back, one level down, in the detail line a human
+reads: deleted and truncated-to-nothing become the same sentence.
+
+Both stay red either way, because neither word is 64 characters, so this is
+not a false green. It is the failure telling the truth about which of the two
+happened, in the clause whose whole subject is telling absences apart."""
+tests = [
+  "tests/test_img_verdict.py::test_a_file_that_is_there_and_empty_is_not_reported_absent",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ ! -s "$body" ]; then
+        rm -f "$body"
+        printf 'empty'
+        return 0
+    fi'''
+replace = '''    if [ ! -s "$body" ]; then
+        rm -f "$body"
+        printf 'absent'
+        return 0
+    fi'''
+
+
+[[mutation]]
+name = "tier3-card-strip-deletes-nothing"
+tier = "fast"
+guard = """
+`mdel` made into a no-op. This is the other function the review found
+unreachable: a strip that deleted nothing also left the fast suite at 1050
+passed. It is not silent at runtime -- probe-droppings-stayed-off-the-card
+catches it -- but that is sixteen minutes of arm64 away, and the row above it
+in this file (tier3-release-droppings-only-checked-after) exists precisely
+because "an mdel that silently did nothing" is a case that has to be told
+apart from a healthy card.
+
+Caught here on a real FAT partition rather than through a synthetic listing,
+so it is the deletion itself that is under test and not a fixture's
+description of one."""
+tests = [
+  "tests/test_img_verdict.py::test_the_strip_takes_the_probes_records_off_a_real_card",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        mdel -i "$IMG@@$BOOT_OFFSET" "::$name" 2>/dev/null || true'''
+replace = '''        : "$name"'''
+
+
+[[mutation]]
+name = "tier3-card-strip-takes-no-control-listing"
+tier = "fast"
+guard = """
+The control listing, taken inside the strip and before the first mdel, is the
+only evidence the probe's records were ever on the card. Without it
+probe-droppings-were-on-the-card reads an absence the phase was handed rather
+than one it created -- and the file it reads is one the verdict tests write by
+hand, so nothing in the suite established that the strip produces it at all
+until this row's test drove the real function."""
+tests = [
+  "tests/test_img_verdict.py::test_the_strip_takes_the_probes_records_off_a_real_card",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    fat_listing "$dir/boot-files-before-strip.txt"'''
+replace = '''    : "$dir"'''
+
+
+[[mutation]]
+name = "tier3-card-digests-skip-a-name-the-clause-reads"
+tier = "fast"
+guard = """
+identity-store-unchanged iterates $FAT_CONTENTS and looks each name up in the
+digest file. A fat_digests that writes fewer lines than the list makes every
+name it skipped read as an empty digest: red, which is the safe direction, but
+red with nothing anywhere saying the file was short rather than the card
+wrong. The mutation stops after the first name."""
+tests = [
+  "tests/test_img_verdict.py::test_the_digest_file_answers_for_every_name_the_clause_reads",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        printf '%s %s\n' "$name" "$(fat_digest_of "$name")" >> "$out"'''
+replace = '''        printf '%s %s\n' "$name" "$(fat_digest_of "$name")" >> "$out"; break'''
+
+
+# --- the order of the three boots ------------------------------------------
+
+[[mutation]]
+name = "tier3-phase-list-order-not-checked"
+tier = "fast"
+guard = """
+The guard checked MEMBERSHIP and not order, so OTP_IMG_PHASES="boot1 release
+boot2" was accepted and stripped the probe's two records off the card before
+boot2 -- the boot that reads them.
+
+NO MIS-ORDERING TRACED PRODUCES A GREEN RUN. They all end red, so this is not
+a false-green hole and is not claimed as one. What it closes is forty minutes
+of arm64 spent arriving at a red in the WRONG PHASE, with a message about the
+image, for a fault in an environment variable -- which is the standard the
+paragraph above this guard in img-boot.sh sets for itself: a debugging switch
+whose settings produce confusing reds is a switch people learn to distrust the
+harness over."""
+tests = [
+  "tests/test_img_verdict.py::test_a_phase_list_in_the_wrong_order_is_refused",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''if [ "$PHASES_SEEN" != "$PHASES_EXPECTED" ]; then'''
+replace = '''if false; then'''
+
+
+[[mutation]]
+name = "tier3-order-check-compares-against-its-own-list"
+tier = "fast"
+guard = """
+The order the guard demands is built inside the loop that says which phases it
+demands, so the set and the sequence are one list. Written out separately they
+are two, and two copies of a list in one file is the defect shell_list() and
+required_checks() exist to prevent -- here it would mean a phase added to the
+demanded set and not to the demanded order, which makes the order check refuse
+the very list the membership check just approved."""
+tests = [
+  "tests/test_img_verdict.py::test_the_order_the_guard_demands_is_the_order_it_checks_for",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    PHASES_EXPECTED="${PHASES_EXPECTED:+$PHASES_EXPECTED }$want"'''
+replace = '''    PHASES_EXPECTED="boot1 boot2"'''
+
+
+# --- what the release note says, and what a failed run can be read from ----
+
+[[mutation]]
+name = "tier3-release-note-boot-count-goes-stale"
+tier = "fast"
+guard = """
+The count in the note attached to a tagged release is the one place this
+project's claims reach somebody who cannot check them, and it went stale the
+moment the gate grew a third boot: the paragraph said "booted under QEMU
+twice" and, four sentences later, "a third boot of the same card". The test in
+this file asserted the literal word "twice", so it was not backing the note --
+it was holding the wrong half of a self-contradicting paragraph in place.
+
+The mutation puts the stale word back. The test derives the word from the
+phases img-boot.sh refuses to run without and refuses any OTHER count word in
+the body as well, because a note that says both would satisfy a check that
+only looked for the right one."""
+tests = [
+  "tests/test_image_workflow.py::test_the_release_notes_boot_count_is_the_one_the_harness_demands",
+]
+[[mutation.edit]]
+file = ".github/workflows/image.yml"
+find = '''            QEMU three times, `otp-unit.service` reached `Started` on all
+            three, the'''
+replace = '''            QEMU twice, `otp-unit.service` reached `Started` on both, the'''
+
+
+[[mutation]]
+name = "tier3-card-evidence-is-not-uploaded"
+tier = "fast"
+guard = """
+$WORK is ${runner.temp}/otp-img, so `*/console*.log`, `verdict.txt`,
+`boot/cmdline.txt` and `boot/config.txt` matched every file the evidence
+artifact carried and none of the five the release phase's card clauses are
+decided from: boot-files-before-strip.txt, boot-files-before.txt,
+boot-files-after.txt, boot-digests-before.txt, boot-digests-after.txt. For the
+phase whose entire new claim is about the card, the card evidence could not be
+retrieved after a run -- and img-boot.sh gave that upload as the REASON for
+truncating the digest it prints.
+
+Held as a rule rather than as a list: the test reads the per-phase filenames
+out of img-boot.sh, so a new one has to be collected or it goes red."""
+tests = [
+  "tests/test_image_workflow.py::test_every_file_a_phase_leaves_behind_travels_as_evidence",
+]
+[[mutation.edit]]
+file = ".github/workflows/image.yml"
+find = '''            ${{ runner.temp }}/otp-img/*/console*.log
+            ${{ runner.temp }}/otp-img/*/boot-*.txt'''
+replace = '''            ${{ runner.temp }}/otp-img/*/console*.log'''
+
+
+# --- the quoted skip line, which is now load-bearing -----------------------
+
+[[mutation]]
+name = "tier3-skip-note-clips-the-condition"
+tier = "fast"
+guard = """
+The IMG-NOTE that quotes the skip line stopped being decoration when the
+clause grew a requirement that the named condition be ours: the parameter it
+gates on reaches the record through this note and nowhere else. `cut -c1-200`
+cleared the wording this image prints by twenty-six characters and v257's
+wording by SIX -- seven more characters of Description= in
+device/systemd/otp-unit-imgcheck.service and the note would have started
+dropping the parameter silently while the gate that reads it stayed green.
+
+The mutation narrows the clip until the parameter falls off. The test rebuilds
+both wordings from the shipped unit file, so it measures the line the image
+can really print rather than one written down here."""
+tests = [
+  "tests/test_img_verdict.py::test_the_quoted_skip_line_cannot_clip_the_condition_it_now_gates_on",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''                       "$phase" "$(printf '%s' "$SKIPLINE" | cut -c1-400)"'''
+replace = '''                       "$phase" "$(printf '%s' "$SKIPLINE" | cut -c1-150)"'''
+
+
+[[mutation]]
+name = "tier3-probe-unit-description-grows-into-the-clip"
+tier = "fast"
+guard = """
+THE OTHER END OF THE SAME PROPERTY, and the one the fixture used to hide. The
+skip line's length is the description's length plus systemd's prose, so
+lengthening Description= is what walks it towards the clip -- and
+tests/test_img_verdict.py carried its own copy of that string, so the unit
+could grow without a single test here measuring the longer line.
+
+The mutation lengthens the description by 117 characters, which leaves the
+condition parameter still inside the 400-character clip and the headroom below
+the margin the test demands. That is deliberate: the test has to go red WHILE
+THERE IS STILL ROOM, or its first failure is a note that has already lost the
+parameter."""
+tests = [
+  "tests/test_img_verdict.py::test_the_quoted_skip_line_cannot_clip_the_condition_it_now_gates_on",
+]
+[[mutation.edit]]
+file = "device/systemd/otp-unit-imgcheck.service"
+find = '''Description=Report the overlay root to the tier-3 image boot'''
+replace = '''Description=Report the overlay root, the identity store, the credential and the saved settings on the boot partition to the tier-3 image boot gate, in as many words as it takes'''
+
+
+# --- where the probe writes its two records --------------------------------
+
+[[mutation]]
+name = "tier3-probe-records-written-outside-boot1"
+tier = "fast"
+guard = """
+The release phase deletes the probe's two records before it boots and requires
+them to have been there to delete. Only boot1 puts them there, and the test
+that was supposed to say so asserted `"$BOOTDIR/<name>" in probe` -- which the
+assertion on the line above it had already established for every name in the
+set. A comment reading "and they are written in boot1" over a check that could
+not tell boot1 from boot2 from a phase that never writes them at all.
+
+The mutation opens the guard so the write happens on EVERY boot, including the
+release boot, which would put the record back on the card after the strip and
+turn probe-droppings-stayed-off-the-card red for a reason that has nothing to
+do with the condition under test. The test now reads which top-level
+`if [ "$PHASE" = ... ]` block the write sits in."""
+tests = [
+  "tests/test_img_verdict.py::test_the_records_the_release_phase_deletes_are_the_ones_the_probe_writes",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''if [ "$PHASE" = "boot1" ]; then
+    # THE POSITIVE CONTROL, and it is the reason boot2's check can mean'''
+replace = '''if [ "$PHASE" != "nosuchphase" ]; then
+    # THE POSITIVE CONTROL, and it is the reason boot2's check can mean'''
