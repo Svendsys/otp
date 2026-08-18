@@ -127,7 +127,8 @@
 # module, an fstab referring to a partition that moved, an initramfs that
 # does not build -- all invisible until something tries.
 #
-# THE READ-ONLY OVERLAY, and why this now boots the image TWICE. Issue #9:
+# THE READ-ONLY OVERLAY, and why this boots the image TWICE (a third boot,
+# for a different question entirely, is described after these two). Issue #9:
 # nothing anywhere had ever booted a machine with the overlay engaged. The
 # image did not enable it, install.sh printed advice, and the two mechanisms
 # tried in the tier-2 Debian guest both failed -- one of them by panicking
@@ -144,6 +145,57 @@
 # The two boots share one image file on purpose: writes that reach the card
 # in boot1 are there in boot2, and writes that only reached the overlay's
 # tmpfs are not. That difference is the entire claim.
+#
+# AND THEN A THIRD BOOT, WHICH IS THE ONE A FLASHED UNIT ACTUALLY HAS.
+#
+#   release  the SAME card again, with NO otp.imgcheck token on the kernel
+#            command line. The probe ships in the image; nothing wakes it.
+#
+# The probe is a test instrument that lives at /opt/otp-unit/img-guest-check.sh
+# on every appliance this project produces, started by
+# otp-unit-imgcheck.service, whose ConditionKernelCommandLine=otp.imgcheck is
+# the only thing standing between an operator's settings and a script that
+# writes a sentinel to /, a marker page count into /boot/firmware/otp-unit.conf
+# and two records of its own beside it. The owner's decision was to KEEP it on
+# production units rather than strip it from release images -- an image with
+# the probe removed is not the image this tier boots -- and to back that
+# decision with a boot rather than with a grep. Until this phase existed the
+# whole claim rested on tests/test_the_guest_probe_cannot_run_on_a_flashed_unit,
+# which reads one string out of the unit file and one out of this file. That is
+# a spelling check. It cannot see a drop-in, a preset, a systemd release that
+# reads the condition differently, or an install.sh that starts the unit some
+# other way, and it says nothing at all about what the machine DOES.
+#
+# WHAT MAKES THIS PHASE HARD IS THAT "NOTHING HAPPENED" IS THE EASIEST THING IN
+# THE WORLD TO PASS BY ACCIDENT. A boot that never ran, an image with the unit
+# deleted, a console nothing was written to and a grep for a string systemd no
+# longer prints all produce the same silence a healthy release boot produces.
+# So every absence this phase asserts sits beside a presence taken with the
+# same fixture, and the phase gates on all of:
+#
+#   - the boot FINISHED: multi-user.target by name, plus everything
+#     per_boot_verdict() already demands of a phase;
+#   - the unit is IN the image and systemd EVALUATED it: systemd's own
+#     condition-skip line, naming otp-unit-imgcheck.service, on this console.
+#     Without this clause, DELETING the unit from the image would make the
+#     phase greener, which is the exact inversion it must not have;
+#   - the probe said nothing: no OTP-GUEST- line, no journal marker under its
+#     `otp-imgcheck` tag, no mention of the CUPS queue it creates -- each
+#     against the same grep run over boot1's console, where it matches;
+#   - the probe wrote nothing to the card: its two records are DELETED from
+#     the FAT partition before this boot and must not come back, and the rest
+#     of the partition -- the identity store, the credential, the machine-id
+#     and the saved settings -- comes out of the boot with the same names and
+#     the same contents it went in with.
+#
+# The deletion is what makes the file half falsifiable. Both records are on the
+# card by the end of boot2, so "no new file appeared" would be true of a card
+# nothing could write to and of a probe that ran and rewrote what was already
+# there. "We took them off and they did not come back" is a statement a boot
+# can fail. The deletion has its own control -- the listing taken before it
+# must show both files -- because if boot1 and boot2 ever stop writing them,
+# this phase has to go red rather than quietly assert an absence it was handed
+# for free.
 #
 # Run 16 (31752321387) is the first one that did it, and it went green on
 # the first attempt: 9/9 guest checks in boot1 and 11/11 in boot2, both
@@ -257,11 +309,14 @@ mkdir -p "$WORK"
 WORK="$(cd "$WORK" && pwd)"
 IMG="$WORK/card.img"
 ESC=$(printf '\033')
-# ONE image file for both boots. Boot 2 is a power-cycle of the same card,
-# and that is the only reason "the setting survived and the sentinel did
+# ONE image file for all three boots. Boot 2 is a power-cycle of the same
+# card, and that is the only reason "the setting survived and the sentinel did
 # not" says anything: a fresh copy of the image would answer both questions
-# with the image build's own contents.
-PHASES="${OTP_IMG_PHASES:-boot1 boot2}"
+# with the image build's own contents. The release boot rides on the same
+# card for the same reason -- it is asked what a boot with no otp.imgcheck
+# token does to a card that two probe boots have already written to, and a
+# fresh copy would be asking about the image build instead.
+PHASES="${OTP_IMG_PHASES:-boot1 boot2 release}"
 # AND NEITHER BOOT IS OPTIONAL. This variable exists so a run debugging the
 # boot itself can stop after one, and nothing used to stop it dropping the
 # second -- the same list drives the boot loop, the verdict loop and the set
@@ -284,8 +339,21 @@ PHASES="${OTP_IMG_PHASES:-boot1 boot2}"
 # reason that has nothing to do with the image. A debugging switch whose
 # one-boot setting produces a confusing red is a switch people learn to
 # distrust the harness over. Both phases, or say which one is missing.
+#
+# AND THE RELEASE BOOT IS DEMANDED ON THE SAME TERMS, for a reason that is
+# neither of those. It is the only phase that observes the artifact behaving
+# the way a flashed unit behaves -- no otp.imgcheck token, so the probe that
+# ships in every image must not run -- and its cost of being dropped is the
+# ugliest one on this list, because dropping it makes NOTHING go red. The
+# other two phases report; this one asserts a silence. A run without it
+# produces a full green verdict, a claim below that says the probe is inert
+# on a release unit, and no evidence anywhere that anybody asked. It is also
+# the phase that DELETES the probe's two records from the card before it
+# boots, so a list that keeps it and drops boot1 or boot2 has nothing to
+# delete and no control saying so -- which the guard above already prevents,
+# and which is a second reason the three move together.
 PHASES_MISSING=""
-for want in boot1 boot2; do
+for want in boot1 boot2 release; do
     case " $PHASES " in
         *" $want "*) ;;
         *) PHASES_MISSING="$PHASES_MISSING $want" ;;
@@ -303,6 +371,13 @@ if [ -n "$PHASES_MISSING" ]; then
     echo "       there, and only a second boot of the same card can say" >&2
     echo "       either. A one-boot run proves neither and must not be" >&2
     echo "       able to pass this gate." >&2
+    echo "       release is the boot with NO otp.imgcheck token, which is" >&2
+    echo "       how every flashed unit boots. It is the only phase that" >&2
+    echo "       observes the shipped probe staying inert, and it is the" >&2
+    echo "       one whose absence turns nothing red on its own: the other" >&2
+    echo "       phases report, this one asserts a silence. Drop it and the" >&2
+    echo "       run still prints a green verdict for an image nobody" >&2
+    echo "       checked the probe was quiet on." >&2
     exit 1
 fi
 
@@ -632,6 +707,85 @@ fat_listing() {
     mdir -b -i "$IMG@@$BOOT_OFFSET" ::/otp-identity >> "$1" 2>/dev/null || true
 }
 
+# --- what a release boot has to leave exactly as it found it --------------
+
+# THE PROBE'S OWN DROPPINGS, named once and used three times: the release
+# phase deletes these before it boots, the verdict requires them to have been
+# there to delete, and the verdict requires them not to have come back.
+# harness/img-guest-check.sh writes both of them, in boot1 only, with
+# $BOOTDIR/otp-imgcheck- prefixes; tests/test_img_verdict.py holds this list
+# against that file so the two cannot drift apart.
+PROBE_DROPPINGS="otp-imgcheck-machine-id otp-imgcheck-credential"
+
+# AND THE FILES A RELEASE BOOT MUST NOT DISTURB, which is a different list and
+# a different question. The droppings are the harness's own litter; these are
+# the operator's: the settings the unit saves, the machine-id that keeps a
+# power-cycled appliance the same machine, and the password hash that is the
+# only login this thing has. A release boot that ATE one of those would be a
+# far worse finding than a probe that ran, and "the listing is unchanged" does
+# not see it -- a file rewritten in place keeps its name. So these three are
+# compared by CONTENT as well.
+FAT_CONTENTS="otp-unit.conf otp-identity/machine-id otp-identity/credential"
+
+# A digest, never the bytes. ::/otp-identity/credential is a sha512-crypt hash
+# and this console and this work directory both travel as CI artifacts, so the
+# comparison is over sha256 and the report prints twelve characters of it --
+# the same trade harness/img-guest-check.sh makes for the same file, for the
+# same reason: equal exactly when the contents are equal, and no use to anyone
+# who reads it.
+#
+# THE WORD `absent` RATHER THAN THE DIGEST OF NOTHING, because the empty
+# string hashes to a perfectly good 64-character value and two of those
+# compare equal -- which is precisely how "the credential survived this boot"
+# would come to mean "there has never been a credential". The gate below
+# requires 64 hex characters on both sides as well as a match.
+fat_digest_of() {
+    local body
+    body=$(mtype -n -i "$IMG@@$BOOT_OFFSET" "::$1" 2>/dev/null || true)
+    if [ -z "$body" ]; then printf 'absent'; return 0; fi
+    printf '%s' "$body" | sha256sum 2>/dev/null | cut -d' ' -f1
+}
+
+# Taken beside fat_listing, at both of the two moments it is taken. mtype and
+# mdel ship in the same mtools package the mcopy check above already stands in
+# for, and neither is made a hard requirement here: without mtype every digest
+# reads `absent` and the content gate goes red, without mdel the droppings stay
+# on the card and the deletion gate goes red. Both failures point at the
+# harness rather than at the image, and both are red rather than green, which
+# is the direction a missing tool has to fail in.
+fat_digests() {
+    local out="$1" name
+    : > "$out"
+    for name in $FAT_CONTENTS; do
+        printf '%s %s\n' "$name" "$(fat_digest_of "$name")" >> "$out"
+    done
+}
+
+# BEFORE the release boot, and before the listing that boot is judged against.
+#
+# Both records are on the card when boot2 ends -- boot1 writes them and
+# nothing removes them -- so a release phase that only asked "did a new file
+# appear?" would be asking a question whose answer is No on a card the probe
+# rewrote in place, and No on a card the emulator could not write to at all.
+# Taking them OFF first turns the claim into one a boot can fail: they were
+# here, we removed them, and a boot with no otp.imgcheck token did not put
+# them back.
+#
+# The listing taken first is the control. If boot1 and boot2 ever stop writing
+# these files, the absence afterwards is one this phase was handed for free,
+# and the verdict has to say so rather than count it.
+strip_probe_droppings() {
+    local dir="$1" name
+    fat_listing "$dir/boot-files-before-strip.txt"
+    for name in $PROBE_DROPPINGS; do
+        # `|| true` because mdel answers non-zero on a file that is not
+        # there -- measured, `mdel: File "::x" not found`, rc 1 -- and under
+        # errexit that would end the run before the control could report the
+        # very absence that caused it.
+        mdel -i "$IMG@@$BOOT_OFFSET" "::$name" 2>/dev/null || true
+    done
+}
+
 # root=/dev/mmcblk0p2 rather than cmdline.txt's root=PARTUUID=..., but not
 # for the reason previously written here. The old comment claimed QEMU does
 # not reproduce PARTUUIDs -- false. A PARTUUID is the MBR disk identifier
@@ -654,7 +808,16 @@ boot_phase() {
     local dir="$WORK/$phase"
     rm -rf "$dir"
     mkdir -p "$dir"
+    # BEFORE the before-listing, or the deletion looks like something the boot
+    # did. The listing this boot is judged against has to be the state the
+    # emulator is handed; strip_probe_droppings takes its own control listing
+    # first, so the three files in this directory read in order: what was on
+    # the card, what we took off it, and what the boot left.
+    case "$phase" in
+        release) strip_probe_droppings "$dir" ;;
+    esac
     fat_listing "$dir/boot-files-before.txt"
+    fat_digests "$dir/boot-digests-before.txt"
     # BOTH UARTs, captured separately. A Pi 3 has two, and the measured QEMU
     # mapping is: FIRST -serial = the PL011 (which this DTB names ttyAMA1),
     # SECOND -serial = the mini-UART, where the earlycon bootconsole lives.
@@ -665,6 +828,23 @@ boot_phase() {
     local console2="$dir/console-uart1.log"
     : > "$console"
     : > "$console2"
+    # THE TOKEN IS ABSENT IN THE RELEASE PHASE, NOT EMPTY, and the difference
+    # is the whole phase. systemd's ConditionKernelCommandLine=otp.imgcheck
+    # matches a bare word AND the left-hand side of an assignment -- that is
+    # documented behaviour and it is what makes otp.imgcheck=boot1 start the
+    # unit at all -- so `otp.imgcheck=` with nothing after it would satisfy
+    # the condition just as well, the probe would start, and only its own
+    # phase guard would stop it. A release phase booted like that tests
+    # nothing: it would be watching the probe's second lock, not the first.
+    #
+    # An empty variable expanding to nothing is the way to leave a word off a
+    # command line that is built by word splitting. It is unquoted for exactly
+    # that reason, which is also why $OVERLAY_TOKENS above is unquoted.
+    local imgcheck_token=""
+    case "$phase" in
+        release) ;;
+        *) imgcheck_token="otp.imgcheck=$phase" ;;
+    esac
     log "Booting $phase under -M raspi3b (emulated, not KVM -- allow minutes)"
     set +e
 # THE COMMAND LINE, and what previous revisions of it got wrong.
@@ -725,9 +905,13 @@ boot_phase() {
 # -- harness/img-guest-check.sh puts a marker into the journal and NOWHERE
 # else, and the verdict below requires it on the console.
 #
-# otp.imgcheck=<phase> is what wakes otp-unit-imgcheck.service, whose
-# ConditionKernelCommandLine is that word. It ships in the image and is
-# inert on a flashed card, where nothing puts the word there.
+# $imgcheck_token is otp.imgcheck=<phase>, which is what wakes
+# otp-unit-imgcheck.service, whose ConditionKernelCommandLine is that word.
+# It ships in the image and is inert on a flashed card, where nothing puts
+# the word there. In the release phase the variable is EMPTY and the token
+# is therefore absent from this line altogether -- see the case that sets
+# it, and the check the verdict makes on the kernel's own echo of what it
+# received.
 #
 # $OVERLAY_TOKENS is boot=overlay, copied out of the image's own
 # cmdline.txt above, or empty when the image does not carry it.
@@ -735,7 +919,7 @@ boot_phase() {
         -M raspi3b -m 1024 \
         -kernel "$KERNEL" -dtb "$DTB" \
         ${INITRD:+-initrd "$INITRD"} \
-        -append "rw earlycon loglevel=7 console=ttyAMA1,115200 systemd.show_status=1 systemd.journald.forward_to_console=1 initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait $OVERLAY_TOKENS otp.imgcheck=$phase" \
+        -append "rw earlycon loglevel=7 console=ttyAMA1,115200 systemd.show_status=1 systemd.journald.forward_to_console=1 initcall_blacklist=bcm2835_pm_driver_init root=/dev/mmcblk0p2 rootfstype=ext4 rootwait $OVERLAY_TOKENS $imgcheck_token" \
         -drive "file=$IMG,if=sd,format=raw" \
         -serial "file:$console" \
         -serial "file:$console2" \
@@ -748,6 +932,55 @@ boot_phase() {
     # guess. The growth column answers it directly: still climbing means
     # slow, flat for minutes means stuck.
     local sample=30 elapsed=0 last=0 early_stop='' now now2 cpu seen
+    # WHAT ENDS THIS PHASE EARLY, and why the release phase needs its own
+    # answer. The two probe boots stop on the probe's own done line. The
+    # release boot has no probe -- that is the entire point of it -- so with
+    # the same marker it would never stop early and would pay the whole
+    # OTP_IMG_TIMEOUT cap on every single run, which is 600 seconds of CI on
+    # each green build for nothing.
+    #
+    # multi-user.target is the release phase's marker, and it is the right
+    # one rather than merely an available one. The verdict already gates every
+    # phase on that exact string -- it is what says a boot FINISHED, promoted
+    # to a gate in run 31972140190 -- so the sampler stops on the same
+    # evidence the verdict requires, and a boot that never reaches it pays the
+    # backstop and is failed for not finishing.
+    #
+    # AND IT IS ALSO THE ANSWER TO "would a probe that ran have had time to
+    # say so?", which is the question a settle window is usually there to
+    # answer and which this marker answers on its own.
+    # otp-unit-imgcheck.service is Type=oneshot and WantedBy=multi-user.target,
+    # and systemd's target_add_default_dependencies() adds Before=<target> to
+    # every unit a target wants unless that unit sets DefaultDependencies=no
+    # -- this one does not. So the target's job cannot complete until the
+    # probe's job has, and a probe that had run would already have printed
+    # everything it prints, including its first line, BEFORE this marker
+    # appeared. A probe that ran and hung would hold the target open until
+    # TimeoutStartSec=480 killed it, and the marker would arrive that much
+    # later with the hang on the console.
+    #
+    # 45 SECONDS OF SETTLE, and the number is about the CARD rather than the
+    # console. This phase asserts that nothing was written to the FAT
+    # partition, and a write the guest made into its page cache is not on the
+    # card until writeback runs: Linux flushes a dirty page once it is older
+    # than dirty_expire_centisecs (default 3000 = 30s), noticed by the
+    # writeback thread on its dirty_writeback_centisecs tick (default 500 =
+    # 5s). 30 + 5 + 10 of margin = 45, so a write made at the instant the
+    # target was reached is on the card before qemu is stopped. Those are the
+    # kernel's documented defaults and are NOT read off this image; if a
+    # release boot ever does write to /boot/firmware, the honest failure is
+    # this gate going red, not a shorter window making it green. The cost is
+    # one and a half extra sampling ticks, against the 10s the probe phases
+    # drain for -- they have a probe that says `sync` before it prints done,
+    # and this phase has nobody to say it.
+    local stop_marker="OTP-GUEST-DONE $phase" stop_what="reported done" settle=10
+    case "$phase" in
+        release)
+            stop_marker="Reached target multi-user.target"
+            stop_what="finished booting"
+            settle=45
+            ;;
+    esac
     while kill -0 "$qemu_pid" 2>/dev/null; do
         sleep "$sample"
         elapsed=$((elapsed + sample))
@@ -772,13 +1005,19 @@ boot_phase() {
         # writing when grep left. With `-q` the early stop simply never
         # fires on a console large enough to lose that race, and every boot
         # pays the full backstop instead. `-c` reads to the end.
+        #
+        # The ANSI strip matters for the release phase's marker as well as for
+        # the probe's: systemd colors the unit name inside a status line, so
+        # the raw bytes are "Reached target ESC[0;1;39mmulti-user.targetESC[0m
+        # - Multi-User System." and no pattern spanning the two words could
+        # match without it. Same defect as run 12's, same fix.
         seen=$(sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' "$console" 2>/dev/null \
-               | grep -cF "OTP-GUEST-DONE $phase" || true)
+               | grep -cF "$stop_marker" || true)
         if [ -z "$early_stop" ] && [ "${seen:-0}" != "0" ]; then
             early_stop=$elapsed
-            printf '   %s reported done at %ss wall; draining 10s, then stopping qemu\n' \
-                   "$phase" "$elapsed" >&2
-            sleep 10
+            printf '   %s %s at %ss wall; draining %ss, then stopping qemu\n' \
+                   "$phase" "$stop_what" "$elapsed" "$settle" >&2
+            sleep "$settle"
             kill "$qemu_pid" 2>/dev/null || true
         fi
         # Host-side CPU%% of the emulator, because flat output alone cannot
@@ -803,6 +1042,7 @@ boot_phase() {
     # AFTER the sync, so what is listed is what reached the card rather than
     # what was still in a page cache when qemu was stopped.
     fat_listing "$dir/boot-files-after.txt"
+    fat_digests "$dir/boot-digests-after.txt"
 }
 
 for phase in $PHASES; do
@@ -872,7 +1112,7 @@ per_boot_verdict() {
 # script BEFORE verdict.txt was written: no IMG-CHECK lines, no rc
 # report, no console tail, precisely in the no-evidence case. Found by
 # the review panel; the identical guard was already on the next line.
-    local LAST_TS KERNEL_ENTRIES SPOKEN
+    local LAST_TS KERNEL_ENTRIES SPOKEN FORWARDED FORWARDED_PID1 KCMDLINE SKIPLINE
     LAST_TS=$(grep -oE '\[ *[0-9]+\.[0-9]+\]' "$CONSOLE_TXT" 2>/dev/null | tr -d '[] ' | sort -g | tail -1 || true)
     # `kernel: ` EXCLUDED, and that is a consequence of the journal now
     # streaming to this console. journald labels a forwarded kernel message
@@ -933,12 +1173,85 @@ per_boot_verdict() {
     # The guest's journal-marker-accepted is the other half of the pair: it
     # says the journal TOOK the marker, so an absence here is a forwarding
     # failure rather than a systemd-cat that did nothing.
-    if grep -qE "OTP-JOURNAL-FORWARDED[[:space:]]+${phase}([[:space:]]|\$)" \
-            "$CONSOLE_TXT" 2>/dev/null; then
-        printf 'IMG-CHECK %s journal-forwarded-to-console PASS\n' "$phase"
-    else
-        printf 'IMG-CHECK %s journal-forwarded-to-console FAIL\n' "$phase"
-    fi
+    #
+    # THE RELEASE PHASE CANNOT BE ASKED THIS, and must not be let off it. The
+    # marker is written by the probe, and the release boot's whole claim is
+    # that the probe did not run -- so demanding the marker there would fail
+    # every healthy release boot, and dropping the clause silently would leave
+    # that phase asserting "the probe's journal tag never appeared" with no
+    # evidence at all that the journal reaches this console. That is the
+    # absence-without-a-control defect, arriving in the one place this phase
+    # was built to close.
+    #
+    # So the release phase is asked the same question a different way: is
+    # there ANY line on this console that only journald forwarding can have
+    # put there? A forwarded line is a monotonic timestamp, a syslog
+    # identifier, a pid and the text -- the shape system_lines() exists to
+    # recognise -- and a line in that shape from a speaker other than PID 1 is
+    # one no other mechanism writes. PID 1 is excluded because it also writes
+    # its status lines straight to /dev/console, and because it falls back to
+    # /dev/kmsg when journald is not up; a `python3[412]:` or `cupsd[380]:`
+    # line has no such second route. Run 72's console, the first this
+    # repository captured with forwarding on, carries hundreds.
+    case "$phase" in
+        release)
+            FORWARDED=$(grep -cE '^\[[^]]*\] [^ ]+\[[0-9]+\]:' "$CONSOLE_TXT" 2>/dev/null || true)
+            FORWARDED_PID1=$(grep -cE '^\[[^]]*\] systemd\[1\]:' "$CONSOLE_TXT" 2>/dev/null || true)
+            if [ "$(( ${FORWARDED:-0} - ${FORWARDED_PID1:-0} ))" -gt 0 ]; then
+                printf 'IMG-CHECK %s journal-forwarding-alive PASS %s forwarded line(s), %s of them PID 1\n' \
+                       "$phase" "${FORWARDED:-0}" "${FORWARDED_PID1:-0}"
+            else
+                printf 'IMG-CHECK %s journal-forwarding-alive FAIL %s forwarded line(s), %s of them PID 1: nothing on this console can only have come through the journal, so every absence this phase reports is unbacked\n' \
+                       "$phase" "${FORWARDED:-0}" "${FORWARDED_PID1:-0}"
+            fi
+            ;;
+        *)
+            if grep -qE "OTP-JOURNAL-FORWARDED[[:space:]]+${phase}([[:space:]]|\$)" \
+                    "$CONSOLE_TXT" 2>/dev/null; then
+                printf 'IMG-CHECK %s journal-forwarded-to-console PASS\n' "$phase"
+            else
+                printf 'IMG-CHECK %s journal-forwarded-to-console FAIL\n' "$phase"
+            fi
+            ;;
+    esac
+    # THE TOKEN THAT DECIDES WHETHER THE PROBE RUNS, READ BACK OFF THE
+    # KERNEL'S OWN ECHO OF WHAT IT WAS GIVEN.
+    #
+    # Not off $imgcheck_token, and not off a copy this script wrote down. The
+    # harness building the command line and the harness checking it are the
+    # same program, and a bug that put the token back would put it in both
+    # places. `Kernel command line:` is printed by the kernel, at KERN_INFO,
+    # from what it actually received -- the one statement in this file about
+    # the command line that the harness cannot get wrong by agreeing with
+    # itself.
+    #
+    # BOTH DIRECTIONS, on the same grep over the same kind of file. The
+    # release phase requires the token to be ABSENT, and an absence is equally
+    # satisfied by a console with no such line at all, by a kernel that stopped
+    # printing it, and by a grep looking for the wrong word. boot1 and boot2
+    # require it to be THERE, spelled with their own phase, which is what makes
+    # the release phase's silence mean something. The line has to exist in
+    # every phase either way.
+    KCMDLINE=$(grep -m1 -F "Kernel command line:" "$CONSOLE_TXT" 2>/dev/null || true)
+    case "$phase" in
+        release)
+            if [ -n "$KCMDLINE" ] \
+               && ! printf '%s' "$KCMDLINE" | grep -qF "otp.imgcheck"; then
+                printf 'IMG-CHECK %s cmdline-carries-no-imgcheck-token PASS\n' "$phase"
+            else
+                printf 'IMG-CHECK %s cmdline-carries-no-imgcheck-token FAIL %s\n' \
+                       "$phase" "${KCMDLINE:-no Kernel command line line on this console}"
+            fi
+            ;;
+        *)
+            if printf '%s' "$KCMDLINE" | grep -qF "otp.imgcheck=$phase"; then
+                printf 'IMG-CHECK %s cmdline-carries-the-imgcheck-token PASS\n' "$phase"
+            else
+                printf 'IMG-CHECK %s cmdline-carries-the-imgcheck-token FAIL %s\n' \
+                       "$phase" "${KCMDLINE:-no Kernel command line line on this console}"
+            fi
+            ;;
+    esac
     # THE FORBIDDEN PHRASES, AND WHO IS ALLOWED TO SAY THEM.
     #
     # Until the journal was forwarded, this console carried kernel output and
@@ -1160,6 +1473,84 @@ per_boot_verdict() {
                 printf 'IMG-CHECK %s second-boot-is-not-a-first-boot FAIL\n' "$phase"
             else
                 printf 'IMG-CHECK %s second-boot-is-not-a-first-boot PASS\n' "$phase"
+            fi
+            ;;
+        release)
+            # The third boot of the same card is not a first boot either, and
+            # it is asked because a release phase that WAS one would mean the
+            # machine-id had been lost between boot2 and here -- which is
+            # exactly the kind of damage this phase is checking the card for,
+            # visible from the console instead of from mtools.
+            if grep -qF "Reached target first-boot-complete.target" \
+                    "$CONSOLE_TXT" 2>/dev/null; then
+                printf 'IMG-CHECK %s release-boot-is-not-a-first-boot FAIL\n' "$phase"
+            else
+                printf 'IMG-CHECK %s release-boot-is-not-a-first-boot PASS\n' "$phase"
+            fi
+            # --- THE CLAUSE THE WHOLE PHASE EXISTS FOR ---------------------
+            #
+            # systemd's own statement that it LOOKED at otp-unit-imgcheck.service
+            # and decided not to start it. Everything else this phase says is
+            # an absence, and every one of those absences is satisfied
+            # perfectly by an image with the unit deleted from it -- so
+            # without this clause, REMOVING the probe from the release image
+            # would make this phase greener, which is the exact inversion a
+            # gate must not have. The decision being tested is to SHIP the
+            # probe and rely on the condition; a phase that rewarded shipping
+            # it would be testing the opposite decision.
+            #
+            # THE WORDING, and where it comes from, because guessing it is how
+            # a gate ends up unable to fire. systemd v257 (trixie's, and this
+            # image's) builds the message in src/core/job.c,
+            # job_emit_done_message(): a start job that completed with
+            # result JOB_DONE while u->condition_result is false takes one of
+            # three shapes --
+            #
+            #   "%s was skipped because of an unmet condition check (%s=%s%s)."
+            #       when unit_find_failed_condition() returns a non-trigger
+            #       condition, which is ours: one ConditionKernelCommandLine=
+            #   "%s was skipped because no trigger condition checks were met."
+            #       for ConditionFirstBoot-style trigger conditions
+            #   "Condition check resulted in %s being skipped."
+            #       the generic format, used when no failed condition object
+            #       is found
+            #
+            # The same three strings are in the systemd 255 binary this was
+            # written against (`strings libsystemd-core-255.so`), so the
+            # wording has been stable across at least two releases. The grep
+            # below accepts any of them and requires the unit's NAME on the
+            # same line, which is the part that is not a matter of wording:
+            # `%s` is unit_status_string(), which returns u->id or
+            # "u->id - description" and only ever drops the id under
+            # StatusUnitFormat=description -- and this image is measurably not
+            # that, because run 12's console carries "Started
+            # ESC[0;1;39motp-unit.serviceESC[0m - OTP pad print unit." A gate
+            # keyed on the full sentence would be keyed on systemd's prose;
+            # this one is keyed on systemd having named the unit while saying
+            # it skipped something.
+            #
+            # AND IT IS THE POSITIVE CONTROL FOR journal-forwarding-alive'S
+            # SUBJECT MATTER TOO. job.c sets do_console = false for precisely
+            # this case -- a condition skip is deliberately NOT printed as a
+            # `[ INFO ]` status line -- so the only way this sentence reaches
+            # a serial port is the journal. Its presence is a second, narrower
+            # statement that forwarding works on this boot.
+            #
+            # The line itself is quoted into an IMG-NOTE below so the exact
+            # wording enters the evidence. The first run that prints it makes
+            # the narrower `(ConditionKernelCommandLine=otp.imgcheck)` form
+            # promotable to a gate of its own, which is the report-then-gate
+            # ladder multi-user.target and the hwrng line both came up.
+            SKIPLINE=$(grep -m1 -E \
+                'otp-unit-imgcheck\.service.*(was skipped because|being skipped)|(was skipped because|being skipped).*otp-unit-imgcheck\.service' \
+                "$CONSOLE_TXT" 2>/dev/null || true)
+            if [ -n "$SKIPLINE" ]; then
+                printf 'IMG-CHECK %s imgcheck-unit-considered-and-skipped PASS\n' "$phase"
+                printf 'IMG-NOTE %s imgcheck-skip-line: %s\n' \
+                       "$phase" "$(printf '%s' "$SKIPLINE" | cut -c1-200)"
+            else
+                printf 'IMG-CHECK %s imgcheck-unit-considered-and-skipped FAIL systemd never named otp-unit-imgcheck.service as skipped: either the unit is not in this image, or it was not enabled, or it RAN\n' \
+                       "$phase"
             fi
             ;;
     esac
@@ -1386,6 +1777,214 @@ userconf_gate() {
     esac
 }
 
+# --- the release boot: what a shipped probe must not do -------------------
+
+# EVERY CLAUSE HERE IS AN ABSENCE, so every clause here carries its control in
+# the same line.
+#
+# The controls are taken from boot1's console and boot1's card, not from a
+# second grep over the release phase's own evidence, and that is deliberate:
+# the question is not "is this file readable" but "would this grep have found
+# the thing if the thing were there". boot1 is the boot where the probe
+# demonstrably ran, so boot1's console is the only fixture in this run that
+# can answer it. It exists in every run: the phase guard above refuses a list
+# without it.
+#
+# A control that comes back zero fails the clause it belongs to rather than
+# passing it, which is the direction that matters -- the failure then reads
+# "this grep can no longer find the probe even where the probe ran", which is
+# a statement about the harness, and the detail prints both counts so nobody
+# has to guess which half went wrong.
+#
+# One function, one pattern, two phases: the counts are comparable because
+# they are produced by the same code over the same kind of file. It does its
+# own ANSI and CR strip off the raw consoles rather than reading the
+# console-text.log phase_paths() writes, so it depends on no other phase
+# having been processed first -- OTP_IMG_PHASES may list the phases in any
+# order, and a control that silently read a file the loop had not written yet
+# would report zero and fail the clause for the wrong reason.
+probe_lines() {
+    sed -e "s/${ESC}\[[0-9;]*[a-zA-Z]//g" -e 's/\r//g' \
+        "$WORK/$2/console.log" "$WORK/$2/console-uart1.log" 2>/dev/null \
+        | grep -cE "$1" || true
+}
+
+release_gate() {
+    local phase="$1"
+    local before="$WORK/$phase/boot-files-before.txt"
+    local after="$WORK/$phase/boot-files-after.txt"
+    local prestrip="$WORK/$phase/boot-files-before-strip.txt"
+    local here control name missing changed dbefore dafter
+
+    # 1. THE PROBE PRINTED NOTHING.
+    #
+    # `OTP-GUEST` and not `OTP-GUEST-`, and the missing hyphen is deliberate.
+    # The probe opens with `OTP-GUEST starting phase=...` and closes with
+    # `OTP-GUEST-DONE`, but it has a third line, and it is the one that
+    # matters most here: `OTP-GUEST refusing to run:` on stderr, which is what
+    # the probe's own phase guard prints when the unit started with no
+    # otp.imgcheck token on the command line. That is the probe RUNNING and
+    # declining -- the second lock doing the first lock's job -- and a pattern
+    # with the trailing hyphen would not see it. OTP-CHECK and OTP-RESULT are
+    # separate prefixes and are not looked for here, because the probe cannot
+    # print either without opening with one of these three first.
+    #
+    # OVER THE WHOLE CONSOLE, NOT OVER system_lines(), and that is a decision
+    # rather than an oversight. The forbidden-phrase loop is scoped to what
+    # the SYSTEM said because the phrases it hunts are ones a unit can quote
+    # innocently. This one is the other way round: the probe's own output
+    # reaches this console as journald-forwarded lines from
+    # `img-guest-check.sh[pid]:`, which is exactly the shape system_lines()
+    # DROPS -- so a SPOKEN-scoped grep here would be a gate that can never
+    # fire, matching nothing on a boot where the probe ran from start to
+    # finish. The echo hazard system_lines() exists for is handled where it
+    # actually lives: the kernel command line is checked against the kernel's
+    # own `Kernel command line:` echo and nowhere else, and no phase greps the
+    # bare word `imgcheck` over a console that prints the unit's name.
+    here=$(probe_lines 'OTP-GUEST' "$phase")
+    control=$(probe_lines 'OTP-GUEST' boot1)
+    if [ "${here:-1}" = "0" ] && [ "${control:-0}" -gt 0 ] 2>/dev/null; then
+        printf 'IMG-CHECK %s guest-probe-silent PASS 0 here, %s in boot1\n' \
+               "$phase" "$control"
+    else
+        printf 'IMG-CHECK %s guest-probe-silent FAIL %s OTP-GUEST line(s) here, %s in boot1 (the control: zero there means this grep no longer finds the probe even where it ran)\n' \
+               "$phase" "${here:-?}" "${control:-?}"
+    fi
+
+    # 2. AND WROTE NOTHING TO THE JOURNAL UNDER ITS OWN TAG.
+    #
+    # The probe's side effects on a real machine are not only files. It puts a
+    # marker into the journal with `systemd-cat -t otp-imgcheck`, and journald
+    # forwards that to this console as `[ts] otp-imgcheck[pid]: ...` -- the
+    # speaker position, which nothing else on this image occupies. Matched in
+    # that position rather than as a bare word on purpose: `otp-imgcheck` IS a
+    # substring of the two record filenames, and a bare-word grep would then
+    # be reporting on the probe's file paths as well as on its journal. (It is
+    # not a substring of `otp-unit-imgcheck.service` -- that name reads
+    # `otp-` then `unit-` -- so the skip line this phase requires above cannot
+    # trip it either way.)
+    #
+    # journal-forwarding-alive is the other half: it says the channel this
+    # absence is measured on is open.
+    here=$(probe_lines 'otp-imgcheck\[[0-9]+\]:' "$phase")
+    control=$(probe_lines 'otp-imgcheck\[[0-9]+\]:' boot1)
+    if [ "${here:-1}" = "0" ] && [ "${control:-0}" -gt 0 ] 2>/dev/null; then
+        printf 'IMG-CHECK %s guest-probe-journal-tag-absent PASS 0 here, %s in boot1\n' \
+               "$phase" "$control"
+    else
+        printf 'IMG-CHECK %s guest-probe-journal-tag-absent FAIL %s line(s) tagged otp-imgcheck here, %s in boot1 (the control)\n' \
+               "$phase" "${here:-?}" "${control:-?}"
+    fi
+
+    # 3. AND THE CUPS QUEUE IT CREATES IS NOT NAMED ANYWHERE.
+    #
+    # WHAT THIS COVERS AND WHAT IT DOES NOT, stated rather than implied. The
+    # probe creates a print queue called `otpimgcheck` with lpadmin, submits a
+    # diagnostic sheet into it, and removes it again. On this console the
+    # queue's name appears only in the probe's OWN two check details, so what
+    # this clause really rules out is a queue whose creation was reported --
+    # which is a slightly wider net than clause 1 and costs one grep.
+    #
+    # IT IS NOT INDEPENDENT EVIDENCE THAT NO QUEUE WAS CREATED, and there is
+    # no cheap way to get any. /etc/cups is a tmpfs (otp-unit-etc-cups.service)
+    # so printers.conf never reaches the card and the host cannot read it;
+    # /var/spool/cups is inside the overlay for the same reason; and cupsd's
+    # log, which device/install.sh sends to syslog and which would therefore
+    # reach this console, records a printer being added at LogLevel info while
+    # install.sh sets no LogLevel at all and CUPS defaults to warn. Asking the
+    # machine would need a probe, and this phase is the one boot that must not
+    # have one. So: this is a fingerprint check, not a queue check.
+    here=$(probe_lines 'otpimgcheck' "$phase")
+    control=$(probe_lines 'otpimgcheck' boot1)
+    if [ "${here:-1}" = "0" ] && [ "${control:-0}" -gt 0 ] 2>/dev/null; then
+        printf 'IMG-CHECK %s guest-probe-cups-queue-unnamed PASS 0 here, %s in boot1\n' \
+               "$phase" "$control"
+    else
+        printf 'IMG-CHECK %s guest-probe-cups-queue-unnamed FAIL %s mention(s) of the otpimgcheck queue here, %s in boot1 (the control)\n' \
+               "$phase" "${here:-?}" "${control:-?}"
+    fi
+
+    # 4. THE CARD: THE CONTROL FOR THE DELETION, FIRST.
+    #
+    # Both records are written by boot1 and read by boot2, so both are on the
+    # card when the strip runs. If that ever stops being true, the two clauses
+    # below are asserting an absence they were handed, and this run has to say
+    # so instead of counting it.
+    missing=""
+    for name in $PROBE_DROPPINGS; do
+        fat_lists "$prestrip" "$name" || missing="$missing $name"
+    done
+    if [ -z "$missing" ]; then
+        printf 'IMG-CHECK %s probe-droppings-were-on-the-card PASS %s\n' \
+               "$phase" "$PROBE_DROPPINGS"
+    else
+        printf 'IMG-CHECK %s probe-droppings-were-on-the-card FAIL not there to delete:%s -- the earlier boots stopped writing them, so this phase would be asserting an absence it did not create\n' \
+               "$phase" "$missing"
+    fi
+
+    # 5. THEY WERE TAKEN OFF, AND THEY DID NOT COME BACK.
+    #
+    # Both ends, because "gone afterwards" alone is also true of an mdel that
+    # silently did nothing followed by a boot that deleted them itself, and of
+    # a listing nothing could read -- which `boot-partition-listed` above rules
+    # out with kernel8.img on this same file.
+    missing=""
+    for name in $PROBE_DROPPINGS; do
+        if fat_lists "$before" "$name"; then missing="$missing before:$name"; fi
+        if fat_lists "$after" "$name"; then missing="$missing after:$name"; fi
+    done
+    if [ -z "$missing" ]; then
+        printf 'IMG-CHECK %s probe-droppings-stayed-off-the-card PASS\n' "$phase"
+    else
+        printf 'IMG-CHECK %s probe-droppings-stayed-off-the-card FAIL%s\n' \
+               "$phase" "$missing"
+    fi
+
+    # 6. AND NOTHING ELSE ON THE PARTITION MOVED.
+    #
+    # A release boot must not be the thing that eats the operator's login. The
+    # listing is compared SORTED: mtools prints FAT directory order, and a
+    # file rewritten in place can take a different slot without anything about
+    # the card having changed in a way anyone cares about. Names appearing or
+    # disappearing is what this clause is for; contents are clause 7.
+    changed=$(diff <(sort "$before" 2>/dev/null) <(sort "$after" 2>/dev/null) 2>/dev/null \
+              | grep -E '^[<>]' | head -10 | tr '\n' ' ' || true)
+    if [ -z "$changed" ]; then
+        printf 'IMG-CHECK %s boot-partition-unchanged PASS %s entries either side\n' \
+               "$phase" "$(wc -l < "$after" 2>/dev/null || echo 0)"
+    else
+        printf 'IMG-CHECK %s boot-partition-unchanged FAIL %s\n' "$phase" "$changed"
+    fi
+
+    # 7. INCLUDING THE THREE FILES WHOSE CONTENTS ARE THE POINT.
+    #
+    # otp-unit.conf is the operator's settings, otp-identity/machine-id is what
+    # keeps a power-cycled appliance the same machine, and
+    # otp-identity/credential is the only login this unit has. A boot that
+    # rewrote any of them keeps the name and the listing above sees nothing.
+    #
+    # `absent` on either side fails, and that is the control: two files that
+    # are not there have identical digests, which is how "the credential
+    # survived" would come to mean "there has never been a credential". The
+    # digests are printed twelve characters wide -- these are sha256 of a
+    # password hash and of a machine-id, and this directory is a CI artifact.
+    missing=""
+    while read -r name dbefore; do
+        [ -n "$name" ] || continue
+        dafter=$(awk -v n="$name" '$1 == n {print $2}' \
+                 "$WORK/$phase/boot-digests-after.txt" 2>/dev/null || true)
+        if [ "${#dbefore}" != 64 ] || [ "$dbefore" != "${dafter:-nothing}" ]; then
+            missing="$missing $name(${dbefore:0:12}../${dafter:0:12}..)"
+        fi
+    done < "$WORK/$phase/boot-digests-before.txt"
+    if [ -z "$missing" ]; then
+        printf 'IMG-CHECK %s identity-store-unchanged PASS %s\n' "$phase" "$FAT_CONTENTS"
+    else
+        printf 'IMG-CHECK %s identity-store-unchanged FAIL%s (a 64-character digest on both sides and equal, or it did not survive this boot)\n' \
+               "$phase" "$missing"
+    fi
+}
+
 : > "$VERDICT"
 for phase in $PHASES; do
     phase_paths "$phase"
@@ -1399,7 +1998,16 @@ for phase in $PHASES; do
     {
         printf -- '--- %s ---\n' "$phase"
         per_boot_verdict "$phase"
-        guest_gate "$phase"
+        # guest_gate demands an OTP-RESULT line, an OTP-GUEST-DONE line and
+        # every named guest check. The release phase has no probe by
+        # construction, so asking it those questions would fail every healthy
+        # release boot -- and answering them by loosening guest_gate would
+        # loosen it for the two phases it was written for. A phase with a
+        # different shape of evidence gets a different gate.
+        case "$phase" in
+            release) release_gate "$phase" ;;
+            *) guest_gate "$phase" ;;
+        esac
         userconf_gate "$phase"
     } >> "$VERDICT"
     # qemu's exit code is CONTEXT, not the verdict. A healthy boot of this
@@ -1409,8 +2017,28 @@ for phase in $PHASES; do
     # 13 booted, started the unit, passed every console check, and was
     # failed on rc=124: the exit code of the stopwatch. The console evidence
     # decides; the rc is reported so a crash mid-run still shows up.
+    #
+    # THE RELEASE PHASE ENDS ON A DIFFERENT MARKER, and this narration has to
+    # name the one it was actually waiting for. It has no guest report and
+    # never will, so "without a guest report" would be a true sentence that
+    # points the reader at the wrong thing entirely -- the phase is late
+    # because the boot did not finish, not because a probe stayed quiet.
+    case "$phase" in
+        release)
+            STOP_EVIDENCE="Reached target multi-user.target"
+            STOPPED_ON="the boot finished"
+            STOP_REPORT="the boot DID finish"
+            STOP_SILENT="without the boot ever finishing"
+            ;;
+        *)
+            STOP_EVIDENCE="OTP-GUEST-DONE $phase"
+            STOPPED_ON="the guest reported done"
+            STOP_REPORT="the guest DID report done"
+            STOP_SILENT="without a guest report"
+            ;;
+    esac
     if [ -n "$EARLY_STOP" ]; then
-        echo "$phase: qemu stopped by the harness at ${EARLY_STOP}s wall, after the guest reported done (rc=$QEMU_RC)" >&2
+        echo "$phase: qemu stopped by the harness at ${EARLY_STOP}s wall, after $STOPPED_ON (rc=$QEMU_RC)" >&2
     elif [ "$QEMU_RC" = 124 ]; then
         # "without a guest report" only if there is no report. rc=124 with
         # an empty early-stop means the sampler never saw the done line
@@ -1419,10 +2047,10 @@ for phase in $PHASES; do
         # backstop it has stopped looking, so a done line in the last
         # sampling window lands in the console and not in early-stop. The
         # console is on disk by now and can simply be asked.
-        if grep -qF "OTP-GUEST-DONE $phase" "$CONSOLE_TXT" 2>/dev/null; then
-            echo "$phase: the guest DID report done, but not in time for the sampler to stop qemu: ran to the ${TIMEOUT}s backstop (rc=124)" >&2
+        if grep -qF "$STOP_EVIDENCE" "$CONSOLE_TXT" 2>/dev/null; then
+            echo "$phase: $STOP_REPORT, but not in time for the sampler to stop qemu: ran to the ${TIMEOUT}s backstop (rc=124)" >&2
         else
-            echo "$phase: qemu ran to the ${TIMEOUT}s backstop without a guest report (rc=124)" >&2
+            echo "$phase: qemu ran to the ${TIMEOUT}s backstop $STOP_SILENT (rc=124)" >&2
         fi
     else
         echo "$phase: qemu exited rc=$QEMU_RC before the backstop" >&2
@@ -1453,15 +2081,22 @@ fi
 # PHASES above stops that combination happening at all; this is the second
 # half of the same fix, and it is the half a future phase list nobody
 # thought of still lands on.
+#
+# THE SENTENCE NOW HAS A THIRD CLAUSE, and it is the one that would be
+# cheapest to leave standing after the boot behind it stopped happening: the
+# other two describe things that were observed to happen, this one describes
+# something that was observed NOT to. A reader has no way to tell an unmade
+# absence from an unasked question, so the release half of the sentence is
+# printed only by a run that booted the release phase.
 CLAIM_MISSING=""
-for want in boot1 boot2; do
+for want in boot1 boot2 release; do
     case " $PHASES " in
         *" $want "*) ;;
         *) CLAIM_MISSING="$CLAIM_MISSING $want" ;;
     esac
 done
 if [ -z "$CLAIM_MISSING" ]; then
-    log "the image boots twice on a read-only overlay, and the unit starts on both"
+    log "the image boots twice on a read-only overlay and the unit starts on both, and a third boot with no otp.imgcheck token left the shipped probe inert: systemd named it and skipped it, it printed nothing, and the two records it writes stayed off the card"
 else
-    log "the image boots on a read-only overlay and the unit starts; phases run: $PHASES -- NOT the two-boot claim, which needs:$CLAIM_MISSING"
+    log "the image boots on a read-only overlay and the unit starts; phases run: $PHASES -- NOT the three-boot claim, which needs:$CLAIM_MISSING"
 fi

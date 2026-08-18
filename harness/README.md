@@ -369,7 +369,7 @@ the moment the guest reports done and judges the boot on ANSI-stripped
 console evidence, not qemu's exit code. The full fifteen-run narrative
 lives in `img-boot.sh`'s header and issue #17.
 
-### Two boots, because the overlay is only observable across a power-cycle
+### Three boots: two for the overlay, one for the way a unit really boots
 
 Issue #9: the read-only root was the largest completely unobserved surface
 in the project, and it is the property everything else rests on — a
@@ -382,8 +382,9 @@ different mechanism, and pi-gen never boots what it builds.
 |---|---|
 | `boot1` | The overlay is engaged. Writes a sentinel to `/` and a setting to `/boot/firmware` through `config.save()`. Goes in with a valid `userconf.txt` seeded into the FAT partition, which has to be consumed. |
 | `boot2` | The **same card image**, booted again. The sentinel must be gone; the setting must still be there; the consumed seed must still be consumed. |
+| `release` | The same card a **third** time, with **no `otp.imgcheck` token** on the kernel command line — the way a flashed unit boots. Nothing wakes the probe, and the phase gates on that being observably true. Described in its own section below. |
 
-One image file across both boots is the whole mechanism: a write that
+One image file across all three boots is the whole mechanism: a write that
 reached the card is there in boot 2 and a write that only reached the
 overlay's tmpfs is not. A fresh copy would answer both questions with the
 image build's own contents.
@@ -407,16 +408,18 @@ numbers move with the list and only the list is authoritative;
 restating it, so no fixture here can describe a healthy boot that is missing
 a check.
 
-The cost stays inside one budget: no extra boot, and the two bounded
-experiments are in different phases — 90 seconds for the diagnostic sheet in
-boot 1, 60 for the malformed seed in boot 2.
+The cost stays inside one budget: no extra boot for the credential work, and
+the two bounded experiments are in different phases — 90 seconds for the
+diagnostic sheet in boot 1, 60 for the malformed seed in boot 2. (The
+`release` boot below *is* an extra boot, and pays for itself in the one thing
+no amount of grepping could establish.)
 
-**`OTP_IMG_PHASES` picks the boots, and it may not drop `boot2`.** It
-defaults to `boot1 boot2`; a run debugging the boot itself can shorten it,
-and `img-boot.sh` exits 1 with a message if what is left does not include
-`boot2`. That guard is not tidiness. The same list drives the boot loop,
-the verdict loop *and* the set of guest checks each phase is required to
-have reported, so removing `boot2` removed
+**`OTP_IMG_PHASES` picks the boots, and it may not drop any of them.** It
+defaults to `boot1 boot2 release`; a run debugging the boot itself can
+shorten it, and `img-boot.sh` exits 1 with a message naming whichever of the
+three is missing. That guard is not tidiness. The same list drives the boot
+loop, the verdict loop *and* the set of guest checks each phase is required
+to have reported, so removing `boot2` removed
 `root-writes-discarded-by-the-power-cycle` and
 `settings-survive-the-power-cycle` from what the run demanded, along with
 the boot that would have produced them: measured, `OTP_IMG_PHASES=boot1`
@@ -425,6 +428,133 @@ on a read-only overlay"*, and `image.yml` puts that claim, in its own
 words, into the body of a tagged release. The concluding line is now
 conditional on the phases that actually ran as well, so the two guards
 have to fail together for the claim to be wrong.
+
+**`release` is demanded for a different reason, and it is the ugliest one on
+that list: dropping it makes nothing go red.** `boot1` and `boot2` *report* —
+take one away and named guest checks go missing and the run says so. The
+release boot asserts a **silence**, so a run without it produces a full green
+verdict and no evidence anywhere that anybody asked. It is also the phase
+that deletes the probe's two records from the card before it boots, so a list
+that kept it and dropped the boots that write them would have nothing to
+delete — which the other two clauses of the guard already prevent.
+
+### The third boot, where nothing is supposed to happen
+
+The probe this tier reads is not injected into a special build. It ships at
+`/opt/otp-unit/img-guest-check.sh` on **every** appliance this project
+produces, `install.sh` enables `otp-unit-imgcheck.service` unconditionally,
+and what the script does is *write*: a sentinel to `/`, a marker page count
+through `config.save()` into `/boot/firmware/otp-unit.conf`, and two records
+of its own beside it — the last three outside the read-only overlay and
+therefore permanent. The only thing standing between an operator's settings
+and all of that is one line:
+
+```
+ConditionKernelCommandLine=otp.imgcheck
+```
+
+The repository owner was asked whether to strip the probe from release images
+or keep it, and chose to keep it: a gate run against a specially prepared
+image proves nothing about the artifact people flash. That decision needs
+backing, and until this phase existed the only thing backing it was
+`tests/test_the_guest_probe_cannot_run_on_a_flashed_unit`, which greps one
+string out of the unit file and one out of the harness. That is a spelling
+check. It cannot see a drop-in, a preset, an `install.sh` that starts the unit
+another way, or a systemd release that reads the condition differently, and it
+says nothing at all about what a booted machine does.
+
+So the card is booted a third time with the token left off the kernel command
+line entirely — **absent, not empty**, because
+`ConditionKernelCommandLine=otp.imgcheck` matches a bare word *and* the
+left-hand side of an assignment, so `otp.imgcheck=` would start the unit just
+as well and the phase would be testing the probe's second lock instead of its
+first.
+
+**Everything this phase claims is an absence, so everything it claims has a
+control beside it.** A boot that never ran, a console nothing was written to,
+an image with the unit deleted and a grep for a string systemd no longer
+prints all produce exactly the silence a healthy release boot produces.
+
+| clause | what it says | its control |
+|---|---|---|
+| `Reached-target-multi-user.target`, `unit-started`, `single-kernel-entry`, the entropy pair | the boot happened and finished | the same bar the other two phases hold, from `per_boot_verdict()` |
+| `imgcheck-unit-considered-and-skipped` | systemd **named** `otp-unit-imgcheck.service` and said it skipped it | the point of the phase — see below |
+| `journal-forwarding-alive` | at least one journald-forwarded line from a speaker that is not PID 1 | the channel every silence below is measured on is open |
+| `cmdline-carries-no-imgcheck-token` | the kernel's own `Kernel command line:` echo has no `otp.imgcheck` on it | `cmdline-carries-the-imgcheck-token`, the same grep, in boots 1 and 2 |
+| `guest-probe-silent` | no `OTP-GUEST` line of any kind | the same grep finds the probe in boot 1 |
+| `guest-probe-journal-tag-absent` | nothing spoke as `otp-imgcheck[pid]:` | same grep, boot 1 |
+| `guest-probe-cups-queue-unnamed` | the `otpimgcheck` queue is not mentioned | same grep, boot 1 |
+| `probe-droppings-were-on-the-card` | the two records **were** there to delete | this is the control |
+| `probe-droppings-stayed-off-the-card` | they are gone before the boot and gone after it | the clause above |
+| `boot-partition-unchanged` | the FAT listing is identical either side, sorted | `boot-partition-listed` (kernel8.img) says the listing is a listing |
+| `identity-store-unchanged` | `otp-unit.conf`, the machine-id and the credential digest to the same 64 characters either side | `absent` on either side fails: two files that are not there have equal digests |
+| `release-boot-is-not-a-first-boot` | no `first-boot-complete.target`, so the persisted machine-id is still readable | `first-boot-really-was-a-first-boot` in boot 1 |
+
+**`imgcheck-unit-considered-and-skipped` is the clause the phase exists for.**
+Every other clause is satisfied *perfectly* by an image with the unit deleted
+from it — no output, no tag, no queue, nothing on the card. Without this one,
+removing the probe would make the phase **greener**, which is the exact
+inversion of the decision it is here to back.
+
+Its wording comes out of systemd's source rather than out of anybody's memory.
+`src/core/job.c` in v257 (trixie's, and this image's) builds the message in
+`job_emit_done_message()`: a start job that finished `JOB_DONE` with
+`u->condition_result` false takes `"%s was skipped because of an unmet
+condition check (%s=%s%s)."` when `unit_find_failed_condition()` returns a
+non-trigger condition — which ours is, one `ConditionKernelCommandLine=` and no
+trigger — and the generic `"Condition check resulted in %s being skipped."`
+when it returns nothing. The same three strings are in the systemd 255 binary
+this was written against (`strings libsystemd-core-255.so`). The gate accepts
+either wording and requires the unit's **name** on the line, which is the part
+that is not a matter of prose: `%s` is `unit_status_string()`, and this image
+demonstrably runs the combined format — run 12's success line is `Started
+ESC[0;1;39motp-unit.serviceESC[0m - OTP pad print unit.` The exact line is
+quoted back as an `IMG-NOTE`, so the narrower form becomes promotable to a
+gate of its own once a real boot has printed it — the same report-then-gate
+ladder `multi-user.target` and the `hwrng` line came up.
+
+That same clause is why `journal-forwarding-alive` has anything to stand on.
+`job.c` sets `do_console = false` for a condition skip, so the sentence is
+*never* printed as a `[ INFO ]` status line: it reaches a serial port through
+the journal or not at all.
+
+**The deletion is what makes the file half falsifiable.** Both records are on
+the card when boot 2 ends, so *"no new file appeared"* would be true of a
+probe that rewrote what was already there and of a card nothing could write
+to. The harness `mdel`s them off between boot 2 and this boot, takes a listing
+first as the control, and then requires them absent at both ends. If boots 1
+and 2 ever stop writing them, the phase goes red rather than quietly asserting
+an absence it was handed for free.
+
+**One thing here is a fingerprint check and not a queue check, and it says so
+in the code.** The probe creates a CUPS queue called `otpimgcheck`, and
+`guest-probe-cups-queue-unnamed` rules out a queue whose creation was
+*reported* — not a queue. There is no cheap independent evidence available:
+`/etc/cups` is a tmpfs (`otp-unit-etc-cups.service`) so `printers.conf` never
+reaches the card, `/var/spool/cups` is inside the overlay, and cupsd's log —
+which `install.sh` sends to syslog and which would therefore reach this
+console — records a printer being added at `LogLevel info`, while `install.sh`
+sets no `LogLevel` and CUPS defaults to `warn`. Asking the machine would need
+a probe, and this is the one boot that must not have one.
+
+**The sampler needs its own stop condition here.** The other two phases stop
+on the probe's `OTP-GUEST-DONE`; this one has no probe, so with the same
+marker it would burn the whole 600s backstop on every green run. It stops on
+`Reached target multi-user.target` — the string the verdict already gates every
+phase on — plus a **45-second settle**. That number is about the card, not the
+console: a write the guest made into its page cache is not on the card until
+writeback runs, and Linux flushes a dirty page once it is older than
+`dirty_expire_centisecs` (default 3000 = 30s), noticed on the
+`dirty_writeback_centisecs` tick (default 500 = 5s). 30 + 5 + 10 of margin.
+The marker also answers *"would a probe that ran have had time to say so?"* on
+its own: `otp-unit-imgcheck.service` is `Type=oneshot` and
+`WantedBy=multi-user.target`, and systemd's `target_add_default_dependencies()`
+adds `Before=<target>` to every unit a target wants, so the target's job
+cannot complete until the probe's has.
+
+The third boot costs a third 600s backstop in the worst case, which is why
+`image.yml`'s `timeout-minutes` went from 40 to 55; the arithmetic is in a
+comment above that key.
 
 ### The seeded `userconf.txt`, which is the other thing a first boot does
 
@@ -435,7 +565,8 @@ boot applies it non-interactively and deletes it. That is why `install.sh`
 replaced the mask with a `ConditionPathExists` drop-in rather than turning
 the unit off. Every run up to #32 exercised only the branch where nobody had
 written one — no seed, no wizard, boot green — so the two branches an
-operator actually meets rode along with the two boots that already existed:
+operator actually meets rode along with the two probe boots that already
+existed:
 
 | Branch | Where | What has to be true |
 |---|---|---|

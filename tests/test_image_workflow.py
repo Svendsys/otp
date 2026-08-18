@@ -264,10 +264,47 @@ def test_the_release_notes_two_boot_claim_is_backed_by_the_harness():
          "the release note's two-boot claim is no longer backed by anything")
     phases = (step_named(build_steps(), BOOT).get("env") or {}).get("OTP_IMG_PHASES")
     if phases is not None:
-        for boot in ("boot1", "boot2"):
+        for boot in ("boot1", "boot2", "release"):
             assert boot in str(phases).split(), \
                 (f"the boot step pins OTP_IMG_PHASES={phases!r}, which does "
-                 f"not run {boot}, but the release note claims both")
+                 f"not run {boot}, but the release note claims all three")
+
+
+def test_the_release_notes_inert_probe_claim_is_backed_by_the_harness():
+    """
+    THE NOTE ADMITS THE IMAGE CONTAINS A TEST PROBE, and that admission is
+    only safe while something has watched the probe stay asleep.
+
+    /opt/otp-unit/img-guest-check.sh ships on every unit, runs as root, and
+    writes to /boot/firmware -- outside the read-only overlay, so
+    permanently. The owner's decision was to keep it rather than strip it
+    from release builds, because a gate run against a specially prepared
+    image says nothing about the artifact people flash. What makes that safe
+    is `ConditionKernelCommandLine=otp.imgcheck` and the third tier-3 boot,
+    which boots the same card with no such token and requires systemd to have
+    named the unit and skipped it, the probe to have printed nothing, and its
+    two records to have stayed off the card after the harness deleted them.
+
+    Drop any of those clauses from the gate, or drop the boot that runs them,
+    and the paragraph attached to a tag becomes a promise nobody checked --
+    the worse direction, because it is a security claim about a script that
+    runs as root on the reader's machine.
+    """
+    body = step_named(build_steps(), ATTACH)["with"]["body"]
+    assert "img-guest-check.sh" in body, body
+    assert "otp.imgcheck" in body, body
+    assert "third boot" in body, body
+    harness = (REPO / "harness" / "img-boot.sh").read_text()
+    for name in ("imgcheck-unit-considered-and-skipped",
+                 "guest-probe-silent",
+                 "guest-probe-journal-tag-absent",
+                 "probe-droppings-stayed-off-the-card",
+                 "identity-store-unchanged"):
+        assert name in harness, (
+            f"the release note says the shipped probe stayed inert and "
+            f"img-boot.sh no longer has a {name} clause to say it with")
+    # And the phase that runs them is one the harness refuses to skip.
+    assert "for want in boot1 boot2 release; do" in harness, harness
 
 
 def test_the_release_notes_credential_claim_is_backed_by_the_harness():

@@ -641,9 +641,9 @@ tests = [
 [[mutation.edit]]
 file = "harness/img-boot.sh"
 find = '''PHASES_MISSING=""
-for want in boot1 boot2; do'''
+for want in boot1 boot2 release; do'''
 replace = '''PHASES_MISSING=""
-for want in boot2; do'''
+for want in boot2 release; do'''
 
 
 [[mutation]]
@@ -679,7 +679,7 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
-find = '''        if grep -qF "OTP-GUEST-DONE $phase" "$CONSOLE_TXT" 2>/dev/null; then'''
+find = '''        if grep -qF "$STOP_EVIDENCE" "$CONSOLE_TXT" 2>/dev/null; then'''
 replace = '''        if false; then'''
 
 
@@ -2216,9 +2216,9 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/img-boot.sh"
-find = '''    if grep -qE "OTP-JOURNAL-FORWARDED[[:space:]]+${phase}([[:space:]]|\$)" \
-            "$CONSOLE_TXT" 2>/dev/null; then'''
-replace = '''    if true; then'''
+find = '''            if grep -qE "OTP-JOURNAL-FORWARDED[[:space:]]+${phase}([[:space:]]|\$)" \
+                    "$CONSOLE_TXT" 2>/dev/null; then'''
+replace = '''            if true; then'''
 
 
 [[mutation]]
@@ -5172,3 +5172,500 @@ tests = [
 file = "tests/test_memory_budget.py"
 find = "a7={a7!r}"
 replace = "a7=False"
+
+# --- tier 3's third boot: the shipped probe staying inert -----------------
+#
+# Every clause in the `release` phase is an ABSENCE, which makes this the
+# densest concentration of unfalsifiable-looking checks in the repository. A
+# boot that never ran, a console nothing was written to, an image with the
+# probe deleted from it and a grep for a string systemd no longer prints all
+# produce exactly the silence a healthy release boot produces. Each row below
+# is one of those readings, put back.
+#
+# tier3-release-token-emptied-not-removed and
+# tier3-release-unit-need-not-be-considered are the two that matter most: the
+# first makes the phase test nothing at all, and the second makes DELETING the
+# probe from the image the greenest thing anyone could do to this gate.
+
+[[mutation]]
+name = "tier3-release-phase-not-required"
+tier = "fast"
+guard = """
+The release boot is the phase whose absence turns NOTHING red on its own.
+boot1 and boot2 report, so dropping one takes named guest checks with it and
+the run is loud. This one asserts a silence: a run without it prints a
+completely green verdict for an image nobody asked the question of, and the
+concluding line -- which image.yml restates into a tagged release body -- has
+to stop making the claim as well."""
+tests = [
+  "tests/test_img_verdict.py::test_a_phase_list_without_the_release_boot_is_refused",
+  "tests/test_img_verdict.py::test_the_default_runs_every_phase_the_guard_demands",
+  "tests/test_image_workflow.py::test_the_release_notes_inert_probe_claim_is_backed_by_the_harness",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''PHASES_MISSING=""
+for want in boot1 boot2 release; do'''
+replace = '''PHASES_MISSING=""
+for want in boot1 boot2; do'''
+
+
+[[mutation]]
+name = "tier3-release-phase-not-in-the-default"
+tier = "fast"
+guard = """
+The guard and the default are two lines that have to agree. A default that
+quietly lost the phase would refuse every run rather than skip it -- red, not
+green -- but red for a reason nobody would guess from the message, and the
+kind of red people fix by editing the guard."""
+tests = [
+  "tests/test_img_verdict.py::test_the_default_runs_every_phase_the_guard_demands",
+  "tests/test_img_verdict.py::test_an_empty_phase_list_falls_back_to_the_default",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = 'PHASES="${OTP_IMG_PHASES:-boot1 boot2 release}"'
+replace = 'PHASES="${OTP_IMG_PHASES:-boot1 boot2}"'
+
+
+[[mutation]]
+name = "tier3-release-token-emptied-not-removed"
+tier = "fast"
+guard = """
+THE EDIT THAT MAKES THE WHOLE PHASE TEST NOTHING.
+
+systemd's ConditionKernelCommandLine=otp.imgcheck matches a bare word AND the
+left-hand side of an assignment -- that is documented behaviour and it is what
+makes otp.imgcheck=boot1 start the unit in the first place. So `otp.imgcheck=`
+with nothing after it satisfies the condition just as well: the unit starts,
+and the only thing that stops the probe writing to /boot/firmware is its own
+phase guard. A release boot run that way is watching the second lock and
+reporting on the first."""
+tests = [
+  "tests/test_img_verdict.py::test_the_release_phase_is_handed_no_token_and_the_others_are",
+  "tests/test_overlay_root.py::test_the_guest_probe_cannot_run_on_a_flashed_unit",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        release) ;;
+        *) imgcheck_token="otp.imgcheck=$phase" ;;'''
+replace = '''        release) imgcheck_token="otp.imgcheck=" ;;
+        *) imgcheck_token="otp.imgcheck=$phase" ;;'''
+
+
+[[mutation]]
+name = "tier3-release-cmdline-token-not-checked"
+tier = "fast"
+guard = """
+The harness that builds the command line and the harness that checks it are
+the same program, so the check reads the token back off the kernel's own
+`Kernel command line:` echo. Take the gate off and a token that reappeared on
+the release phase's -append -- by a merge, by a debugging edit, by the case
+arm above losing its release branch -- reaches the guest with nothing
+noticing."""
+tests = [
+  "tests/test_img_verdict.py::test_a_release_boot_handed_the_token_fails",
+  "tests/test_img_verdict.py::test_a_release_boot_with_no_command_line_echo_at_all_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            if [ -n "$KCMDLINE" ] \
+               && ! printf '%s' "$KCMDLINE" | grep -qF "otp.imgcheck"; then'''
+replace = '''            if true; then'''
+
+
+[[mutation]]
+name = "tier3-probe-phases-need-not-carry-the-token"
+tier = "fast"
+guard = """
+The other direction, and what makes the release phase's absence mean
+anything: the same grep over the same kind of file has to find the token in
+the two boots that are supposed to have it. Without that, "no otp.imgcheck on
+the release console" is equally true of a harness that stopped putting the
+token on any console at all."""
+tests = [
+  "tests/test_img_verdict.py::test_the_probe_phases_are_required_to_carry_the_token",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            if printf '%s' "$KCMDLINE" | grep -qF "otp.imgcheck=$phase"; then'''
+replace = '''            if true; then'''
+
+
+[[mutation]]
+name = "tier3-release-unit-need-not-be-considered"
+tier = "fast"
+guard = """
+THE INVERSION THIS PHASE MUST NOT HAVE.
+
+An image with otp-unit-imgcheck.service deleted from it satisfies every other
+release clause perfectly: no probe output, no journal tag, no CUPS queue,
+nothing on the card. Take this clause off and REMOVING the probe makes the
+gate greener -- which is the exact opposite of the decision it exists to back,
+which was to ship the probe and rely on its condition."""
+tests = [
+  "tests/test_img_verdict.py::test_a_release_boot_whose_probe_unit_is_missing_fails",
+  "tests/test_img_verdict.py::test_a_skip_line_about_some_other_unit_is_not_this_one",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            if [ -n "$SKIPLINE" ]; then'''
+replace = '''            if true; then'''
+
+
+[[mutation]]
+name = "tier3-skip-line-need-not-name-the-unit"
+tier = "fast"
+guard = """
+A boot of Raspberry Pi OS skips a dozen units on conditions. "was skipped
+because" anywhere on the console is satisfied by any one of them and says
+nothing whatever about the probe -- the unit's NAME on the line is the part
+that is not a matter of systemd's prose."""
+tests = [
+  "tests/test_img_verdict.py::test_a_skip_line_about_some_other_unit_is_not_this_one",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = """                'otp-unit-imgcheck\\.service.*(was skipped because|being skipped)|(was skipped because|being skipped).*otp-unit-imgcheck\\.service' \\"""
+replace = """                '(was skipped because|being skipped)' \\"""
+
+
+[[mutation]]
+name = "tier3-release-journal-forwarding-unverified"
+tier = "fast"
+guard = """
+The release phase cannot use the probe's forwarding marker -- the marker is
+the probe's, and the phase's claim is that the probe did not run. So it
+requires a journald-forwarded line from a speaker that is not PID 1 instead.
+Without it, "the probe's journal tag never appeared" is equally true of a
+console the journal never reached, and the tag clause is measuring a channel
+nobody checked was open."""
+tests = [
+  "tests/test_img_verdict.py::test_a_release_console_the_journal_never_reached_fails",
+  "tests/test_img_verdict.py::test_pid_1_talking_to_itself_is_not_journal_forwarding",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            if [ "$(( ${FORWARDED:-0} - ${FORWARDED_PID1:-0} ))" -gt 0 ]; then'''
+replace = '''            if true; then'''
+
+
+[[mutation]]
+name = "tier3-release-forwarding-counts-pid-1"
+tier = "fast"
+guard = """
+PID 1 is subtracted for a reason: it writes its status lines straight to
+/dev/console and falls back to /dev/kmsg when journald is not up, so a console
+carrying nothing but systemd[1] lines is exactly what a boot with forwarding
+switched OFF looks like. Counting them makes the control pass on the boot it
+exists to catch."""
+tests = [
+  "tests/test_img_verdict.py::test_pid_1_talking_to_itself_is_not_journal_forwarding",
+  "tests/test_img_verdict.py::test_a_release_console_the_journal_never_reached_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            FORWARDED_PID1=$(grep -cE '^\[[^]]*\] systemd\[1\]:' "$CONSOLE_TXT" 2>/dev/null || true)'''
+replace = '''            FORWARDED_PID1=0'''
+
+
+[[mutation]]
+name = "tier3-release-probe-output-not-gated"
+tier = "fast"
+guard = """
+The first absence, and the one everything else is a refinement of: the probe
+printed nothing. Take the `here` half off and the clause reports on boot1's
+console alone -- a control with nothing to control."""
+tests = [
+  "tests/test_img_verdict.py::test_a_release_boot_where_the_probe_spoke_fails",
+  "tests/test_img_verdict.py::test_a_probe_that_ran_and_refused_is_not_a_probe_that_stayed_inert",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ "${here:-1}" = "0" ] && [ "${control:-0}" -gt 0 ] 2>/dev/null; then
+        printf 'IMG-CHECK %s guest-probe-silent PASS 0 here, %s in boot1\n' \'''
+replace = '''    if [ "${control:-0}" -gt 0 ] 2>/dev/null; then
+        printf 'IMG-CHECK %s guest-probe-silent PASS 0 here, %s in boot1\n' \'''
+
+
+[[mutation]]
+name = "tier3-release-probe-silence-has-no-control"
+tier = "fast"
+guard = """
+"This grep found nothing" is what a working release boot looks like AND what
+a grep that can no longer find the probe looks like -- a renamed marker, a
+changed prefix, an ANSI strip that stopped stripping. boot1 is the only boot
+in the run where the probe demonstrably ran, so the clause requires the same
+grep to find it there."""
+tests = [
+  "tests/test_img_verdict.py::test_the_silence_is_not_believed_when_the_control_boot_is_silent_too",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ "${here:-1}" = "0" ] && [ "${control:-0}" -gt 0 ] 2>/dev/null; then
+        printf 'IMG-CHECK %s guest-probe-silent PASS 0 here, %s in boot1\n' \'''
+replace = '''    if [ "${here:-1}" = "0" ]; then
+        printf 'IMG-CHECK %s guest-probe-silent PASS 0 here, %s in boot1\n' \'''
+
+
+[[mutation]]
+name = "tier3-release-probe-silence-misses-the-refusal"
+tier = "fast"
+guard = """
+`OTP-GUEST` and not `OTP-GUEST-`: the probe's third line is `OTP-GUEST
+refusing to run:`, which its own phase guard prints when the unit STARTED
+with no otp.imgcheck token. That is the probe running and the second lock
+doing the first lock's job -- the single most interesting thing this phase
+could catch -- and a trailing hyphen walks straight past it. The opening line
+`OTP-GUEST starting phase=` has no hyphen either."""
+tests = [
+  "tests/test_img_verdict.py::test_a_probe_that_ran_and_refused_is_not_a_probe_that_stayed_inert",
+  "tests/test_img_verdict.py::test_a_release_boot_where_the_probe_spoke_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    here=$(probe_lines 'OTP-GUEST' "$phase")'''
+replace = '''    here=$(probe_lines 'OTP-GUEST-DONE' "$phase")'''
+
+
+[[mutation]]
+name = "tier3-release-journal-tag-not-gated"
+tier = "fast"
+guard = """
+The probe's side effects are not only files: it writes a marker into the
+journal with `systemd-cat -t otp-imgcheck`, and journald puts that tag in the
+speaker position of the forwarded line. A release console carrying that
+speaker is one where the probe reached the journal."""
+tests = [
+  "tests/test_img_verdict.py::test_a_release_boot_carrying_the_probes_journal_tag_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    here=$(probe_lines 'otp-imgcheck\[[0-9]+\]:' "$phase")'''
+replace = '''    here=0'''
+
+
+[[mutation]]
+name = "tier3-release-cups-queue-not-gated"
+tier = "fast"
+guard = """
+The probe creates a CUPS queue called otpimgcheck for its diagnostic sheet.
+This is a fingerprint check rather than a queue check -- /etc/cups is a tmpfs
+and cupsd at LogLevel warn does not log a printer being added, so nothing
+host-visible survives -- but it is one grep, and it is wider than the
+OTP-GUEST clause beside it."""
+tests = [
+  "tests/test_img_verdict.py::test_a_release_boot_naming_the_probes_cups_queue_fails",
+  "tests/test_img_verdict.py::test_the_cups_queue_control_comes_off_the_boot_that_made_one",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    here=$(probe_lines 'otpimgcheck' "$phase")
+    control=$(probe_lines 'otpimgcheck' boot1)'''
+replace = '''    here=0
+    control=1'''
+
+
+[[mutation]]
+name = "tier3-release-deletion-has-no-control"
+tier = "fast"
+guard = """
+The probe's two records are written by boot1 and left by boot2, and the
+release phase deletes them before it boots. That is what makes "they did not
+come back" a statement a boot can fail -- but only while there was something
+to delete. If the earlier boots ever stop writing them, the absence afterwards
+is one the phase was handed for free, true of a working image and a broken one
+alike."""
+tests = [
+  "tests/test_img_verdict.py::test_a_release_phase_with_nothing_to_delete_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        fat_lists "$prestrip" "$name" || missing="$missing $name"'''
+replace = '''        : "$prestrip" "$name"'''
+
+
+[[mutation]]
+name = "tier3-release-droppings-only-checked-after"
+tier = "fast"
+guard = """
+Both ends. "Gone afterwards" alone is true of an mdel that silently did
+nothing followed by a boot that deleted them itself, and of a listing nothing
+could read -- and mtools writing nothing and saying nothing against a wrong
+offset is how run 1 read a harness bug as a bad image."""
+tests = [
+  "tests/test_img_verdict.py::test_a_strip_that_did_nothing_fails_rather_than_passing",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        if fat_lists "$before" "$name"; then missing="$missing before:$name"; fi'''
+replace = '''        : "$before" "$name"'''
+
+
+[[mutation]]
+name = "tier3-release-droppings-may-come-back"
+tier = "fast"
+guard = """
+The file half of the claim: a boot with no otp.imgcheck token did not write
+the probe's records back onto the card. This is the clause a probe that
+actually ran would trip."""
+tests = [
+  "tests/test_img_verdict.py::test_a_release_boot_that_put_the_probes_records_back_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        if fat_lists "$after" "$name"; then missing="$missing after:$name"; fi'''
+replace = '''        : "$after" "$name"'''
+
+
+[[mutation]]
+name = "tier3-release-may-rearrange-the-boot-partition"
+tier = "fast"
+guard = """
+A release boot must not be the thing that eats the operator's login. The
+identity store, the credential and the saved settings are all on this
+partition, outside the overlay, and a boot with no otp.imgcheck token has no
+business adding or removing anything there."""
+tests = [
+  "tests/test_img_verdict.py::test_a_release_boot_that_changed_the_boot_partition_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ -z "$changed" ]; then
+        printf 'IMG-CHECK %s boot-partition-unchanged PASS %s entries either side\n' \'''
+replace = '''    if true; then
+        printf 'IMG-CHECK %s boot-partition-unchanged PASS %s entries either side\n' \'''
+
+
+[[mutation]]
+name = "tier3-release-may-rewrite-what-it-keeps"
+tier = "fast"
+guard = """
+The listing cannot see this one: a file rewritten in place keeps its name. The
+credential is the only login this unit has and the machine-id is what keeps a
+power-cycled appliance the same machine, so both are compared by content --
+as digests, because this work directory is uploaded as a CI artifact."""
+tests = [
+  "tests/test_img_verdict.py::test_a_release_boot_that_rewrote_a_kept_file_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''        if [ "${#dbefore}" != 64 ] || [ "$dbefore" != "${dafter:-nothing}" ]; then'''
+replace = '''        if [ "$dbefore" != "${dafter:-nothing}" ]; then
+            : # the length clause is what stops two absences comparing equal'''
+
+
+[[mutation]]
+name = "tier3-release-two-absences-are-not-a-kept-file"
+tier = "fast"
+guard = """
+The absence trap, in the one release clause that compares values. `absent`
+equals `absent`, and so does the sha256 of nothing to the sha256 of nothing --
+which is exactly how "the credential survived this boot" comes to mean "there
+has never been a credential". The row above removes the length clause; this
+one is the reading it lets through."""
+tests = [
+  "tests/test_img_verdict.py::test_two_files_that_are_not_there_are_not_an_unchanged_store",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''    if [ -z "$body" ]; then printf 'absent'; return 0; fi'''
+replace = '''    if [ -z "$body" ]; then printf '%s' "absent-but-64-characters-long-0000000000000000000000000000000000000000" | cut -c1-64; return 0; fi'''
+
+
+[[mutation]]
+name = "tier3-release-boot-may-be-a-first-boot"
+tier = "fast"
+guard = """
+first-boot-complete.target in the third boot of the same card means PID 1
+could not read a machine-id -- the identity the two boots before it persisted
+has gone. That is damage this phase is watching the card for, seen from the
+console instead of from mtools."""
+tests = [
+  "tests/test_img_verdict.py::test_a_release_boot_that_was_a_first_boot_fails",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''                printf 'IMG-CHECK %s release-boot-is-not-a-first-boot FAIL\n' "$phase"
+            else
+                printf 'IMG-CHECK %s release-boot-is-not-a-first-boot PASS\n' "$phase"'''
+replace = '''                printf 'IMG-CHECK %s release-boot-is-not-a-first-boot PASS\n' "$phase"
+            else
+                printf 'IMG-CHECK %s release-boot-is-not-a-first-boot PASS\n' "$phase"'''
+
+
+[[mutation]]
+name = "tier3-release-phase-asked-for-a-guest-report"
+tier = "fast"
+guard = """
+The release phase has no probe by construction, so guest_gate's demands --
+an OTP-RESULT line, an OTP-GUEST-DONE line, every named guest check -- would
+fail every healthy release boot. The wrong fix is to loosen guest_gate, which
+would loosen it for the two phases it was written for; the right one is a
+different gate for a different shape of evidence."""
+tests = [
+  "tests/test_img_verdict.py::test_a_healthy_release_boot_passes_every_clause",
+  "tests/test_img_verdict.py::test_the_release_phase_is_not_asked_for_a_guest_report",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            release) release_gate "$phase" ;;'''
+replace = '''            release) release_gate "$phase"; guest_gate "$phase" ;;'''
+
+
+[[mutation]]
+name = "tier3-release-phase-pays-the-whole-backstop"
+tier = "fast"
+guard = """
+The sampler stops the other two phases on the probe's done line. This phase
+has no probe, so with the same marker it never stops early and burns the whole
+600s backstop on every green run -- ten minutes of CI per build to observe
+nothing, and a job cap that then has to be raised again to fit it."""
+tests = [
+  "tests/test_img_verdict.py::test_the_release_phase_has_a_stop_condition_of_its_own",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            stop_marker="Reached target multi-user.target"'''
+replace = '''            stop_marker="OTP-GUEST-DONE $phase"'''
+
+
+[[mutation]]
+name = "tier3-release-settle-too-short-for-writeback"
+tier = "fast"
+guard = """
+The settle window is about the CARD, not the console. This phase asserts that
+nothing was written to the FAT partition, and a write the guest made into its
+page cache is not on the card until writeback runs -- dirty_expire_centisecs
+defaults to 3000 (30s) and the writeback thread ticks every
+dirty_writeback_centisecs, 500 (5s). A 10s drain would stop the emulator with
+the write still in RAM and the clause would pass on the boot it exists to
+catch."""
+tests = [
+  "tests/test_img_verdict.py::test_the_release_phase_has_a_stop_condition_of_its_own",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''            settle=45'''
+replace = '''            settle=10'''
+
+
+[[mutation]]
+name = "tier3-three-boot-claim-unconditional"
+tier = "fast"
+guard = """
+The concluding line is what a reader takes away, and image.yml restates it
+into the body of a tagged release. Its newest clause is the one that would be
+cheapest to leave standing after the boot behind it stopped happening: the
+other two describe things that were observed to happen, and this one describes
+something observed NOT to. A reader cannot tell an unmade absence from an
+unasked question."""
+tests = [
+  "tests/test_img_verdict.py::test_a_two_phase_run_does_not_claim_the_probe_stayed_inert",
+]
+[[mutation.edit]]
+file = "harness/img-boot.sh"
+find = '''CLAIM_MISSING=""
+for want in boot1 boot2 release; do'''
+replace = '''CLAIM_MISSING=""
+for want in boot1 boot2; do'''
