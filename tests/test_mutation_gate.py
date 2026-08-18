@@ -24,6 +24,9 @@ is a failure in the ordinary suite and not only in the gate job.
 """
 from __future__ import annotations
 
+import importlib.util
+import os
+import pathlib
 import sys
 from pathlib import Path
 
@@ -297,6 +300,144 @@ class TestTheTreeIsPutBack:
         with pytest.raises(RuntimeError):
             one.apply_and_judge(mutation())
         assert (scratch / "verdict.py").read_bytes() == before
+
+    def test_a_same_length_mutation_does_not_outlive_itself_in_the_cache(
+            self, scratch):
+        """
+        Putting the BYTES back is not the same as putting the tree back.
+
+        CPython decides a `__pycache__` entry is still valid by comparing
+        the source's mtime in whole seconds and its size, and nothing else.
+        A mutation whose replacement is the same length as what it replaced
+        -- a swapped pair of lines -- changes neither, so a mutated run
+        that finishes inside a second leaves a cache entry the RESTORED
+        file matches exactly, and the interpreter goes on running the
+        mutation out of a tree that `git diff --exit-code` calls clean.
+
+        Found the hard way: after a fast-tier run in which every row was
+        reported caught and the tree was verified clean, the next ordinary
+        `pytest` in the same checkout failed on the swapped-line mutation
+        from `panel-replacement-runs-before-anything-can-find-it`.
+
+        The mutation here is written and restored inside one call, which is
+        well inside one second, and it is length-preserving by
+        construction: `return 17` for `return 18`.
+        """
+        target = scratch / "verdict.py"
+        cached = pathlib.Path(importlib.util.cache_from_source(str(target)))
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        original = target.read_bytes()
+        stamp = target.stat().st_mtime
+
+        # A cache entry that claims to be for the file as it stands now,
+        # exactly as a mutated run leaves behind. The contents do not
+        # matter -- what is asserted is whether it is still believed.
+        cached.write_bytes(b"the mutated bytecode")
+        os.utime(cached, (stamp, stamp))
+
+        one = gate.Gate(repo=scratch, tiers={"fast": FAST}, runner=fake(red()))
+        one._baselines[("fast", CAUGHT)] = ""
+        one.apply_and_judge(mutation("same-length", edits=[
+            gate.Edit(path="verdict.py", find="return 17",
+                      replace="return 18")]))
+
+        assert target.read_bytes() == original, "the source was not restored"
+        assert not cached.exists(), (
+            "the restored file still has its cache entry, and the source's "
+            "(mtime, size) are what they were -- so every later run in this "
+            "checkout executes the mutation out of a tree that git calls "
+            "clean")
+
+    def test_the_mutated_run_never_starts_with_a_cache_entry_to_believe(
+            self, scratch):
+        """
+        The APPLY side, which the test above cannot see.
+
+        That one plants an entry and finds it gone at the end, which the
+        restore's own `_write` satisfies on its own. Measured: reverting
+        only the apply side -- `self._write(target, ...)` back to
+        `target.write_bytes(...)` in `apply_and_judge` -- left this file
+        green at 33 passed and left
+        `mutation-gate-leaves-the-mutation-in-the-bytecode-cache` reported
+        caught, because that row mutates `cached.unlink()` and so disables
+        both sides at once.
+
+        And it is the direction that costs something. A mutation written
+        within a second of the original's cache entry is executed AS THE
+        ORIGINAL: the row survives, the report says the guard is fine, and
+        nothing anywhere is red. So the question is asked at the only
+        moment it can be answered -- when the mutated run starts -- from
+        inside the runner, where a stale entry is visible.
+        """
+        target = scratch / "verdict.py"
+        cached = pathlib.Path(importlib.util.cache_from_source(str(target)))
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        stamp = target.stat().st_mtime
+        cached.write_bytes(b"bytecode for the file as it stands now")
+        os.utime(cached, (stamp, stamp))
+
+        seen = []
+
+        def watching(repo, tier, tests):
+            seen.append(cached.exists())
+            return red()
+
+        one = gate.Gate(repo=scratch, tiers={"fast": FAST}, runner=watching)
+        one._baselines[("fast", CAUGHT)] = ""
+        outcome = one.apply_and_judge(mutation("same-length", edits=[
+            gate.Edit(path="verdict.py", find="return 17",
+                      replace="return 18")]))
+
+        assert seen == [False], (
+            f"the mutated run started with the original's cache entry "
+            f"still in place (runner saw {seen}), and CPython compares "
+            f"only the source's mtime in whole seconds and its size -- so "
+            f"the subprocess may have executed the ORIGINAL and this row's "
+            f"verdict means nothing")
+        assert outcome.ok, outcome.detail
+
+    def test_a_mutation_the_cache_could_shadow_is_not_given_a_verdict(
+            self, scratch, monkeypatch):
+        """
+        And when the entry survives the write anyway, the row is BROKEN.
+
+        `_write` dropping the entry is not the same as the entry being
+        gone: `__pycache__` can be unwritable, and a second process can
+        compile the file in the window. Either way the run that follows
+        may be measuring the original, so the gate refuses to score it
+        rather than reporting a verdict it cannot stand behind -- and not
+        SURVIVED, which would send someone off to write a test that is
+        already there.
+
+        The pre-fix `_write` is put back for the duration, because that is
+        exactly what "the entry survived the write" looks like.
+        """
+        target = scratch / "verdict.py"
+        cached = pathlib.Path(importlib.util.cache_from_source(str(target)))
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        original = target.read_bytes()
+        stamp = target.stat().st_mtime
+        cached.write_bytes(b"bytecode for the file as it stands now")
+        os.utime(cached, (stamp, stamp))
+        monkeypatch.setattr(gate.Gate, "_write",
+                            staticmethod(lambda t, data: t.write_bytes(data)))
+
+        ran = []
+        one = gate.Gate(repo=scratch, tiers={"fast": FAST},
+                        runner=lambda *a: ran.append(a) or red())
+        one._baselines[("fast", CAUGHT)] = ""
+        outcome = one.apply_and_judge(mutation("same-length", edits=[
+            gate.Edit(path="verdict.py", find="return 17",
+                      replace="return 18")]))
+
+        assert outcome.verdict == "BROKEN", (
+            f"a row whose mutation the cache could shadow was given a "
+            f"verdict anyway: {outcome.verdict} -- {outcome.detail}")
+        assert "may have executed the ORIGINAL" in outcome.detail
+        assert ran == [], "the tests were run against a file that may not "\
+                          "have been the mutated one"
+        assert target.read_bytes() == original, "the source was not restored"
+        cached.unlink(missing_ok=True)
 
     def test_every_file_of_a_multi_edit_mutation_is_restored(self, scratch):
         before = {name: (scratch / name).read_bytes()

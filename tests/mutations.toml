@@ -3895,6 +3895,560 @@ find = "    if len(message) > REPORT_MAX_CHARS:"
 replace = "    if False:      # mutation: no cap on the length of a report"
 
 
+# --- and the supervisor above it ------------------------------------------
+#
+# The guard rows above stop an exception from OUR callback killing lgpio's
+# dispatch thread. These are for the case where it is already dead --
+# something else in the process raising, or the guard's own last-resort
+# swallow failing -- because by then there is nothing left to catch anything
+# with, and every button in the process is inert until a power cycle, which
+# discards the pad in progress and its key material.
+#
+# The decision implemented is "build it, log only": notice, restore
+# delivery, write to the journal, change nothing else. Every row here is a
+# way for that to be installed, running, green, and not true -- and the
+# first is the most important one, because it is the panel as it shipped
+# before the supervisor existed, which the suite has to be able to tell
+# apart from the panel with one.
+#
+# WHAT IS NOT HERE. Nothing that names a test needing lgpio.
+# requirements-dev.txt leaves lgpio out and it is linux-only, so
+# TestRevivingLgpiosOwnDispatchThread -- where the repair is proved to
+# actually put edge delivery back, against the library's own dispatch loop
+# -- skips in CI, and a skipped test cannot go red. The rows below are
+# caught by the stand-in classes, which run everywhere.
+
+[[mutation]]
+name = "panel-never-notices-a-dead-dispatch-thread"
+tier = "fast"
+guard = """
+The supervisor itself: the panel as it shipped before this change, which
+caught exceptions out of its own callbacks and did nothing whatever about a
+dispatch thread that had already stopped.
+
+That is not a hypothetical state. lgpio's notification thread is a
+module-level singleton started at import (lgpio.py:562) whose dispatch loop
+has no guard around the call (lgpio.py:531-559), and nothing anywhere
+restarts it. Anything in the process that raises inside a callback ends it,
+and from then on no button fires again -- not this one, not the other two,
+not a panel built afterwards. On this unit the remedy is a power cycle,
+which throws away the pad being made.
+
+The check is the thread's own liveness, which is directly observable, so
+there is no threshold to pick and nothing for a healthy unit to trip.
+
+The mutation removes the one call that looks."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_dead_dispatcher_is_restarted_and_the_journal_says_so",
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_press_half_taken_when_the_dispatcher_died_cannot_become_back",
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_wait_with_no_deadline_still_looks_at_the_dispatcher",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "            self._watch()"
+replace = "            pass  # mutation: the panel as it was before the supervisor"
+
+[[mutation]]
+name = "panel-restarts-a-dispatch-thread-that-is-running"
+tier = "fast"
+guard = """
+Quiet on a healthy unit, which is the difference between a diagnostic and a
+line people learn to skip. A supervisor that acts on a dispatcher that is
+working writes into the journal on every idle poll, and then the one line
+that mattered goes past unread -- in a journal that is the only diagnostic
+this device has.
+
+It is also the difference between restoring delivery and interrupting it: a
+replacement started over a live reader puts TWO threads on one notification
+pipe, where a sixteen-byte record can be split between them and unpacked as
+nonsense.
+
+The mutation acts whether or not the thread is alive."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_healthy_dispatcher_is_never_restarted_and_never_mentioned",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "            if thread is None or thread.is_alive():"
+replace = "            if thread is None:      # mutation: alive counts as dead"
+
+[[mutation]]
+name = "panel-retries-a-failed-revival-without-a-bound"
+tier = "fast"
+guard = """
+`_watch` runs on every `wait`, and a printing job asks with `timeout=0` on
+every progress step -- fifty times in a pad. The repair allocates a thread
+and its failure formats a traceback, so an unbounded retry spends both on
+every one of those, in the minutes this 512 MiB board with no swap is
+nearest its ceiling and for a fault whose most likely cause is that it
+already is. It writes fifty reports into the same journald `_report` must
+never wait on, as well.
+
+The mutation removes the interval. The named test keeps a revival failing
+across fifty waits and requires exactly one attempt."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_dispatcher_that_stays_dead_is_not_retried_without_a_bound",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """            if (self._revive_at is not None
+                    and now - self._revive_at < REVIVE_SECONDS):"""
+replace = "            if False:      # mutation: attempt on every single wait"
+
+[[mutation]]
+name = "panel-carries-a-press-time-across-a-revival"
+tier = "fast"
+guard = """
+The one piece of panel state a revival has to clear, and the reason it is
+restoration rather than policy.
+
+`_on_press` records a timestamp and `_on_release` decides OK versus BACK by
+measuring against it. A dispatch thread that dies BETWEEN the two leaves
+that timestamp behind, and the release that eventually arrives -- minutes
+later, once delivery is back -- measures more than HOLD_SECONDS and arrives
+as BACK where the operator pressed OK. While a job is printing those are
+opposite things: BACK purges the spool and destroys the pad pair. It is the
+confusion the whole tap-versus-hold design exists to prevent, arriving by a
+route the design did not have.
+
+The mutation leaves the timestamp in place. The named test plants a stale
+one, revives, and requires the next release to be ignored -- with a control
+first, on a panel whose dispatcher is alive, showing that the same stale
+timestamp really does produce a BACK."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_press_half_taken_when_the_dispatcher_died_cannot_become_back",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """            self._pressed_at = None
+            try:
+                discarded = self._reviver(thread)"""
+replace = """            try:
+                discarded = self._reviver(thread)"""
+
+[[mutation]]
+name = "panel-revival-that-raises-takes-the-event-loop-with-it"
+tier = "fast"
+guard = """
+The repair allocates a thread, and the fault it exists to meet is the one
+that breaks allocating next. `_watch` runs on the app's event loop, so an
+exception out of it ends `App.run()`, `main()` returns 0, and systemd's
+`Restart=on-failure` reads a zero exit as success and does NOT restart --
+the appliance is simply off until somebody power-cycles it, which is the
+failure `KeyboardButtons.allow_quit` already exists for.
+
+A failed revival must cost a line in the journal and nothing else.
+
+The mutation narrows the catch to a type the repair cannot raise."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_revival_that_raises_leaves_the_panel_answering",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """            except BaseException as exc:        # noqa: BLE001
+                self._revive_failed += 1"""
+replace = """            except ValueError as exc:           # mutation: no catch
+                self._revive_failed += 1"""
+
+[[mutation]]
+name = "panel-supervisors-own-report-takes-the-event-loop-with-it"
+tier = "fast"
+guard = """
+The last swallow in `_watch`, covering everything the check does including
+its own reporting -- the same trade `_guarded` makes one level down, for
+the same reason. Saying what happened allocates an f-string and formats a
+traceback, which is exactly what a MemoryError breaks next, and stderr on
+this unit is a socket to journald that can be closed. Losing the log entry
+is bad; losing the loop that draws the panel and reads the buttons is
+worse, and on this device it is a power cycle.
+
+The mutation narrows the outer catch. The named tests make the reporter and
+then the probe raise, and require the panel to answer the next press."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_report_about_a_revival_cannot_kill_the_event_loop",
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_probe_that_raises_cannot_kill_the_event_loop",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """        except BaseException:                   # noqa: BLE001
+            # The whole check, including its own reporting."""
+replace = """        except ValueError:                      # mutation: no last resort
+            # The whole check, including its own reporting."""
+
+[[mutation]]
+name = "panel-keeps-watching-after-it-has-closed"
+tier = "fast"
+guard = """
+`close()` is the app going away, and it is the one moment the supervisor
+could race a teardown: reviving lgpio's thread on behalf of a panel being
+torn down is work for nobody, done while the `Button`s under it are being
+closed.
+
+The mutation keeps watching regardless. The named test closes a panel with
+a dead dispatcher and requires it never to be asked -- with the control
+immediately after, on an open panel and the same fakes, which does revive."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_closed_panel_stops_watching",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "            if self._closed:"
+replace = "            if False:      # mutation: a closed panel keeps watching"
+
+[[mutation]]
+name = "panel-revives-the-dispatcher-in-silence"
+tier = "fast"
+guard = """
+"Log only" means the journal is the whole of the report. The operator
+cannot be told -- the panel is a 128x64 OLED with a menu on it, and the
+decision was explicitly that nothing may be drawn -- so a revival that says
+nothing leaves a unit whose buttons stopped and started again with no
+record that either happened, and the next person to look sees a device that
+"sometimes misses presses".
+
+The mutation makes a successful revival silent while still performing it,
+which is the shape that is easy to ship by accident and impossible to
+notice from the outside."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_dead_dispatcher_is_restarted_and_the_journal_says_so",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """        if exc is None:
+            bound = \"\"
+            if discarded >= BACKLOG_MAX_BYTES:"""
+replace = """        if exc is None:
+            return
+        if exc is None:
+            bound = \"\"
+            if discarded >= BACKLOG_MAX_BYTES:"""
+
+[[mutation]]
+name = "panel-revival-hides-that-the-drain-gave-up"
+tier = "fast"
+guard = """
+The one case where discarding the backlog does not prevent the replay, and
+the report is the only place it can be seen.
+
+`_discard_backlog` stops at BACKLOG_MAX_BYTES so a pipe somebody is still
+filling cannot hold the app's event loop for as long as it likes. Everything
+past the bound stays in the pipe, and the replacement thread delivers it --
+presses aimed at a panel that was not listening, arriving at machine speed
+at whatever is on screen now, which is the entire hazard the drain exists
+for. A success line that says "discarded rather than replayed" and stops
+there describes that run wrongly, and the journal is the only diagnostic
+this device has.
+
+The mutation keeps the drain and its bound exactly as they are and makes the
+report silent about having hit it."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_drain_that_stopped_at_its_bound_says_the_rest_is_coming",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "            if discarded >= BACKLOG_MAX_BYTES:"
+replace = "            if False:  # mutation: never say the drain gave up"
+
+[[mutation]]
+name = "panel-revival-cries-wolf-about-the-drain-giving-up"
+tier = "fast"
+guard = """
+The other direction of the same line, because the two are one edit apart and
+only one of them is caught by the row above.
+
+A revival that emptied the pipe and says it stopped at its bound sends
+whoever reads the journal hunting a replay that did not happen -- on a unit
+whose journal is its only diagnostic, and where the whole argument for
+reporting at all is that nothing is written when nothing is wrong.
+
+The mutation says it every time."""
+tests = [
+  "tests/test_hardware.py::TestTheDispatchThreadIsWatched::test_a_dead_dispatcher_is_restarted_and_the_journal_says_so",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "            if discarded >= BACKLOG_MAX_BYTES:"
+replace = "            if True:  # mutation: always say the drain gave up"
+
+[[mutation]]
+name = "panel-replays-what-was-pressed-at-a-dead-panel"
+tier = "fast"
+guard = """
+The half that decides whether recovery is safe or harmful.
+
+Nothing drains lgpio's notification pipe while its thread is dead -- the
+read end stays open, because a thread killed inside `cb.func` never reaches
+the `self._file.close()` at the end of `run()` (lgpio.py:559) -- so every
+press made at a panel that was not listening piles up in it. Measured, with
+forty press/release pairs written to a dead dispatcher's pipe and the thread
+then restarted over it: all eighty edges were delivered back to back at the
+moment of recovery.
+
+On this device that drives the menu at machine speed with presses aimed at
+a screen nobody moved on, and OK and BACK mean opposite things while a job
+is printing. ui._drain states the same rule for presses banked while the
+loop was blocked: replaying them is always wrong.
+
+The mutation skips the drain and reports nothing thrown away."""
+tests = [
+  "tests/test_hardware.py::TestTheReplacementDispatchThread::test_it_empties_the_pipe_before_anything_can_read_it",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "    discarded = _discard_backlog(source)"
+replace = "    discarded = 0      # mutation: the backlog is replayed instead"
+
+[[mutation]]
+name = "panel-drain-reads-the-descriptor-and-not-the-reader"
+tier = "fast"
+guard = """
+Where the backlog actually is, which is the part that is easy to get wrong
+and impossible to see afterwards.
+
+lgpio reads notifications with `self._file.read(16)` on a BufferedReader
+(lgpio.py:504, 543), and one of those pulls up to 8192 bytes out of the pipe
+whatever it was asked for. So the edges written in the same burst as the one
+that kills the thread are already inside Python when it dies. Measured in a
+container, killing the thread with a burst written in one call: the kernel
+held 0 bytes (FIONREAD) and the reader held 960 -- sixty edges that a drain
+of the file DESCRIPTOR finds none of, and that are then replayed into the
+menu on recovery.
+
+The mutation is the descriptor-only drain, which is the version that was
+written first and passed everything until the test below was added."""
+tests = [
+  "tests/test_hardware.py::TestDiscardingAStaleBacklog::test_it_takes_what_the_reader_has_already_buffered",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "                got = source.readinto1(_BACKLOG_BUFFER)"
+replace = "                got = os.readv(source.fileno(), [_BACKLOG_BUFFER])"
+
+[[mutation]]
+name = "panel-drain-can-park-the-thread-it-runs-on"
+tier = "fast"
+guard = """
+There is no way to ask a pipe how much it is holding, so the drain reads
+until it is empty -- and a blocking read on an empty pipe does not fail, it
+PARKS. `_watch` runs on the app's event loop, so a drain that can block is
+the panel frozen by the thing that was repairing it: exactly the hazard
+`_report`'s `select()` question exists for, one function along.
+
+The mutation drains without asking for non-blocking first. The named test
+uses a reader that raises the moment it is read while the descriptor could
+still block, rather than letting the run hang -- a hang neither reports nor
+counts as caught."""
+tests = [
+  "tests/test_hardware.py::TestDiscardingAStaleBacklog::test_it_reads_only_while_the_descriptor_cannot_park_and_puts_it_back",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "    os.set_blocking(fd, False)"
+replace = "    pass  # mutation: read the pipe while it can still block"
+
+[[mutation]]
+name = "panel-drain-leaves-the-pipe-non-blocking"
+tier = "fast"
+guard = """
+The other end of the same trick. lgpio's `run` loop is
+`buf += self._file.read(RECV_SIZ)` with nothing between iterations
+(lgpio.py:538), so a descriptor left non-blocking turns it into a spin that
+delivers nothing and never sleeps -- on a single-core-scheduled appliance,
+a panel that looks perfectly alive, answers `is_alive()`, and is not there.
+
+The mutation drops the restore. Both named tests check it: one after a
+drain that succeeded, one after a read that raised, because the restore is
+in a `finally` and only the second says so."""
+tests = [
+  "tests/test_hardware.py::TestDiscardingAStaleBacklog::test_it_reads_only_while_the_descriptor_cannot_park_and_puts_it_back",
+  "tests/test_hardware.py::TestDiscardingAStaleBacklog::test_a_read_that_fails_still_leaves_it_blocking",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "        os.set_blocking(fd, True)"
+replace = "        pass  # mutation: leave the pipe non-blocking afterwards"
+
+[[mutation]]
+name = "panel-drain-never-gives-up"
+tier = "fast"
+guard = """
+The bound on the drain. It runs on the app's event loop, so a writer that
+keeps up with it holds that loop for as long as it cares to. A Linux pipe
+holds 64 KiB by default and lgpio leaves it there, so the bound is sixteen
+times what the kernel can actually be holding: it is a backstop against a
+loop that never ends, not a limit on real traffic.
+
+The mutation removes the bound. The named test's stand-in stops at three
+times the bound rather than never, so a missing bound reads as a number
+that is too large instead of as a hang."""
+tests = [
+  "tests/test_hardware.py::TestDiscardingAStaleBacklog::test_it_gives_up_rather_than_draining_a_pipe_somebody_is_filling",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "        while dropped < BACKLOG_MAX_BYTES:"
+replace = "        while True:      # mutation: drain for as long as it takes"
+
+[[mutation]]
+name = "panel-replacement-opens-a-notification-handle-of-its-own"
+tier = "fast"
+guard = """
+Why the repair is not a fresh `lgpio._callback_thread()`, which is the
+obvious way to write it.
+
+`gpio_claim_alert` routes a line's edges to `_notify_thread._notify` at the
+moment the alert is claimed (lgpio.py:1293). A replacement on a NEW handle
+is therefore reading a pipe the kernel is not writing to, while every alert
+already claimed goes on arriving at the old one and reaching nobody -- a
+panel that is exactly as deaf as before, with a journal line saying it
+recovered, which is worse than no supervisor at all.
+
+(A fresh handle also creates another `.lgd-nfy*` FIFO in the directory lgpio
+recorded at import. Measured: the C side keeps that directory and the Python
+side opens the FIFO relative to the CURRENT one, so a process that has
+chdir'd since import gets FileNotFoundError and leaks the handle it opened.)
+
+The mutation gives the replacement a handle of its own."""
+tests = [
+  "tests/test_hardware.py::TestTheReplacementDispatchThread::test_the_replacement_takes_over_the_handle_and_the_pipe",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "    fresh._notify = dead._notify"
+replace = "    fresh._notify = None      # mutation: not the handle alerts go to"
+
+[[mutation]]
+name = "panel-replacement-takes-a-copy-of-the-callback-list"
+tier = "fast"
+guard = """
+`lgpio.callback()` appends to whatever `_notify_thread` is at the time it is
+called (lgpio.py:578). A replacement holding a COPY of the list therefore
+serves the registrations that existed at the moment of repair and silently
+stops serving anything registered afterwards -- the same deafness as the
+dead thread, in a new place, on a panel built after the recovery.
+
+The mutation copies the list instead of sharing it."""
+tests = [
+  "tests/test_hardware.py::TestTheReplacementDispatchThread::test_it_shares_the_callback_list_rather_than_copying_it",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = "    fresh.callbacks = dead.callbacks"
+replace = "    fresh.callbacks = list(dead.callbacks)      # mutation: a copy"
+
+[[mutation]]
+name = "panel-replacement-runs-before-anything-can-find-it"
+tier = "fast"
+guard = """
+The order between publishing the replacement and starting it. Everything in
+lgpio that arms an edge reads the module-level singleton as it goes --
+`callback()` at lgpio.py:578, `gpio_claim_alert` at lgpio.py:1293 -- so a
+claim racing the repair must never be able to see the thread that is going
+away. They are the same notification handle today; the order costs nothing
+and does not depend on that staying true.
+
+The mutation starts first and publishes after."""
+tests = [
+  "tests/test_hardware.py::TestTheReplacementDispatchThread::test_it_is_published_before_it_is_started",
+]
+[[mutation.edit]]
+file = "otpunit/hw/buttons.py"
+find = """    lgpio._notify_thread = fresh
+    fresh.start()"""
+replace = """    fresh.start()
+    lgpio._notify_thread = fresh"""
+
+[[mutation]]
+name = "mutation-gate-leaves-the-mutation-in-the-bytecode-cache"
+tier = "fast"
+guard = """
+The gate's own restore, and the half of it that putting the bytes back does
+not cover.
+
+CPython decides a `__pycache__` entry is still valid from the source's mtime
+in whole seconds and its size, and nothing else. A row whose `replace` is
+the same length as its `find` -- a swapped pair of lines -- changes neither,
+and a mutated run that finishes inside a second leaves a cache entry the
+RESTORED file matches exactly. The interpreter then goes on executing the
+mutation, in a tree `git diff --exit-code` reports as clean, for every run
+in that checkout until something else touches the file.
+
+Found the hard way while adding the panel rows above: the fast tier reported
+214/214 caught, the tree was verified clean, and the next ordinary `pytest`
+in the same checkout failed on the swapped-line mutation from
+panel-replacement-runs-before-anything-can-find-it. Measured:
+
+    pyc records mtime 1787071573 size 41074
+    src has      mtime 1787071573 size 41074
+
+It runs the other way too, and that way is worse: a mutation written within
+a second of the original's cache entry can be executed AS THE ORIGINAL, and
+the row survives for a reason that has nothing to do with its guard -- a
+green line in a report, which is what this whole mechanism exists to refuse.
+
+The mutation drops the cache invalidation and keeps the byte-for-byte
+restore, which is the version that was shipped."""
+tests = [
+  "tests/test_mutation_gate.py::TestTheTreeIsPutBack::test_a_same_length_mutation_does_not_outlive_itself_in_the_cache",
+]
+[[mutation.edit]]
+file = "tests/mutation_gate.py"
+find = "            cached.unlink()"
+replace = "            pass  # mutation: the cache entry outlives the restore"
+
+[[mutation]]
+name = "mutation-gate-applies-a-mutation-into-a-live-bytecode-cache"
+tier = "fast"
+guard = """
+The other half of the same fault, and neither the row above nor its test
+could tell the two apart.
+
+The row above mutates `cached.unlink()`, which is shared by both writes and
+so disables both at once; its test plants a cache entry, calls
+apply_and_judge and finds the entry gone at the end, which the RESTORE side
+satisfies on its own. Measured: reverting only the apply side -- putting
+`target.write_bytes(...)` back where `self._write(...)` now stands in
+apply_and_judge -- left the gate's own file green at 33 passed and left the
+row above still reported caught, with the dangerous direction wide open.
+
+Dangerous because a mutation written within a second of the original's cache
+entry is then executed AS THE ORIGINAL: (mtime, size) are unchanged, CPython
+compares nothing else, the row SURVIVES for a reason that has nothing to do
+with its guard, and the report says so in green.
+
+The mutation is that revert. The named test watches from inside the runner,
+at the only moment the question can be answered."""
+tests = [
+  "tests/test_mutation_gate.py::TestTheTreeIsPutBack::test_the_mutated_run_never_starts_with_a_cache_entry_to_believe",
+]
+[[mutation.edit]]
+file = "tests/mutation_gate.py"
+find = "                self._write(target, target.read_bytes().replace("
+replace = "                target.write_bytes(target.read_bytes().replace("
+
+[[mutation]]
+name = "mutation-gate-scores-a-row-the-cache-could-shadow"
+tier = "fast"
+guard = """
+And the check that covers the ways the entry survives a correct write:
+`__pycache__` not writable, or another process compiling the file inside the
+window. `_write` deleting the entry is not the same as the entry being gone,
+and only the gate can tell the difference -- afterwards, a row that executed
+the original is indistinguishable from a row whose guard is missing.
+
+BROKEN and not SURVIVED, deliberately: SURVIVED sends someone off to write a
+test that already exists.
+
+The mutation stops asking."""
+tests = [
+  "tests/test_mutation_gate.py::TestTheTreeIsPutBack::test_a_mutation_the_cache_could_shadow_is_not_given_a_verdict",
+]
+[[mutation.edit]]
+file = "tests/mutation_gate.py"
+find = "            shadowed = self._shadowed_by_cache(mutation)"
+replace = "            shadowed = \"\"  # mutation: never ask before running"
+
+
 # --- the operator's login, which used to last one boot --------------------
 #
 # The seed reached /etc/shadow and /etc is inside the overlay, so the
