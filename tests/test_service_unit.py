@@ -109,6 +109,48 @@ class TestTheUnitCanActuallyStart:
             f"create them; systemd fails the unit with 216/GROUP and "
             f"Restart=on-failure loops it forever. Created: {created}")
 
+    def test_the_unit_runs_somewhere_it_can_actually_write(self):
+        """
+        The working directory decides which pin factory the panel gets, and
+        that is not a sentence anybody expects to be true.
+
+        `import lgpio` creates a FIFO in the CURRENT WORKING DIRECTORY as it
+        runs (lgpio 0.2.2.0, lgpio.py:503-504, from the module-level
+        `_notify_thread = _callback_thread()` on line 562). On a read-only
+        cwd it does not degrade, it RAISES -- and gpiozero catches
+        `Exception` rather than `ImportError` around each factory it tries
+        (2.0.1, devices.py:299), so that raise is indistinguishable from
+        python3-lgpio not being installed. The chain walks on past rpigpio
+        and pigpio, neither of which is in device/packages.txt, and lands on
+        NativeFactory: a dispatch thread with no guard around its callbacks
+        (native.py:353-370) that the supervisor in otpunit/hw/buttons.py
+        cannot see, because that one reads
+        `sys.modules["lgpio"]._notify_thread`.
+
+        ProtectSystem=strict mounts everything read-only bar /dev, /proc and
+        /sys, and ReadWritePaths grants back the boot partition alone -- so
+        `WorkingDirectory=/opt/otp-unit`, which is what used to be here, was
+        exactly that cwd. RuntimeDirectory= is the one path systemd creates
+        and mounts read-write for this unit, before the process chdirs.
+        Issue #43.
+
+        A static check because the alternative is a tier-3 boot, and
+        harness/img-guest-check.sh's unit-names-its-pin-factory is that boot
+        asking the same question of a running machine.
+        """
+        runtime = directive("RuntimeDirectory")
+        assert runtime, ("no RuntimeDirectory=, so there is no writable "
+                         "directory for the unit to run in")
+        assert directive("WorkingDirectory") == f"/run/{runtime}", (
+            f"WorkingDirectory is {directive('WorkingDirectory')!r}; under "
+            f"ProtectSystem={directive('ProtectSystem')!r} that is read-only, "
+            f"`import lgpio` raises there, and gpiozero falls through to a "
+            f"pin factory nothing in this project supervises")
+        # And the sandbox the argument rests on is still the one described.
+        assert directive("ProtectSystem") == "strict", (
+            "ProtectSystem is no longer strict, so the reasoning above and "
+            "in the unit file no longer describes this unit")
+
     def test_the_unit_still_bans_core_dumps_itself(self):
         """
         LimitCORE=0 is what actually protects THIS process.

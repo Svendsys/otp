@@ -2469,6 +2469,64 @@ replace = "UNIT_LOG=$(journalctl -u otp-unit.service --no-pager 2>/dev/null | tr
 
 
 [[mutation]]
+name = "guest-pin-factory-check-accepts-any-factory"
+tier = "fast"
+guard = """
+The name is the whole point. `python3-lgpio` being installed does not
+establish that gpiozero is using it: the chain takes the first factory that
+IMPORTS, catching Exception rather than ImportError, and `import lgpio`
+raises on a read-only working directory -- so a unit can be sitting on
+NativeFactory, whose dispatch thread nothing in otpunit/ supervises, while
+looking healthy from every other angle this tier has. A check that accepted
+"some factory loaded" would pass on exactly that unit. Issue #43."""
+tests = [
+  "tests/test_overlay_root.py::test_a_unit_that_fell_through_to_the_native_factory_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ "$PIN_FACTORY" = "$PIN_FACTORY_EXPECTED" ]; then echo yes; else echo no; fi)" \'''
+replace = '''      "$(if [ -n "$PIN_FACTORY" ]; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "guest-pin-factory-check-shrugs-at-a-silent-unit"
+tier = "fast"
+guard = """
+An absence is a FAIL, for the reason it is one clause up: a unit that died
+before it named a factory, or one whose line was reworded so that nothing
+matches it any more, produces the same silence as a unit that never ran. A
+check reading that as "nothing to complain about" would go green on the boot
+most worth catching, and would go on doing so forever."""
+tests = [
+  "tests/test_overlay_root.py::test_a_unit_that_never_named_a_factory_fails",
+]
+[[mutation.edit]]
+file = "harness/img-guest-check.sh"
+find = '''      "$(if [ "$PIN_FACTORY" = "$PIN_FACTORY_EXPECTED" ]; then echo yes; else echo no; fi)" \'''
+replace = '''      "$(if [ -z "$PIN_FACTORY" ] || [ "$PIN_FACTORY" = "$PIN_FACTORY_EXPECTED" ]; then echo yes; else echo no; fi)" \'''
+
+
+[[mutation]]
+name = "unit-runs-in-a-directory-it-cannot-write-to"
+tier = "fast"
+guard = """
+The one line that decides which pin factory the shipped unit gets, and
+nothing about it looks like it. `import lgpio` creates a FIFO in the current
+working directory; ProtectSystem=strict leaves /opt read-only; gpiozero
+swallows the resulting exception as though the package were absent and falls
+through to native, which the panel's supervisor cannot see. Putting
+WorkingDirectory back on the read-only tree is a silent downgrade of the
+panel's fault handling -- the shape of defect issue #43 was opened about."""
+tests = [
+  "tests/test_service_unit.py::TestTheUnitCanActuallyStart::test_the_unit_runs_somewhere_it_can_actually_write",
+]
+[[mutation.edit]]
+file = "device/systemd/otp-unit.service"
+find = "WorkingDirectory=/run/otp-unit"
+replace = "WorkingDirectory=/opt/otp-unit"
+
+
+[[mutation]]
 name = "guest-sheet-bytes-not-checked-for-being-a-page"
 tier = "fast"
 guard = """
@@ -5154,7 +5212,7 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/README.md"
-find = "**23 guest checks in boot 1 and 23 in boot 2**"
+find = "**24 guest checks in boot 1 and 24 in boot 2**"
 replace = "**21 guest checks in boot 1 and 21 in boot 2**"
 
 

@@ -35,8 +35,10 @@ kernel without `vkms` should still get the other four.
 from __future__ import annotations
 
 import errno
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -1696,6 +1698,146 @@ class TestTheRealButtonPath:
             "no press arrived after a callback raised, which is what a "
             "dead notification thread looks like.\n  " + self.why(PIN_DOWN))
         assert buttons.wait(timeout=0.5) is None, "one press, one event"
+
+
+# --- the working directory, which decides the pin factory ------------------
+
+#: Run in a fresh interpreter, from whatever directory the caller puts it
+#: in, and report the three things that decide which factory a booted unit
+#: gets. A SUBPROCESS on purpose: `import lgpio` starts a module-level
+#: thread and creates a FIFO in the working directory (lgpio.py:503-504,
+#: 562), so importing it here would put both inside the pytest process and
+#: leave the FIFO in the repository.
+FACTORY_PROBE = '''
+import json, os, sys, warnings
+report = {"cwd": os.getcwd(), "writable": os.access(os.getcwd(), os.W_OK)}
+try:
+    import lgpio
+    report["lgpio"] = "imported"
+except Exception as exc:
+    report["lgpio"] = "%s: %s" % (type(exc).__name__, exc)
+sys.path.insert(0, sys.argv[1])
+from otpunit.hw.buttons import pin_factory_report
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    import gpiozero
+    try:
+        gpiozero.Device.pin_factory = gpiozero.Device._default_pin_factory()
+    except Exception as exc:
+        report["factory_error"] = "%s: %s" % (type(exc).__name__, exc)
+    report["fallbacks"] = [str(w.message) for w in caught]
+report["report"] = pin_factory_report()
+print(json.dumps(report))
+'''
+
+
+class TestTheWorkingDirectoryDecidesTheFactory:
+    """
+    Issue #43, measured rather than argued, against the real libraries.
+
+    `otp-unit.service` runs with `WorkingDirectory=/run/otp-unit` and the
+    comment on that line says why: `import lgpio` creates a FIFO in the
+    current working directory, so on a read-only cwd it RAISES, and
+    gpiozero -- which catches `Exception` and not `ImportError` around each
+    factory it tries -- treats that exactly like the package being absent
+    and walks on to a factory whose dispatch thread nothing here
+    supervises. Every word of that is a claim about two libraries this
+    repository does not own, and the unit file is one line that anybody
+    might tidy.
+
+    So it is run: the same probe from a read-only directory and from a
+    writable one, in a private mount namespace, on the lgpio and gpiozero
+    the panel actually uses. The pair is the point -- either result alone
+    is equally "this machine cannot import lgpio at all".
+    """
+
+    def probe(self, tmp_path, read_only):
+        script = tmp_path / "factory-probe.py"
+        script.write_text(FACTORY_PROBE)
+        where = tmp_path / ("ro" if read_only else "rw")
+        where.mkdir()
+        if not shutil.which("unshare"):
+            pytest.skip("no unshare(1) here to make a private mount namespace")
+        # tmpfs and not a chmod: this runs as root, and root writes through
+        # mode bits. A read-only MOUNT is what the unit's sandbox gives it
+        # and the only thing that reproduces it.
+        mount = (f'mount -t tmpfs -o ro tmpfs "{where}" || exit 97; '
+                 if read_only else "")
+        proc = subprocess.run(
+            ["unshare", "--mount", "sh", "-c",
+             f'{mount}cd "{where}" || exit 98; '
+             f'exec {sys.executable} "{script}" "{REPO}"'],
+            capture_output=True, text=True, timeout=120)
+        if proc.returncode == 97:
+            pytest.skip("this host would not let us mount a tmpfs")
+        assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+        # lgpio's C side writes its complaint to stderr; the JSON is the
+        # last line of stdout.
+        return json.loads(proc.stdout.strip().splitlines()[-1]), where
+
+    def test_lgpio_imports_from_a_writable_working_directory(self, tmp_path):
+        """
+        The control, and the half that says the unit file's answer works.
+
+        The FIFO is asserted too, because it is the whole mechanism: a
+        `.lgd-nfy*` in the directory is lgpio having written to the cwd at
+        import time, which is what the read-only case cannot do.
+        """
+        pytest.importorskip("lgpio")
+        report, where = self.probe(tmp_path, read_only=False)
+        assert report["writable"] is True, report
+        assert report["lgpio"] == "imported", report
+        assert report["report"].endswith("lgpio imported: yes; "
+                                         f"cwd {where} writable: yes)"), report
+        assert list(where.glob(".lgd-nfy*")), (
+            f"lgpio imported without creating its FIFO in {where}; the "
+            f"reasoning on otp-unit.service's WorkingDirectory= describes a "
+            f"version of lgpio this is no longer running")
+
+    def test_lgpio_raises_from_a_read_only_working_directory(self, tmp_path):
+        """
+        THE FAULT. Not "degrades", not "runs without notifications" -- the
+        import itself raises, out of a negative handle lgpio formats into a
+        filename nobody asked for.
+        """
+        pytest.importorskip("lgpio")
+        report, _ = self.probe(tmp_path, read_only=True)
+        assert report["writable"] is False, report
+        assert report["lgpio"] != "imported", report
+        assert ".lgd-nfy" in report["lgpio"], (
+            f"lgpio failed for a reason that is not the FIFO: "
+            f"{report['lgpio']}")
+        assert "lgpio imported: no" in report["report"], report
+
+    def test_gpiozero_reads_that_raise_as_the_package_being_absent(
+            self, tmp_path):
+        """
+        THE REASON THE FAULT IS SILENT, and the reason the unit has to say
+        which factory it got rather than trusting packages.txt.
+
+        gpiozero's fallback message for an lgpio that RAISED and for an
+        lgpio that was never installed are the same shape of line at the
+        same level: a warning, on the way to the next factory. Nothing in
+        the process is told the difference. Both readings are taken here
+        from the same gpiozero, so the comparison is not between a memory
+        of one and a reading of the other.
+        """
+        pytest.importorskip("lgpio")
+        broken, _ = self.probe(tmp_path, read_only=True)
+        working, _ = self.probe(tmp_path, read_only=False)
+        assert broken["fallbacks"], broken
+        assert broken["fallbacks"][0].startswith("Falling back from lgpio:"), \
+            broken["fallbacks"]
+        assert ".lgd-nfy" in broken["fallbacks"][0], broken["fallbacks"]
+        # And it is a WARNING: the caller sees a factory chosen, not an
+        # error. On this host there is no Pi revision to find, so every
+        # factory falls back and gpiozero ends at BadPinFactory -- which is
+        # not the interesting part. The interesting part is that the lgpio
+        # line reads as a fallback in both runs, and only the reason after
+        # the colon changes.
+        assert working["fallbacks"][0].startswith("Falling back from lgpio:"), \
+            working["fallbacks"]
+        assert ".lgd-nfy" not in working["fallbacks"][0], working["fallbacks"]
 
 
 @needs_sim("i2c-bus", "i2c-stub")

@@ -26,7 +26,44 @@ Requires=otp-unit-etc-cups.service
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 -m otpunit
-WorkingDirectory=/opt/otp-unit
+# The RUNTIME directory, not /opt/otp-unit where the code lives, and the
+# reason is one import.
+#
+# `import lgpio` CREATES A FIFO IN THE WORKING DIRECTORY (lgpio 0.2.2.0,
+# lgpio.py:503-504, from the module-level `_notify_thread =
+# _callback_thread()` on line 562). With cwd on a read-only mount it does
+# not degrade -- it raises, and it raises confusingly, because lgpio does
+# not check the negative handle it got back and formats it into a filename
+# it then fails to open:
+#
+#     xCreatePipe: Can't set permissions (436) for .../.lgd-nfy0
+#     FileNotFoundError: [Errno 2] ...: '.lgd-nfy-3'
+#
+# ProtectSystem=strict below mounts the whole hierarchy read-only except
+# /dev, /proc and /sys, and ReadWritePaths grants back the boot partition
+# and nothing else -- so with cwd in /opt that import failed on every unit
+# this ships to. gpiozero catches `Exception` rather than `ImportError`
+# around each factory it tries (2.0.1, devices.py:299), which makes that
+# failure indistinguishable from python3-lgpio not being installed: the
+# chain walked on past rpigpio and pigpio, neither of which is in
+# device/packages.txt, and landed on NativeFactory -- whose edge dispatch
+# thread has no guard around its callbacks either and is NOT covered by
+# the supervisor in otpunit/hw/buttons.py. Issue #43.
+#
+# RuntimeDirectory= below makes /run/otp-unit, on tmpfs, and systemd
+# creates it and mounts it read-write into the namespace before the
+# process chdirs -- so the FIFO lands there, on the same tmpfs TMPDIR
+# already points at, and is taken away with the directory when the unit
+# stops. Nothing here needs cwd for anything else: PYTHONPATH is absolute,
+# `python3 -m otpunit` finds the package through it, and
+# `grep -rn chdir otpunit/ device/ image/ harness/` finds no call.
+#
+# THE UNIT SAYS WHICH FACTORY IT GOT, once, at startup
+# (otpunit.hw.buttons.pin_factory_report), and harness/img-guest-check.sh
+# requires that name to be LGPIOFactory on every tier-3 boot. Reverting
+# this line turns that check red rather than turning the panel's
+# supervisor silently into decoration.
+WorkingDirectory=/run/otp-unit
 Environment=PYTHONPATH=/opt/otp-unit
 Environment=PYTHONDONTWRITEBYTECODE=1
 Restart=on-failure

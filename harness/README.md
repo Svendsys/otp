@@ -762,7 +762,7 @@ requires it. The guest's `journal-marker-accepted` is the other half: it says
 the journal *took* the marker, so a console without it is a forwarding
 failure rather than a `systemd-cat` that did nothing.
 
-**Two behavioural checks ride on it.** `unit-detects-no-panel` reads the
+**Three behavioural checks ride on it.** `unit-detects-no-panel` reads the
 unit's own journal for three strings: `no OLED (` (the display probe raised),
 `interface -- display: none,` (nothing was found to draw on) and `no usable
 interface; printing unattended` (the unit chose the headless route). The
@@ -775,6 +775,30 @@ console and no buttons logs both of them. All three are held against
 `otpunit/hmi.py` and `otpunit/__main__.py` by `tests/test_img_verdict.py`,
 because a check whose needle lives in another file is one rewording away from
 matching nothing forever.
+
+`unit-names-its-pin-factory` reads the same journal, from the same poll, for
+one more line — `pin factory: <class name>` — and **requires the name to be
+`LGPIOFactory`**. This is issue #43, and the reason it is a check rather than
+a comment is that installing `python3-lgpio` does not establish that gpiozero
+is using it. gpiozero takes the first factory in `lgpio, rpigpio, pigpio,
+native` that *imports*, catching `Exception` rather than `ImportError` on each
+(2.0.1, `devices.py:281-302`), and `import lgpio` creates a FIFO in the
+working directory as it runs — so on a read-only cwd it **raises**, and that
+raise is indistinguishable from the package being absent. The unit used to
+run with `WorkingDirectory=/opt/otp-unit` under `ProtectSystem=strict`, which
+is exactly such a cwd, and neither `python3-rpi.gpio` nor `python3-pigpio` is
+installed: the fallback's next stop is `NativeFactory`, whose edge dispatch
+thread calls its callbacks with no guard (`native.py:353-370`) and which the
+supervisor in `otpunit/hw/buttons.py` cannot even see, because that reads
+`sys.modules["lgpio"]._notify_thread`. A unit on the wrong factory therefore
+looks healthy from every angle this tier had, and carries an unsupervised
+copy of the fault the panel code is built around. The unit now runs with its
+cwd on its own tmpfs runtime directory so the intended import can succeed,
+and this check is what keeps that true: revert the unit file and tier 3 goes
+red naming what it got instead. Whether a Button *constructs* is deliberately
+not read — that is a property of the emulator (`[Errno 22] Invalid argument`
+on QEMU's gpiochip), where the factory gpiozero chose is a property of the
+image.
 
 `diagnostic-sheet-renders` and `diagnostic-sheet-reaches-cups` are the print
 path, and they come with a correction to how the issue framed it. **The
@@ -1203,9 +1227,10 @@ files end byte-for-byte as they were found and nothing needs undoing. No hash
 is invented and none is printed: the "before" password is this unit's own,
 one character changed, and only digests reach the console.
 
-The counts move with it: **23 guest checks in boot 1 and 23 in boot 2**, up
-from 19 and 19 — the credential work added two to each and the cloud-init
-purge below two more. The run recorded below predates all of it.
+The counts move with it: **24 guest checks in boot 1 and 24 in boot 2**, up
+from 19 and 19 — the credential work added two to each, the cloud-init purge
+below two more, and `unit-names-its-pin-factory` (issue #43) one more to both.
+The run recorded below predates all of it.
 
 ### The provisioning agent that was on every image, and is not now
 

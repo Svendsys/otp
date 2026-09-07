@@ -147,6 +147,103 @@ class TestProbesAreHonestAboutTheRealSystem:
         assert interface.describe()
 
 
+class TestTheUnitSaysWhichPinFactoryItGot:
+    """
+    Issue #43. `python3-gpiozero` and `python3-lgpio` are both installed on
+    the unit, and for a long time the codebase treated that as establishing
+    which factory the panel runs on. It does not: gpiozero takes the first of
+    lgpio, rpigpio, pigpio, native that IMPORTS, catching `Exception` and not
+    `ImportError` on each (2.0.1, devices.py:281-302), and `import lgpio`
+    creates a FIFO in the working directory as it runs -- so on a read-only
+    cwd it raises, and the raise reads exactly like the package not being
+    installed. The unit that falls through lands on NativeFactory, whose
+    dispatch thread the supervisor in otpunit/hw/buttons.py cannot see.
+
+    So the unit says which one it got, once, and tier 3 requires the name.
+    These are about that line existing and being logged from the one place
+    where there is an answer to give.
+    """
+
+    def _fake_gpiozero(self, monkeypatch, name):
+        import types
+        fake = types.ModuleType("gpiozero")
+        fake.Device = type("Device", (), {"pin_factory": type(name, (), {})()})
+        monkeypatch.setitem(sys.modules, "gpiozero", fake)
+
+    def test_the_factory_is_logged_when_the_buttons_open(self, monkeypatch):
+        force(monkeypatch, gpio=True)
+        self._fake_gpiozero(monkeypatch, "LGPIOFactory")
+        lines = []
+        hmi.detect(log=lines.append)
+        assert any(line.startswith("pin factory: LGPIOFactory ")
+                   for line in lines), lines
+
+    def test_the_factory_is_logged_when_the_buttons_do_not(self, monkeypatch):
+        """
+        AND ON THE FAILING PATH, which is the one worth reading. A unit whose
+        Button constructor raised still chose a factory -- the emulated Pi is
+        exactly that machine -- and a unit whose lgpio never imported is the
+        case this line exists to catch. Logging it only on success would put
+        the answer out of reach in both.
+        """
+        force(monkeypatch, gpio=False, keyboard=False)
+        self._fake_gpiozero(monkeypatch, "NativeFactory")
+        lines = []
+        interface = hmi.detect(log=lines.append)
+        assert interface.buttons is None
+        assert any(line.startswith("pin factory: NativeFactory ")
+                   for line in lines), lines
+
+    def test_it_is_said_once_and_not_per_probe(self, monkeypatch):
+        force(monkeypatch, gpio=True)
+        self._fake_gpiozero(monkeypatch, "LGPIOFactory")
+        lines = []
+        hmi.detect(log=lines.append)
+        assert sum(line.startswith("pin factory: ") for line in lines) == 1, \
+            lines
+
+    def test_a_unit_with_no_gpiozero_at_all_still_answers(self, monkeypatch):
+        """
+        "none", rather than an exception or a missing line. This runs on the
+        cold-start path of a device whose one job is to keep printing, so the
+        report may not be the thing that stops it -- and a dev box running
+        --sim has no gpiozero at all.
+        """
+        force(monkeypatch, gpio=False, keyboard=True)
+        monkeypatch.delitem(sys.modules, "gpiozero", raising=False)
+        lines = []
+        hmi.detect(log=lines.append)
+        assert any(line.startswith("pin factory: none ") for line in lines), \
+            lines
+
+    def test_reporting_never_imports_gpiozero_to_answer(self, monkeypatch):
+        """
+        The report may not be what CHOOSES the factory.
+
+        `import gpiozero` walks the fallback chain, `import lgpio` and the
+        FIFO it wants to create along with it, and `Device.ensure_pin_factory`
+        picks one where none had been picked. Either would make the line
+        describe a process the line itself changed -- and on a unit with no
+        panel it would run the whole GPIO stack to say so.
+        """
+        from otpunit.hw import buttons
+
+        monkeypatch.delitem(sys.modules, "gpiozero", raising=False)
+        monkeypatch.delitem(sys.modules, "lgpio", raising=False)
+        assert buttons.pin_factory_name() == "none"
+        assert "gpiozero" not in sys.modules
+        assert "lgpio" not in sys.modules
+
+    def test_the_report_survives_a_working_directory_that_is_gone(
+            self, monkeypatch):
+        from otpunit.hw import buttons
+
+        monkeypatch.setattr(buttons.os, "getcwd",
+                            lambda: (_ for _ in ()).throw(
+                                FileNotFoundError(2, "No such file")))
+        assert buttons.pin_factory_report().startswith("pin factory: ")
+
+
 class TestClosingUp:
     def test_close_survives_a_part_that_throws(self):
         class Rude:

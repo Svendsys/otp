@@ -978,6 +978,59 @@ def test_the_probe_looks_for_the_display_the_unit_actually_reports():
         "otpunit/__main__ no longer logs the interface it detected"
 
 
+def test_the_probe_looks_for_the_pin_factory_line_the_unit_actually_logs(
+        monkeypatch):
+    """
+    The fourth needle, and the one with the most moving parts: a name, a
+    format, and a shell expansion that has to cut the name back out of it.
+
+    `unit-names-its-pin-factory` greps the unit's journal for a line the
+    probe never writes, strips a fixed prefix off it and compares the first
+    word to `PIN_FACTORY_EXPECTED`. Every one of those steps is written in a
+    different file from the one that produces the line, so all three are held
+    against the shipped formatter here -- RUN, not grepped for, because
+    `pin_factory_report()` assembles its line out of an f-string and a class
+    name and a `grep -rn` over otpunit/ would find no such string anywhere.
+
+    Issue #43. tests/test_overlay_root.py runs the whole check against a
+    journal made of files; this is the fast-suite guard on the strings the
+    two files have to agree about.
+    """
+    import sys
+    import types
+
+    sys.path.insert(0, str(REPO))
+    from otpunit.hw import buttons
+
+    probe = GUEST_CHECK.read_text()
+    expected = shell_value(GUEST_CHECK, "PIN_FACTORY_EXPECTED")
+
+    # The unit, holding a factory of exactly the name the probe demands.
+    # A module object with the one attribute the shipped code reads: it
+    # answers out of sys.modules and imports nothing, which is what makes
+    # faking it this cheaply legitimate.
+    fake = types.ModuleType("gpiozero")
+    fake.Device = type("Device", (), {"pin_factory": type(expected, (), {})()})
+    monkeypatch.setitem(sys.modules, "gpiozero", fake)
+    line = buttons.pin_factory_report()
+
+    # 1. the prefix the probe strips, and the name in the position it strips
+    #    it from.
+    assert line.startswith(f"pin factory: {expected} "), line
+    # 2. the ERE the probe greps the journal with -- read out of the probe
+    #    rather than restated, and required to take the WHOLE line off a
+    #    journal whose newlines have been turned into spaces.
+    ere = re.search(r"grep -m1 -oE '(pin factory: [^']*)'", probe)
+    assert ere, "the probe no longer greps for a pin factory line"
+    joined = f"Aug 17 00:04:09 otp-unit python3[412]: {line} next line here"
+    match = re.search(ere.group(1), joined)
+    assert match and match.group(0) == line, (ere.group(1), joined)
+    # 3. and the two expansions that cut the name back out, which is the
+    #    step a longer report format would silently break.
+    assert match.group(0).removeprefix("pin factory: ").split(" ")[0] \
+        == expected, line
+
+
 # --- the seed itself, which three files have to agree about ---------------
 
 BUILD_SH = REPO / "image" / "build.sh"

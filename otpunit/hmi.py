@@ -30,7 +30,8 @@ import os
 import sys
 from dataclasses import dataclass
 
-from otpunit.hw.buttons import GpioButtons, KeyboardButtons
+from otpunit.hw.buttons import (GpioButtons, KeyboardButtons,
+                               pin_factory_report)
 from otpunit.hw.display import ConsoleDisplay, Ssd1306Display
 
 
@@ -55,20 +56,23 @@ class Interface:
         detection on any of its four pin factories, so wherever gpiozero
         finds a factory at all the constructor succeeds. This used to say
         "on any Pi with lgpio installed -- every unit this targets", which
-        named a factory nothing here establishes: gpiozero catches
+        named a factory nothing here established: gpiozero catches
         `Exception` and not `ImportError` when a factory fails to import
         (gpiozero 2.0.1, devices.py:299), so an lgpio whose import RAISES
         -- which it does when the working directory is read-only, and this
-        unit runs with `WorkingDirectory=/opt/otp-unit` under
+        unit ran with `WorkingDirectory=/opt/otp-unit` under
         `ProtectSystem=strict` -- is indistinguishable from an lgpio that
-        was never installed, and the fallback walks on to native. Which
-        factory a booted unit ends up on is issue #43. Nothing below
-        depends on the answer, which is the point: none of them can tell
-        you whether a button is wired to the pin. That made the keyboard
-        branch unreachable, and worse: attaching a monitor to a working
-        headless unit promoted `display` to non-None, `interactive` to
-        True, and sent it into a menu whose first `buttons.wait()` blocks
-        on an empty queue forever. No pad, no log line, no timeout.
+        was never installed, and the fallback walks on to native. That was
+        issue #43; open_buttons below now logs the class name gpiozero
+        settled on and tier 3 requires it by name, and the unit's working
+        directory moved onto its own writable tmpfs so the answer can be
+        the intended one. Nothing here depends on which it is, which is
+        the point: none of the four can tell you whether a button is wired
+        to the pin. That made the keyboard branch unreachable, and worse:
+        attaching a monitor to a working headless unit promoted `display`
+        to non-None, `interactive` to True, and sent it into a menu whose
+        first `buttons.wait()` blocks on an empty queue forever. No pad,
+        no log line, no timeout.
 
         A keyboard being present says nothing either -- it says a keyboard
         is plugged in, not that anyone is at it.
@@ -181,11 +185,33 @@ def open_display(rotate: int = 0, log=None):
 
 def open_buttons(log=None):
     """The best input available, and what it is."""
+    buttons = None
     try:
-        return GpioButtons(), "GPIO buttons"
+        buttons = GpioButtons()
     except Exception as exc:                     # noqa: BLE001
         if log:
             log(f"no GPIO buttons ({exc})")
+
+    # WHICH PIN FACTORY, said once, whether or not a pin could be claimed.
+    #
+    # HERE and not at the top of main(), because there is nothing to say
+    # before this line runs: gpiozero picks a factory when the first device
+    # is constructed, so a report taken any earlier reads "none" on every
+    # unit ever built, including the ones it exists to describe. And AFTER
+    # the except, not inside the try, because a constructor that raised is
+    # the case worth reading -- on the emulated Pi the claim fails EINVAL
+    # with a perfectly good factory behind it, and on a unit whose lgpio
+    # never imported the name on this line is the whole diagnosis.
+    #
+    # It costs one journal line per boot and answers a question nothing in
+    # this tree could answer before: `python3-lgpio` being installed does
+    # not establish that gpiozero is USING it. See
+    # otpunit.hw.buttons.pin_factory_report, and issue #43 for what went
+    # unobserved until it was written down.
+    if log:
+        log(pin_factory_report())
+    if buttons is not None:
+        return buttons, "GPIO buttons"
 
     if keyboard_connected() and console_usable():
         return KeyboardButtons(allow_quit=False), "USB keyboard"

@@ -139,6 +139,94 @@ def _report(message: str) -> None:
     print(message, file=stream, flush=True)
 
 
+def pin_factory_name() -> str:
+    """
+    The gpiozero pin factory this process ended up on, by class name.
+
+    "none" where there is not one: gpiozero was never imported, or it was
+    and no device has been constructed yet, or every factory in the chain
+    failed to import and gpiozero raised `BadPinFactory` at the caller.
+    All three are the same answer to the question this is asked -- WHICH
+    ONE IS DRIVING THE PINS -- and none of them is worth a distinct token
+    on a journal line nobody reads twice.
+
+    `sys.modules.get` rather than `import gpiozero`, and a plain attribute
+    read rather than `Device.ensure_pin_factory()`, because both of the
+    obvious alternatives have side effects and this is a REPORT. Importing
+    gpiozero on a process that never had one would take the fallback chain
+    -- `import lgpio` and the FIFO it creates in the working directory,
+    among the rest -- purely to describe a process that is not using any
+    of it; and `ensure_pin_factory()` CHOOSES a factory where none had
+    been chosen, which would make the report the thing that decided the
+    answer. `Device.pin_factory` is a plain class attribute, `None` until
+    `Device.ensure_pin_factory()` assigns the chain's winner to it on the
+    first device built (gpiozero 2.0.1, devices.py:241 and 269-270), so
+    reading it tells you what happened and changes nothing.
+    """
+    gpiozero = sys.modules.get("gpiozero")
+    if gpiozero is None:
+        return "none"
+    try:
+        factory = gpiozero.Device.pin_factory
+    except Exception:                           # noqa: BLE001
+        return "unknown"
+    return "none" if factory is None else type(factory).__name__
+
+
+def pin_factory_report() -> str:
+    """
+    One line naming the factory, and the two facts that decide which one.
+
+    WHY THE UNIT SAYS THIS AT ALL. `python3-gpiozero` and `python3-lgpio`
+    are both in device/packages.txt, so the shipped unit looks certain to
+    be on lgpio -- and for a while this codebase said so as settled fact.
+    It is not settled by installing the package. gpiozero walks lgpio,
+    rpigpio, pigpio, native and takes the first that IMPORTS, catching
+    `Exception` and not `ImportError` on the way (gpiozero 2.0.1,
+    devices.py:281-302), and `import lgpio` is one of the few imports in
+    Python that can fail for a reason that has nothing to do with the
+    package being there: it creates a FIFO in the working directory at
+    import time (see dispatch_thread), so a unit whose cwd it cannot write
+    to falls through to a factory nobody chose, with a warning that reads
+    exactly like the package being absent. Issue #43.
+
+    So the three things worth having are on one line, and they are worth
+    having together: the name is the answer, and the other two are why.
+    ONE line -- it is wrapped here only to fit this margin:
+
+        pin factory: LGPIOFactory
+            (lgpio imported: yes; cwd /run/otp-unit writable: yes)
+
+    A `NativeFactory` next to `lgpio imported: no` and an unwritable cwd
+    is the whole diagnosis in one read, and it is the case this exists to
+    catch. harness/img-guest-check.sh requires the name to be
+    `LGPIOFactory` on every tier-3 boot; the parenthetical is not matched
+    by anything, and is there for the person reading the journal after a
+    check has gone red.
+
+    NEVER RAISES. It is called from the detection path on a unit whose one
+    job is to keep printing, and a report that can take the panel down
+    with it is worse than no report. `os.access` and not a trial write:
+    the process is root, so the mode bits it consults are not the whole
+    truth -- but a read-only MOUNT is, which is the case here (access(2)
+    fails EROFS for W_OK regardless of uid), and a probe that creates a
+    file in the working directory of a running appliance to answer a
+    logging question is not a trade worth making.
+    """
+    try:
+        cwd = os.getcwd()
+    except OSError as exc:                      # deleted out from under us
+        cwd, writable = f"unreadable ({exc})", "no"
+    else:
+        try:
+            writable = "yes" if os.access(cwd, os.W_OK) else "no"
+        except Exception:                       # noqa: BLE001
+            writable = "unknown"
+    imported = "yes" if "lgpio" in sys.modules else "no"
+    return (f"pin factory: {pin_factory_name()} "
+            f"(lgpio imported: {imported}; cwd {cwd} writable: {writable})")
+
+
 def dispatch_thread():
     """
     lgpio's edge dispatch thread, or None if this process has no such thing.
@@ -175,16 +263,28 @@ def dispatch_thread():
     deaf in exactly the way #37 and this supervisor exist to answer -- and
     nothing here can even see that thread.
 
-    And which factory a booted unit lands on is not established anywhere.
-    `import lgpio` does not merely fail to be useful on a read-only
-    working directory, it RAISES (above); gpiozero catches `Exception`
-    rather than `ImportError` around each attempt (devices.py:299), so
-    that raise is indistinguishable from lgpio not being installed and the
-    chain walks on; `otp-unit.service` sets `WorkingDirectory=/opt/otp-unit`
-    under `ProtectSystem=strict`; and `device/packages.txt` has neither
-    python3-rpi.gpio nor python3-pigpio, so the next stop would be native.
-    Answering that needs a Pi and is tracked as issue #43. Until it is
-    answered, read this file as covering the lgpio case and no other.
+    WHICH FACTORY A BOOTED UNIT LANDS ON IS NOW SAID OUT LOUD, because
+    for a long time nothing established it. `import lgpio` does not merely
+    fail to be useful on a read-only working directory, it RAISES (above);
+    gpiozero catches `Exception` rather than `ImportError` around each
+    attempt (devices.py:299), so that raise is indistinguishable from
+    lgpio not being installed and the chain walks on; `otp-unit.service`
+    used to set `WorkingDirectory=/opt/otp-unit` under
+    `ProtectSystem=strict`; and `device/packages.txt` has neither
+    python3-rpi.gpio nor python3-pigpio, so the next stop was native --
+    where the same fault is unsupervised and nothing above can see it.
+    Issue #43.
+
+    Two things answer it now and neither of them is an argument. The unit
+    runs with its working directory on its own tmpfs runtime directory,
+    which is where lgpio may create the FIFO its import wants
+    (otp-unit.service); and `pin_factory_report()` above puts the class
+    name this process actually ended up on into the journal at startup,
+    where harness/img-guest-check.sh reads it back and requires it to be
+    `LGPIOFactory` by name on every tier-3 boot. So read this file as
+    covering the lgpio case and no other, and read that check as what
+    keeps the unit inside it. If it ever reports another name, the fix is
+    the factory, not this supervisor.
     """
     lgpio = sys.modules.get("lgpio")
     return None if lgpio is None else getattr(lgpio, "_notify_thread", None)

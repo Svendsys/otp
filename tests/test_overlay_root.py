@@ -2899,12 +2899,24 @@ esac
 # machine has neither half of an interface. An earlier version of this
 # fixture said `input: GPIO buttons` and called itself the machine as it is
 # now; it was the machine nothing has ever booted.
+#
+# THE PIN FACTORY LINE IS NOT QUOTED FROM THAT RUN and cannot be: the run
+# predates the line existing. Everything else here is the console as
+# recorded; this one is what otpunit/hw/buttons.pin_factory_report() emits,
+# and `test_the_fixture_is_the_journal_the_shipped_detection_produces` holds
+# the whole fixture against the real detection running rather than against
+# this reading of it. The VALUES are what a unit whose working directory is
+# writable reports -- lgpio imports, gpiozero takes the first factory in its
+# chain -- which is the case device/systemd/otp-unit.service now arranges
+# and the case unit-names-its-pin-factory requires. Issue #43.
 HEADLESS_JOURNAL = (
     "Aug 17 00:04:02 otp-unit systemd[1]: Started otp-unit.service.\n"
     "Aug 17 00:04:09 otp-unit python3[412]: no OLED (FileNotFoundError: "
     "[Errno 2] No such file or directory: '/dev/i2c-1')\n"
     "Aug 17 00:04:09 otp-unit python3[412]: no GPIO buttons ([Errno 22] "
     "Invalid argument)\n"
+    "Aug 17 00:04:09 otp-unit python3[412]: pin factory: LGPIOFactory "
+    "(lgpio imported: yes; cwd /run/otp-unit writable: yes)\n"
     "Aug 17 00:04:09 otp-unit python3[412]: interface -- display: none, "
     "input: none\n"
     "Aug 17 00:04:09 otp-unit python3[412]: no usable interface; printing "
@@ -2929,7 +2941,17 @@ BUTTONS_JOURNAL = (HEADLESS_JOURNAL
 # too.
 NO_FACTORY_JOURNAL = HEADLESS_JOURNAL.replace(
     "no GPIO buttons ([Errno 22] Invalid argument)",
-    "no GPIO buttons (BadPinFactory: Unable to load any default pin factory!)")
+    "no GPIO buttons (BadPinFactory: Unable to load any default pin factory!)"
+).replace(
+    # And the factory line goes with it, because the two cannot disagree:
+    # BadPinFactory means gpiozero assigned nothing to `Device.pin_factory`,
+    # so pin_factory_report() says "none" on that machine. A fixture claiming
+    # a live LGPIOFactory beside a BadPinFactory exception would be a machine
+    # nothing can boot, which is the defect the note above HEADLESS_JOURNAL
+    # records this section already having shipped once.
+    "pin factory: LGPIOFactory (lgpio imported: yes; cwd /run/otp-unit "
+    "writable: yes)",
+    "pin factory: none (lgpio imported: no; cwd /run/otp-unit writable: yes)")
 
 # And a machine that DID find something to draw on. An HDMI monitor with no
 # buttons: hmi.open_display still logs "no OLED (" because the SSD1306 probe
@@ -2994,7 +3016,8 @@ def test_a_headless_boot_reports_the_marker_and_the_missing_panel(tmp_path):
     proc, _ = run_journal(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert results(proc) == {"journal-marker-accepted": "PASS",
-                             "unit-detects-no-panel": "PASS"}, proc.stdout
+                             "unit-detects-no-panel": "PASS",
+                             "unit-names-its-pin-factory": "PASS"}, proc.stdout
 
 
 def test_the_marker_is_never_written_where_the_console_would_get_it_anyway(tmp_path):
@@ -3138,7 +3161,141 @@ def test_a_unit_that_never_said_what_it_settled_on_fails(tmp_path):
     assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
 
 
-def journal_from_the_real_hmi(monkeypatch, *, oled_present, buttons_present=False):
+# --- and which factory it is on, which nothing used to ask ---------------
+#
+# unit-detects-no-panel is about the DISPLAY. These are about the pins, and
+# they are a separate check because the two answers are independent: the
+# emulated machine has no panel and is still expected to be holding the
+# factory the image installs. Issue #43 -- `python3-lgpio` being in
+# device/packages.txt does not establish that gpiozero is using it, and until
+# this check existed nothing in any tier had ever looked.
+
+
+def expected_factory() -> str:
+    """The name the shipped probe requires, read out of the probe."""
+    match = re.search(r"^PIN_FACTORY_EXPECTED=(\S+)$",
+                      GUEST_CHECK.read_text(), re.M)
+    assert match, "img-guest-check.sh no longer names an expected pin factory"
+    return match.group(1)
+
+
+def test_the_expected_factory_is_the_one_the_unit_is_built_to_get(tmp_path):
+    """
+    The name in the probe and the reason the unit can produce it are in two
+    different files, and only one of them is load-bearing on its own.
+
+    `WorkingDirectory=` under `ProtectSystem=strict` is what decides whether
+    `import lgpio` can create its FIFO, and therefore whether gpiozero's
+    first choice imports at all. A unit whose cwd went back to /opt would
+    fall through to NativeFactory -- silently, because gpiozero catches
+    `Exception` and not `ImportError` -- so the two are asserted together
+    here rather than left to a tier-3 boot to discover.
+    """
+    unit = (REPO / "device" / "systemd" / "otp-unit.service").read_text()
+    cwd = re.search(r"^WorkingDirectory=(\S+)$", unit, re.M)
+    runtime = re.search(r"^RuntimeDirectory=(\S+)$", unit, re.M)
+    assert cwd and runtime, unit
+    assert cwd.group(1) == f"/run/{runtime.group(1)}", (
+        f"the unit runs in {cwd.group(1)}, which RuntimeDirectory= does not "
+        f"make writable, so `import lgpio` raises there and gpiozero falls "
+        f"through to a factory nothing supervises")
+    assert expected_factory() == "LGPIOFactory", (
+        "the probe requires a factory this image is no longer arranged to "
+        "get; if that is deliberate, the supervisor in otpunit/hw/buttons.py "
+        "covers lgpio and nothing else")
+
+
+def test_a_healthy_unit_names_the_factory_the_probe_requires(tmp_path):
+    # The positive control. HEADLESS_JOURNAL carries the intended line, and
+    # everything below asserts a FAIL against a variation of it.
+    proc, _ = run_journal(tmp_path, unit_journal=HEADLESS_JOURNAL)
+    assert results(proc)["unit-names-its-pin-factory"] == "PASS", proc.stdout
+
+
+def test_a_unit_that_fell_through_to_the_native_factory_fails(tmp_path):
+    """
+    THE CASE THIS CHECK EXISTS FOR, and the reason it reads a name rather
+    than "a factory loaded".
+
+    A unit on NativeFactory prints, runs a menu, and looks healthy from
+    every angle tier 3 had before this. What it does not have is a
+    supervised edge dispatcher: NativeDispatchThread calls
+    `pin._call_when_changed` with no guard (gpiozero 2.0.1, native.py:
+    353-370), and the supervisor in otpunit/hw/buttons.py reads
+    `sys.modules["lgpio"]._notify_thread`, which on that machine is not
+    there. Every other line in this journal is the same as the healthy one.
+    """
+    journal = HEADLESS_JOURNAL.replace(
+        "pin factory: LGPIOFactory (lgpio imported: yes; "
+        "cwd /run/otp-unit writable: yes)",
+        "pin factory: NativeFactory (lgpio imported: no; "
+        "cwd /opt/otp-unit writable: no)")
+    assert journal != HEADLESS_JOURNAL, "the fixture stopped naming a factory"
+    proc, _ = run_journal(tmp_path, unit_journal=journal)
+    assert results(proc)["unit-names-its-pin-factory"] == "FAIL", proc.stdout
+    # And the failure has to SAY what it got, because this check going red is
+    # the only place the answer to issue #43 is ever written down.
+    assert "NativeFactory" in proc.stdout, proc.stdout
+
+
+def test_a_unit_with_no_factory_at_all_fails(tmp_path):
+    """
+    gpiozero raising BadPinFactory leaves `Device.pin_factory` unset and the
+    unit reports "none" -- truthfully, and it is still not lgpio. An absence
+    of buttons is allowed here (unit-detects-no-panel passes for it); an
+    absence of the factory the panel code is written against is not.
+    """
+    proc, _ = run_journal(tmp_path, unit_journal=NO_FACTORY_JOURNAL)
+    assert results(proc)["unit-names-its-pin-factory"] == "FAIL", proc.stdout
+    assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
+
+
+def test_a_unit_that_never_named_a_factory_fails(tmp_path):
+    """
+    Silence is a FAIL, for the reason the interface line's absence is: a
+    check that shrugged at a missing line would pass on the boot where the
+    unit died before it got there, which is the boot worth catching.
+    """
+    journal = "\n".join(line for line in HEADLESS_JOURNAL.splitlines()
+                        if "pin factory:" not in line) + "\n"
+    proc, _ = run_journal(tmp_path, unit_journal=journal)
+    assert results(proc)["unit-names-its-pin-factory"] == "FAIL", proc.stdout
+    assert "no 'pin factory:' line" in proc.stdout, proc.stdout
+
+
+def test_the_named_check_reads_what_the_shipped_code_actually_logs(
+        tmp_path, monkeypatch):
+    """
+    End to end with no fixture in the middle, and then the mutant.
+
+    The real hmi.open_buttons runs, the real pin_factory_report() formats
+    the line off a `Device.pin_factory` that is there to be read, and the
+    shipped probe judges the result. Then the same code with a factory
+    gpiozero fell through to, which has to go red -- otherwise this check
+    is a string that matches whatever the unit says.
+    """
+    healthy = journal_from_the_real_hmi(monkeypatch, oled_present=False,
+                                        factory=expected_factory())
+    proc, _ = run_journal(tmp_path, unit_journal=healthy)
+    assert results(proc)["unit-names-its-pin-factory"] == "PASS", proc.stdout
+
+    fallen = journal_from_the_real_hmi(monkeypatch, oled_present=False,
+                                       factory="NativeFactory")
+    assert healthy != fallen, "the mutation changed nothing the unit logs"
+    proc, _ = run_journal(tmp_path, unit_journal=fallen)
+    assert results(proc)["unit-names-its-pin-factory"] == "FAIL", proc.stdout
+
+    # And the third shape: gpiozero never imported at all, which is what a
+    # process that has not built a device yet reports. Also not lgpio.
+    none = journal_from_the_real_hmi(monkeypatch, oled_present=False,
+                                     factory=None)
+    proc, _ = run_journal(tmp_path, unit_journal=none)
+    assert results(proc)["unit-names-its-pin-factory"] == "FAIL", proc.stdout
+
+
+def journal_from_the_real_hmi(monkeypatch, *, oled_present,
+                              buttons_present=False,
+                              factory="LGPIOFactory"):
     """
     The lines otpunit's own detection writes, on the machine tier 3 boots.
 
@@ -3152,10 +3309,36 @@ def journal_from_the_real_hmi(monkeypatch, *, oled_present, buttons_present=Fals
     -- `no GPIO buttons ([Errno 22] Invalid argument)` is the line that
     console carries. `buttons_present=True` is the real-Pi case instead,
     where gpiozero reserves the pin and succeeds.
+
+    `factory` is which pin factory gpiozero is to be found holding when the
+    unit asks, and it is a parameter because it is the one thing here that
+    the emulated console cannot settle: the recorded run predates the unit
+    saying it. "LGPIOFactory" is the intended answer and the one
+    unit-names-its-pin-factory requires; "NativeFactory" is what a unit
+    whose lgpio import raised falls through to; None is a unit that never
+    got a factory at all.
     """
     import sys
+    import types
     sys.path.insert(0, str(REPO))
     from otpunit import hmi
+
+    # THE FACTORY, faked at the only place the shipped code reads it.
+    # pin_factory_report() answers out of sys.modules and does not import
+    # anything (deliberately -- importing gpiozero here would run the real
+    # fallback chain, `import lgpio` and its FIFO included, on the machine
+    # running the tests), so a module object with the one attribute it reads
+    # is the whole of what has to be present. `factory=None` is the machine
+    # that never got one at all.
+    if factory is None:
+        monkeypatch.delitem(sys.modules, "gpiozero", raising=False)
+        monkeypatch.delitem(sys.modules, "lgpio", raising=False)
+    else:
+        fake = types.ModuleType("gpiozero")
+        fake.Device = type("Device", (),
+                           {"pin_factory": type(factory, (), {})()})
+        monkeypatch.setitem(sys.modules, "gpiozero", fake)
+        monkeypatch.setitem(sys.modules, "lgpio", types.ModuleType("lgpio"))
 
     class Dummy:
         def close(self):
@@ -3218,6 +3401,20 @@ def test_the_fixture_is_the_journal_the_shipped_detection_produces(monkeypatch):
                  "no usable interface; printing unattended"):
         assert line in journal, (line, journal)
         assert line in HEADLESS_JOURNAL, (line, HEADLESS_JOURNAL)
+
+    # And the line this fixture cannot quote from any console, which is
+    # exactly why it is worth holding here: it is a running function's
+    # output rather than a string somebody typed twice. The NAME is compared
+    # literally, because that is the whole of what the probe reads; the
+    # parenthetical is compared by SHAPE, because the two facts in it are
+    # about the machine that ran -- the cwd of a pytest process is the
+    # repository, not /run/otp-unit -- and pinning those here would be
+    # asserting where the tests were run from.
+    shape = (r"pin factory: LGPIOFactory "
+             r"\(lgpio imported: (?:yes|no); cwd \S+ writable: (?:yes|no)\)")
+    assert "pin factory: LGPIOFactory " in journal, journal
+    assert re.search(shape, journal), journal
+    assert re.search(shape, HEADLESS_JOURNAL), HEADLESS_JOURNAL
 
 
 def test_the_buttons_fixture_is_the_journal_a_real_pi_produces(monkeypatch):

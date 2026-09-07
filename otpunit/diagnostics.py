@@ -31,6 +31,10 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 
 import otp_generator as gen
+# Imported for the sheet's one row about the GPIO stack. Safe to import
+# here -- it touches sys.modules and nothing else, and deliberately does
+# not import gpiozero to answer.
+from otpunit.hw.buttons import pin_factory_name
 
 # Wiring, repeated here rather than referenced, because the sheet has to be
 # useful to someone holding it next to a Pi with no other documentation.
@@ -323,6 +327,16 @@ def collect(settings=None, printer=None, queue=None, driver=None,
         ("luma.oled", _try(lambda: _module_version("luma.oled"))),
         ("gpiozero", _try(lambda: _module_version("gpiozero"))),
         ("lgpio", _try(lambda: _module_version("lgpio"))),
+        # WHICH of the four gpiozero settled on, which the two rows above
+        # do NOT tell you. `lgpio 0.2.2.0` here means the module imports
+        # when diagnostics asks it to, from whatever directory this process
+        # is in; it does not mean the panel is running on it, because
+        # gpiozero swallows a failed factory import as though the package
+        # were absent and walks on to the next (issue #43). This row is the
+        # answer, read off `Device.pin_factory` without importing anything
+        # -- so on a sheet printed by a unit that never opened a button it
+        # says "none", truthfully.
+        ("Pin factory", _try(pin_factory_name)),
     ]))
 
     printer_rows = [

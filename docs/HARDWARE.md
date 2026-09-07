@@ -167,7 +167,12 @@ unit found:
 - the wiring table, so you can build the panel from the sheet alone
 - an I2C scan, so you can tell "nothing wired up" from "wired up, but at
   0x3D"
-- which of `luma.oled`, `gpiozero` and `lgpio` actually imported
+- which of `luma.oled`, `gpiozero` and `lgpio` actually imported, and
+  **which pin factory gpiozero settled on** — the second is not implied by
+  the first: gpiozero takes the first of `lgpio, rpigpio, pigpio, native`
+  that imports and treats a failed import as an absent package, so a unit
+  can have lgpio installed and be driving its pins with something else
+  (issue #43). `LGPIOFactory` is the intended answer
 - the printer it detected, the queue it created and the driver it matched
 - whether swap is off, whether the root filesystem is a read-only overlay,
   whether any network link is up, whether the kernel CSPRNG is seeded, and

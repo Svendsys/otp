@@ -314,16 +314,32 @@ check journal-marker-accepted \
 # the journal straight afterwards asks a unit that has not decided anything
 # yet, and reads "it never looked for a panel". Bounded, because a unit that
 # is never going to say it must still produce a report.
+#
+# ONE POLL FOR BOTH CHECKS. The pin-factory line below comes out of the same
+# journal, from the same call in the same function, so it is read in this
+# loop rather than in one of its own: a second bounded wait would add its
+# whole worst case to the probe's total, which
+# tests/test_overlay_root.py::test_the_probe_is_given_longer_than_its_own_bounded_wait
+# holds against otp-unit-imgcheck.service's TimeoutStartSec -- and 60s of it
+# would have put the probe past that timeout, losing the whole report on a
+# slow boot to buy nothing.
 NO_OLED=no
 NO_DISPLAY=no
 HEADLESS=no
+PIN_FACTORY_LINE=""
 UNIT_LOG=""
 for _ in $(seq 1 30); do
     UNIT_LOG=$(journalctl -b -u otp-unit.service --no-pager 2>/dev/null | tr '\n' ' ')
     case "$UNIT_LOG" in *"no OLED ("*) NO_OLED=yes ;; esac
     case "$UNIT_LOG" in *"interface -- display: none,"*) NO_DISPLAY=yes ;; esac
     case "$UNIT_LOG" in *"no usable interface; printing unattended"*) HEADLESS=yes ;; esac
-    [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ] && break
+    # `[^)]*\)` and not `.*`: UNIT_LOG is the whole journal with the newlines
+    # turned into spaces, so a greedy match would run on into every line
+    # after it. The report ends at the close bracket by construction.
+    PIN_FACTORY_LINE=$(printf '%s' "$UNIT_LOG" \
+                       | grep -m1 -oE 'pin factory: [^)]*\)' || true)
+    [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ] \
+        && [ -n "$PIN_FACTORY_LINE" ] && break
     sleep 2
 done
 # What it decided it had, quoted back. Display and input are chosen
@@ -336,6 +352,63 @@ UNIT_IFACE=$(printf '%s' "$UNIT_LOG" | grep -m1 -oE 'interface -- .{0,60}' || tr
 check unit-detects-no-panel \
       "$(if [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \
       "no-oled=$NO_OLED no-display=$NO_DISPLAY headless=$HEADLESS ${UNIT_IFACE:-no 'interface --' line in the unit journal}"
+
+# --- which pin factory the unit is actually driving the pins with ---------
+
+# THE ASSUMPTION THIS TURNS INTO A CHECK. device/packages.txt installs
+# python3-gpiozero and python3-lgpio, and the codebase said for a long time
+# that every unit it targets therefore runs on lgpio. Installing the package
+# does not establish that. gpiozero tries lgpio, rpigpio, pigpio and native
+# in that order and takes the first that IMPORTS, catching `Exception` and
+# not `ImportError` on each (gpiozero 2.0.1, devices.py:281-302) -- and
+# `import lgpio` creates a FIFO in the working directory as it runs
+# (lgpio 0.2.2.0, lgpio.py:503-504), so it RAISES where the cwd is
+# read-only, which is exactly what `WorkingDirectory=/opt/otp-unit` under
+# `ProtectSystem=strict` used to give it. That raise is indistinguishable
+# from the package being absent: the chain walks on, past two factories this
+# image does not install, to NativeFactory. Issue #43.
+#
+# WHY THE NAME AND NOT JUST "SOMETHING LOADED". NativeFactory is not a
+# lesser lgpio, it is a different fault surface. It dispatches edges on a
+# thread of its own whose callbacks have no guard around them (native.py:
+# 353-370), so one exception out of a callback ends that thread and every
+# button in the process goes deaf -- the fault #37 and #42 exist to answer
+# -- and the supervisor in otpunit/hw/buttons.py reads
+# `sys.modules["lgpio"]._notify_thread`, so on such a unit it finds None and
+# does nothing at all. A unit on the wrong factory therefore looks entirely
+# healthy from outside and carries an unsupervised copy of the fault the
+# panel code is built around. Nothing in any tier observed which one it was
+# on: tier 1 builds its own factory through tests/pirig.py and does not run
+# under the unit's sandbox, and this tier boots the artifact but never asked.
+#
+# WHAT IS READ. otpunit/hw/buttons.pin_factory_report(), logged once by
+# otpunit/hmi.open_buttons after the Button constructor has been tried --
+# which is the earliest there is an answer, because gpiozero picks a factory
+# when the first device is constructed. The name is `Device.pin_factory`'s
+# class name; the parenthetical after it is why, and nothing matches on it.
+#
+# THE EXPECTED NAME IS A VARIABLE so that tests/test_img_verdict.py can read
+# it out of this file rather than restate it, the way it reads USERCONF_USER
+# and the check lists -- a fixture carrying its own copy of the answer is how
+# a check goes on passing against a question nobody is asking any more.
+#
+# ON THE EMULATED MACHINE the pin CLAIM still fails: run 32020772161, boot1
+# console-text.log:713-714, `no GPIO buttons ([Errno 22] Invalid argument)`.
+# That is deliberately not what this reads. Whether a Button can be built on
+# a QEMU raspi3b is a property of the emulator; which factory gpiozero chose
+# is a property of the image, and it is the one that is the same on a real
+# Pi. So the line is logged whether or not the constructor raised, and this
+# check reads only the name.
+#
+# READ IN THE PANEL POLL ABOVE, not in a loop of its own -- see the note on
+# that loop for why the probe cannot afford a second bounded wait.
+PIN_FACTORY_EXPECTED=LGPIOFactory
+# The first word after the colon, which is the class name.
+PIN_FACTORY=${PIN_FACTORY_LINE#pin factory: }
+PIN_FACTORY=${PIN_FACTORY%% *}
+check unit-names-its-pin-factory \
+      "$(if [ "$PIN_FACTORY" = "$PIN_FACTORY_EXPECTED" ]; then echo yes; else echo no; fi)" \
+      "want=$PIN_FACTORY_EXPECTED got=${PIN_FACTORY:-nothing} -- ${PIN_FACTORY_LINE:-no 'pin factory:' line in the unit journal}"
 
 # --- CUPS, which is the half of the design the overlay could break --------
 

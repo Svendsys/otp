@@ -1790,7 +1790,8 @@ per_boot_verdict() {
 # against each other so they cannot drift apart in the other direction.
 GUEST_CHECKS_COMMON="root-is-overlay root-write-lands-and-is-readable \
 unit-active unit-not-restart-looping journal-marker-accepted \
-unit-detects-no-panel etc-cups-is-its-own-tmpfs cups-running \
+unit-detects-no-panel unit-names-its-pin-factory \
+etc-cups-is-its-own-tmpfs cups-running \
 cupsd-config-valid boot-partition-separate setting-saved-to-the-boot-partition \
 cloud-init-is-not-installed cloud-init-kill-switch-survives-the-purge \
 network-wait-cannot-hold-the-boot-open \
