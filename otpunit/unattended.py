@@ -659,6 +659,11 @@ def sheet(kind, codeword="", settings=None, seconds=0, tally=None,
                        "identical, and that is the point: one stays with "
                        "you, the other goes to the person you will be "
                        "talking to. Hand it over in person."),
+                (None, "THIS PAD IS ONE-WAY. Only one of you ever encrypts "
+                       "with it; the other only decrypts. If you both sent "
+                       "from it you could each use the same page, and that "
+                       "breaks both messages. For replies, print a second "
+                       "pair."),
             ]),
             diagnostics.Section("THE FOUR RULES", [
                 (None, "1. NEVER use a page twice. Not for a second message, "
@@ -669,8 +674,8 @@ def sheet(kind, codeword="", settings=None, seconds=0, tally=None,
                        "never an archive."),
                 (None, "3. KEEP THE TWO COPIES APART. Both in one place means "
                        "one raid takes the channel and everything it carried."),
-                (None, "4. NEVER send the same message on two channels. If "
-                       "one is broken, the other is handed to them as a crib."),
+                (None, "4. ONE DIRECTION PER PAD. The holder of one copy "
+                       "sends, the holder of the other receives. Never both."),
             ]),
             diagnostics.Section("TO USE IT", [
                 (None, "Both ends work from the same numbered page. Turn "
@@ -680,9 +685,15 @@ def sheet(kind, codeword="", settings=None, seconds=0, tally=None,
                 (None, "The tabula recta card does the arithmetic for you: "
                        "find the message letter along the top and the key "
                        "letter down the side."),
-                (None, "Pad the message out with A to the end of the page, so "
-                       "its length gives nothing away. Under the padding "
-                       "convention the ciphertext there is just the key."),
+                # Only where the pages carry one.
+                *([(None, "Begin every message with the AUTH group printed "
+                          "in the page header, encrypted like the rest. The "
+                          "receiver decrypts it first and REJECTS the "
+                          "message if it does not match their own page.")]
+                  if settings.with_auth else []),
+                (None, "Pad the message out with A to the length you agreed "
+                       "at the handover, so its real length gives nothing "
+                       "away."),
             ]),
             diagnostics.Section("TO MAKE MORE", [
                 (None, "Power the unit off and on with the printer attached. "

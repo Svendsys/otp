@@ -28,8 +28,8 @@ paper = A4
 a7 = no
 
 # The AUTH group: five key letters per page reserved for authentication and
-# never used for encryption (see otp.md, Authentication). The letters are
-# always CSPRNG output; only the length is adjustable.
+# never used for encryption (see otp.md, Authentication). The letters come
+# from the same source as the key body; only the length is adjustable.
 #
 # Five is what the manual's procedure assumes -- it says the first *group*
 # of every message is the auth group, and a group is five letters. Change

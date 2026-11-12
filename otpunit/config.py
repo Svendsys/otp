@@ -177,6 +177,12 @@ class Settings:
             problems.append("auto swap delay cannot be negative")
         if self.auto_codeword and not _codeword_ok(self.auto_codeword):
             problems.append("auto codeword must be A-Z, 0-9, - or _ only")
+        elif self.auto_codeword and gen.fit_codeword_size(
+                self.auto_codeword, self.font_size, self.a7, self.with_auth,
+                self.auth_size) is None:
+            # Unchecked, a long one printed at the minimum size straight
+            # through the AUTH group on every page of the pad.
+            problems.append("auto codeword too long for the page header")
         # isfinite as well as > 0: nan compares False against BOTH bounds, so
         # a bare `<= 0` check lets it through to calc_max_chars, which then
         # raises out of load() before the panel exists.

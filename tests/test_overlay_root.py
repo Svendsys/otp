@@ -2605,7 +2605,7 @@ def test_the_closing_summary_names_what_was_done_to_the_whole_machine():
     # Indentation allowed: the growfs mask is inside the overlay branch, and
     # a pattern anchored at column one is exactly how it went unlisted.
     masked = sorted(set(re.findall(r"^[ \t]*systemctl mask (\S+)$", body, re.M)))
-    assert len(masked) == 3, masked
+    assert len(masked) == 4, masked
     for unit in masked:
         assert unit in summary, (
             f"install.sh masks {unit} on any machine it touches and the "
@@ -2621,7 +2621,7 @@ def test_the_closing_summary_names_what_was_done_to_the_whole_machine():
         "how to reverse it: /etc/cloud/cloud-init.disabled")
     # And the count in the prose, which is the half a list of names cannot
     # keep honest -- it said "Three" while naming three of four.
-    assert "Four machine-wide changes" in summary, summary
+    assert "Five machine-wide changes" in summary, summary
 
 
 GETTY_BLOCK = ("install -d /etc/systemd/system/getty@tty1.service.d",

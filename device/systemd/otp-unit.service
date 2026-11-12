@@ -25,8 +25,22 @@ Requires=otp-unit-etc-cups.service
 
 [Service]
 Type=simple
+# No swap, enforced here as well as at provisioning. install.sh masks
+# swap.target, but that is one release's idea of how swap gets switched on;
+# this holds regardless, and it runs before any key material can exist.
+# '-': a machine with no swap to turn off is the normal case, not a failure.
+ExecStartPre=-/sbin/swapoff -a
 ExecStart=/usr/bin/python3 -m otpunit
-WorkingDirectory=/opt/otp-unit
+# NOT /opt/otp-unit. lgpio creates a notification FIFO (.lgd-nfy*) in the
+# working directory when it is imported, and under ProtectSystem=strict
+# that directory is read-only: the import raises, gpiozero swallows it and
+# falls back to a pin factory that cannot work, and a unit with buttons
+# wired comes up believing it has none. The runtime directory is a
+# writable tmpfs; imports come from PYTHONPATH, not the cwd. LG_WD is
+# lgpio's own name for the same setting, stated as well so neither
+# mechanism is the only one.
+WorkingDirectory=/run/otp-unit
+Environment=LG_WD=/run/otp-unit
 Environment=PYTHONPATH=/opt/otp-unit
 Environment=PYTHONDONTWRITEBYTECODE=1
 Restart=on-failure

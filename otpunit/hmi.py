@@ -34,6 +34,9 @@ from otpunit.hw.buttons import GpioButtons, KeyboardButtons
 from otpunit.hw.display import ConsoleDisplay, Ssd1306Display
 
 
+OLED_ADDRESSES = (0x3C, 0x3D)
+
+
 @dataclass
 class Interface:
     display: object | None = None
@@ -168,11 +171,18 @@ def console_usable() -> bool:
 
 def open_display(rotate: int = 0, log=None):
     """The best display available, and what it is."""
-    try:
-        return Ssd1306Display(rotate=rotate), "SSD1306 OLED"
-    except Exception as exc:                     # noqa: BLE001
-        if log:
-            log(f"no OLED ({exc})")
+    # 0x3C is what almost every SSD1306 module ships as; 0x3D is the other
+    # position of the address jumper. Trying only the first sent a unit
+    # with a 0x3D panel headless, where it prints on its own.
+    failures = []
+    for address in OLED_ADDRESSES:
+        try:
+            return (Ssd1306Display(address=address, rotate=rotate),
+                    "SSD1306 OLED")
+        except Exception as exc:                 # noqa: BLE001
+            failures.append(f"0x{address:02X}: {exc}")
+    if log:
+        log(f"no OLED ({'; '.join(failures)})")
 
     if screen_connected() and console_usable():
         return ConsoleDisplay(stream=sys.stdout, hint=False), "HDMI console"

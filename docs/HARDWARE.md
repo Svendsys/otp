@@ -210,7 +210,7 @@ With the unit powered and the image flashed:
 sudo i2cdetect -y 1
 
 # Are the buttons wired right? Press each; the pin should read 0.
-raspi-gpio get 5,6,13
+pinctrl get 5,6,13
 
 # Is the unit running?
 systemctl status otp-unit
@@ -220,7 +220,7 @@ journalctl -u otp-unit -f
 ```
 
 If the OLED shows nothing but `i2cdetect` finds it at `3d` rather than `3c`,
-the address differs — pass it in the service's `ExecStart`. If the display
+that is fine — the unit tries both addresses. If the display
 is an SH1106 (common on 1.3" modules) the panel will look shifted; those
 need `sh1106` instead of `ssd1306` in `otpunit/hw/display.py`.
 

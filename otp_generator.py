@@ -87,6 +87,8 @@ HWRNG_TIMEOUT = float(os.environ.get("OTP_HWRNG_TIMEOUT", "60"))
 # Small enough that the deadline above is tested often on a slow device,
 # large enough not to make syscalls the bottleneck on a fast one.
 _HWRNG_CHUNK = 4096
+# Pause between polls of a non-blocking TRNG that has nothing ready yet.
+_HWRNG_POLL = 0.001
 
 # A stuck TRNG is a real failure mode, and the one that matters most: it
 # fails silently, and a pad made from its output is not a pad. Anything
@@ -138,7 +140,12 @@ def _hwrng_bytes(n: int, path: str | None = None) -> bytes | None:
             try:
                 chunk = os.read(fd, min(_HWRNG_CHUNK, n - got))
             except BlockingIOError:
-                time.sleep(0.01)
+                # 1ms, not 10. A non-blocking read hands back only what the
+                # driver has buffered (64 bytes on virtio-rng, a FIFO's worth
+                # on bcm2835), so the sleep between polls caps throughput at
+                # buffer/sleep: measured on virtio-rng, 10ms halved it
+                # (4.8 vs 8.6 KiB/s blocking) and 1ms matched blocking.
+                time.sleep(_HWRNG_POLL)
                 continue
             except OSError:
                 return None

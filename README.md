@@ -33,7 +33,7 @@ Suggested classroom flow:
 
 1. Work through the **Example transmission** section together, by hand, with the numbers.
 2. Introduce the **tabula recta** (Tools section) and repeat the exercise letters-only.
-3. Set the **Exercises** appendix — three graded problems with an answer key,
+3. Set the **Exercises** appendix — four graded problems with an answer key,
    including a garbled-decrypt repair. Print worksheets for them (`--worksheets`).
 4. Generate a small training set (`--pages 20 --training`), pair students up, and
    run full two-way exchanges: encrypt, transmit by voice, authenticate, decrypt,
@@ -93,7 +93,7 @@ are A5: two per A4 sheet, one cut.
 | `--a4` | off | Four A6 pad pages per A4 sheet with crop marks, imposed **cut-and-stack** — see [Printing on A4](#printing-on-a4) |
 | `--letter` | off | The same, on US Letter |
 | `--tabula` | 0 | Also generate N tabula recta cards as `TABULA_RECTA.pdf` — the manual's 26×26 table, pocket-sized to go in the envelope with the pad. No key material. |
-| `--auth-size` | 5 | Letters in the AUTH group. The letters are always CSPRNG output; only the length is adjustable. |
+| `--auth-size` | 5 | Letters in the AUTH group. The letters are drawn from the same source as the key body; only the length is adjustable. |
 | `--random-codewords` | 0 | Generate N random `<MODIFIER>-<NOUN>` codewords instead of reading a file |
 | `--stdout` | off | Write the single generated PDF to stdout instead of a file: `otp_generator.py --random-codewords 1 --pages 100 --a4 --stdout \| lp -n 2 -o Collate=True`. Note the `-n 2`: a pad set is two identical copies, and once the bytes are down the pipe they are gone — re-running makes a *different* pad, not the twin. `Collate=True` is not optional: without it the copies come out interleaved (page 1, page 1, page 2, page 2), which is one stack to deal out by hand rather than two pads. See the caveat below; this keeps key material out of *this program's* output, not out of your spooler. |
 

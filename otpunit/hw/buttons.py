@@ -6,6 +6,7 @@ job without a fourth switch to wire up.
 """
 from __future__ import annotations
 
+import atexit
 import os
 import queue
 import select
@@ -409,6 +410,22 @@ class KeyboardButtons(Buttons):
 
     def __init__(self, allow_quit: bool = False):
         self.allow_quit = allow_quit
+        # The terminal's settings from before the first raw-mode wait(), so
+        # close() can put them back. Raw mode is entered once and HELD:
+        # restoring it after every wait() left the console cooked while a
+        # frame rendered or a pad generated, so keys echoed over the panel
+        # and Ctrl+C in that window was a SIGINT that ended the process
+        # mid-job.
+        self._saved_tty = None
+
+    def close(self) -> None:
+        if self._saved_tty is not None:
+            fd, saved = self._saved_tty
+            self._saved_tty = None
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            except (termios.error, OSError, ValueError):
+                pass
 
     def _map(self, key):
         if key in self.QUIT_KEYS:
@@ -440,34 +457,33 @@ class KeyboardButtons(Buttons):
             return self._map(line.strip()[:1] or "\n")
 
         fd = sys.stdin.fileno()
-        saved = termios.tcgetattr(fd)
-        try:
+        if self._saved_tty is None:
+            self._saved_tty = (fd, termios.tcgetattr(fd))
+            atexit.register(self.close)
             # TCSANOW, not setraw's TCSAFLUSH default. TCSAFLUSH DISCARDS
-            # the pending input queue, and wait() enters raw mode on every
-            # call -- so every key pressed while the app was rendering a
-            # frame was thrown away by the terminal driver. Measured at 27%
-            # loss just from panel redraws, approaching 100% while a pad is
-            # generating.
+            # the pending input queue, so keys typed before the first
+            # wait() would be thrown away by the terminal driver.
             tty.setraw(fd, termios.TCSANOW)
-            ready, _, _ = select.select([sys.stdin], [], [], timeout)
-            if not ready:
-                return None
-            ch = sys.stdin.read(1)
-            if ch == "\x1b":
-                # An escape byte may be a lone Esc or the start of an arrow
-                # sequence, and in raw mode nothing distinguishes them but
-                # time. A bare read(2) here blocked FOREVER on a single Esc
-                # -- the most natural key to press at a prompt -- which
-                # recreated the exact hang that Interface.prove() exists to
-                # prevent, inside prove() itself.
-                for _ in range(2):
-                    ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-                    if not ready:
-                        break
-                    ch += sys.stdin.read(1)
-            return self._map(ch)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        # os.read on the descriptor, never sys.stdin.read: the text layer
+        # is buffered, so its first read(1) swallowed the whole of an arrow
+        # key's three bytes, select() then saw an empty descriptor, and the
+        # sequence was reported as a bare Esc -- arrow keys never worked on
+        # a real console, and fast typing lagged a key behind.
+        ready, _, _ = select.select([fd], [], [], timeout)
+        if not ready:
+            return None
+        ch = os.read(fd, 1).decode("latin-1")
+        if ch == "\x1b":
+            # An escape byte may be a lone Esc or the start of an arrow
+            # sequence, and in raw mode nothing distinguishes them but
+            # time. An unbounded read here would block forever on a
+            # single Esc.
+            for _ in range(2):
+                ready, _, _ = select.select([fd], [], [], 0.05)
+                if not ready:
+                    break
+                ch += os.read(fd, 1).decode("latin-1")
+        return self._map(ch)
 
 
 class GpioButtons(Buttons):

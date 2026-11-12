@@ -95,9 +95,28 @@ fi
 # --- hardware -----------------------------------------------------------
 
 log "Enabling I2C and disabling the radios"
+# config.txt has conditional sections: everything after a `[pi4]` or `[cm5]`
+# header applies to that model only. Appending blindly therefore made these
+# settings conditional on any card whose file ends in such a section, and a
+# line already present inside one satisfied the "is it there" test without
+# applying. So: a setting counts only where it applies to every model, and
+# an append is preceded by `[all]` unless the file already ends in one.
+config_applies_to_all() {
+    awk -v want="$1" '
+        /^[[:space:]]*\[/ { all = ($0 ~ /^[[:space:]]*\[all\][[:space:]]*$/); seen = 1; next }
+        (!seen || all) && $0 == want { found = 1 }
+        END { exit found ? 0 : 1 }' "$CONFIG_TXT"
+}
+config_ends_unconditional() {
+    awk '
+        /^[[:space:]]*\[/ { all = ($0 ~ /^[[:space:]]*\[all\][[:space:]]*$/); seen = 1 }
+        END { exit (!seen || all) ? 0 : 1 }' "$CONFIG_TXT"
+}
 set_config() {
     local key="$1"
-    grep -qxF "$key" "$CONFIG_TXT" || printf '%s\n' "$key" >> "$CONFIG_TXT"
+    config_applies_to_all "$key" && return 0
+    config_ends_unconditional || printf '[all]\n' >> "$CONFIG_TXT"
+    printf '%s\n' "$key" >> "$CONFIG_TXT"
 }
 # The unit is offline by design: an OTP generator has no business holding a
 # network interface, and the radios are the easiest thing to switch off.
@@ -116,6 +135,17 @@ log "Removing swap"
 systemctl disable --now dphys-swapfile 2>/dev/null || true
 apt-get purge -y dphys-swapfile 2>/dev/null || true
 rm -f /var/swap
+# dphys-swapfile is the bookworm mechanism. Trixie replaced it with zram
+# swap (rpi-swap on top of systemd-zram-generator), optionally with
+# writeback to a file on the card, and the three lines above do nothing
+# about that. Masking swap.target stops systemd activating ANY swap unit,
+# whatever generated it, without depending on those package names; the
+# packages are left installed because purging them by guesswork could take
+# raspberrypi-sys-mods along. otp-unit.service also runs `swapoff -a`
+# before every start, which is the half that holds whatever a future
+# release calls its swap.
+systemctl mask swap.target
+swapoff -a 2>/dev/null || true
 
 
 # --- logging ------------------------------------------------------------
@@ -1335,11 +1365,11 @@ power-cycle is a full reset and nothing a session touched survives it.
 Settings still persist -- they live on the boot partition, which is outside
 the overlay.
 
-Four machine-wide changes were made as well -- two because an unbounded
+Five machine-wide changes were made as well -- two because an unbounded
 network wait held this image's boot open for its whole length, one because
-the overlay made every boot look like a first boot, and one because an
-online resize of a read-only root cannot work (see the comments in this
-script):
+the overlay made every boot look like a first boot, one because an online
+resize of a read-only root cannot work, and one because key material must
+never be paged out (see the comments in this script):
 
   * systemd-networkd-wait-online.service is MASKED. Nothing on this machine
     can wait for network-online.target through networkd any more, including
@@ -1370,7 +1400,12 @@ script):
     this machine can grow the root filesystem any more. Undo with
     `sudo systemctl unmask systemd-growfs-root.service`.
 
-All four are deliberate on an air-gapped key printer and all four outlive
+  * swap.target is MASKED, so systemd activates no swap of any kind on this
+    machine -- not a swap file, not zram. Key material lives in RAM and
+    must never be paged anywhere. Undo with
+    `sudo systemctl unmask swap.target`.
+
+All five are deliberate on an air-gapped key printer and all five outlive
 this script. tty1 is the front panel; the login prompt is on tty2 (Alt+F2).
 
 TWO THINGS ARE ON THE BOOT PARTITION, in /boot/firmware/otp-identity, and

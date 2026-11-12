@@ -271,6 +271,10 @@ class Ssd1306Display(Display):
         is 126px -- so this costs the shipped configuration nothing.
         """
         for row, text in enumerate(frame.rendered()):
+            # The bitmap face is Latin-1 and Pillow raises on anything
+            # outside it, which would blank the whole frame over one
+            # character in a printer's name.
+            text = text.encode("latin-1", "replace").decode("latin-1")
             fitted, left = self._fit(text.rstrip())
             draw.text((left, row * ROW_HEIGHT + ROW_TOP), fitted,
                       font=self._font, fill=255)

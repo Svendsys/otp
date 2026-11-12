@@ -2518,8 +2518,8 @@ tests = [
 ]
 [[mutation.edit]]
 file = "otpunit/hmi.py"
-find = '            log(f"no OLED ({exc})")'
-replace = '            log(f"no display ({exc})")'
+find = """        log(f"no OLED ({'; '.join(failures)})")"""
+replace = """        log(f"no display ({'; '.join(failures)})")"""
 
 
 # --- issue #21: the identity, the emulator's board revision, and the panel

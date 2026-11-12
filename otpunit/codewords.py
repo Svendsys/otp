@@ -109,8 +109,14 @@ def split(codeword: str) -> tuple[str, str]:
 
 
 def is_filename_safe(codeword: str) -> bool:
-    """Codewords become PDF filenames; otp_generator enforces the same rule."""
-    return bool(codeword) and all(ch.isalnum() or ch in "-_" for ch in codeword)
+    """
+    Codewords become PDF filenames; otp_generator enforces the same rule.
+
+    ASCII only: str.isalnum() is true for every Unicode letter, but the
+    Courier on the page is a WinAnsi font and substitutes silently.
+    """
+    return bool(codeword) and all(
+        (ch.isascii() and ch.isalnum()) or ch in "-_" for ch in codeword)
 
 
 def validate(codeword: str, font_size: float, a7: bool, with_auth: bool,
