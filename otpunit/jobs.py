@@ -181,12 +181,10 @@ class PadPairJob:
         if self.copies_done >= self.spec.copies:
             raise RuntimeError("all copies already submitted")
         letter = "AB"[self.copies_done] if self.spec.copies > 1 else ""
-        # Deliberately NOT the codeword. The job title becomes the IPP
-        # job-name, which CUPS records in /var/cache/cups/job.cache (kept
-        # forever by default) and, if page logging is on, in page_log.
-        # The document metadata is scrubbed for the same reason -- see
-        # otp_generator.new_canvas. Both matter: fixing only the envelope
-        # left the codeword sitting in the PDF's /Title.
+        # Deliberately not the codeword. The job title becomes the IPP
+        # job-name, which CUPS records in its job cache and page log. The
+        # PDF metadata is scrubbed for the same reason; see
+        # otp_generator.new_canvas.
         title = f"OTP {letter}".strip() if self.spec.carries_key_material \
             else self.spec.kind.value.upper()
         # Pad pages and tabula cards are A6; worksheets and the manual are
@@ -207,12 +205,11 @@ class PadPairJob:
         """
         Zero the key material and empty the spool. Safe to call twice.
 
-        The key is ALWAYS zeroed; that part is not optional. The purge is,
-        because `cancel -x -a` cancels every job on the queue including
-        one that is still printing. A caller that could not establish the
-        queue was empty passes purge=False and leaves the spool alone --
-        it is on tmpfs and dies with the power, which is a far better
-        outcome than shredding the copy currently coming out.
+        The key is always zeroed. The purge is conditional, because
+        `cancel -x -a` cancels every job on the queue including one still
+        printing: a caller that could not establish the queue was empty
+        passes purge=False and leaves the spool, which is on tmpfs and
+        dies with the power.
         """
         if self._buffer is not None:
             zero(self._buffer)
@@ -222,10 +219,8 @@ class PadPairJob:
         if purge:
             self.cups.purge(self.queue)
         else:
-            # Only the `cancel` is dangerous. Clearing TempDir is not, and
-            # cancelling is exactly when it matters: CUPS SIGKILLs the
-            # filter chain, so Ghostscript never unlinks its scratch file.
-            # Skipping both left plaintext pages in /run/cups/tmp.
+            # Only the `cancel` is dangerous. TempDir is still cleared,
+            # since a killed filter chain leaves plaintext pages there.
             try:
                 self.cups._clear_temp()
             except Exception:                    # noqa: BLE001

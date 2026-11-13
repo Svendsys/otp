@@ -1,22 +1,9 @@
 """The tier-2 verdict logic, tested against synthetic consoles.
 
-WHY THIS EXISTS. Every audit round so far has found a harness check that
-could not fail: a boot offset aimed at a zero-filled gap, a grep for the
-image's hostname, a spool check that was really a systemd invariant, a
-truncated-run gate that passed a truncated run. Each was found by hand,
-mutated by hand, and confirmed by hand -- and the next one was found the
-same way, one round later.
-
-`vm-check.sh` grew a three-phase gate, and the whole value of three boots
-rests on that gate noticing when a boot did not happen. A boot that never
-happens produces no output, which is indistinguishable from a boot with
-nothing to say. So the gate is the load-bearing part, and it is exactly the
-kind of code that quietly stops discriminating.
-
-These tests run the real verdict block -- sliced out of the real script, not
-a copy of it -- against consoles built to fail one way each. A gate that
-has stopped discriminating fails here rather than two months from now on a
-green run that meant nothing.
+The three-phase gate in `vm-check.sh` has to notice a boot that did not
+happen, and a missing boot produces no output at all. These tests run the
+real verdict block, sliced out of the script, against consoles built to
+fail one way each.
 """
 import subprocess
 import textwrap
@@ -34,9 +21,8 @@ PHASES = ("provision", "reboot", "persist")
 def verdict_block() -> str:
     """The real verdict logic, from the marker to the end of the script.
 
-    Sliced rather than duplicated. A copy of this logic in the test file
-    would go on passing after somebody changed the original -- which is the
-    same defect as a rig carrying its own copy of MaxJobs.
+    Sliced rather than duplicated: a copy would keep passing after the
+    original changed.
     """
     text = VM_CHECK.read_text()
     assert MARKER in text, f"{VM_CHECK} no longer contains {MARKER!r}"
@@ -44,11 +30,8 @@ def verdict_block() -> str:
 
 
 def console(phases=PHASES, counts=None, done=None, fails=(), repeat=()):
-    """Build a guest console transcript.
-
-    Defaults to a clean three-phase run; every argument makes it worse in
-    one specific way.
-    """
+    """Build a guest console transcript: a clean three-phase run by default,
+    and each argument makes it worse in one specific way."""
     counts = counts or {}
     done = PHASES if done is None else done
     lines = ["OTP-INSTALL rc=0"]
@@ -64,8 +47,7 @@ def console(phases=PHASES, counts=None, done=None, fails=(), repeat=()):
             lines.append(f"OTP-RESULT {phase} {passed}/{total}")
         if phase in done:
             lines.append(f"OTP-GUEST-DONE {phase}")
-    # A serial console emits CRLF. Every line really does arrive with a
-    # trailing \r, and that has broken this script's comparisons before.
+    # A serial console emits CRLF, so every line carries a trailing CR.
     return "".join(line + "\r\n" for line in lines)
 
 
@@ -102,18 +84,14 @@ class TestTheGatePasses:
 
 
 class TestTheGateFails:
-    """Each of these is a way the run is broken. If any returns 0, the gate
-    it is aimed at has stopped discriminating."""
+    """Each case is one way a run is broken; a zero exit means the gate aimed
+    at it has stopped discriminating."""
 
     @pytest.mark.parametrize("missing", PHASES)
     def test_a_phase_that_never_reported_fails(self, tmp_path, missing):
-        """The gate this whole three-boot design rests on.
-
-        Dropping `persist` is the realistic case: the guest reboots, does
-        not come back, and the transcript ends looking tidy. Under the
-        single-phase form this replaces -- `tail -1` of the result line --
-        that run passed on the strength of the previous phase.
-        """
+        """A run missing a whole phase fails and names the phase. Dropping
+        `persist` is the realistic case: the guest reboots and never comes
+        back."""
         kept = [p for p in PHASES if p != missing]
         result = run_verdict(tmp_path, console(phases=kept, done=kept))
         assert result.returncode != 0, (
@@ -136,23 +114,21 @@ class TestTheGateFails:
         assert result.returncode != 0, "13/14 was accepted as a pass"
 
     def test_a_fail_line_fails_even_when_the_counts_agree(self, tmp_path):
-        """Belt and braces: the counts come from the guest, which is the
-        thing under test. A guest that miscounts must not be able to talk
-        its way to a green run."""
+        """A FAIL line fails the run even when the counts agree, because the
+        counts come from the guest, which is the thing under test."""
         result = run_verdict(tmp_path, console(fails=("unit-holds-tty1",)))
         assert result.returncode != 0, "a FAIL line was accepted"
 
     def test_a_phase_reporting_twice_fails(self, tmp_path):
-        """The runner reboots itself. A failed state write loops it on one
-        phase forever, and 'it reported' stays true of a machine doing
-        nothing else."""
+        """A phase that reports twice fails: a failed state write loops the
+        self-rebooting runner on one phase."""
         result = run_verdict(tmp_path, console(repeat=("reboot",)))
         assert result.returncode != 0, "a boot loop was accepted"
         assert "2x" in result.stderr
 
     def test_a_nonzero_qemu_exit_fails(self, tmp_path):
-        """124 is the timeout. The transcript can look complete right up to
-        where the axe fell."""
+        """A nonzero qemu exit fails the run (124 is the timeout) even when
+        the transcript looks complete."""
         result = run_verdict(tmp_path, console(), qemu_rc=124)
         assert result.returncode != 0, "a killed qemu was accepted"
 
@@ -162,20 +138,11 @@ class TestTheGateFails:
 
 
 class TestASharedSerialConsole:
-    """The guest and the kernel write to the same serial port.
-
-    Observed, after sixteen checks had passed:
-
-        OTP-RESULT provi[  104.959304] systemd-ssh-generator[5039]: Failed...
-
-    A kernel message landed in the middle of the marker and split the word
-    "provision" in half. The guest now runs with loglevel=3 so the console
-    is quiet, but a harness that loses a twenty-minute run to one unlucky
-    printk is a harness with a bad day in it somewhere.
-    """
+    """The guest and the kernel share one serial port, so a kernel message can
+    land inside or after a marker."""
 
     def test_a_marker_with_a_kernel_message_after_it_is_still_read(self, tmp_path):
-        """Interleaving that lands AFTER the marker must not hide it."""
+        """Noise that lands after the marker must not hide it."""
         noise = "[  104.9] systemd-ssh-generator[5039]: Failed to query CID"
         transcript = console().replace(
             "OTP-RESULT persist 14/14",
@@ -196,12 +163,9 @@ class TestASharedSerialConsole:
         assert result.returncode == 0, result.stderr
 
     def test_a_marker_split_mid_word_still_fails(self, tmp_path):
-        """The half-written marker must NOT be salvaged into a pass.
-
-        This is the case that actually happened. Tolerating trailing noise
-        is right; guessing at a truncated phase name would be inventing a
-        result the guest never reported.
-        """
+        """A marker split mid-word is not salvaged into a pass: guessing at a
+        truncated phase name would invent a result the guest never
+        reported."""
         transcript = console().replace(
             "OTP-RESULT persist 14/14",
             "OTP-RESULT persi[  104.9] systemd-ssh-generator: Failed",
@@ -220,15 +184,8 @@ class TestASharedSerialConsole:
 
 
 class TestTheFailurePathSaysWhy:
-    """A gate that fails without explaining why costs an hour every time.
-
-    The first run of the three-boot cycle died in a tenth of a second --
-    qemu rejected `serial=` on a raw -drive and never booted -- and the run
-    reported "the guest never reported. Last 80 lines of the console:"
-    followed by nothing, because there was no console. The one line that
-    explained it was qemu's stderr, thirty lines up the job log and easy to
-    scroll past.
-    """
+    """A failing gate has to say why. When qemu dies before the guest boots
+    there is no console, and the only explanation is qemu's stderr."""
 
     def test_an_empty_console_surfaces_qemu_stderr(self, tmp_path):
         boom = (
@@ -255,11 +212,8 @@ class TestTheFailurePathSaysWhy:
 
 class TestTheGateIsNotFooledByWhitespace:
     def test_crlf_does_not_break_the_count_comparison(self, tmp_path):
-        """A trailing \\r once made "13" and "13\\r" unequal and failed a run
-        in which everything passed. The transcripts here all carry CRLF, so
-        the clean-run test above already covers this -- but it is named
-        because the regression is cheap to reintroduce and expensive to
-        diagnose from a log where the difference is invisible."""
+        """The count comparison survives CRLF line endings; named separately
+        because the difference is invisible in a log."""
         transcript = console()
         assert "\r\n" in transcript
         assert run_verdict(tmp_path, transcript).returncode == 0

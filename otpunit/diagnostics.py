@@ -157,15 +157,10 @@ def _entropy():
     """
     Whether the kernel CSPRNG is seeded, with the raw estimate as context.
 
-    The seeded state is the finding. The bit count is not, and this row
-    used to be only the count with an "ok"/"LOW" verdict attached at 256
-    -- which invited an operator to sit and wait for a number that has
-    not gated anything since Linux 5.6. getrandom() blocks until the CRNG
-    is initialised and ignores the estimate afterwards, and the estimate
-    is clamped to the pool size, so on a healthy machine it reads its own
-    maximum for ever (measured: 256, pinned, on an idle 6.18 kernel).
-    Kept alongside because while the CRNG is NOT seeded it does climb,
-    and then it is the only progress an operator can see.
+    The seeded state is the finding. The bit count gates nothing on a
+    modern kernel and is pinned at the pool size once seeded; it is shown
+    because while the CRNG is not seeded it climbs, and is then the only
+    progress an operator can see.
     """
     bits = gen.entropy_bits()
     count = "unknown" if bits is None else f"{bits} bits"
@@ -275,11 +270,8 @@ def collect(settings=None, printer=None, queue=None, driver=None,
                "headless unit has."),
         (None, "NO KEY MATERIAL IS ON THIS SHEET -- no codeword, no key -- so "
                "sending it to someone for help cannot compromise a pad."),
-        # It used to say "safe to show anyone", four sections above this
-        # unit's board serial and the printer's serial number in its device
-        # URI. Neither is key material and both are worth having when
-        # diagnosing, but they identify a specific machine, and telling
-        # someone a page is safe for anyone is a claim to get right.
+        # Not "safe to show anyone": the board serial and the printer's
+        # serial are not key material, but they identify this machine.
         (None, "It does identify this hardware: the board serial below, the "
                "printer's serial inside its device URI, and any network link "
                "it can see. That names the unit, not the pad. Cross them out "
@@ -418,23 +410,17 @@ def render(sections, output, page_size=A4, title=STATUS_TITLE,
     """
     Draw the report onto `output` (a path or a binary stream).
 
-    The heading is a parameter because these same two columns are used for
-    the sheets that stand in for a panel, and the status sheet's "contains
-    no key material" is a dangerous thing to print at the top of the sheet
-    that tells someone to keep the secret pages above it.
+    The heading is a parameter because the same layout is used for the
+    sheets that stand in for a panel, where the status sheet's "contains
+    no key material" would be dangerously wrong.
 
-    Content that does not fit runs onto another sheet. It used to be
-    counted and thrown away, with a one-line footnote saying how much had
-    gone: on A6 that was 241 of 282 lines, so the entire user interface of
-    a mute unit came out as a title, a wiring table and an apology.
+    Content that does not fit runs onto another sheet.
     """
     width, height = page_size
     canvas = gen.new_canvas(output, page_size, title="OTP unit")
 
-    # A6 is 105mm wide. Two columns there leave 13pt of width for a value
-    # beside a 30mm label, so every value wrapped to one word per line and
-    # the sheet overflowed by an order of magnitude. Narrow paper gets one
-    # column, a smaller margin and a label column scaled to fit.
+    # A6 is too narrow for two columns of label and value, so narrow paper
+    # gets one column, a smaller margin and a label column scaled to fit.
     narrow = width < 400
     columns = 1 if narrow else 2
     margin = (9 if narrow else 14) * mm
@@ -511,9 +497,9 @@ def render(sections, output, page_size=A4, title=STATUS_TITLE,
         # Never strand a section title at the foot of a column.
         keep_with = (rows[index + 1][0] if items and items[0][0] == "head"
                      and index + 1 < len(rows) else 0)
-        # The balance target applies to every column but the last one on
-        # the sheet, which runs to the floor. Enforcing it everywhere sent
-        # the final few rows onto a second, near-empty sheet.
+        # The balance target applies to every column but the last on the
+        # sheet, which runs to the floor, so the final rows do not spill
+        # onto a near-empty extra sheet.
         limit = target if column < columns - 1 else available
         if used and used + advance + keep_with > limit:
             next_column()
@@ -567,8 +553,6 @@ def _page_size(settings):
 
     from reportlab.lib.pagesizes import A6
 
-    # A6 was missing, so an A6-only unit rendered A4 instruction sheets
-    # and submitted them to a queue loaded with A6.
     return {"A4": A4, "LETTER": LETTER, "A6": A6}.get(
         getattr(settings, "paper", "A4"), A4)
 
@@ -602,12 +586,10 @@ def run_headless(cups, settings=None, poll_seconds=2.0, log=print,
             log(f"printer lookup failed: {exc}")
 
         if not devices:
-            # Only re-arm after SEVERAL consecutive empties. devices()
-            # returns [] for a busy cupsd or a timed-out lpinfo just as it
-            # does for an unplugged cable, and re-arming on one of those
-            # started a whole second pad pair -- 68 more sheets and a new
-            # codeword -- with the first still in the tray. Measured: one
-            # bad poll in five produced 12 pad-pair starts in 60 polls.
+            # Only re-arm after several consecutive empties: devices()
+            # returns [] for a busy cupsd or a timed-out lpinfo as well as
+            # for an unplugged cable, and re-arming on a hiccup would start
+            # a second pad pair with the first still in the tray.
             misses += 1
             if printed_for is not None and misses >= GONE_AFTER:
                 log("printer disconnected")
@@ -637,7 +619,7 @@ def run_headless(cups, settings=None, poll_seconds=2.0, log=print,
             log(f"queue setup failed: {exc}")
             driver = f"SETUP FAILED: {exc}"
 
-        # Mark the connection handled BEFORE running the sequence. A
+        # Mark the connection handled before running the sequence. A
         # failure part-way through must not leave the loop thinking this
         # printer is still untouched and start over, printing copy A of a
         # second pair on top of the first.

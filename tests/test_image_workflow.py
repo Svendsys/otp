@@ -1,31 +1,12 @@
 """What a tag is allowed to publish.
 
-`image.yml` builds the image, uploads it as an artifact, boots it (tier 3),
-and on a tag attaches it to the release. The ORDER of the last two is the
-whole of this file: for a while the attachment happened first, so a tagged
-image that could not boot shipped anyway, to be written to a card and
-handed to somebody.
-
-The ordering is invisible in review -- two steps moved a hundred lines
-apart in a 350-line workflow -- and nothing in CI would notice it moving
-back, because the only run that would demonstrate it is a tag run with a
-broken image, which is the run nobody wants to have.
-
-THE FIRST VERSION OF THIS FILE WAS A CHECK THAT COULD BARELY FAIL. It
-matched the gate's condition by substring, so `success() && startsWith(..)`
-becoming `success() || startsWith(..)` -- one character, and a change that
-publishes a release tagged `master` on every green push -- left all seven
-assertions green. Nine mutations survived it in total: a duplicate attach
-step, a renamed one, `|| true` on the boot script, a deleted `files:`. The
-assertions below are written against those nine.
-
-WHAT THIS CANNOT DO is prove GitHub honours the gate. It asserts the
-workflow says the right thing. That a step whose `if` names no status
-function carries an implicit `success()`, and that an intervening
-`always()` step does not clear the job's failure state, are the runner's
-semantics -- confirmed against actions/runner's StepsRunner, which updates
-job status only inside `if (step.Result == TaskResult.Failed)` -- and are
-not reproducible here.
+`image.yml` builds the image, uploads it as an artifact, boots it (tier 3)
+and, on a tag, attaches it to the release. The attachment must come after
+the boot, or a tagged image that cannot boot ships anyway. These tests
+assert what the workflow says; that GitHub honours the gate (an `if` naming
+no status function implies `success()`, and an intervening `always()` step
+does not clear the job's failure) is the runner's semantics and is not
+reproducible here.
 """
 from __future__ import annotations
 
@@ -43,9 +24,8 @@ BOOT = "Boot the image"
 ATTACH = "Attach to the release"
 UPLOAD = "Upload"
 
-#: The gate, exactly. Pinned as a whole expression rather than probed for
-#: substrings, because the structure is the part that matters: `&&` -> `||`
-#: contains every token a substring check looks for and inverts the meaning.
+#: The gate, pinned as a whole expression: `&&` -> `||` keeps every token a
+#: substring check looks for and inverts the meaning.
 GATE = "success() && startsWith(github.ref, 'refs/tags/')"
 
 #: Anything in a `run:` that stops a failing command from failing the step.
@@ -53,20 +33,16 @@ SWALLOWS_FAILURE = ("|| true", "|| :", "set +e", "continue-on-error")
 
 
 def workflow() -> dict:
-    # `on:` parses as the boolean True under YAML 1.1, which is harmless
-    # here but startling if you go looking for it.
+    # `on:` parses as the boolean True under YAML 1.1.
     return yaml.safe_load(WORKFLOW.read_text())
 
 
 def build_steps() -> list:
-    """
-    The steps of the job that builds and boots the image.
+    """The steps of the job that builds and boots the image.
 
-    Named `build`, not `image`. `image` is the job branch protection
-    requires: it always runs, reports on every pull request, and does
-    nothing but read the other two's results. Everything these tests are
-    about -- the boot, the artifact, the release attachment -- lives in
-    `build`, which is conditional. See test_the_required_check_always_runs.
+    That job is `build`, which is conditional. `image` is the
+    always-running job branch protection requires; it only reads the
+    others' results.
     """
     return workflow()["jobs"]["build"]["steps"]
 
@@ -76,9 +52,8 @@ def index_of(steps, name) -> int:
     assert matches, (
         f"no step named {name!r} in image.yml; the steps are: "
         + ", ".join(repr(s.get("name")) for s in steps))
-    # Uniqueness is load-bearing. A SECOND step of the same name appended
-    # at the end with `always()` would leave a first-match lookup happily
-    # asserting the gated one while the ungated duplicate ships the image.
+    # Uniqueness matters: a first-match lookup would miss an ungated
+    # duplicate step of the same name.
     assert len(matches) == 1, f"{name!r} appears {len(matches)} times"
     return matches[0]
 
@@ -87,10 +62,8 @@ def step_named(steps, name) -> dict:
     return steps[index_of(steps, name)]
 
 
-# A step publishes a release if it USES a release action or if it SHELLS
-# OUT to one. Matching only on `uses:` missed the second kind entirely: a
-# `run: gh release upload "$TAG" image/deploy/*.img.xz` placed before the
-# boot is a publisher by any measure and left all eight tests green.
+# A step publishes a release if it uses a release action or shells out to
+# one.
 PUBLISHING_ACTIONS = ("gh-release", "create-release", "upload-release")
 PUBLISHING_COMMANDS = ("gh release create", "gh release upload",
                        "hub release", "/releases/assets", "/releases }}",
@@ -98,17 +71,9 @@ PUBLISHING_COMMANDS = ("gh release create", "gh release upload",
 
 
 def release_publishers(paths=None) -> list:
-    """
-    Every step in EVERY workflow file that can create a release or attach
-    an asset to one, by what it uses or runs rather than what it is called.
-
-    Name-based lookup cannot see a second publisher under another name --
-    `Publish the release asset`, placed before the boot, was invisible to
-    the first version of this file and shipped the image ungated. Scanning
-    only image.yml has the same hole one level up: ci.yml runs on every
-    push to master and has no boot gate at all, so a publisher added there
-    would never meet one.
-    """
+    """Every step in every workflow file that can create a release or attach
+    an asset to one, found by what it uses or runs, not by its name. Other
+    workflows are scanned too because they have no boot gate at all."""
     found = []
     for path in sorted(paths if paths is not None else WORKFLOWS.glob("*.yml")):
         document = yaml.safe_load(path.read_text())
@@ -126,7 +91,7 @@ def release_publishers(paths=None) -> list:
 
 
 def test_the_release_asset_is_attached_after_the_boot():
-    """The point of the file."""
+    """The release asset is attached only after the boot has passed."""
     steps = build_steps()
     assert index_of(steps, ATTACH) > index_of(steps, BOOT), (
         "the release attachment runs before the boot gate, so a tag whose "
@@ -150,11 +115,8 @@ def test_there_is_exactly_one_thing_that_can_publish_a_release():
 
 
 def test_the_plain_artifact_is_still_uploaded_before_the_boot():
-    """
-    The other half, and it must NOT move. Debugging a red boot needs the
-    image that failed, so the artifact is uploaded unconditionally and
-    early. Only the release asset is gated.
-    """
+    """The plain artifact is uploaded unconditionally and before the boot:
+    debugging a red boot needs the image that failed."""
     steps = build_steps()
     assert index_of(steps, UPLOAD) < index_of(steps, BOOT)
     upload = step_named(steps, UPLOAD)
@@ -168,13 +130,8 @@ EVIDENCE = "Upload the boot evidence"
 
 
 def phase_evidence_files() -> set:
-    """Every file img-boot.sh leaves in a phase's directory, off the harness.
-
-    Read rather than listed, for the reason `required_checks` in
-    tests/test_img_verdict.py is: a list written out here would go on
-    approving an upload that had stopped collecting a file the harness had
-    started writing, which is precisely the defect below.
-    """
+    """Every file img-boot.sh leaves in a phase's directory, read off the
+    harness so that a new file cannot be missed by a hand-written list."""
     harness = (REPO / "harness" / "img-boot.sh").read_text()
     found = set(re.findall(r'\$(?:dir|WORK/\$phase)/([A-Za-z0-9._-]+)',
                            harness))
@@ -183,30 +140,14 @@ def phase_evidence_files() -> set:
 
 
 def test_every_file_a_phase_leaves_behind_travels_as_evidence():
-    """
-    THE CARD EVIDENCE WAS NOT COLLECTED, IN THE PHASE WHOSE CLAIM IS THE CARD.
-
-    The upload globbed `*/console*.log`, `verdict.txt` and the boot
-    partition's own cmdline.txt and config.txt. `$WORK` is
-    `${runner.temp}/otp-img`, so boot-files-before-strip.txt,
-    boot-digests-before.txt, boot-digests-after.txt and the pre-existing
-    boot-files-{before,after}.txt matched no glob at all -- and those five
-    files are the entire basis of probe-droppings-were-on-the-card,
-    probe-droppings-stayed-off-the-card, boot-partition-unchanged and
-    identity-store-unchanged. A `boot-partition-unchanged FAIL` naming ten
-    differing entries could not be traced to the listings it came out of
-    after the run had finished.
-
-    Held as a rule and not as a list. The filenames come out of the harness,
-    so a new one has to be added to the upload or this goes red -- in the
-    fast suite, rather than as an artifact somebody could not download
-    sixteen minutes into an arm64 run.
-    """
+    """Every file a phase writes is matched by an evidence-upload glob. The
+    listings and digests are the basis of the card checks, and a FAIL there
+    cannot be diagnosed without them."""
     step = step_named(build_steps(), EVIDENCE)
     globs = [line.strip() for line in step["with"]["path"].splitlines()
              if line.strip()]
-    # The phase directory is one level under $WORK; only the globs that have
-    # that level in them can match a per-phase file.
+    # The phase directory is one level under $WORK; only globs with that
+    # level can match a per-phase file.
     per_phase = [Path(g).name for g in globs
                  if "/otp-img/*/" in g.replace("\\", "/")]
     assert per_phase, f"no glob reaches into a phase directory: {globs}"
@@ -232,22 +173,8 @@ MTOOLS_JOBS = {
 
 
 def test_the_jobs_that_need_mtools_install_mtools():
-    """
-    A SKIP THAT BECOMES PERMANENT IS THE HOLE REOPENING.
-
-    The card functions were unreachable from any test for the whole of their
-    existence: they sit above the block test_img_verdict.py slices, and
-    rewriting fat_digest_of to hand every file the same sixty-four characters
-    left the suite passing and would have reported
-    `identity-store-unchanged PASS` at runtime forever. The tests that close
-    that need mtools, and they are marked to skip without it -- which is the
-    right behaviour on a developer's machine and exactly the wrong behaviour
-    in CI, where a skip is indistinguishable from a pass in the summary.
-
-    So the installs are asserted here rather than trusted. Deleting either
-    line is a one-line change that silently removes the coverage this whole
-    section was written to add, and this is what makes it a red test instead.
-    """
+    """The jobs whose tests need mtools install it. Those tests skip without
+    it, and in CI a skip is indistinguishable from a pass."""
     ci = yaml.safe_load((WORKFLOWS / "ci.yml").read_text())
     for job, why in MTOOLS_JOBS.items():
         assert job in ci["jobs"], f"ci.yml no longer has a {job!r} job"
@@ -257,12 +184,9 @@ def test_the_jobs_that_need_mtools_install_mtools():
 
 
 def test_the_boot_evidence_upload_still_carries_the_verdict():
-    """
-    The digest in the verdict is truncated to twelve characters on purpose --
-    it covers a password hash -- and that trade is only honest while the
-    verdict itself is retrievable. It is the one file outside a phase
-    directory that this artifact exists for.
-    """
+    """The evidence upload carries verdict.txt: the digest it holds is
+    truncated on purpose (it covers a password hash), so the verdict has to
+    be retrievable."""
     step = step_named(build_steps(), EVIDENCE)
     globs = step["with"]["path"]
     assert "verdict.txt" in globs, globs
@@ -276,12 +200,8 @@ def test_the_boot_evidence_upload_still_carries_the_verdict():
 
 
 def test_the_gate_is_exactly_the_expression_it_should_be():
-    """
-    Pinned whole. Probing for `success()` and `refs/tags/` separately is
-    what let `&&` -> `||` through: that mutation keeps both tokens, drops
-    the gate entirely, and publishes a release named after whatever branch
-    was pushed. `!startsWith(...)` inverts it and keeps them too.
-    """
+    """The gate is exactly the pinned expression. Checking for `success()` and
+    `refs/tags/` separately would pass `&&` -> `||` and `!startsWith(...)`."""
     condition = " ".join(str(step_named(build_steps(), ATTACH)["if"]).split())
     assert condition == GATE, (
         f"the release gate now reads {condition!r}, not {GATE!r}. If the "
@@ -290,12 +210,8 @@ def test_the_gate_is_exactly_the_expression_it_should_be():
 
 
 def test_the_boot_step_can_still_fail_the_job():
-    """
-    The gate is worth nothing if the thing it gates on cannot go red, and
-    `continue-on-error` is not the cheapest way to break that -- appending
-    `|| true` to the script invocation is one token and leaves every
-    structural property of the step intact.
-    """
+    """The boot step can still fail the job: nothing in it (`|| true`,
+    `continue-on-error`) swallows a failure, or the gate gates on nothing."""
     boot = step_named(build_steps(), BOOT)
     assert not boot.get("continue-on-error"), boot
     assert "if" not in boot, \
@@ -313,29 +229,17 @@ def test_the_boot_step_can_still_fail_the_job():
 
 
 def test_the_asset_is_the_image():
-    """
-    `fail_on_unmatched_files` defaults to false, so a tag run with no
-    `files:` at all publishes a release carrying the caveat note and no
-    image, entirely green.
-    """
+    """The attached asset is the image. `fail_on_unmatched_files` defaults to
+    false, so a missing `files:` would publish a release with no image."""
     attach = step_named(build_steps(), ATTACH)
     assert "softprops/action-gh-release@" in attach["uses"], attach["uses"]
     assert attach["with"]["files"] == "image/deploy/*.img.xz", attach["with"]
 
 
 def test_the_note_is_appended_so_it_cannot_eat_the_release_notes():
-    """
-    The action's update path is `body = workflowBody || existingReleaseBody`
-    unless append_body is set. Publishing a release through the GitHub UI
-    creates the release AND the tag, and the tag push is what starts this
-    workflow -- so the release already exists when the step runs, making
-    the update path the normal case rather than the exotic one.
-
-    Without append_body the caveat paragraph therefore REPLACES whatever
-    changelog the maintainer wrote. An earlier version of this test pinned
-    append_body out, on the reasoning that only the create path mattered,
-    and so held the defect in place.
-    """
+    """The note is appended to the release body. Without append_body the
+    action replaces an existing body, and a release created in the GitHub
+    UI already exists (with the maintainer's notes) when this step runs."""
     attach = step_named(build_steps(), ATTACH)["with"]
     assert attach.get("append_body") is True, \
         ("without append_body the note REPLACES the maintainer's release "
@@ -344,19 +248,13 @@ def test_the_note_is_appended_so_it_cannot_eat_the_release_notes():
     assert "harness/img-boot.sh" in body, \
         "the note must point at the file that states the gate's limits"
     assert "otp-unit.service" in body
-    # Folded, not literal: release bodies render hard line breaks, and a
-    # block scalar would ship this at whatever width the YAML is wrapped to.
+    # Folded, not literal: release bodies render hard line breaks.
     assert "\n" not in body.strip(), \
         "the note carries hard line breaks and will render ragged"
 
 
-# How many boots the note is allowed to claim, spelled the way English
-# spells it. Derived and not hard-coded, because the number in the note is
-# the number of phases the harness demands and those two moved apart exactly
-# once: the release phase made the gate three boots and the sentence went on
-# saying "twice" for the whole of this branch, with a later sentence in the
-# SAME paragraph calling the release boot "a third boot of the same card".
-# One paragraph, two counts, and the test in this file pinned the wrong half.
+# How many boots the note may claim, as English words. Derived from the
+# harness so the note and the phase count cannot drift apart.
 BOOT_COUNT_WORDS = {1: "once", 2: "twice", 3: "three times",
                     4: "four times", 5: "five times"}
 
@@ -370,28 +268,11 @@ def demanded_boots() -> int:
 
 
 def test_the_release_notes_boot_count_is_the_one_the_harness_demands():
-    """
-    The note tells whoever downloads a tagged image how many times it was
-    booted, that a file written to `/` in the first boot was gone in the
-    second, and that a setting written to `/boot/firmware` was not. Nothing
-    in this workflow makes any of that true: `OTP_IMG_PHASES` decides which
-    boots happen, and the harness is what reads it.
+    """The note's boot count is the one the harness demands.
 
-    So the claim rests on two things, and both are asserted here. The
-    harness must refuse a phase list without boot2 -- a one-boot run used to
-    pass the whole gate and still print the two-boot conclusion -- and this
-    workflow must not set the variable to something that drops a boot. A
-    run halved to save CI minutes has to go red rather than ship a release
-    body that says what did not happen.
-
-    THE COUNT IS DERIVED AND THE OTHER COUNTS ARE FORBIDDEN, which is the
-    half this test used to get wrong. It asserted the literal word "twice"
-    while the phase guard demanded three boots and a later sentence in the
-    same paragraph called the release boot "a third boot of the same card" --
-    so the assertion was not backing the note, it was holding a stale
-    sentence in place against the rest of the paragraph. Requiring the right
-    word is not enough on its own either: a note that says both would still
-    pass. Exactly one count word, and it has to be the harness's.
+    The harness must refuse a phase list that drops a boot, the workflow
+    must not set `OTP_IMG_PHASES` to one, and the note must contain exactly
+    one count word: the harness's.
     """
     body = step_named(build_steps(), ATTACH)["with"]["body"]
     boots = demanded_boots()
@@ -415,33 +296,13 @@ def test_the_release_notes_boot_count_is_the_one_the_harness_demands():
 
 
 def test_the_job_cap_clears_every_boots_backstop():
-    """
-    The job cap has to LOSE the race to the script's own timeout, always.
+    """The job cap exceeds the worst case of every boot's own timeout.
 
-    A GitHub job cap firing is a cancellation, and a cancelled job skips the
-    verdict and the evidence upload -- `failure()` is false on cancellation --
-    so a run that hit the cap costs the diagnosis as well as the run. That was
-    learned the hard way at fifteen minutes, and it is why the number has
-    moved twice since.
-
-    ARITHMETIC, NOT A HABIT, and derived from the two shipped files that
-    decide it: how many boots the harness refuses to run without, and what
-    backstop this workflow gives each one. `timeout -k 30` means a boot can
-    take the backstop plus a thirty-second kill grace before the wrapper
-    returns. A fourth phase, or a raised backstop, has to move this key --
-    and until it does, this test is what says so, in seconds rather than in
-    a cancelled arm64 run three quarters of an hour later.
-
-    IT IS A TRIPWIRE AS WELL AS A DERIVATION, and calling it only the second
-    understates it. The arithmetic below is genuinely derived -- change the
-    backstop or the kill grace and the sums move on their own -- but
-    `boots == 3` is a hard assertion, so adding or removing a phase turns
-    this red whether or not the cap still clears the new worst case. That is
-    deliberate and it is not redundant with the derivation: a fourth boot
-    inside a cap that happens to be generous enough would pass the sums in
-    silence, and every other file that states a boot count (the release note
-    above, harness/README.md, this workflow's budget summary) would go on
-    saying three. The tripwire is what makes somebody look at all of them.
+    A job cap firing is a cancellation, which skips the verdict and the
+    evidence upload. The bound is derived from the harness's boot count and
+    the workflow's per-boot backstop plus the `timeout -k 30` kill grace.
+    `boots == 3` is also asserted outright, so adding a phase forces a look
+    at every other place that states the count.
     """
     harness = (REPO / "harness" / "img-boot.sh").read_text()
     boots = demanded_boots()
@@ -460,34 +321,22 @@ def test_the_job_cap_clears_every_boots_backstop():
         f"timeout-minutes: {cap} does not even cover {boots} boots at "
         f"{backstop}s + {grace}s of kill grace ({worst_boots:.1f} min), so a "
         f"run that lost every boot would be cancelled instead of reported")
-    # And the rest of the job has to fit as well: pi-gen on a cache miss was
-    # 6m58s on run 31752321387, and everything else on that run (checkout,
-    # apt, cache save, artifact upload, decompress, verdict) was 1m19s.
-    # Doubling both leaves the margin this key is supposed to carry.
+    # The rest of the job has to fit too: twice the pi-gen cache-miss time
+    # (6m58s) and twice everything else (1m19s).
     assert cap >= worst_boots + 2 * (6 + 58 / 60) + 2 * (1 + 19 / 60), (
         f"timeout-minutes: {cap} leaves no room for a slow pi-gen on top of "
         f"{worst_boots:.1f} minutes of worst-case boots")
 
 
 def test_the_release_notes_inert_probe_claim_is_backed_by_the_harness():
-    """
-    THE NOTE ADMITS THE IMAGE CONTAINS A TEST PROBE, and that admission is
-    only safe while something has watched the probe stay asleep.
+    """The note's claim that the shipped test probe is inert is backed by the
+    harness.
 
-    /opt/otp-unit/img-guest-check.sh ships on every unit, runs as root, and
-    writes to /boot/firmware -- outside the read-only overlay, so
-    permanently. The owner's decision was to keep it rather than strip it
-    from release builds, because a gate run against a specially prepared
-    image says nothing about the artifact people flash. What makes that safe
-    is `ConditionKernelCommandLine=otp.imgcheck` and the third tier-3 boot,
-    which boots the same card with no such token and requires systemd to have
-    named the unit and skipped it, the probe to have printed nothing, and its
-    two records to have stayed off the card after the harness deleted them.
-
-    Drop any of those clauses from the gate, or drop the boot that runs them,
-    and the paragraph attached to a tag becomes a promise nobody checked --
-    the worse direction, because it is a security claim about a script that
-    runs as root on the reader's machine.
+    img-guest-check.sh ships on every unit, runs as root and writes to
+    /boot/firmware. It is safe only because of
+    `ConditionKernelCommandLine=otp.imgcheck` and the release boot, which
+    checks that systemd skipped the unit, the probe printed nothing and its
+    records stayed off the card.
     """
     body = step_named(build_steps(), ATTACH)["with"]["body"]
     assert "img-guest-check.sh" in body, body
@@ -507,74 +356,51 @@ def test_the_release_notes_inert_probe_claim_is_backed_by_the_harness():
 
 
 def test_the_release_notes_credential_claim_is_backed_by_the_harness():
-    """
-    The note tells whoever downloads a tagged image that a seeded
-    userconf.txt was applied and consumed, that the second boot stayed quiet
-    without the unit being disabled, and that a malformed seed failed fast.
-    None of that is made true by this workflow: the harness demands those
-    checks by name, and if it stops demanding them the sentence is a
-    statement about nothing.
-    """
+    """The note's credential claims (a seeded userconf.txt applied and
+    consumed, a quiet second boot, a malformed seed failing fast) are
+    backed by checks the harness demands by name."""
     body = step_named(build_steps(), ATTACH)["with"]["body"]
     assert "userconf" in body, body
     harness = (REPO / "harness" / "img-boot.sh").read_text()
     for name in ("userconf-seed-applied", "userconf-seeded-boot-ran-no-wizard",
                  "userconf-unseeded-boot-skips-the-wizard",
                  "userconf-malformed-seed-fails-fast",
-                 # And the three the note's STRONGEST clause rests on. It no
-                 # longer says the password lasts one boot; it says it is
-                 # still in force after the power cycle, which is a claim
-                 # about a machine rather than about a mechanism. Drop any of
-                 # these from the gate and the sentence attached to a tag is
-                 # a statement about nothing -- the worse direction, because
-                 # the old wording at least understated.
+                 # The checks behind the claim that the password is still in
+                 # force after a power cycle.
                  "credential-recorded-outside-the-overlay",
                  "credential-recorded-for-the-next-boot",
                  "credential-survives-the-power-cycle",
-                 # And the one the note's USERNAME sentence rests on. A note
-                 # that promises the credential without saying the rename
-                 # does not survive sends an operator to a tty2 prompt to
-                 # type a name this machine does not have -- with no network
-                 # and no sshd behind it, which is the whole recovery path.
+                 # The check behind the note's username sentence: the rename
+                 # does not survive, and the operator must be told which name
+                 # to type.
                  "credential-recovers-a-store-naming-another-account"):
         assert name in harness, (
             f"the release note claims the credential path was checked, but "
             f"img-boot.sh no longer requires {name}")
-    # THE CAVEAT ITSELF, in the body. The check above says the harness proves
-    # it; this says the reader is told. `userconf-pi` renames the UID-1000
-    # account to whatever a seed names and the rename dies with the overlay,
-    # so the account is `otp` on every boot after the one that applied it.
+    # The caveat itself must be in the body: `userconf-pi` renames the
+    # UID-1000 account and the rename dies with the overlay, so the account
+    # is `otp` on every later boot.
     assert "USERNAME does not survive" in body, (
         "the release note promises a persistent login without saying the "
         "username reverts: an operator would type a name that is not there")
     assert "Log in as `otp`" in body, body
-    # AND IT SAYS WHAT KEEPING IT COSTS. A note that tells a reader their
-    # password now persists, without telling them it persists as an
-    # offline-crackable hash on a partition any card reader can mount, has
-    # told them the half that sounds like good news. This is the one place
-    # this project's claims reach someone who cannot check them.
+    # The note also says what persistence costs: the hash sits on a partition
+    # any card reader can mount.
     for warning in ("world-readable", "offline"):
         assert warning in body, (
             f"the release note announces a persistent login without the word "
             f"{warning!r}: the exposure is part of the claim, not a footnote")
-    # And the harness has to plant one, or the seeded branch is untested and
-    # every check above it passes on an empty boot partition. The COPY, not
-    # the name: the log line next to it says ::userconf.txt as well.
+    # The harness has to plant a userconf.txt, or the seeded branch is
+    # untested. The copy is matched, not the name, which a log line also
+    # contains.
     assert re.search(r"^mcopy[^\n]*::userconf\.txt", harness, re.M), \
         "nothing seeds a userconf.txt, so the note's first clause is empty"
 
 
 def test_the_release_notes_boot_completion_claim_is_backed_by_the_harness():
-    """
-    Two sentences that only exist because run 31968966879 disproved them.
-
-    Neither boot in that run finished: an unbounded
-    systemd-networkd-wait-online held network-online.target, which held
-    cloud-init's config stage, which held the credential wizard -- and the
-    apply the wizard performs ends by starting a getty on the front panel's
-    tty. Both are checks on the booted image now, and a note that says so
-    has to be backed by a harness that still demands them by name.
-    """
+    """The note's claims that both boots ran to completion (network-online not
+    blocking, the getty on the panel's tty started) are backed by checks
+    the harness demands by name."""
     body = step_named(build_steps(), ATTACH)["with"]["body"]
     assert "front panel" in body, body
     assert "network" in body, body
@@ -587,32 +413,17 @@ def test_the_release_notes_boot_completion_claim_is_backed_by_the_harness():
 
 
 def test_the_release_notes_identity_claim_is_backed_by_the_harness():
-    """
-    The newest sentence in the note, and the one most easily left standing
-    after the thing behind it stops being checked.
+    """The note's claim that the second boot is the same machine as the first
+    is backed by the named machine-id checks and by the host-side check
+    that systemd did not treat it as a first boot.
 
-    It says the second boot came up as the same machine as the first. Three
-    named guest checks make that true -- the machine-id in use matches the
-    copy kept OUTSIDE the overlay, boot1 really recorded that id where boot2
-    could read it, and boot2's id is identical to it -- and without all three
-    the sentence is a claim about nothing on a device that prints key
-    material. The fourth name is the host-side half, which owes nothing to a
-    check running inside the guest: systemd itself said the second boot was
-    not a first boot.
-
-    AND IT MAY NOT CLAIM A STABLE SSH FINGERPRINT. It used to, because this
-    unit used to copy its host keys onto the FAT partition. `ENABLE_SSH=0`
-    means the image ships with `ssh.service` disabled and never runs sshd, so
-    that was a fingerprint nobody could be shown, bought with private keys on
-    a partition every local account can read. A release note is the one place
-    this project's claims reach someone who cannot check them, and a
-    withdrawn feature it still advertises is the worst version of that.
+    The note must not claim a stable SSH fingerprint: `ENABLE_SSH=0` means
+    sshd never runs and no host key is kept outside the overlay.
     """
     body = step_named(build_steps(), ATTACH)["with"]["body"]
     assert "machine-id" in body, body
-    # The exposure is part of the claim, not a footnote: the boot partition
-    # is vfat mounted with `defaults`, so everything on it is 0755 root:root,
-    # and the note is the only place a person who flashes this image is told.
+    # The exposure is part of the claim: the boot partition is vfat mounted
+    # with `defaults`, so everything on it is world-readable.
     assert "otp-identity" in body, body
     assert "world-readable" in body, body
     assert "fingerprint" not in body.lower(), (
@@ -620,9 +431,8 @@ def test_the_release_notes_identity_claim_is_backed_by_the_harness():
         "fingerprint; the image disables sshd and keeps no host key outside "
         "the overlay: " + body)
     assert "copy of the host keys" not in body.lower(), body
-    # And it says so rather than going quiet, because "the identity is kept
-    # on the FAT partition" invites exactly the wrong guess about what else
-    # is up there.
+    # Stated explicitly, so nobody assumes host keys are kept on the FAT
+    # partition too.
     assert "no SSH host key is written outside the overlay" in body, body
     harness = (REPO / "harness" / "img-boot.sh").read_text()
     for name in ("machine-id-persisted-outside-the-overlay",
@@ -636,31 +446,23 @@ def test_the_release_notes_identity_claim_is_backed_by_the_harness():
 
 # --- what counts as a change to the image --------------------------------
 #
-# The probe runs INSIDE the image. install.sh installs
-# harness/img-guest-check.sh into /opt/otp-unit and enables a unit that runs
-# it on every tier-3 boot, so editing a check edits the artifact -- and both
-# of the mechanisms that decide whether to rebuild it were written before
-# that was true.
+# The probe runs inside the image: install.sh installs
+# harness/img-guest-check.sh into /opt/otp-unit, so editing a check edits the
+# artifact.
 
 PROBE = "harness/img-guest-check.sh"
 
 
 def test_the_probe_is_really_part_of_the_image():
-    # The premise of the two tests below, stated rather than assumed: if
-    # install.sh stops installing it, they are guarding nothing.
+    # The premise of the two tests below: if install.sh stops installing the
+    # probe, they guard nothing.
     assert PROBE in (REPO / "device" / "install.sh").read_text()
 
 
 def test_a_change_to_the_probe_runs_the_image_job():
-    """
-    The filter decides whether the expensive job runs at all. The probe was
-    not in it, so a pull request that changed only a guest check ran five
-    fast jobs, none of which can execute that file, and reported green.
-
-    The shipped regex is applied to real paths here rather than searched for
-    as a substring: `harness/img-boot\\.sh$` contains the word harness and
-    matches none of this.
-    """
+    """A change to the probe triggers the image job; no other job can execute
+    that file. The shipped regex is applied to real paths, not searched for
+    as a substring."""
     filter_run = None
     for step in workflow()["jobs"]["changes"]["steps"]:
         if "grep -qE" in str(step.get("run", "")):
@@ -672,20 +474,15 @@ def test_a_change_to_the_probe_runs_the_image_job():
     for path in (PROBE, "harness/img-boot.sh", "device/install.sh",
                  "image/build.sh", ".github/workflows/image.yml"):
         assert matcher.search(path), f"{path} does not trigger the image job"
-    # And the filter still filters: a docs-only change must not pay for a
-    # pi-gen build.
+    # And a docs-only change must not pay for a pi-gen build.
     for path in ("README.md", "tests/test_img_verdict.py", "harness/README.md"):
         assert not matcher.search(path), f"{path} needlessly triggers a build"
 
 
 def test_the_cache_key_covers_the_probe_the_image_ships():
-    """
-    A key that ignores the probe restores an image built before the edit and
-    boots yesterday's guest checks. That does not fail honestly: the harness
-    demands each named check by name, so the run goes red for checks the
-    guest never emitted -- which reads as a broken image rather than a stale
-    cache, and the first place anyone looks is the boot.
-    """
+    """The cache key covers the probe. Otherwise a stale image boots old guest
+    checks and the run goes red for checks the guest never emitted, which
+    reads as a broken image."""
     for step in build_steps():
         if str(step.get("uses", "")).startswith("actions/cache/restore"):
             key = str(step["with"]["key"])
@@ -693,17 +490,15 @@ def test_the_cache_key_covers_the_probe_the_image_ships():
     else:
         raise AssertionError("no cache restore step in the build job")
     assert PROBE in key, key
-    # The things already in it stay in it: an image built before otpunit
-    # changed is the wrong image to boot even though pi-gen would not care.
+    # Existing inputs stay in the key: an image built before otpunit changed
+    # is the wrong image to boot.
     for pattern in ("image/**", "device/**", "otpunit/**", "codewords/**"):
         assert pattern in key, key
 
 
 def test_the_gate_never_fires_on_a_branch_or_a_pull_request():
-    """
-    `tag_name` defaults to `github.ref_name`, so a gate that let a branch
-    through would create a release literally called `master`.
-    """
+    """The gate never fires on a branch or pull request: `tag_name` defaults
+    to `github.ref_name`, so it would create a release called `master`."""
     condition = str(step_named(build_steps(), ATTACH)["if"])
     assert re.search(r"startsWith\(\s*github\.ref\s*,\s*'refs/tags/'\s*\)",
                      condition), condition
@@ -712,11 +507,8 @@ def test_the_gate_never_fires_on_a_branch_or_a_pull_request():
 
 # --- the required check, which exists to always report -------------------
 #
-# Branch protection requires a check called `image`. It used to be the
-# build job itself, path-filtered at the trigger, so a pull request that
-# touched none of those paths never ran it -- and a required check that
-# never reports does not pass by default, it blocks forever. Five PRs sat
-# behind that. These hold the replacement to the shape that fixes it.
+# Branch protection requires a check called `image`. A required check that
+# never reports blocks forever, so it must run on every pull request.
 
 
 def test_the_required_check_is_not_filtered_out_of_existing():
@@ -743,20 +535,14 @@ def test_the_expensive_job_is_the_conditional_one():
     build = workflow()["jobs"]["build"]
     assert build["needs"] == "changes"
     assert build["if"] == "needs.changes.outputs.image == 'true'"
-    # The cost is why any of this exists: a docs-only PR must not pay
-    # for a pi-gen build. If this job stops being conditional the gate
-    # still works, but every PR in the repository gets slower.
+    # The build job stays conditional so a docs-only PR does not pay for a
+    # pi-gen build.
     assert build["runs-on"] == "ubuntu-24.04-arm"
 
 
 def test_the_gate_cannot_pass_by_falling_off_the_end():
-    """
-    Every branch of the verdict either exits non-zero or says why not.
-
-    A gate whose default is success is not a gate. `set -e` plus an
-    explicit exit on each path is what keeps an unforeseen combination
-    -- a new job result string, say -- from reading as approval.
-    """
+    """Every branch of the verdict either exits non-zero or says why not, so
+    an unforeseen job result cannot read as approval."""
     run = workflow()["jobs"]["image"]["steps"][0]["run"]
     assert "set -euo pipefail" in run
     assert run.count("exit 1") >= 3, (

@@ -1,9 +1,6 @@
-"""Tests for producing pads with no panel and no buttons.
-
-The point of this mode is that someone who cannot obtain an SSD1306 still
-gets working pads. So the tests are about the two things that can go
-wrong in a way the operator cannot see or correct: the sequence printing
-in the wrong order, and the unit ignoring the only abort it offers.
+"""Tests for producing pads with no panel and no buttons. They cover what the
+operator cannot see or correct: the sequence printing in the wrong order, and
+the unit ignoring the only abort it offers.
 """
 import sys
 from pathlib import Path
@@ -80,17 +77,16 @@ def run(cups, **kwargs):
 
 class TestTheSequence:
     def test_it_prints_a_complete_usable_set_in_order(self, monkeypatch):
-        # The manual is a file on the unit; stand one in so the ordering
-        # can be checked without the rendered asset being present.
+        # Stand in for the manual so ordering can be checked without the
+        # rendered asset.
         monkeypatch.setattr(unattended.jobs, "manual_available", lambda: True)
         monkeypatch.setattr(unattended.jobs, "generate",
                             lambda spec, *a, **k: bytearray(b"%PDF-fake"))
         cups = Cups()
         assert run(cups) == 0
-        # Status first so the countdown is readable BEFORE the wait. Then
-        # the MANUAL -- ahead of the pads deliberately, so that if paper
-        # runs out what survives is the instructions rather than half a
-        # pad. Then the card, copy A, the tray break, copy B.
+        # Status first so the countdown is readable before the wait; the MANUAL
+        # ahead of the pads so that if paper runs out the instructions survive;
+        # then the card, copy A, the tray break, copy B.
         assert cups.titles() == ["OTP status", "MANUAL", "TABULA RECTA",
                                  "OTP A", "REMOVE COPY A", "OTP B",
                                  "WHAT TO DO NOW"]
@@ -123,18 +119,15 @@ class TestTheSequence:
             "media": "A4", "number-up": "2"}
 
     def test_even_one_up_the_manual_still_names_its_media(self):
-        # A6 cannot take two A5 pages, but returning a bare {} left the
-        # manual as the one job in the whole sequence submitted with no
-        # size at all, rendered at whatever the queue defaulted to.
+        # A6 cannot take two A5 pages, but the manual must still be submitted
+        # with a size.
         assert unattended._manual_options(config.Settings(paper="A6")) == {
             "media": "A6"}
 
 
 class TestThePaperEstimate:
-    """
-    Someone deciding whether to let this run may have a finite stack of
-    paper and no way to get more, and running out mid-pair loses the pair
-    rather than just the paper.
+    """The sheet count the status sheet quotes is right: running out of paper
+    mid-pair loses the pair, not just the paper.
     """
 
     def test_it_counts_both_copies_and_the_imposition(self):
@@ -157,19 +150,15 @@ class TestThePaperEstimate:
         assert a6 > a4 * 3
 
     def test_a7_counts_two_pad_pages_to_a_sheet(self):
-        """
-        A7 pages print two to an A6 sheet, so 100 pages is 50 sheets a
-        copy. Restating the imposition here instead of asking Settings
-        quoted 100 -- double the true cost, on the one sheet whose entire
-        job is to let someone check they have enough paper.
+        """A7 pages print two to an A6 sheet, so 100 pages cost 50 sheets a copy.
+        An overestimate misleads someone checking they have enough paper.
         """
         a7 = config.Settings(pages=100, a7=True, auto_manual=False)
         assert a7.sheets == 50
         assert unattended.sheets_needed(a7) == 50 * 2 + 4
 
     def test_a7_quotes_the_media_that_comes_out_of_the_tray(self):
-        # A7 lays out on A6 sheets whatever `paper` says, and `paper` is
-        # what the notice used to name.
+        # A7 lays out on A6 sheets whatever `paper` says.
         lines = " ".join(unattended._plan(
             config.Settings(pages=10, a7=True, paper="A4")))
         assert "sheets of A6" in lines
@@ -192,8 +181,8 @@ class TestThePaperEstimate:
         assert not any("OSPREY" in title for title in cups.titles())
 
     def test_a_configured_codeword_is_the_one_printed(self, monkeypatch):
-        # Page streams are compressed, so assert on the spec the job was
-        # built from rather than grepping the PDF for the word.
+        # Page streams are compressed, so assert on the spec the job was built
+        # from.
         seen = {}
         real = unattended.jobs.PadPairJob
 
@@ -225,8 +214,7 @@ class TestThePaperEstimate:
         assert cups.titles() == ["OTP status"]
 
     def test_a_tabula_failure_does_not_cost_the_pads(self, monkeypatch):
-        # The card is useful, not essential. Losing it must not lose the
-        # thing the operator actually needs.
+        # The card is useful, not essential: losing it must not lose the pads.
         import otpunit.jobs as jobs_mod
 
         real = jobs_mod.generate
@@ -244,10 +232,8 @@ class TestThePaperEstimate:
 
 
 class TestUnpluggingIsTheAbort:
-    """
-    The printer cable is the one control that needs no parts. If pulling
-    it does not stop the unit, someone with no display has no way to say
-    no at all.
+    """Pulling the printer cable stops the unit: it is the one control that needs
+    no parts, and the only way to say no without a display.
     """
 
     def test_unplugging_during_the_wait_prints_no_pad(self):
@@ -278,18 +264,16 @@ class TestUnpluggingIsTheAbort:
                                  log=lambda *_: None)
 
     def test_one_empty_poll_does_not_abandon_the_pad(self):
-        # devices() returns [] for a busy cupsd, not just for an unplugged
-        # cable. Treating a single one as a disconnect threw away pads.
+        # devices() returns [] for a busy cupsd too, so one empty poll is not a
+        # disconnect.
         cups = Cups(script=[[DEVICE], [], [DEVICE], [], [DEVICE]])
         assert unattended.countdown(cups, seconds=5, sleep=lambda s: None,
                                     log=lambda *_: None) == "elapsed"
 
 
 class TestAButtonMeansPrintNow:
-    """
-    A press is the whole vocabulary here: stop waiting. That matters
-    because a button is the one part someone can improvise -- a wire or a
-    paperclip across pin 33 and ground is a button.
+    """A press means stop waiting. A button is the one part someone can improvise:
+    a wire across pin 33 and ground.
     """
 
     def test_a_press_ends_the_wait_early(self):
@@ -306,8 +290,7 @@ class TestAButtonMeansPrintNow:
                                     log=lambda *_: None) == "elapsed"
 
     def test_a_broken_button_layer_is_not_fatal(self):
-        # An unexportable pin or a missing lgpio must degrade to "no
-        # button", never stop the pads.
+        # An unexportable pin or a missing lgpio degrades to "no button".
         class Broken:
             def wait(self, timeout=0):
                 raise OSError(121, "Remote I/O error")
@@ -318,13 +301,8 @@ class TestAButtonMeansPrintNow:
                                     log=lambda *_: None) == "elapsed"
 
     def test_opening_buttons_never_raises(self):
-        """
-        On a unit with no gpiozero, no gpiochip or no permissions this has
-        to answer "no button", not take the pads down with it.
-
-        This module used to carry its own copy of hmi.open_buttons, which
-        nothing called: __main__ hands the buttons in. One implementation,
-        so a fix to it cannot land on the dead one.
+        """hmi.open_buttons answers "no button" on a unit with no gpiozero,
+        gpiochip or permissions, so a missing button never stops the pads.
         """
         from otpunit import hmi
 
@@ -345,15 +323,11 @@ class TestTheSheetsThatStandInForAPanel:
         assert data.startswith(b"%PDF")
 
     def test_no_sheet_over_key_material_claims_to_be_harmless(self, monkeypatch):
-        """
-        The status sheet's heading says it contains no key material, and
-        that heading used to be printed on EVERY sheet -- including the
-        one telling the operator to keep the secret pages above it. A
-        contradiction there gets live key material binned.
+        """Only the status sheet carries the "no key material" heading; a sheet
+        lying on secret pages must not, or live key material gets binned.
 
-        Asserted on the heading each sheet asks for, not on the rendered
-        bytes: reportlab's page streams are not greppable, so a raw-bytes
-        check here passes whatever the sheet says.
+        Asserted on the heading each sheet asks for, since reportlab's page
+        streams are not greppable.
         """
         seen = []
         real = unattended.diagnostics.render_bytes
@@ -382,8 +356,8 @@ class TestTheSheetsThatStandInForAPanel:
         assert "secret" in seen["subtitle"].lower()
 
     def test_the_status_sheet_still_says_it_is_harmless(self):
-        # The converse: that reassurance belongs on the sheet that really
-        # is safe to photograph and send to someone for help.
+        # The converse: the reassurance belongs on the sheet that is safe to
+        # photograph.
         from otpunit import diagnostics
 
         assert "no key material" in diagnostics.STATUS_SUBTITLE
@@ -401,8 +375,7 @@ class TestTheSheetsThatStandInForAPanel:
 
 class TestEverySheetAsksForTheRightPaper:
     def test_the_instruction_sheets_carry_the_media_size(self):
-        # These were submitted with no options at all, so a LETTER unit
-        # rendered Letter and asked the queue for nothing.
+        # A LETTER unit must ask the queue for Letter.
         class Recording(Cups):
             def __init__(self):
                 super().__init__()
@@ -426,15 +399,9 @@ class TestEverySheetAsksForTheRightPaper:
 
 
 class TestCopyBActuallyReachesPaper:
-    """
-    finish() purges the spool with `cancel -x -a`, which cancels EVERY job
-    on the queue including the one printing. It ran in a finally directly
-    after copy B was handed to lp -- which returns once a job is spooled,
-    not printed. So the unit cancelled its own copy B on every single run
-    and then printed a sheet saying the pair was complete.
-
-    The interactive path has always waited for the queue to drain before
-    touching the spool. These pin that the unattended path does too.
+    """The unattended path waits for the queue to drain before purging the spool.
+    lp returns once a job is spooled, and `cancel -x -a` cancels the job that
+    is printing, so purging straight after submit would cancel copy B.
     """
 
     class Spool(Cups):
@@ -476,20 +443,17 @@ class TestCopyBActuallyReachesPaper:
         assert cups.polls > 0, "the queue must actually be asked"
 
     def test_a_queue_that_never_drains_is_not_purged(self):
-        # Unknowable state is not an empty queue. Better to leave the
-        # spool than cancel a job that may still be printing.
+        # Unknowable state is not an empty queue: leave the spool sooner than
+        # cancel a job that may be printing.
         cups = self.Spool(stuck=True)
         run(cups, settings=settings())
         assert cups.purged_with_work in (False, None)
 
 
 class TestTheTrayCanExplainItselfWithoutAPrinter:
-    """
-    The HALF sheet needs the printing channel, and the commonest reason
-    copy B fails is that the printing channel broke. Measured with cupsd
-    killed after the separator: the last sheet in the tray promised a copy
-    B that never came, and nothing ever said otherwise. The warning has to
-    be printed while there is still a printer to print it.
+    """The warning that copy B may be missing is printed before copy B is
+    attempted, while there is still a printer: the commonest reason copy B
+    fails is that printing broke.
     """
 
     def test_the_separator_says_what_a_missing_copy_b_means(self):
@@ -501,8 +465,8 @@ class TestTheTrayCanExplainItselfWithoutAPrinter:
         assert "DESTROY" in text
 
     def test_a_broken_printer_cannot_erase_that_warning(self, monkeypatch):
-        # The separator is already on paper before copy B is attempted, so
-        # nothing that happens afterwards can take it back.
+        # The separator is on paper before copy B is attempted, so nothing
+        # afterwards can take it back.
         class DiesAfterSeparator(Cups):
             """cupsd stops answering the moment the separator is on paper."""
 
@@ -534,13 +498,9 @@ def _sections(kind, **kwargs):
 
 
 class TestTheQueueIsNeverAskedToHoldTwoJobs:
-    """
-    The unit ships MaxJobs 4 and cupsd does not queue past it -- it
-    REFUSES, with `lp: Too many active jobs.` Measured against a real
-    cupsd at the old MaxJobs 1: the status sheet and the manual printed
-    and every job after them was rejected in turn, so the operator got a
-    sheet promising a pad pair followed by silence. Waits existed in two
-    of the six gaps; they are needed in all of them.
+    """Each job waits for the queue to drain before the next is submitted. The
+    unit ships MaxJobs 4 and cupsd refuses, not queues, past the limit (`lp:
+    Too many active jobs.`).
     """
 
     class OneAtATime(Cups):
@@ -579,8 +539,7 @@ class TestTheQueueIsNeverAskedToHoldTwoJobs:
                                  "WHAT TO DO NOW"]
 
     def test_only_one_job_is_ever_outstanding(self, monkeypatch):
-        # The spool holds one job's key material at a time, which is what
-        # the low MaxJobs was reaching for in the first place.
+        # The spool holds one job's key material at a time.
         monkeypatch.setattr(unattended.jobs, "generate",
                             lambda spec, *a, **k: bytearray(b"%PDF-fake"))
         cups = self.OneAtATime(max_jobs=4)
@@ -589,13 +548,9 @@ class TestTheQueueIsNeverAskedToHoldTwoJobs:
 
 
 class TestADrainedQueueIsNotProofOfPrinting:
-    """
-    ErrorPolicy is abort-job, deliberately, so a job that fails is
-    discarded as promptly as one that printed and `lpstat -o` empties just
-    as fast. Measured with the tray empty against a real cupsd: all seven
-    jobs aborted, the queue drained in four seconds, and the unit printed
-    "YOUR PAD PAIR IS PRINTED / They are identical" over an empty tray,
-    returned 0, and zeroed the key so copy B could never be remade.
+    """An empty queue is not read as success. ErrorPolicy is abort-job, so a
+    failed job is discarded as promptly as a printed one; the unit must check
+    for a printer fault before announcing the pair or zeroing the key.
     """
 
     class OutOfPaper(Cups):
@@ -623,22 +578,20 @@ class TestADrainedQueueIsNotProofOfPrinting:
         assert text[:4] == b"%PDF"
 
     def test_the_reason_reaches_the_half_sheet(self):
-        # A sheet that says the pad failed without saying why leaves the
-        # operator to guess at a printer they may not be able to see.
+        # The sheet must say why the pad failed.
         rows = [value for section in _sections(unattended.HALF, trouble="Out of paper")
                 for _, value in section.rows]
         assert any("Out of paper" in str(value) for value in rows)
 
     def test_it_stops_before_wasting_copy_b_on_a_dead_printer(self):
-        # Copy A already failed; 25 more sheets of a pad nobody can use is
-        # the wrong answer.
+        # Copy A already failed, so copy B is not printed.
         cups = self.OutOfPaper()
         run(cups)
         assert "OTP B" not in cups.titles()
 
     def test_a_queue_that_cannot_be_asked_falls_back_to_the_drain(self):
-        # Silence is not a fault. Inventing one would send an operator to
-        # burn a pair that printed perfectly.
+        # Silence is not a fault: inventing one would have the operator burn a
+        # good pair.
         class Mute(Cups):
             def printer_fault(self, name="OTP"):
                 return None
@@ -657,13 +610,9 @@ class TestADrainedQueueIsNotProofOfPrinting:
 
 
 class TestThePlugWorksDuringTheDrainToo:
-    """
-    Unplugging the printer is the only cancel this mode offers, and the
-    drain is the longest wait in the sequence -- a 25-sheet copy A at 12ppm
-    is over two minutes, and the bound is fifteen. It used to poll only
-    lpstat, so pulling the cable during that window did nothing at all: the
-    unit sat there until the timeout and then printed copy B's separator to
-    a printer that had gone.
+    """Unplugging the printer aborts during the drain as well. The drain is the
+    longest wait in the sequence, and the cable is the only cancel this mode
+    offers.
     """
 
     class Gone(Cups):
@@ -687,10 +636,8 @@ class TestThePlugWorksDuringTheDrainToo:
             unattended.drain(cups, "OTP", lambda s: None, lambda *_: None)
 
     def test_one_empty_poll_during_the_drain_is_not_a_disconnect(self):
-        """
-        Cups.devices() returns [] for a busy cupsd and a timed-out lpinfo
-        exactly as it does for an unplugged cable, and the drain runs while
-        cupsd is at its busiest.
+        """A single empty devices() answer during the drain does not abort: a busy
+        cupsd returns [] just as an unplugged cable does.
         """
         class Flaky(Cups):
             def __init__(self):
@@ -709,20 +656,17 @@ class TestThePlugWorksDuringTheDrainToo:
                                 lambda *_: None) is True
 
     def test_the_drain_is_bounded_even_with_a_no_op_sleep(self):
-        # A wall clock alone does not bound a loop whose sleep does not
-        # advance one, which is every test in this file.
+        # The sleep in these tests does not advance a wall clock, so the loop
+        # needs its own bound.
         cups = self.Gone(disconnect_after=10_000)
         assert unattended.drain(cups, "OTP", lambda s: None, lambda *_: None,
                                 timeout=10.0, step=2.0) is False
 
 
 class TestTheSpoolIsPurgedWhenNothingCanBePrinting:
-    """
-    finish(purge=False) leaves the spooled pad on tmpfs. That is the right
-    call while a copy may still be feeding paper -- cancelling destroys it.
-    It is the wrong call once the printer is gone, and an abort is exactly
-    the case where it is gone: there is nothing left to destroy, and what
-    stays behind is a complete copy of the key.
+    """The spool is purged on a disconnect abort. finish(purge=False) is right
+    while a copy may still be feeding paper, but once the printer is gone what
+    stays on tmpfs is a complete copy of the key.
     """
 
     class Vanishes(Cups):
@@ -735,14 +679,12 @@ class TestTheSpoolIsPurgedWhenNothingCanBePrinting:
 
         def devices(self):
             self.polls += 1
-            # Present through the status sheet and the countdown, gone by
-            # the time copy A is draining.
+            # Present through the status sheet and the countdown, gone by the
+            # time copy A is draining.
             return [DEVICE] if self.polls <= 8 else []
 
         def active_jobs(self, name="OTP"):
-            # Work outstanding, so the drain is the window the disconnect
-            # lands in -- which is the realistic case: the drain is the
-            # longest wait in the sequence.
+            # Work outstanding, so the disconnect lands in the drain.
             return 1 if self.submitted else 0
 
         def purge(self, name="OTP"):
@@ -755,8 +697,8 @@ class TestTheSpoolIsPurgedWhenNothingCanBePrinting:
             "the printer is gone; the spooled pad is all that is left"
 
     def test_an_unknown_failure_does_not_purge(self, monkeypatch):
-        # Anything other than a disconnect leaves the queue in a state we
-        # cannot reason about, and cancelling a live job loses that copy.
+        # Any abort other than a disconnect leaves the queue state unknown, and
+        # cancelling a live job loses that copy.
         cups = Cups()
         purged = []
         monkeypatch.setattr(cups, "purge", lambda name="OTP": purged.append(1))

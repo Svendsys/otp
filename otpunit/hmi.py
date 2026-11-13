@@ -46,40 +46,22 @@ class Interface:
 
     @property
     def interactive(self) -> bool:
-        """A menu needs something to draw on AND something to press."""
+        """A menu needs something to draw on and something to press."""
         return self.display is not None and self.buttons is not None
 
     def prove(self, seconds: float = 20.0, sleep=None, clock=None) -> bool:
         """
         Wait for one press, to confirm somebody can actually drive this.
 
-        Opening GpioButtons proves NOTHING about whether buttons exist.
-        gpiozero only reserves and configures a pin; there is no presence
-        detection on any of its four pin factories, so wherever gpiozero
-        finds a factory at all the constructor succeeds. This used to say
-        "on any Pi with lgpio installed -- every unit this targets", which
-        named a factory nothing here establishes: gpiozero catches
-        `Exception` and not `ImportError` when a factory fails to import
-        (gpiozero 2.0.1, devices.py:299), so an lgpio whose import RAISES
-        -- which it does when the working directory is read-only, and this
-        unit runs with `WorkingDirectory=/opt/otp-unit` under
-        `ProtectSystem=strict` -- is indistinguishable from an lgpio that
-        was never installed, and the fallback walks on to native. Which
-        factory a booted unit ends up on is issue #43. Nothing below
-        depends on the answer, which is the point: none of them can tell
-        you whether a button is wired to the pin. That made the keyboard
-        branch unreachable, and worse: attaching a monitor to a working
-        headless unit promoted `display` to non-None, `interactive` to
-        True, and sent it into a menu whose first `buttons.wait()` blocks
-        on an empty queue forever. No pad, no log line, no timeout.
+        Opening GpioButtons proves nothing about whether buttons exist:
+        gpiozero only reserves a pin and has no presence detection. A
+        keyboard being plugged in does not mean anyone is at it either.
+        Trusting either would send a headless unit with a monitor attached
+        into a menu that blocks forever instead of printing.
 
-        A keyboard being present says nothing either -- it says a keyboard
-        is plugged in, not that anyone is at it.
-
-        So neither is trusted. One press within the window and the panel
-        is proven; silence means print instead. The cost is that an
-        operator must press something at boot, which also tells them the
-        panel works.
+        So one press within the window proves the panel, and silence means
+        print instead. The cost is that the operator must press something
+        at boot.
         """
         import time
 
@@ -172,8 +154,7 @@ def console_usable() -> bool:
 def open_display(rotate: int = 0, log=None):
     """The best display available, and what it is."""
     # 0x3C is what almost every SSD1306 module ships as; 0x3D is the other
-    # position of the address jumper. Trying only the first sent a unit
-    # with a 0x3D panel headless, where it prints on its own.
+    # position of the address jumper.
     failures = []
     for address in OLED_ADDRESSES:
         try:

@@ -1,9 +1,6 @@
-# Apt packages the print unit needs, one per line.
-#
-# This is the single source of truth: device/install.sh reads it, and the
-# pi-gen stage generates its 00-packages from it. Everything here is in
-# Debian Trixie, so a freshly flashed image needs no network on first boot
-# -- which matters for a device whose whole point is being offline.
+# Apt packages the print unit needs, one per line: the single source for
+# device/install.sh and the pi-gen stage. All are baked into the image, so
+# first boot needs no network.
 
 # Generation
 python3-reportlab
@@ -12,21 +9,12 @@ python3-reportlab
 python3-luma.oled
 python3-pil
 python3-gpiozero
-# NOT in Debian proper -- it comes from archive.raspberrypi.org, which
-# Raspberry Pi OS enables and pi-gen therefore has. Checking these names
-# against packages.debian.org flags it as missing; that is the check
-# being wrong, not this line. It does mean install.sh needs Raspberry Pi
-# OS rather than plain Debian, which is what docs/IMAGE.md tells you to
-# flash anyway.
+# From archive.raspberrypi.org, not Debian proper, so install.sh needs
+# Raspberry Pi OS rather than plain Debian.
 python3-lgpio
 i2c-tools
-# Listed even though python3-luma.core already Depends on it, because
-# otpunit/diagnostics.py imports smbus2 directly to scan the I2C bus for
-# the status sheet. Relying on another package's dependency graph for
-# something we import ourselves means the day luma is dropped -- say for
-# a unit built to run headless -- the scan goes quiet rather than
-# failing loudly, and that scan is the one line on the sheet that tells
-# someone whether their panel is wired up.
+# otpunit/diagnostics.py imports smbus2 directly for the status sheet's I2C
+# scan, so it is listed rather than left to python3-luma.core's Depends.
 python3-smbus2
 
 # Printing. ipp-usb covers driverless IPP-over-USB, which is most printers
@@ -37,10 +25,8 @@ cups-filters
 ipp-usb
 ghostscript
 
-# Drivers, listed individually rather than via printer-driver-all. That
-# metapackage carries every driver under Recommends and nothing under
-# Depends, so with --no-install-recommends it installs an empty package and
-# the unit ends up with no drivers at all.
+# Drivers, listed individually: printer-driver-all carries them only under
+# Recommends, so with --no-install-recommends it installs nothing.
 # HP LaserJet Pro M12a/M12w and the rest of the ZjStream family
 printer-driver-foo2zjs
 # Brother HL-2030/2140/L2300 and relatives
@@ -56,12 +42,8 @@ printer-driver-splix
 # Minolta PagePro
 printer-driver-min12xxw
 
-# The Foomatic PPD database, precompiled. Driver binaries are useless
-# without a PPD to drive them, and host-based lasers are exactly the
-# printers that need one rather than a driverless queue -- without this an
-# HP LaserJet Pro M12w has a driver on disk and no way to use it.
-# NOT foomatic-db: the compressed-ppds package Conflicts/Replaces it, and
-# asking apt for both makes the whole install unsatisfiable.
+# The Foomatic PPD database, precompiled: host-based lasers need a PPD, not
+# a driverless queue. Not foomatic-db, which Conflicts with this package.
 foomatic-db-compressed-ppds
 foomatic-db-engine
 
@@ -69,17 +51,7 @@ foomatic-db-engine
 # apt-get at the exact moment the unit has no network by design.
 overlayroot
 
-# Entropy -- and NOT what seeds the CRNG at boot. That claim was here, and
-# it was wrong. The Pi's TRNG is driven by bcm2835-rng, which is BUILT IN
-# to the Raspberry Pi kernel (CONFIG_HW_RANDOM_BCM2835=y, read out of the
-# linux-image-*-rpi-v8 package), so the kernel's own hwrng core credits
-# the pool before userspace exists at all: measured under emulation in
-# issue #17, the driver registers at ~2.4s and "random: crng init done"
-# follows immediately, with no configuration and no daemon. Tier 3 now
-# asserts both lines appear on the console; see harness/img-boot.sh.
-#
-# rngd's contribution is everything AFTER that: it goes on feeding
-# /dev/hwrng into the pool for the life of the unit. Worth keeping for
-# that, but a unit without it still seeds on time, so nothing in the boot
-# path may be written as though it depended on this package.
+# Entropy. The Pi's TRNG driver (bcm2835-rng) is built into the kernel and
+# seeds the CRNG before userspace exists; rngd only keeps feeding /dev/hwrng
+# into the pool afterwards, so nothing in the boot path may depend on it.
 rng-tools5

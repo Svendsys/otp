@@ -1,30 +1,18 @@
-"""Producing pads with no panel, no buttons and no way to get either.
+"""Producing pads with no panel and no buttons.
 
-The status sheet on its own answers the wrong question. It tells someone
-to go and find a 128x64 SSD1306 and three momentary switches, which
-assumes there is somewhere to find them. If there is not -- and the case
-this unit exists for is exactly the case where there is not -- then a
-device that can only ask for parts is a brick that prints a shopping list.
-
-So the panel is treated as an optimisation, not a requirement. The pads
-are the point. Everything the panel ever did was choose a codeword and a
-page count, and both have defaults that are fine.
-
-What is left is a control surface built from what is certainly available:
+The panel is an optimisation, not a requirement: all it does is choose a
+codeword and a page count, and both have usable defaults. Without it the
+control surface is what is certainly available:
 
   time        the unit waits, and says on paper exactly how long
-  the plug    unplugging the printer aborts; it is the one control that
-              needs no parts at all
-  the SD card any computer that can read a FAT partition can edit
-              otp-unit.conf, which is a complete configuration channel
-  a wire      GPIO13 to ground is a button. A paperclip is a button. If
-              anything at all is bridging those pins, a press means
-              "stop waiting, print it now"
+  the plug    unplugging the printer aborts
+  the SD card otp-unit.conf on the FAT partition is the configuration
+  a wire      anything bridging GPIO13 to ground is a button; a press
+              means "stop waiting, print it now"
   paper       the sheets between the copies are the user interface
 
-The sequence is deliberately one-shot. It prints a pair and stops, rather
-than looping, because unattended key material accumulating in an output
-tray is its own hazard.
+The sequence is one-shot: it prints a pair and stops, because unattended
+key material accumulating in an output tray is its own hazard.
 """
 from __future__ import annotations
 
@@ -40,9 +28,7 @@ class Aborted(Exception):
 
 
 # Consecutive empty device lists before believing the printer is really
-# gone. One empty answer is a hiccup; several in a row is a cable. Shared
-# with the headless loop rather than restated: two copies of a threshold
-# whose whole job is to be the same number is a drift waiting to happen.
+# gone. Shared with the headless loop so the two cannot drift.
 GONE_AFTER = diagnostics.GONE_AFTER
 
 
@@ -75,11 +61,9 @@ def countdown(cups, seconds, buttons=None, sleep=None, log=print,
     """
     sleep = sleep or time.sleep
     pressed = _press_waiter(buttons)
-    # Discard edges banked BEFORE this window opened. GpioButtons is a
-    # queue, and a stray edge -- a wire being connected, a test press at
-    # boot -- otherwise satisfies the very next countdown instantly. Two
-    # banked taps erased both the 5-minute abort window and the tray
-    # break, spooling copy A and copy B back to back.
+    # Discard edges banked before this window opened. GpioButtons is a
+    # queue, and a stray edge would otherwise end the countdown instantly,
+    # erasing the abort window or the tray break.
     for _ in range(64):
         if not pressed():
             break
@@ -89,13 +73,9 @@ def countdown(cups, seconds, buttons=None, sleep=None, log=print,
         if pressed():
             log("button pressed; starting now")
             return "pressed"
-        # A single empty answer is NOT a disconnect. The real
-        # Cups.devices() swallows every error and returns [] -- a busy
-        # cupsd, a timed-out lpinfo, a missing binary all look identical
-        # to an unplugged cable. Reading one of those as "unplugged"
-        # abandoned the pad mid-pair over a hiccup, and the except-clause
-        # that was supposed to tolerate it was dead code, because
-        # devices() cannot raise.
+        # A single empty answer is not a disconnect: Cups.devices() returns
+        # [] for a busy cupsd or a timed-out lpinfo as well as for an
+        # unplugged cable.
         try:
             present = bool(cups.devices())
         except Exception as exc:                 # noqa: BLE001
@@ -114,21 +94,17 @@ def drain(cups, queue, sleep, log, timeout=900.0, step=2.0,
     """
     Block until the queue reports no work, or the timeout expires.
 
-    True means the queue is genuinely empty and it is safe to purge.
-    False means we could not establish that -- an unanswerable lpstat or a
-    queue that never emptied -- in which case the caller must NOT purge,
-    because cancelling a job that is still printing destroys the copy.
+    True means the queue is empty and it is safe to purge. False means
+    that could not be established (an unanswerable lpstat, or a queue that
+    never emptied), and the caller must not purge: cancelling a job that
+    is still printing destroys the copy.
 
-    Raises Aborted if the printer goes away while we wait. The plug is the
-    only cancel this mode offers, and a 25-sheet copy A is fifteen minutes
-    of drain: leaving that window deaf meant pulling the cable during the
-    longest wait in the sequence did nothing at all until the wait ended.
+    Raises Aborted if the printer goes away meanwhile; the plug is the
+    only cancel this mode offers.
 
-    Measured against a WALL CLOCK, not by adding up the sleeps. Each poll
-    runs lpstat through subprocess with Cups.TIMEOUT = 120s, and counting
-    only the sleeps let a wedged cupsd stretch a 3600-second budget to
-    sixty-one hours. Bounded by the poll count as well, because a test that
-    injects a no-op sleep never advances a real clock.
+    The timeout is wall-clock, because each poll can itself block for up
+    to Cups.TIMEOUT. It is also bounded by poll count, for tests whose
+    injected sleep never advances a real clock.
     """
     clock = clock or time.monotonic
     deadline = clock() + timeout
@@ -141,8 +117,7 @@ def drain(cups, queue, sleep, log, timeout=900.0, step=2.0,
             queued = None
         if queued == 0:
             return True
-        # One empty answer is a hiccup, several in a row is a cable -- the
-        # same rule the countdown uses, for the same reason.
+        # Same rule as countdown(): several misses in a row is a cable.
         try:
             present = bool(cups.devices())
         except Exception:                        # noqa: BLE001
@@ -169,35 +144,20 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
     # See otpunit.posture. Training pads are not secret and still print.
     refused = refuse_live if not settings.training else ""
 
-    # Every sheet carries the media size. Dropping it left the status,
-    # swap and done sheets submitted with no media at all, so a LETTER or
-    # A6 unit rendered one size and asked the queue for another.
+    # Every sheet carries the media size, so the queue is never asked for a
+    # different size than was rendered.
     paper = {"media": _media(settings)}
 
     def send(data, title, options=None):
-        # Wait for the queue before adding to it. cupsd does not queue past
-        # MaxJobs, it REJECTS -- `lp: Too many active jobs.` The unit shipped
-        # MaxJobs 1 when that was found: measured against a real cupsd, the
-        # manual spooled, then the tabula, copy A, the separator and the
-        # final sheet were all refused in turn, and the operator got a status
-        # sheet promising a pad followed by nothing at all. Every gap in this
-        # sequence needs the wait, not just the two that had it.
-        #
-        # install.sh ships MaxJobs 4 now, and THIS WAIT is what makes the
-        # sequence independent of that number rather than the number itself
-        # -- measured by the mutation gate (tests/mutations.toml,
-        # sequence-submits-without-waiting-for-the-queue): with the drain
-        # here, MaxJobs back at 1 leaves the whole hardware tier green; with
-        # it gone, the same value loses the pair in under four seconds.
+        # Wait for the queue before adding to it: past MaxJobs cupsd
+        # rejects a job rather than queueing it. This wait is what makes
+        # the sequence independent of the MaxJobs value.
         drain(cups, queue, sleep, log, timeout=_drain_timeout(settings))
         cups.submit(data, name=queue, title=title,
                     options=paper if options is None else options)
 
-    # 1. Say what is about to happen, before doing any of it. Guarded like
-    #    everything else: send() now waits for the queue first, so it can
-    #    raise Aborted, and this call sits outside every other try. A
-    #    missing /usr/bin/lp reached here as a bare FileNotFoundError and
-    #    left run() by the front door.
+    # 1. Say what is about to happen, before doing any of it. Guarded
+    #    because send() can raise.
     try:
         send(diagnostics.render_bytes(
             diagnostics.collect(settings=settings, printer=_first(cups),
@@ -206,9 +166,8 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
             diagnostics._page_size(settings)), "OTP status")
         log("status sheet submitted")
     except Exception as exc:                     # noqa: BLE001
-        # Nothing can be printed, so there is nothing to say and nowhere to
-        # say it. Do not go on to generate a pad for a printer that just
-        # refused a single sheet.
+        # Do not go on to generate a pad for a printer that just refused a
+        # single sheet.
         log(f"could not print the status sheet: {exc}")
         return 1
 
@@ -219,37 +178,18 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         log(f"not printing a live pad: {refused}")
         return 1
 
-    # 2. The codeword, and not one line earlier.
-    #
-    #    Rolling one draws from the CSPRNG, and os.urandom blocks inside
-    #    getrandom() until the kernel has seeded it. This used to be the
-    #    first statement in run(), which meant a unit at first boot with
-    #    no network and no RTC printed NOTHING AT ALL -- not the status
-    #    sheet, not the plan, not the row that would have explained it.
-    #    Measured against this function before the move: an empty
-    #    submission list and an empty log, indefinitely.
-    #
-    #    The status sheet needs no codeword -- it must never carry one --
-    #    so it goes out first and reports the CRNG state itself, and the
-    #    wait below happens with that page already in the tray. In this
-    #    mode the printer IS the panel, so that page is the only place the
-    #    unit can say anything at all.
+    # 2. The codeword, and not earlier. Rolling one draws from the CSPRNG,
+    #    which blocks until the kernel has seeded it. The status sheet
+    #    needs no codeword and must never carry one, so it goes out first
+    #    and reports the CRNG state; in this mode it is the only place the
+    #    unit can say anything.
     announced = [None]
     missing = [0]
 
     def waiting(seconds):
-        # THE PLUG STAYS LIVE. This wait has no upper bound, and the sheet
-        # already in the tray tells the operator that unplugging the
-        # printer aborts -- that is the whole control surface this mode
-        # has. A wait that ignores it leaves the unit exactly as dead as
-        # the silent hang this gate exists to replace, one step further
-        # on: the page says "pull the cable to stop", and pulling it does
-        # nothing until entropy arrives. Found by review on this PR.
-        #
-        # Same rule as countdown() and drain(): one empty answer is a
-        # hiccup, GONE_AFTER in a row is a cable. devices() swallows every
-        # error and returns [], so a busy cupsd looks identical to an
-        # unplugged one and a single miss must not abort a pad.
+        # The plug stays live during this unbounded wait: the sheet in the
+        # tray says unplugging aborts. Same rule as countdown(): one empty
+        # answer is a hiccup, GONE_AFTER in a row is a cable.
         try:
             present = bool(cups.devices())
         except Exception:                        # noqa: BLE001
@@ -258,9 +198,8 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         if missing[0] >= GONE_AFTER:
             raise Aborted("printer disconnected while waiting for entropy")
 
-        # First, then every 30s. The unit's journal is volatile and lives
-        # in RAM, so a line every half second for a wait with no upper
-        # bound is a slow leak into the one resource it cannot spare.
+        # First, then every 30s: the journal lives in RAM and this wait
+        # has no upper bound.
         if announced[0] is not None and seconds - announced[0] < 30.0:
             return
         announced[0] = seconds
@@ -284,11 +223,9 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         log(f"aborted: {exc}")
         return 1
 
-    # 4. The manual, BEFORE the pads. A pad is useless to someone who
-    #    does not know the rules -- one reused page undoes the whole
-    #    thing -- and the person this mode exists for has no other way to
-    #    find out. It goes first so that if the paper runs out, what
-    #    survives is the instructions rather than half a pad.
+    # 4. The manual, before the pads. A pad is useless to someone who does
+    #    not know the rules, and if the paper runs out, what survives
+    #    should be the instructions rather than half a pad.
     if settings.auto_manual:
         try:
             book = jobs.generate(jobs.JobSpec(jobs.JobKind.MANUAL, "", settings))
@@ -311,11 +248,8 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
     #    copies are byte-identical -- which is what makes them a pair.
     spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, codeword, settings)
     job = jobs.PadPairJob(spec, cups, queue)
-    # Reset before generating and read after, so the sheet reports what
-    # THIS pad was made from. A probe at sheet-render time answers a
-    # different question: the status sheet probes five minutes before
-    # generation starts and the final sheet probes after it ends, and a
-    # device that dies in between made every page after it CSPRNG-only.
+    # Reset before generating and read after, so the final sheet reports
+    # what this pad was made from, not what a probe predicts.
     gen_module().TALLY.reset()
     try:
         job.generate()
@@ -327,10 +261,9 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
     drained = purge = False
     trouble = ""
     try:
-        # The pad copies go through PadPairJob rather than send(), so they
-        # need the same wait for the queue that send() does. Copy B gets it
-        # from the tray break; copy A follows the tabula card directly and
-        # was the submission that MaxJobs refused.
+        # The pad copies go through PadPairJob, not send(), so copy A
+        # needs the same wait for the queue. Copy B gets it from the tray
+        # break.
         drain(cups, queue, sleep, log, timeout=_drain_timeout(settings))
         job.print_next_copy()
         log(f"copy A submitted ({settings.pages} pages)")
@@ -340,14 +273,10 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         send(sheet(SWAP, codeword=codeword, settings=settings,
                    seconds=settings.auto_swap_delay), "REMOVE COPY A")
 
-        # Wait for copy A and the separator to physically COME OUT before
-        # timing the tray break. lp returns once a job is spooled, so a
-        # fixed timer started here runs while the printer is still working
-        # -- at 12 ppm a 25-sheet copy A needs 125s against a 90s break, so
-        # copy B was spooled before the separator sheet even landed.
+        # Wait for copy A and the separator to come out before timing the
+        # tray break: lp returns once a job is spooled, not printed.
         drain(cups, queue, sleep, log, timeout=_drain_timeout(settings))
-        # If copy A did not reach paper, copy B will not either, and 25
-        # more sheets of a pad nobody can use is the wrong answer. Stop and
+        # If copy A did not reach paper, copy B will not either. Stop and
         # say what the printer said.
         fault = _fault(cups, queue)
         if fault:
@@ -358,38 +287,30 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         job.print_next_copy()
         log("copy B submitted")
 
-        # THE important wait. finish() below purges the spool with
-        # `cancel -x -a`, which cancels every job on the queue INCLUDING
-        # the one currently printing -- and copy B was handed to lp
-        # microseconds ago. Without this the unit cancelled its own copy B
-        # on every single run, then printed a sheet saying the pair was
-        # complete. The interactive path has always waited for this; the
-        # unattended path did not.
+        # finish() below purges the spool with `cancel -x -a`, which
+        # cancels every job on the queue including one still printing.
+        # Copy B was only just handed to lp, so wait for it to drain.
         drained = drain(cups, queue, sleep, log,
                         timeout=_drain_timeout(settings))
         if not drained:
             log("queue never drained; leaving the spool rather than "
                 "cancelling a copy that may still be printing")
-        # A drained queue is necessary but NOT sufficient. It says the
-        # spool emptied; under ErrorPolicy abort-job that happens just as
-        # fast when every job failed. Ask the printer as well.
+        # A drained queue is necessary but not sufficient: under
+        # ErrorPolicy abort-job it empties just as fast when every job
+        # failed. Ask the printer as well.
         purge = drained
         fault = _fault(cups, queue)
         if fault:
             log(f"the queue drained but the printer reports: {fault}")
-        # Setting this on the drain alone handed the operator "YOUR PAD
-        # PAIR IS PRINTED / They are identical" over a tray that was empty
-        # because the printer had run out of paper -- the exact failure the
-        # HALF sheet exists to report, made unreachable.
+        # A fault means the tray may be empty, so the HALF sheet is the
+        # right one even though the queue drained.
         printed_b = drained and not fault
         trouble = fault or trouble
     except Aborted as exc:
         log(f"aborted mid-pair: {exc}")
         trouble = trouble or str(exc)
-        # The printer is gone, so nothing can be mid-print and there is
-        # nothing left to destroy by cancelling. What IS still there is a
-        # spooled copy of the pad, which is the one case where purging is
-        # both safe and the whole point.
+        # The printer is gone, so nothing can be mid-print. A spooled copy
+        # of the pad may remain, so purging is both safe and necessary.
         purge = True
     except Exception as exc:                     # noqa: BLE001
         # Anything else leaves the queue in an unknown state, and cancelling
@@ -406,9 +327,8 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
             # Never let a wipe failure mask what happened to the pair.
             log(f"wipe failed: {exc}")
 
-    # 8. What they are now holding -- which is NOT always a pair. Saying
-    #    "two identical copies" over half a pair is worse than saying
-    #    nothing, because the operator files it and finds out later.
+    # 8. What they are now holding, which is not always a pair. Claiming
+    #    "two identical copies" over half a pair is worse than silence.
     try:
         send(sheet(DONE if printed_b else HALF, codeword=codeword,
                    settings=settings, tally=gen_module().TALLY,
@@ -428,15 +348,8 @@ def _first(cups):
     return devices[0] if devices else None
 
 
-# One definition, in printer.py next to printer_fault itself. This used to
-# be a verbatim copy of the UI's helper -- docstring reasoning included --
-# so a change to what counts as "cannot tell" had to land in both places or
-# the panel and the headless run would disagree about the only question
-# either of them asks.
-# The shared DECISION, not just a shared helper -- see
-# printer.fault_text. Deciding on raw printer-state-message here
-# while the panel weighed the IPP reasons meant the two modes
-# disagreed about the same printer in both directions.
+# The shared decision (see printer.fault_text), so the panel and the
+# headless run cannot disagree about the same printer.
 _fault = printer.fault_text
 
 
@@ -449,10 +362,8 @@ def _media(settings: Settings) -> str:
 
 
 # Seconds of drain budget per physical sheet, plus a fixed floor. A fixed
-# 900s bound is generous for the 25-sheet default and far too short for
-# `pages = 1000`, which is 250 sheets and over twenty minutes of printing
-# on a 12ppm laser -- the drain would time out, the purge be skipped and a
-# perfectly good pair reported as half.
+# bound would time out on a large pad (pages = 1000 is 250 sheets), skip
+# the purge and report a good pair as half.
 DRAIN_PER_SHEET = 12.0
 DRAIN_FLOOR = 300.0
 
@@ -465,15 +376,10 @@ def _manual_options(settings: Settings) -> dict:
     """
     Two manual pages per sheet on A4 or Letter.
 
-    The manual is laid out A5, which is exactly half of A4, so two to a
-    sheet is a clean fit rather than a scaling compromise -- and it halves
-    28 sheets to 14. Paper is a real constraint for anyone relying on this
-    mode, so it is not a detail.
-
-    Anything narrower gets one page a sheet -- but it still gets the media,
-    because returning a bare {} left the manual as the only job in the
-    sequence submitted with no size at all, to be rendered at whatever the
-    queue happened to default to.
+    The manual is laid out A5, exactly half of A4, and paper is a real
+    constraint in this mode. Narrower paper gets one page a sheet. The
+    media size is always included so the job is never left to the queue's
+    default.
     """
     media = {"media": _media(settings)}
     if settings.paper in ("A4", "LETTER"):
@@ -493,14 +399,8 @@ def sheets_needed(settings: Settings) -> int:
     """
     Roughly how much paper a full run costs, for the status sheet.
 
-    Someone deciding whether to let this run may have a finite stack and
-    no way to get more. Better an estimate on the first sheet than a
-    printer that stops halfway through copy B.
-
-    `Settings.sheets` already knows the imposition, including that A7 is
-    two pad pages to an A6 sheet. Restating the arithmetic here got A7
-    wrong by a factor of two -- 100 pages quoted as 100 sheets a copy
-    rather than 50 -- which is exactly the number this is printed for.
+    Uses `Settings.sheets`, which already accounts for the imposition (A7
+    is two pad pages to an A6 sheet).
     """
     # status + tabula + swap + done
     return _manual_sheets(settings) + settings.sheets * 2 + 4
@@ -552,19 +452,16 @@ HALF = "half"
 
 def _key_source(tally=None) -> str:
     """
-    Said on the pad's own sheet, not just the status sheet.
+    The key source, for the pad's own sheet.
 
-    Someone may keep this page with the pad for years. If the unit had no
-    hardware TRNG, what they are holding is stream-cipher output rather
-    than a one-time pad -- still strong, but not unbreakable-in-principle,
-    and that is a difference they are entitled to know about the specific
-    pad in their hand.
+    Someone may keep this page with the pad for years; without a hardware
+    TRNG what they hold is stream-cipher output, not a one-time pad.
     """
     try:
         if tally is not None and tally.total:
             return tally.summary()
-        # No tally means nobody generated anything through this path; fall
-        # back to a probe and be clear that is what it is.
+        # No tally means nothing was generated through this path; fall
+        # back to a probe and say that is what it is.
         if gen_module().entropy_source() == "hwrng+urandom":
             return "hardware TRNG available (not measured for this pad)"
         return ("NO HARDWARE RNG WAS FOUND. This key came from the system "
@@ -608,13 +505,9 @@ def sheet(kind, codeword="", settings=None, seconds=0, tally=None,
                        "Anyone who photographs them can read every message "
                        "the pad ever protects."),
             ]),
-            # The sheet that reports a failed copy B has to be printed, and
-            # if copy B failed because the printing stopped working then it
-            # cannot be. Measured: with cupsd killed after the separator,
-            # the last thing in the tray was this sheet promising a copy B
-            # that never came, and nothing ever said otherwise. So the
-            # warning goes here, in advance, while there is still a printer
-            # to put it on paper.
+            # A failed copy B may mean the report of it cannot be printed
+            # either, so the warning goes here in advance, while there is
+            # still a working printer.
             diagnostics.Section("IF NOTHING FOLLOWS THIS SHEET", [
                 (None, "A COPY B AND A FINAL INSTRUCTION SHEET SHOULD COME "
                        "OUT AFTER THIS ONE. If they do not -- the printer "
@@ -640,9 +533,8 @@ def sheet(kind, codeword="", settings=None, seconds=0, tally=None,
                        "no second copy to give to the person you were going "
                        "to talk to. A one-time pad only works because both "
                        "ends hold the SAME key."),
-                # The printer usually knows -- out of paper, cover open,
-                # jammed -- and saying so is the difference between a sheet
-                # that ends the problem and one that only reports it.
+                # The printer usually knows why: out of paper, cover open,
+                # jammed.
                 ("Reported", trouble or "nothing; the printer gave no reason"),
                 ("Codeword", codeword or "(unset)"),
             ]),

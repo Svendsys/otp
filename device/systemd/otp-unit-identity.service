@@ -10,45 +10,14 @@ Before=sysinit.target
 Conflicts=shutdown.target
 Before=shutdown.target
 
-# WHAT USED TO BE HERE, and why it is not. This unit also copied the SSH host
-# keys onto the boot partition, so it carried
-# `After=regenerate_ssh_host_keys.service` (that unit opens with
-# `rm -f /etc/ssh/ssh_host_*_key*`, so a restore placed before it was
-# deleted by it), `Before=ssh.service ssh.socket`, and
-# `ConditionPathIsReadWrite=/etc` for the restore's writes. image/build.sh
-# sets ENABLE_SSH=0, so this appliance ships with ssh.service disabled and
-# never runs sshd; the only thing that ever started it was the first-boot
-# `preset-all` that persisting the machine-id ends. The host-key half is gone
-# and every ordering that existed for it went with it -- an ordering edge
-# nothing needs is an ordering edge nobody can check.
-
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/opt/otp-unit/persist-identity.sh
-# StandardError only: a healthy run's notes are worth having, and the script
-# writes them all to stderr.
-#
-# AND ON THE CONSOLE, WHICH IS THE HALF THAT WAS MISSING. The journal alone
-# reaches nobody on a shipped unit: device/install.sh sets Storage=volatile so
-# it dies with the power, and systemd.journald.forward_to_console=1 is on the
-# tier-3 harness's kernel command line and NOT in the image's cmdline.txt --
-# deliberately, because a device that prints one-time pads must not narrate
-# every unit's output to whoever is watching the serial header. So what this
-# script said about a refused restore was readable only under emulation, on
-# the one machine whose operator may be locked out of the shell that could
-# have read it.
-#
-# journal+console is the narrowest fix available: it puts THIS unit's stderr
-# on /dev/console and leaves every other unit quiet. It runs at sysinit,
-# before any getty and before otp-unit.service takes tty1, so the notes are on
-# the screen during the boot and nothing has to be logged in to see them. The
-# script prints no hash -- only lengths -- and strips the one card-controlled
-# string it quotes back, so there is nothing here a console must not carry.
-#
-# The screen is gone the moment the front panel starts, which is why
-# persist-identity.sh also leaves every refusal in a file on the boot
-# partition: see CRED_NOTE there.
+# The script writes its notes to stderr. journal+console puts this unit's
+# stderr on the screen during boot, because the journal is volatile and a
+# locked-out operator cannot read it. The script prints no hash, only
+# lengths, and also leaves refusals on the boot partition (CRED_NOTE there).
 StandardOutput=journal
 StandardError=journal+console
 

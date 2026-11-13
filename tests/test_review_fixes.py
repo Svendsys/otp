@@ -1,5 +1,6 @@
-"""Regressions for defects found by reading the code against real hardware
-behaviour, none of which the fakes could show."""
+"""Regressions for defects that only show against real hardware behaviour, not the
+fakes.
+"""
 import os
 import pty
 import subprocess
@@ -17,7 +18,9 @@ SERVICE = REPO / "device" / "systemd" / "otp-unit.service"
 
 
 def test_arrow_keys_and_fast_typing_survive_a_real_tty():
-    """Buffered stdin swallowed the tail of every escape sequence."""
+    """Escape sequences and fast typing arrive whole: buffered stdin would swallow
+    their tails.
+    """
     master, slave = pty.openpty()
     script = textwrap.dedent("""
         import sys

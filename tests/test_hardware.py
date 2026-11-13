@@ -1,13 +1,8 @@
-"""Tests for the hardware layer.
+"""Tests for the hardware layer: the button threading and timing, and the failure
+modes the fakes never exercise.
 
-This layer had no coverage at all for three review rounds, which is exactly
-why a race in the button handling survived them: FakeButtons is a
-single-threaded list pop and FakeDisplay never raises, so neither the
-threading nor the failure modes were ever exercised.
-
-gpiozero and luma are not test dependencies -- the tests that need them skip
-when they are absent. What does not need them is the timing logic itself,
-which is deliberately written so it can be driven with a fake clock.
+gpiozero, lgpio and luma are not test dependencies; tests that need them skip.
+The timing logic is driven with a fake clock.
 """
 import array
 import fcntl
@@ -29,9 +24,8 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-# A path under the temp dir, not "/nonexistent": the suite runs as
-# root, where that absolute path is perfectly writable, and any test
-# reaching SAVE SETTINGS created a real file at the host's root.
+# Under the temp dir, not "/nonexistent": the suite runs as root, where that
+# path is writable.
 SCRATCH_CONFIG = str(pathlib.Path(tempfile.gettempdir()) /
                      "otp-unit-test.conf")
 
@@ -41,17 +35,11 @@ from otpunit.hw.display import ConsoleDisplay, Frame, Ssd1306Display
 
 
 class Clock:
-    """
-    A monotonic clock the test drives by hand, optionally broken once.
+    """A monotonic clock the test drives by hand, optionally failing once.
 
-    Installed with `use_clock` as buttons.py's whole `time`, rather than by
-    setting `monotonic` on the real time module: that module is shared with
-    every thread in the process, so patching it reaches anything else that
-    happens to be timing something. It matters most for `fails_with`, which
-    arms exactly ONE failure -- a stray reader could spend it, and the test
-    that wanted a broken clock would quietly get a working one.
-
-    `fails_with` is armed for the calling thread only, for the same reason.
+    Installed with `use_clock` as buttons.py's whole `time`, not patched onto
+    the shared time module, so no other thread can spend the one-shot failure.
+    `fails_with` is armed for the calling thread only.
     """
 
     def __init__(self, fails_with=None):
@@ -92,16 +80,9 @@ def press_handler(monkeypatch):
 
 
 class TestTapVersusHold:
-    """
-    One press must produce exactly one event.
-
-    The previous design had gpiozero's when_held set a flag that
-    when_released checked -- a check-then-act split across two threads. A
-    release landing in the window between the hold thread deciding and it
-    setting the flag emitted OK *and* BACK from one press and left the flag
-    stuck, swallowing the next tap. On this device that is not cosmetic:
-    while a job is printing OK and BACK mean opposite things, so one
-    borderline press could purge the spool and destroy a pad pair.
+    """One press produces exactly one event. While a job is printing OK and BACK
+    mean opposite things, so a borderline press that emitted both could purge
+    the spool and destroy a pad pair.
     """
 
     def test_a_short_press_is_ok(self, monkeypatch):
@@ -130,8 +111,8 @@ class TestTapVersusHold:
             assert unit.wait(timeout=0) is expected, held
 
     def test_a_press_at_the_boundary_never_emits_both(self, monkeypatch):
-        # Sweep across the deadline; every single press must yield exactly
-        # one event, whichever side it lands on.
+        # Sweep across the deadline: each press yields exactly one event,
+        # whichever side it lands on.
         for micros in range(-200, 201, 5):
             unit, clock = press_handler(monkeypatch)
             unit._on_press()
@@ -181,9 +162,8 @@ class TestTapVersusHold:
 
 class TestDebounceIsNotSoLongItDropsPresses:
     def test_bounce_window_is_shorter_than_a_deliberate_tap(self):
-        # lgpio's debounce DROPS an edge that is not stable for the whole
-        # window rather than merging it, so a bounce time near a human tap
-        # makes presses vanish. Contact bounce is 1-5ms.
+        # lgpio's debounce drops an edge not stable for the whole window, so a
+        # bounce time near a human tap loses presses. Contact bounce is 1-5ms.
         assert buttons_mod.BOUNCE_SECONDS <= 0.02
         assert buttons_mod.BOUNCE_SECONDS >= 0.005
 
@@ -221,11 +201,9 @@ class TestDisplayFailuresDoNotEscape:
 
 
 class TestPanelTextIsAlwaysDrawable:
-    """
-    Pillow's default bitmap font is latin-1, and drawing anything outside
-    it raises inside the display driver where nothing catches it. Panel
-    text often comes from a CUPS error, decoded with errors="replace", so
-    a truncated or localised message carries U+FFFD or accents.
+    """Panel text is always encodable as latin-1, the range of Pillow's bitmap
+    font; anything else raises inside the display driver. CUPS errors decoded
+    with errors="replace" can carry U+FFFD or accents.
     """
 
     def test_wrap_output_is_always_ascii(self):
@@ -245,35 +223,18 @@ class TestPanelTextIsAlwaysDrawable:
 
 # --- nothing a callback does may reach lgpio's dispatch thread -----------
 #
-# The defect these exercise is not in this repository: lgpio dispatches
-# every GPIO edge in the process from ONE thread and puts no guard around
-# the call (lgpio 0.2.2.0, lgpio.py:531-559), and that thread is a
-# module-level singleton started at import (lgpio.py:562). So one exception
-# out of a button callback ends it, and every button in the process --
-# including buttons on a panel built later -- goes quiet for the rest of
-# the process, reported only as a warning nobody reads.
-#
-# On a 512 MiB board with no swap making 1000-page pads
-# (tests/test_memory_budget.py) the exception to expect is MemoryError, and
-# the remedy for a dead panel is a power cycle, which discards the pad in
-# progress. Hence the guard in GpioButtons._guarded, and hence these.
-#
-# What is asserted throughout is the PROPERTY -- a later press still
-# arrives -- and not "an exception was caught", which a panel that has
-# stopped delivering anything at all would also satisfy.
+# lgpio dispatches every GPIO edge in the process from one unguarded singleton
+# thread, so one exception out of a button callback silences every button until
+# a power cycle. GpioButtons._guarded prevents that. The property asserted
+# throughout is that a later press still arrives, not that an exception was
+# caught.
 
 
 class FakeButton:
-    """
-    The only part of gpiozero's `Button` that `GpioButtons` uses.
-
-    Standing in for it keeps this whole section runnable where gpiozero is
-    not installed, which is every CI run of the fast suite:
-    requirements-dev.txt deliberately leaves gpiozero out. Nothing about
-    the CALLBACKS is faked -- they are read back off this object exactly as
-    they were handed over, and `TestRealGpiozero` below drives the same
-    property through real gpiozero so this stand-in cannot quietly stop
-    resembling it.
+    """The only part of gpiozero's `Button` that `GpioButtons` uses, so this
+    section runs without gpiozero. The callbacks are the real ones, read back
+    as handed over; `TestRealGpiozero` drives the same property through the
+    real library.
     """
 
     def __init__(self, pin, pull_up=True, bounce_time=None):
@@ -289,13 +250,10 @@ class FakeButton:
 
 
 class FakeDispatcher:
-    """
-    The one thing `GpioButtons._watch` asks of lgpio's thread: is it alive.
+    """The one thing `GpioButtons._watch` asks of lgpio's thread: is it alive.
 
-    Counting the probes is not decoration. Most of what is asserted about
-    the supervisor is that NOTHING happened -- no revival, no journal line
-    -- and a panel that never looked at the dispatcher at all would satisfy
-    every one of those. `probes` is what tells the two apart.
+    `probes` counts the questions, so "nothing happened" can be told from
+    "never looked".
     """
 
     def __init__(self, alive=True):
@@ -326,52 +284,34 @@ class Reviver:
 
 
 def build_panel(monkeypatch, **injected):
-    """
-    A real `GpioButtons`, with `FakeButton` standing in for gpiozero.
+    """A real `GpioButtons`, with `FakeButton` standing in for gpiozero.
 
-    The dispatch probe is stood in for as well, unless the caller names its
-    own, and that is not only convenience. The shipped default reaches into
-    lgpio's module globals for a thread this process shares with everything
-    else in it -- which is right on the unit, where that thread is the one
-    delivering the panel's edges, and wrong here, where it belongs to
-    whatever imported lgpio first. Left as it comes, every `revived == 0`
-    in this file would be a statement about a library that CI does not even
-    install (requirements-dev.txt leaves lgpio out), and so could not fail.
-    A healthy stand-in makes those assertions mean something everywhere.
+    The dispatch probe is stood in for too unless the caller supplies one: the
+    shipped default reads lgpio's process-wide thread, which CI does not even
+    install.
     """
     module = types.ModuleType("gpiozero")
     module.Button = FakeButton
     monkeypatch.setitem(sys.modules, "gpiozero", module)
-    # None, and not the default stand-in, when the caller brought its own
-    # probe. It used to be the default either way, which is a decoy: a
-    # caller that injects `dispatcher=lambda: mine` and then asserts
-    # `panel.stand_in_dispatcher.probes == 0` would be asking a thread the
-    # panel never touched, and the assertion would pass however many times
-    # the real probe ran. An AttributeError on None is the loud version of
-    # "there is nothing here to read".
+    # None when the caller brought its own probe, so reading
+    # stand_in_dispatcher by mistake fails instead of passing vacuously.
     thread = None
     if "dispatcher" not in injected:
         thread = FakeDispatcher(alive=True)
         injected["dispatcher"] = lambda: thread
     injected.setdefault("reviver", Reviver())
     panel = GpioButtons(**injected)
-    # What the panel was given, where a test can read it back. The panel
-    # keeps these as `_dispatcher`/`_reviver`, which are callables rather
-    # than the objects an assertion wants to look at.
+    # What the panel was given, where a test can read it back.
     panel.stand_in_dispatcher = thread
     panel.stand_in_reviver = injected["reviver"]
     return panel
 
 
 class MemoryStarvedQueue(queue.Queue):
-    """
-    The panel's event queue, with no memory for the next `failures` puts.
+    """The panel's event queue, raising MemoryError on the next `failures` puts.
 
-    `self._events.put(...)` is the one allocation every one of the three
-    shipped callbacks makes, so starving it is how an exception is raised
-    from INSIDE the shipped callback rather than beside it. MemoryError
-    because that is the failure this board is actually exposed to: 512 MiB,
-    no swap, and a pad job that peaks near the ceiling.
+    `self._events.put(...)` is the one allocation every shipped callback makes,
+    so this raises from inside the shipped callback.
     """
 
     def __init__(self):
@@ -386,19 +326,11 @@ class MemoryStarvedQueue(queue.Queue):
 
 
 class JournalPipe:
-    """
-    Stderr as the unit has it: a pipe with a reader the test can withdraw.
+    """Stderr as the unit has it: a pipe with a reader the test can withdraw.
 
-    On the unit stderr is a stream socket to journald. The failure that
-    matters is not a closed one -- that raises, and a raise is caught --
-    but a FULL one, which does not raise: the writer parks inside write(2)
-    until somebody reads, and `except BaseException: pass` is no defence
-    against a call that never returns. journald being restarted, wedged or
-    simply behind is enough to produce it.
-
-    Shrunk to a single page with F_SETPIPE_SZ so `wedge` is quick; the
-    default 64 KiB would do the same job more slowly, and a kernel that
-    refuses the resize just gets the slower version.
+    The failure that matters is a full pipe, which does not raise: the writer
+    parks in write(2) until somebody reads. Shrunk to one page with
+    F_SETPIPE_SZ so `wedge` is quick.
     """
 
     PAGE = 4096
@@ -437,14 +369,9 @@ class JournalPipe:
             os.set_blocking(self._write, True)
 
     def close(self, timeout=5.0):
-        # Drain until nothing more comes, and only then close. Two reasons,
-        # both learned by hanging: a writer parked in write(2) has to be let
-        # go or the daemon thread holding it goes into the next test, and a
-        # writer with more to say parks again the moment the buffer refills,
-        # so one read is not enough. Closing underneath one of those blocks
-        # on the file object's own lock -- a teardown hang, in a test that
-        # has already decided it failed, which the mutation gate scores as
-        # BROKEN rather than caught.
+        # Drain until nothing more comes, and only then close: a writer parked
+        # in write(2) must be released, and closing underneath one blocks on
+        # the file object's lock.
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and self.take(timeout=0.2):
             pass
@@ -456,19 +383,15 @@ class JournalPipe:
 
 
 def dispatch_for(button):
-    """
-    gpiozero's chain from an lgpio edge to `when_pressed`, in four lines.
+    """gpiozero's chain from an lgpio edge to `when_pressed`.
 
-    Deliberately unguarded, because gpiozero's real one is: measured by
-    reading it, `LGPIOPin._call_when_changed` -> `PiPin._call_when_changed`
-    -> `Button._pin_changed` -> `EventsMixin._fire_events` ->
-    `_fire_activated` contains no try anywhere, and
+    Unguarded, as gpiozero's real one is;
     `TestRealGpiozero::test_gpiozero_lets_a_callback_exception_straight_out`
-    proves it against the real library rather than by reading.
+    checks that against the library.
     """
     def dispatch(chip, gpio, level, tick):
-        # 0 is the line pulled to ground, which for a pull_up=True Button
-        # is "pressed" -- the same sense the gpio-sim harness drives.
+        # 0 is the line pulled to ground, which for a pull_up=True Button is
+        # "pressed".
         handler = button.when_pressed if level == 0 else button.when_released
         if handler is not None:
             handler()
@@ -476,24 +399,12 @@ def dispatch_for(button):
 
 
 class StandInNotifier:
-    """
-    lgpio's notification thread, in the one shape that costs a panel.
+    """lgpio's notification thread in miniature: one thread, one callback list
+    shared by every button, and a dispatch with no try around it, so the first
+    exception out of a callback ends delivery on every line.
 
-    Copied from lgpio 0.2.2.0's `_callback_thread.run` (lgpio.py:531-559):
-    ONE thread, one list of callbacks shared by every button in the
-    process, and a dispatch with no try around it --
-
-        for cb in self.callbacks:
-            if cb.chip == chip and cb.gpio == gpio:
-                cb.func(chip, gpio, level, tick)
-
-    -- so the first exception out of `cb.func` ends the thread and every
-    later edge, on any line, reaches nobody. The transport here is a Queue
-    rather than lgpio's FIFO and there is no struct decoding, because
-    neither of those is what the guard is about.
-
-    `RealNotifier` runs the same scenarios through lgpio's own `run`
-    wherever lgpio is installed, which is what keeps this honest.
+    The transport is a Queue, not lgpio's FIFO. `RealNotifier` runs the same
+    scenarios through lgpio's own `run` where lgpio is installed.
     """
 
     def __init__(self):
@@ -527,17 +438,10 @@ class StandInNotifier:
 
 
 class RealNotifier:
-    """
-    lgpio's actual notification thread, fed forged edges through a pipe.
+    """lgpio's actual notification thread, fed forged edges through a pipe.
 
-    `_callback_thread.__init__` opens an lgpio notification handle and a
-    `.lgd-nfy*` FIFO in the working directory. None of that is dispatch,
-    and skipping it keeps a second FIFO out of the repository root -- so
-    the fields `run` reads are set up by hand and `run` itself is lgpio's
-    own, unmodified. Measured in a container with no gpiochip and no
-    CONFIG_GPIOLIB: an edge written into the pipe reaches the callback, and
-    an unguarded raise out of that callback kills the thread and every edge
-    after it.
+    The constructor's notification handle and `.lgd-nfy*` FIFO are skipped and
+    the fields `run` reads are set up by hand; `run` itself is lgpio's own.
     """
 
     def __init__(self):
@@ -548,15 +452,9 @@ class RealNotifier:
         threading.Thread.__init__(thread)
         read, self._write = os.pipe()
         thread._notify = None
-        # Buffered, because lgpio's own is: `open('.lgd-nfy{}'..., 'rb')`
-        # (lgpio.py:504) gives a BufferedReader, and `run`'s `read(16)`
-        # against one pulls up to 8192 bytes out of the pipe and keeps the
-        # rest inside Python. That is not a detail: it is where edges sit
-        # when a callback kills the thread mid-burst, and a drain that
-        # cannot see them replays them on recovery. With `buffering=0`
-        # here, which is what this was, that case cannot be reproduced at
-        # all -- and TestRevivingLgpiosOwnDispatchThread would pass against
-        # a drain that only reads the descriptor.
+        # Buffered, as lgpio's own reader is: `read(16)` pulls up to 8192 bytes
+        # into Python, which is where edges sit when a callback kills the
+        # thread mid-burst.
         thread._file = open(read, "rb")
         thread.go = True
         thread.daemon = True
@@ -578,14 +476,8 @@ class RealNotifier:
         os.write(self._write, self.frame(gpio, level))
 
     def fire_together(self, *frames):
-        """
-        Several edges in ONE write, so one read takes them all.
-
-        Which is the case that matters for a drain: `run` reads with
-        `self._file.read(16)` on a BufferedReader, and that pulls up to
-        8192 bytes out of the pipe whatever it was asked for. Edges
-        written together with the one that kills the thread therefore end
-        up INSIDE Python, where a drain of the descriptor cannot see them.
+        """Several edges in one write, so one buffered read takes them all and
+        they sit inside Python where a drain of the descriptor cannot see them.
         """
         os.write(self._write, b"".join(frames))
 
@@ -601,8 +493,7 @@ class RealNotifier:
             pass
         self._thread.join(timeout=2)
         # run() closes this on a clean exit; a thread killed by a callback
-        # never got there, and a leaked fd per test is not acceptable in a
-        # suite this size.
+        # never gets there.
         self._thread._file.close()
         os.close(self._write)
 
@@ -635,14 +526,9 @@ def panel(monkeypatch, notifier):
 
 @pytest.fixture
 def unhandled(monkeypatch):
-    """
-    Every exception that escaped a thread, and the only place it is seen.
-
-    That is the point of collecting them: a dying dispatch thread reports
-    itself HERE and nowhere the operator or the failing test would look.
-    Replacing the hook also keeps pytest's own
-    PytestUnhandledThreadExceptionWarning out of the summary for the one
-    test that kills a thread on purpose.
+    """Every exception that escaped a thread: the only place a dying dispatch
+    thread reports itself. Replacing the hook also keeps pytest's
+    thread-exception warning out of the summary.
     """
     escaped = []
     monkeypatch.setattr(threading, "excepthook", escaped.append)
@@ -653,15 +539,9 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
 
     def test_an_unguarded_callback_kills_every_button_in_the_process(
             self, notifier, panel, unhandled):
-        """
-        The control: the same dispatcher, proving it really is fatal.
-
-        Without this the tests below could pass against a notifier that
-        swallows exceptions itself, which would make them assert nothing.
-        The raiser here is what the shipped callback would be with the
-        guard taken off -- `self._events.put(Press.UP)`, no wrapper -- and
-        it is registered on a line of its own so the panel's own three
-        callbacks stay armed and can be shown to go quiet with it.
+        """The control: an unguarded callback that raises really does silence
+        every button on this dispatcher, so the tests below cannot pass against
+        a notifier that swallows exceptions.
         """
         spare = 99
         notifier.register(
@@ -679,8 +559,7 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
             "assertion in this class is about a dispatcher lgpio does not "
             "have")
 
-        # A perfectly healthy guarded button, on a queue with no failures
-        # left, now delivers nothing at all. That is the whole defect.
+        # A healthy guarded button now delivers nothing at all.
         notifier.fire(buttons_mod.PIN_UP)
         assert panel.wait(timeout=0.5) is None
 
@@ -691,9 +570,8 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
 
     def test_a_press_on_another_button_survives_one_that_raises(
             self, notifier, panel):
-        """
-        THE property, in the order it happens on the device: an edge that
-        raises, then an edge that must still arrive.
+        """After an edge whose callback raises, an edge on another button still
+        arrives.
         """
         panel._events.failures = 1
 
@@ -720,10 +598,9 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
 
     def test_a_raising_release_does_not_cost_the_next_ok(
             self, notifier, panel):
-        """
-        OK is the expensive one: it is guarded twice, on press and on
-        release, and it is the button that means opposite things while a
-        job prints.
+        """A raising release does not cost the next OK. OK is guarded on press and
+        on release, and is the button that means opposite things while a job
+        prints.
         """
         ok = buttons_mod.PIN_OK
         panel._events.failures = 1
@@ -741,24 +618,11 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
 
     def test_a_journal_nobody_is_reading_does_not_park_the_thread(
             self, monkeypatch, notifier, panel):
-        """
-        The report is on the dispatch thread too, so it gets the same rule.
+        """A full stderr pipe does not park the dispatch thread: a thread blocked
+        in write(2) delivers no edges while still looking alive.
 
-        Catching the exception bought a panel that survives a lost edge,
-        and then handed the same thread a `print(..., flush=True)` to
-        stderr -- which on the unit is a stream socket to journald. A
-        socket nobody is draining does not raise, it BLOCKS, and a thread
-        parked in write(2) delivers no more edges: the same dead panel the
-        guard exists to prevent, only harder to see, because the thread is
-        still alive and `is_alive()` still says so. Before this PR nothing
-        wrote to stderr from this thread at all.
-
-        Two halves, in this order. First the control: with a reader, the
-        report really does travel down the dispatch thread into stderr --
-        without which the second half could pass against a `_report` that
-        never touches the journal. Then the same thing with the reader
-        withdrawn and the pipe full, where the only acceptable answer is
-        that the next press still arrives.
+        First the control, that with a reader the report does reach stderr;
+        then with the pipe wedged the next press must still arrive.
         """
         clock = use_clock(monkeypatch)
         journal = JournalPipe()
@@ -775,16 +639,10 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
             panel._events.failures = 1
             notifier.fire(buttons_mod.PIN_UP)
             written = journal.take(timeout=2)
-            # Wait for the reporter to have STAMPED, not merely written.
-            # `_note_lost` records `_said_at` AFTER `_report` returns, so a
-            # clock advanced the instant the bytes appear can get in first
-            # -- the stamp is then taken from the ALREADY ADVANCED clock,
-            # the second loss falls inside the interval after all, and
-            # nothing ever tries to write to the wedged pipe this test is
-            # about. Measured on this container with the machine
-            # deliberately saturated (12 busy loops on 4 cores): 7 of 15
-            # runs of this module failed exactly that way, on `assert
-            # len(attempts) == 2`, before this wait was here.
+            # Wait for the reporter to have stamped `_said_at`, which happens
+            # after `_report` returns; advancing the clock first would put the
+            # second loss inside the interval and nothing would write to the
+            # wedged pipe.
             stamped = time.monotonic() + 5
             while panel._said_at is None and time.monotonic() < stamped:
                 time.sleep(0.01)
@@ -793,8 +651,7 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
                 "cannot make the second one due and the wedge below would "
                 "be tested against a report that is never attempted")
 
-            # Due again, so the loss below is one the reporter really does
-            # try to write rather than one the interval swallows.
+            # Due again, so the next loss is one the reporter tries to write.
             clock.advance(buttons_mod.REPORT_SECONDS)
             journal.wedge()
 
@@ -823,30 +680,12 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
 
     def test_many_failures_in_a_row_still_leave_the_panel_answering(
             self, notifier, panel):
-        """
-        Losing edges is not a reason to recover, and this states that.
+        """Twenty failures in a row leave the panel taking, losing and counting
+        edges, and nothing is revived: a caught exception means the dispatch
+        thread is alive, and the supervisor keys only on it being dead.
 
-        There is a supervisor now (`GpioButtons._watch`), and this test is
-        where its boundary is written down, because the two mechanisms
-        answer different faults and confusing them would make the noisy one
-        drive the drastic one. The guard catching an exception means the
-        dispatch thread is ALIVE and the panel is working: the edge is
-        gone, the operator presses again, and nothing needs restarting. The
-        supervisor keys on the thread being dead and on nothing else -- not
-        on a count of losses, not on a silence, neither of which
-        distinguishes a broken panel from a working one nobody is touching.
-
-        So under twenty failures in a row the contract is what it always
-        was: the panel keeps taking edges, keeps losing them, and keeps
-        counting them. Nothing degrades, nothing gives up, and nothing is
-        revived.
-
-        What it does NOT do is say so twenty times. The reporting is
-        bounded -- first loss in full, one line every REPORT_SECONDS after
-        that -- because twenty full reports is 14 KB into a journald that
-        `_report` must never wait on. That contract is
-        `TestALostPressIsSaidOutLoud`'s; the count asserted here is what
-        survives it.
+        Reporting stays bounded (see TestALostPressIsSaidOutLoud); the count
+        asserted here is what survives that.
         """
         panel._events.failures = 20
         for _ in range(20):
@@ -867,19 +706,10 @@ class TestNoCallbackExceptionReachesTheDispatchThread:
 
 
 class TestALostPressIsSaidOutLoud:
-    """
-    The operator sees nothing -- the panel is what just failed -- so the
-    journal is the only record there is. A guard that swallows in silence
-    turns a diagnosable fault into a unit that "sometimes misses presses".
-
-    Said out loud, but BOUNDED, which is the second half of the contract
-    and the reason most of these tests drive the clock. Each full report is
-    ~690 bytes and the faults that cause one cause them in bursts, so: the
-    first loss in full with its traceback, then at most one summary line
-    every REPORT_SECONDS. Nothing here may make the dispatch thread wait on
-    a journald that is not reading (`test_a_wedged_journal_...`), because a
-    thread parked in write(2) costs the panel exactly what an uncaught
-    exception costs it, while still looking alive.
+    """A lost press is written to the journal, the only record there is, but
+    bounded: the first loss in full with its traceback, then at most one
+    summary line every REPORT_SECONDS. Nothing may make the dispatch thread
+    wait on a journald that is not reading.
     """
 
     @pytest.fixture
@@ -889,9 +719,8 @@ class TestALostPressIsSaidOutLoud:
         return said
 
     def test_the_default_report_goes_to_stderr(self, capsys):
-        """
-        Without this the tests below would pass just as happily against a
-        `_report` that writes nowhere at all.
+        """The default `_report` writes to stderr, so the tests below cannot pass
+        against one that writes nowhere.
         """
         buttons_mod._report("otp: front panel: hello")
         captured = capsys.readouterr()
@@ -899,16 +728,8 @@ class TestALostPressIsSaidOutLoud:
         assert captured.out == "", "stdout is the simulator's panel"
 
     def test_a_report_too_long_for_the_pipe_is_cut_rather_than_parked(self):
-        """
-        The other half of not blocking, and the half that is easy to lose.
-
-        `select()` answering "writable" for a pipe promises PIPE_BUF (4096)
-        bytes and no more: a longer write puts the first 4096 in and parks
-        in the kernel for the rest. The report is built from an exception's
-        `str()` and a formatted traceback, neither of which this code gets
-        to choose the length of -- a deep stack or a chatty OSError is
-        enough -- so it is capped below PIPE_BUF before the question is
-        asked. A truncated line in the journal is a diagnostic; a parked
+        """A report longer than PIPE_BUF is truncated, not written whole. select()
+        promises only PIPE_BUF (4096) bytes without blocking, and a parked
         dispatch thread is a dead panel.
         """
         journal = JournalPipe()
@@ -939,10 +760,8 @@ class TestALostPressIsSaidOutLoud:
             f"the line was cut without saying so: {written[-80:]!r}")
 
     def test_it_names_the_press_that_was_lost(self, monkeypatch, reports):
-        """
-        Every line that gets out names its own press, the summary lines
-        included -- "an edge was lost" does not say which button the
-        operator is pressing to no effect.
+        """Every line, summaries included, names its press, so the journal says
+        which button is failing.
         """
         clock = use_clock(monkeypatch)
         unit = build_panel(monkeypatch)
@@ -951,8 +770,7 @@ class TestALostPressIsSaidOutLoud:
 
         unit._events.failures = 1
         by_pin[buttons_mod.PIN_UP].when_pressed()
-        # Past the summary interval, so the second loss is a line of its
-        # own rather than a number folded into a later one.
+        # Past the summary interval, so the second loss gets a line of its own.
         clock.advance(buttons_mod.REPORT_SECONDS)
         unit._events.failures = 1
         by_pin[buttons_mod.PIN_DOWN].when_pressed()
@@ -972,8 +790,7 @@ class TestALostPressIsSaidOutLoud:
 
         said = reports[0]
         assert "MemoryError: no memory to record a press" in said
-        # The traceback, because the journal is the only diagnostic there
-        # is and "something raised" does not say which line.
+        # The traceback says which line raised.
         assert "Traceback (most recent call last)" in said
         assert "buttons.py" in said
 
@@ -993,15 +810,9 @@ class TestALostPressIsSaidOutLoud:
 
     def test_a_burst_says_the_first_in_full_and_then_counts(
             self, monkeypatch, reports):
-        """
-        The bound, stated as a property: a panel losing every edge writes a
-        report, not a stream of them.
-
-        Measured before the bound existed: one lost edge is 11 lines and
-        690 bytes with flush=True, so a panel dropping presses as fast as
-        an operator can make them wrote unboundedly into the journal --
-        into journald, whose blocking is the hazard `_report` is built
-        around, at exactly the moment the panel was in trouble.
+        """A burst of losses writes one full report and then counts, with a single
+        summary line per interval: the journal must not be flooded just when
+        the panel is in trouble.
         """
         clock = use_clock(monkeypatch)
         unit = build_panel(monkeypatch)
@@ -1022,8 +833,8 @@ class TestALostPressIsSaidOutLoud:
             "the first report must say that later ones are summarised, or "
             "the gaps in the journal look like the losses stopped")
 
-        # And when the interval is up, one line -- not a second traceback
-        # -- carrying both totals.
+        # When the interval is up, one line carrying both totals, not a second
+        # traceback.
         clock.advance(buttons_mod.REPORT_SECONDS)
         unit._events.failures = 1
         by_pin[buttons_mod.PIN_DOWN].when_pressed()
@@ -1037,10 +848,8 @@ class TestALostPressIsSaidOutLoud:
 
     def test_a_lost_press_start_says_the_release_will_be_ignored(
             self, monkeypatch, reports):
-        """
-        The one loss with a consequence beyond itself: `_on_release`
-        ignores a release it saw no press for, so losing the press start
-        silently costs the OK as well.
+        """Losing a press start is reported as also costing the OK, because
+        `_on_release` ignores a release it saw no press for.
         """
         clock = use_clock(monkeypatch,
                           Clock(fails_with=OSError(9, "Bad file descriptor")))
@@ -1061,21 +870,11 @@ class TestALostPressIsSaidOutLoud:
 
     def test_a_lost_press_start_leaves_no_press_time_behind(
             self, monkeypatch, reports):
-        """
-        The same loss, with the worst state it could be left in.
+        """A failed `_on_press` clears any earlier press timestamp; a stale one
+        would make the next release measure as a hold and emit BACK for an OK.
 
-        If a failed `_on_press` left the PREVIOUS press's timestamp in
-        place, the next release would measure against it, find more than
-        HOLD_SECONDS, and emit BACK where the operator pressed OK -- which
-        while a job is printing are opposite things, and is the confusion
-        the whole tap-versus-hold design exists to prevent. The report
-        promises the release is ignored; this is that promise holding
-        whatever was there before.
-
-        The stale timestamp is planted by hand: gpiozero alternates
-        pressed/released and `_on_release` clears before it can fail, so
-        there is no route to it from outside today. The clearing costs one
-        line and does not depend on that staying true.
+        The stale timestamp is planted by hand, since there is no route to it
+        from outside.
         """
         clock = use_clock(monkeypatch,
                           Clock(fails_with=OSError(9, "Bad file descriptor")))
@@ -1096,11 +895,8 @@ class TestALostPressIsSaidOutLoud:
 
     def test_a_report_that_itself_fails_cannot_kill_the_panel(
             self, monkeypatch):
-        """
-        Reporting allocates -- an f-string and a formatted traceback --
-        which is precisely what a MemoryError breaks next, and stderr on
-        this unit is a pipe to journald that can be closed or full. The
-        guard's last resort is to lose the log entry rather than the panel.
+        """A report that raises is swallowed: reporting allocates and writes to a
+        pipe that can fail, and the log entry is lost sooner than the panel.
         """
         def refuses(message):
             raise MemoryError("no memory to log with either")
@@ -1119,31 +915,15 @@ class TestALostPressIsSaidOutLoud:
 
 # --- and a dispatch thread that is already dead ---------------------------
 #
-# The guard above answers "an exception got out of OUR callback". It cannot
-# answer "the dispatch thread is already gone", because by then there is
-# nothing left in the process to catch anything: lgpio's notification thread
-# is a module-level singleton started at import (lgpio.py:562), nothing
-# restarts it, and every button in the process -- including a panel built
-# afterwards -- is inert from that moment until a power cycle, which on this
-# unit discards the pad in progress and its key material.
-#
-# The decision this implements is "build it, log only": notice, put delivery
-# back, say so in the journal, and change nothing else. The signal is the
-# thread's own liveness, which is directly observable, rather than a silence
-# threshold -- on a device that sits untouched between pads there is no
-# defensible number of quiet seconds, and every candidate fires on a healthy
-# unit.
+# The guard cannot help once the dispatch thread is gone. The supervisor
+# notices, restores delivery, logs, and changes nothing else. Its signal is the
+# thread's liveness, not a silence threshold: an idle unit is quiet too.
 
 
 class TestTheDispatchThreadIsWatched:
-    """
-    The supervisor's policy, without needing a dead lgpio to drive it.
-
-    The probe and the repair are both injected, because there is exactly one
-    place in this suite that can produce a genuine dead dispatch thread
-    (`TestRevivingLgpiosOwnDispatchThread`, below, which is where the claim
-    that a revival WORKS is made and measured). A policy testable only there
-    would be a policy tested once, in one shape, on machines that have lgpio.
+    """The supervisor's policy, with the probe and the repair injected so it runs
+    without lgpio. `TestRevivingLgpiosOwnDispatchThread` is where a revival is
+    shown to work.
     """
 
     @pytest.fixture
@@ -1154,9 +934,8 @@ class TestTheDispatchThreadIsWatched:
 
     def test_a_healthy_dispatcher_is_never_restarted_and_never_mentioned(
             self, monkeypatch, reports):
-        """
-        A supervisor that logs on a working unit is one people learn to
-        ignore, and then the one line that mattered goes past unread.
+        """A healthy dispatcher causes no revival and no journal line; a
+        supervisor that logs on a working unit gets ignored.
         """
         thread = FakeDispatcher(alive=True)
         reviver = Reviver()
@@ -1199,18 +978,8 @@ class TestTheDispatchThreadIsWatched:
 
     def test_a_drain_that_stopped_at_its_bound_says_the_rest_is_coming(
             self, monkeypatch, reports):
-        """
-        The one case where discarding the backlog does NOT prevent a replay.
-
-        `_discard_backlog` gives up at BACKLOG_MAX_BYTES so that a pipe
-        somebody is still filling cannot hold the app's event loop for as
-        long as it likes. The price is that everything past the bound stays
-        in the pipe and the replacement thread delivers it -- presses aimed
-        at a panel that was not listening, arriving at machine speed, which
-        is the whole hazard the drain exists for. The journal is the only
-        diagnostic this device has, so the one report that says "discarded
-        rather than replayed" may not stay quiet about the megabyte where
-        that is not what happened.
+        """When `_discard_backlog` stops at BACKLOG_MAX_BYTES, the report says the
+        remainder will be replayed, not that everything was discarded.
         """
         thread = FakeDispatcher(alive=False)
         panel = build_panel(
@@ -1231,18 +1000,9 @@ class TestTheDispatchThreadIsWatched:
 
     def test_a_revival_changes_nothing_but_the_dispatcher(
             self, monkeypatch, reports):
-        """
-        "Log only" in the one form a test can hold it to.
-
-        The owner's decision was to restore delivery and nothing else: no
-        pixel drawn -- the panel is a 128x64 OLED with a menu on it -- and
-        no job touched. What this file can check is the panel's own side of
-        that: the three `Button`s are the same objects afterwards, still
-        open, still carrying the same callbacks. A supervisor that closed
-        and rebuilt them would take the lines down and back up under an
-        operator's finger, and on a shared pin cache it is how a panel ends
-        up holding pins from a factory that has closed (see
-        pirig.release_gpiozero).
+        """A revival leaves the three `Button`s the same objects, open, with the
+        same callbacks. Rebuilding them would bounce the lines under the
+        operator's finger and risk stale pins (see pirig.release_gpiozero).
         """
         thread = FakeDispatcher(alive=False)
         panel = build_panel(monkeypatch, dispatcher=lambda: thread,
@@ -1261,21 +1021,9 @@ class TestTheDispatchThreadIsWatched:
 
     def test_a_revival_that_raises_leaves_the_panel_answering(
             self, monkeypatch, reports):
-        """
-        The repair allocates a thread, and the fault it is here to meet is
-        the one that breaks allocating next.
-
-        This said an exception out of `_watch` ends `App.run()`, `main()`
-        returns 0, and `Restart=on-failure` reads that as success and does
-        not restart. That was wrong: `__main__.main` does not catch
-        arbitrary exceptions, so they come out of it and the process exits
-        1. Measured, `ui.App.run` patched to raise MemoryError on the
-        `--sim` path -- the only one that ends in `return 0` -- gave a
-        traceback out of `main()` and `EXIT=1`. What a raise here really
-        buys is therefore a restart every RestartSec=15 for as long as the
-        dispatcher stays dead, each one discarding the pad in progress and
-        its key material. One failed revival must cost a log line, not the
-        unit and not the pad.
+        """A revival that raises costs a log line and the panel keeps answering.
+        An exception out of `_watch` would exit the process and restart the
+        unit every RestartSec, each time discarding the pad in progress.
         """
         thread = FakeDispatcher(alive=False)
         reviver = Reviver(raises=MemoryError("no memory to start a thread"))
@@ -1301,15 +1049,9 @@ class TestTheDispatchThreadIsWatched:
 
     def test_a_dispatcher_that_stays_dead_is_not_retried_without_a_bound(
             self, monkeypatch, reports):
-        """
-        The volume half, and the memory half, of the same hazard.
-
-        `_watch` runs on every `wait`, and a printing job asks with
-        `timeout=0` on every progress step -- fifty times in a pad. A
-        repair attempted on each of those would allocate a thread and
-        format a traceback fifty times over, in the exact minutes the board
-        is nearest its 512 MiB ceiling, and write fifty reports into a
-        journald that `_report` must never wait on.
+        """A dispatcher that stays dead is retried at a bounded rate. `_watch`
+        runs on every `wait`, including each progress step of a job, when
+        memory is tightest.
         """
         clock = use_clock(monkeypatch)
         thread = FakeDispatcher(alive=False)
@@ -1339,21 +1081,12 @@ class TestTheDispatchThreadIsWatched:
 
     def test_a_press_half_taken_when_the_dispatcher_died_cannot_become_back(
             self, monkeypatch, reports):
-        """
-        The one piece of state a revival must clear, and why.
+        """A revival clears the press timestamp, so a release arriving after it is
+        not measured as a hold and emitted as BACK, which purges the spool
+        mid-job.
 
-        `_on_press` records a timestamp and `_on_release` decides OK versus
-        BACK by measuring against it. A dispatch thread that dies BETWEEN
-        the two leaves that timestamp behind; the release that eventually
-        arrives -- minutes later, once delivery is back -- measures more
-        than HOLD_SECONDS and arrives as BACK where the operator pressed
-        OK. While a job is printing those are opposite things: BACK purges
-        the spool and destroys the pad pair.
-
-        The control comes first, on a panel whose dispatcher is alive: the
-        same stale timestamp, the same release, and it really does come out
-        as BACK. Without it this test would pass against an `_on_release`
-        that had stopped emitting anything at all.
+        The control comes first: on a live dispatcher the same stale timestamp
+        does produce BACK.
         """
         clock = use_clock(monkeypatch)
         alive = FakeDispatcher(alive=True)
@@ -1383,14 +1116,8 @@ class TestTheDispatchThreadIsWatched:
 
     def test_a_report_about_a_revival_cannot_kill_the_event_loop(
             self, monkeypatch):
-        """
-        The last resort, and the only swallow in `_watch`.
-
-        Saying what happened allocates -- an f-string, a formatted
-        traceback -- which is precisely what a MemoryError breaks next, and
-        stderr on this unit is a socket to journald that can be closed.
-        `_watch` runs on the app's event loop, so losing the log line has
-        to beat losing the loop.
+        """A failing report about a revival is swallowed: `_watch` runs on the
+        app's event loop, and losing the log line beats losing the loop.
         """
         def refuses(message):
             raise MemoryError("no memory to log with either")
@@ -1411,10 +1138,8 @@ class TestTheDispatchThreadIsWatched:
 
     def test_a_probe_that_raises_cannot_kill_the_event_loop(
             self, monkeypatch, reports):
-        """
-        The probe reaches into another library's module globals. It has no
-        business raising, and `_watch` may not find out the hard way on the
-        thread that draws the panel.
+        """A probe that raises does not escape `_watch`, which runs on the thread
+        that draws the panel.
         """
         def refuses():
             raise RuntimeError("lgpio is being reloaded under us")
@@ -1429,10 +1154,8 @@ class TestTheDispatchThreadIsWatched:
         assert panel.wait(timeout=0) is Press.UP
 
     def test_a_closed_panel_stops_watching(self, monkeypatch, reports):
-        """
-        `close()` is the app going away. Reviving lgpio's thread on behalf
-        of a panel that is being torn down is work for nobody, and it is
-        the one moment the supervisor could race a teardown.
+        """After `close()` no revival is attempted: the panel is being torn down,
+        and a revival could race it.
         """
         thread = FakeDispatcher(alive=False)
         reviver = Reviver()
@@ -1445,8 +1168,7 @@ class TestTheDispatchThreadIsWatched:
             f"a closed panel asked {thread.probes} time(s) anyway")
         assert reviver.called == []
 
-        # The control: the same fakes on a panel that is not closed do get
-        # a revival, so the silence above is closing and not the fakes.
+        # The control: the same fakes on an open panel do get a revival.
         open_panel = build_panel(monkeypatch, dispatcher=lambda: thread,
                                  reviver=reviver)
         open_panel.wait(timeout=0)
@@ -1454,29 +1176,25 @@ class TestTheDispatchThreadIsWatched:
 
     def test_a_wait_with_no_deadline_still_looks_at_the_dispatcher(
             self, monkeypatch):
-        """
-        The main menu blocks in `wait()` with no timeout (ui.App.run), so an
-        unsliced `queue.get()` there would mean a dispatcher that died while
-        the unit sat idle was never looked at again -- the panel would stay
-        dead until a press that could not arrive.
+        """A `wait()` with no timeout still probes the dispatcher periodically.
+        The main menu blocks that way, and a dispatcher that died while idle
+        would otherwise never be noticed.
         """
         monkeypatch.setattr(buttons_mod, "WATCH_SECONDS", 0.01)
         panel = build_panel(monkeypatch, reviver=Reviver())
         thread = FakeDispatcher(alive=True)
 
         def dispatcher():
-            # A press appears while the panel is already blocked, which is
-            # what a press on an idle menu is.
+            # A press appears while the panel is already blocked, as on an idle
+            # menu.
             if thread.probes == 2:
                 panel._events.put(Press.UP)
             return thread
 
         panel._dispatcher = dispatcher
 
-        # On its own thread, and joined with a deadline, because the way
-        # this fails is that `wait()` never comes back at all -- a test
-        # that called it here would hang the run rather than fail it, and
-        # the mutation gate scores a hang as BROKEN instead of caught.
+        # On its own thread, joined with a deadline: the failure mode is
+        # `wait()` never returning.
         got = []
         waiter = threading.Thread(target=lambda: got.append(panel.wait()),
                                   daemon=True)
@@ -1490,42 +1208,22 @@ class TestTheDispatchThreadIsWatched:
                 f"would stay dead waiting for a press that cannot arrive")
             assert thread.probes >= 3
         finally:
-            # Let a stuck waiter go, so a failure here does not leave a
-            # thread parked on this queue for the rest of the session.
+            # Release a stuck waiter so a failure does not leave a thread
+            # parked.
             panel._events.put(Press.QUIT)
             waiter.join(2)
 
 
 class TestFindingLgpiosDispatchThread:
-    """
-    `dispatch_thread`, which is what decides there is anything to supervise.
-
-    It must not import lgpio to find out. lgpio's import creates a FIFO in
-    the working directory (lgpio.py:503-504) and raises where that directory
-    is read-only -- measured in this container, from a directory on a
-    read-only mount:
-
-        xCreatePipe: Can't set permissions ... /.lgd-nfy0
-        FileNotFoundError: [Errno 2] ...: '.lgd-nfy-3'
-
-    which is not a thing to provoke from a recovery path that may run while
-    a pad is printing.
+    """`dispatch_thread` finds lgpio's thread without importing lgpio: the import
+    creates a FIFO in the cwd and raises where that is read-only.
     """
 
     def test_a_process_that_never_imported_lgpio_has_nothing_to_supervise(
             self, monkeypatch):
-        """
-        Not hypothetical: gpiozero takes the first pin factory that imports
-        -- lgpio, rpigpio, pigpio, native -- so a unit whose panel came up
-        on any of the other three has no lgpio dispatch thread at all, and
-        the honest answer about a thread that does not exist is None.
-
-        None is the right ANSWER and it is not a solved problem. On such a
-        unit the supervisor does nothing, while the fault it exists for is
-        still there: `NativeDispatchThread._run` calls
-        `pin._call_when_changed` with no guard either (gpiozero 2.0.1,
-        native.py:353-370). Which factory the shipped unit runs on is
-        issue #43, and it needs a Pi to answer.
+        """With lgpio never imported the answer is None, as on a unit whose panel
+        came up on another pin factory. The supervisor then does nothing,
+        though other factories dispatch unguarded too (issue #43).
         """
         monkeypatch.delitem(sys.modules, "lgpio", raising=False)
         assert buttons_mod.dispatch_thread() is None
@@ -1540,9 +1238,8 @@ class TestFindingLgpiosDispatchThread:
 
     def test_it_finds_the_module_level_singleton_and_not_a_copy(
             self, monkeypatch):
-        """
-        The control for the two above, which would both pass against a
-        `dispatch_thread` that returned None unconditionally.
+        """The control: with lgpio present it returns the module-level singleton,
+        so the None cases above are not unconditional.
         """
         stand_in = types.ModuleType("lgpio")
         stand_in._notify_thread = sentinel = object()
@@ -1551,27 +1248,17 @@ class TestFindingLgpiosDispatchThread:
 
     def test_an_lgpio_without_a_dispatch_thread_is_not_an_error(
             self, monkeypatch):
-        # A partially imported module -- another thread inside `import
-        # lgpio` -- has the module object in sys.modules and no
-        # `_notify_thread` on it yet. `_watch` runs on the event loop and
-        # may not raise, so this is answered rather than thrown.
+        # A partially imported lgpio is in sys.modules with no `_notify_thread`
+        # yet; `_watch` may not raise, so that is answered too.
         monkeypatch.setitem(sys.modules, "lgpio", types.ModuleType("lgpio"))
         assert buttons_mod.dispatch_thread() is None
 
 
 class WatchedReader:
-    """
-    A notification pipe's read end that refuses to be parked.
+    """A notification pipe's read end that raises if read while it could block, so
+    a bad drain fails instead of hanging.
 
-    Only the two things `_discard_backlog` uses. Recording how it was asked
-    is not enough on its own: a drain that reads while the descriptor can
-    still block does not come back, and a test that asserted afterwards
-    would hang rather than fail -- which the mutation gate scores as BROKEN
-    instead of caught. So the refusal is raised at the moment it happens.
-
-    The `blocking` list is still kept, and is the positive control: an
-    empty one means nothing was ever read, which a drain that did nothing
-    at all would also produce.
+    `blocking` records every read; an empty list means nothing was read at all.
     """
 
     def __init__(self, source):
@@ -1596,13 +1283,9 @@ class WatchedReader:
 
 
 class TestDiscardingAStaleBacklog:
-    """
-    The drain, on a pipe, with no lgpio and no panel in sight.
-
-    It is the half of a revival that decides whether recovery is safe or
-    harmful: everything the operator pressed at a panel that was not
-    listening is sitting in that pipe, and delivering it is driving the
-    menu at machine speed with presses aimed at a screen nobody moved on.
+    """The drain, on a pipe, with no lgpio and no panel. Presses made at a panel
+    that was not listening sit in that pipe, and replaying them would drive the
+    menu at machine speed.
     """
 
     @pytest.fixture
@@ -1626,17 +1309,8 @@ class TestDiscardingAStaleBacklog:
             "the drain ate the pipe rather than emptying it")
 
     def test_it_takes_what_the_reader_has_already_buffered(self, pipe):
-        """
-        The case a drain of the DESCRIPTOR cannot see, and the reason this
-        one goes through the file object.
-
-        lgpio reads its notifications with `self._file.read(16)` on a
-        BufferedReader (lgpio.py:504, 543), and one of those pulls up to
-        8192 bytes out of the pipe whatever it was asked for. So edges
-        written in the same burst as the one that kills the dispatch thread
-        are already inside Python when it dies -- the kernel is holding
-        nothing at all, which the first assertion here states rather than
-        assumes.
+        """The drain discards what the BufferedReader already holds, not only what
+        is in the pipe: lgpio's `read(16)` pulls up to 8192 bytes into Python.
         """
         os.write(pipe[1], b"E" * 976)
         source = pipe[0]
@@ -1653,27 +1327,11 @@ class TestDiscardingAStaleBacklog:
 
     def test_it_reads_only_while_the_descriptor_cannot_park_and_puts_it_back(
             self, pipe):
-        """
-        Both halves of the flag, and only the flag.
+        """Every read happens with O_NONBLOCK set, and the descriptor is blocking
+        again afterwards, as lgpio's own loop requires.
 
-        This was named for a property it does not test and which is not
-        true as stated -- "it never leaves the descriptor able to park the
-        caller". What it asserts is that every read happened with
-        O_NONBLOCK set and that the descriptor was blocking again
-        afterwards -- and the second of those is the descriptor being left
-        ABLE to park, deliberately, because lgpio's own loop needs it that
-        way (`buf += self._file.read(16)`, lgpio.py:542, meets None
-        otherwise and raises).
-
-        The parking this cannot rule out is the other one: the
-        `BufferedReader`'s lock, held by a reader already inside a blocking
-        read(2), which no flag on the descriptor reaches. Measured -- the
-        drain did not return in five seconds. It is unreachable today
-        because the only caller is the app's single event-loop thread and
-        it only drains a dispatch thread that `is_alive()` says has
-        stopped; `_discard_backlog`'s docstring is where that argument
-        lives, because it is about the caller and not about anything a
-        test of this function can hold still.
+        The BufferedReader's lock is not covered; see `_discard_backlog`'s
+        docstring.
         """
         source, write = pipe
         os.write(write, b"e" * 32)
@@ -1704,16 +1362,11 @@ class TestDiscardingAStaleBacklog:
 
     def test_it_gives_up_rather_than_draining_a_pipe_somebody_is_filling(
             self, pipe):
-        """
-        The drain runs on the app's event loop. A writer keeping up with it
-        would otherwise hold that loop for as long as it cared to, which is
-        the panel frozen by the thing that was repairing it.
+        """The drain stops at its bound when a writer keeps up, so it cannot hold
+        the app's event loop.
 
-        The stand-in stops eventually rather than never, deliberately: an
-        endless one turns a missing bound into a HANG, and a test that
-        hangs neither reports nor is scored as having caught anything.
-        Three times the bound is enough to tell "stopped at the bound" from
-        "read everything there was".
+        The stand-in writer stops at three times the bound, so a missing bound
+        fails instead of hanging.
         """
         limit = 3 * buttons_mod.BACKLOG_MAX_BYTES
 
@@ -1738,15 +1391,9 @@ class TestDiscardingAStaleBacklog:
 
 
 class TestTheReplacementDispatchThread:
-    """
-    What `revive_dispatch` builds, with a stand-in for lgpio.
-
-    lgpio is not a fast-suite dependency -- requirements-dev.txt leaves it
-    out, and it is linux-only -- so `TestRevivingLgpiosOwnDispatchThread`
-    below, which is where the repair is proved to actually restore edge
-    delivery, does not run in CI. These do: they hold the assembly to
-    account without the library, and the class they build is a real
-    `threading.Thread` subclass initialised exactly the way lgpio's own is.
+    """What `revive_dispatch` builds, with a stand-in module for lgpio so it runs
+    in CI. The class built is a real `threading.Thread` subclass initialised as
+    lgpio's own is.
     """
 
     @pytest.fixture
@@ -1757,11 +1404,8 @@ class TestTheReplacementDispatchThread:
 
         class CallbackThread(threading.Thread):
             def start(self):
-                # Recorded here, on the caller's thread, rather than in
-                # run(): whether the module global had been repointed by
-                # the time the thread began is a question about ORDER, and
-                # asking it from inside the new thread would answer it
-                # whenever the scheduler got round to it.
+                # Recorded on the caller's thread: whether the module global
+                # was repointed before the thread began is a question of order.
                 found = module._notify_thread is self
                 module.order.append("published" if found else "started")
                 super().start()
@@ -1802,12 +1446,9 @@ class TestTheReplacementDispatchThread:
 
     def test_it_shares_the_callback_list_rather_than_copying_it(self, lgpio,
                                                                 dead):
-        """
-        A copy diverges the moment anything registers again: `lgpio.callback`
-        appends to whatever `_notify_thread` is at the time (lgpio.py:578),
-        so a panel built afterwards would land its callbacks in a list the
-        running thread had stopped reading -- the same silent deafness in a
-        new place.
+        """The replacement shares the dead thread's callback list.
+        `lgpio.callback` appends to whatever `_notify_thread` is, so a copy
+        would leave later registrations unread.
         """
         corpse, _ = dead
         buttons_mod.revive_dispatch(corpse)
@@ -1835,10 +1476,8 @@ class TestTheReplacementDispatchThread:
 
     def test_the_dead_thread_is_left_exactly_as_it_was_found(self, lgpio,
                                                              dead):
-        """
-        Nothing is joined and nothing is stopped. A dead thread has nothing
-        to wait for, and `_watch` runs on the app's event loop -- a join
-        there is the panel frozen by its own supervisor.
+        """The dead thread is neither joined nor stopped: `_watch` runs on the
+        app's event loop, where a join would freeze the panel.
         """
         corpse, _ = dead
         buttons_mod.revive_dispatch(corpse)
@@ -1850,27 +1489,12 @@ class TestTheReplacementDispatchThread:
 
 
 class TestRevivingLgpiosOwnDispatchThread:
-    """
-    The claim the whole supervisor rests on, measured against lgpio itself.
+    """The repair measured against lgpio itself: lgpio's own `run` dispatches the
+    edges and dies of them, and the shipped `revive_dispatch` puts it back.
 
-    A supervisor that reports a recovery that did not happen is worse than
-    no supervisor: the journal then says the buttons are back when every one
-    of them is still inert. So the repair is not asserted through a stand-in
-    here. lgpio's own `_callback_thread.run` dispatches these edges, lgpio's
-    own dispatch loop dies of them, and the shipped `revive_dispatch` is
-    what is asked to put it back.
-
-    What is substituted is the TRANSPORT, for the reason `RealNotifier`
-    gives: a pipe rather than the `.lgd-nfy*` FIFO lgpio opens at import, so
-    that a test run does not depend on -- or kill -- the process-wide
-    notification thread that everything else in the process shares. The read
-    end is a `BufferedReader` over a pipe either way, which is what the
-    drain below is about.
-
-    Not measured here, because this container has no gpiochip: that the
-    kernel keeps writing alerts into that handle while nothing reads it, and
-    that they are delivered on the far side of a revival. `gpio-sim` is
-    where that is answerable, and it is not available on this machine.
+    Only the transport is substituted, a pipe for the `.lgd-nfy*` FIFO, so the
+    process-wide notification thread is untouched. Not covered: kernel alerts
+    arriving on a real gpiochip while nothing reads.
     """
 
     UP, SPARE = 5, 99
@@ -1884,26 +1508,22 @@ class TestRevivingLgpiosOwnDispatchThread:
         import lgpio
 
         made = RealNotifier()
-        # So that `revive_dispatch`, which repoints the module global as
-        # lgpio's own `callback()` and `gpio_claim_alert` read it, is
-        # working on this one and not on the process's real dispatcher.
-        # monkeypatch puts the real one back afterwards whatever happens.
+        # So `revive_dispatch` works on this thread and not on the process's
+        # real dispatcher.
         monkeypatch.setattr(lgpio, "_notify_thread", made._thread)
         try:
             yield made
         finally:
-            # Whichever thread is now on the handle -- the revived one
-            # shares this one's file object, and stopping the DEAD one
-            # would close that file underneath a running reader.
+            # Whichever thread is now on the handle: the revived one shares the
+            # file object, and stopping the dead one would close it under a
+            # running reader.
             made._thread = lgpio._notify_thread
             made.stop()
 
     def kill(self, dispatcher, *extra):
-        """
-        Kill it the way an unguarded callback does, and prove it is dead.
-
-        `extra` goes into the same write as the killing edge, which is how
-        edges end up inside the reader's own buffer rather than in the pipe.
+        """Kill it the way an unguarded callback does, and prove it is dead.
+        `extra` goes into the same write as the killing edge, so it ends up in
+        the reader's buffer.
         """
         arrived = []
         dispatcher.register(self.UP, lambda c, g, l, t: arrived.append(l))
@@ -1932,17 +1552,9 @@ class TestRevivingLgpiosOwnDispatchThread:
 
     def test_a_dead_dispatcher_is_deaf_even_to_callbacks_added_afterwards(
             self, dispatcher, unhandled):
-        """
-        Why the repair is not "rebuild the panel", stated as a measurement.
-
-        The obvious reading of a dead panel is that fresh `Button`s would
-        arm fresh callbacks and work again. They would not: `lgpio.callback`
-        appends to `_notify_thread.callbacks` (lgpio.py:578) and
-        `gpio_claim_alert` routes the kernel's edges to
-        `_notify_thread._notify` (lgpio.py:1293) -- the module-level
-        singleton, whether or not anything is still reading it. So a
-        supervisor that rebuilt the panel and said so would have been
-        announcing a recovery that had not happened.
+        """A callback registered after the death receives nothing: lgpio routes
+        registrations and edges to the module-level singleton whether or not it
+        is running. So rebuilding the panel is not a repair.
         """
         arrived = self.kill(dispatcher)
 
@@ -1961,10 +1573,8 @@ class TestRevivingLgpiosOwnDispatchThread:
 
     def test_edge_delivery_comes_back_on_the_registrations_already_there(
             self, dispatcher, unhandled):
-        """
-        The repair, and the property it has to buy: an edge on a callback
-        that was armed BEFORE the death, delivered after it, with nothing
-        re-registered and no `Button` rebuilt.
+        """After a revival an edge reaches a callback that was armed before the
+        death, with nothing re-registered.
         """
         import lgpio
 
@@ -1995,23 +1605,12 @@ class TestRevivingLgpiosOwnDispatchThread:
 
     def test_edges_banked_while_the_dispatcher_was_dead_are_not_replayed(
             self, dispatcher, unhandled):
-        """
-        The half that makes recovery safe rather than harmful.
+        """Edges banked while the dispatcher was dead are discarded on revival,
+        not delivered back to back into the menu.
 
-        Nothing drains lgpio's notification pipe while its thread is dead --
-        the read end stays open, because a thread killed inside `cb.func`
-        never reaches the `self._file.close()` at the end of `run()` -- so
-        the presses of an operator jabbing at a panel that does nothing pile
-        up in it. Measured without the drain: all sixty banked edges were
-        delivered back to back at the moment of recovery. On this device
-        that drives the menu at machine speed, and OK and BACK mean opposite
-        things while a job is printing.
-
-        The banked edges are written in the SAME call as the one that kills
-        the thread, which is the case a drain of the file descriptor cannot
-        see: `run` reads through a BufferedReader, so they are already
-        inside Python by then. Measured, in this container: the kernel held
-        0 bytes and the reader held 960.
+        They are written in the same call as the killing edge, so they sit in
+        the BufferedReader where a drain of the descriptor alone would miss
+        them.
         """
         banked = [dispatcher.frame(self.UP, level=n % 2) for n in range(60)]
         arrived = self.kill(dispatcher, *banked)
@@ -2030,8 +1629,8 @@ class TestRevivingLgpiosOwnDispatchThread:
             f"A drain that reads the descriptor rather than the file object "
             f"sees none of it -- the BufferedReader already has it")
 
-        # And the panel is genuinely back, rather than quiet because the
-        # drain is still eating everything.
+        # And the panel is back, not quiet because the drain is still eating
+        # everything.
         dispatcher.fire(self.UP)
         deadline = time.monotonic() + 3
         while not arrived and time.monotonic() < deadline:
@@ -2080,14 +1679,9 @@ class TestRealGpiozero:
             Device.pin_factory = None
 
     def test_gpiozero_lets_a_callback_exception_straight_out(self):
-        """
-        The assumption `dispatch_for` above is built on, checked against
-        the library rather than by reading it.
-
-        MockFactory dispatches on the caller's thread, so "gpiozero does
-        not catch" shows up right here as a raise out of `drive_low()`. In
-        production that same raise lands in lgpio's dispatch thread, where
-        there is nothing above it either.
+        """gpiozero does not catch a callback's exception: with MockFactory it
+        comes straight out of `drive_low()`. This is the assumption
+        `dispatch_for` rests on.
         """
         pytest.importorskip("gpiozero")
         from gpiozero import Button, Device
@@ -2110,14 +1704,8 @@ class TestRealGpiozero:
             Device.pin_factory = None
 
     def test_a_raising_shipped_callback_does_not_escape_gpiozero(self):
-        """
-        The same property as the stand-in section, through the real chain:
-        a press whose callback raises, and then a press that must arrive.
-
-        The control for it is the test directly above -- same factory, same
-        pin, same kind of exception -- which shows that an unguarded
-        callback does escape here. So this test passing is the guard
-        working, not gpiozero quietly absorbing it.
+        """Through real gpiozero, a press whose shipped callback raises does not
+        escape and the next press arrives. The test above is its control.
         """
         pytest.importorskip("gpiozero")
         from gpiozero import Device

@@ -29,12 +29,9 @@ for tool in docker pandoc weasyprint; do
         exit 1
     }
 done
-# build-docker.sh runs `which qemu-aarch64` on the HOST and exits if it is
-# missing, so registering binfmt via a container is not enough on x86.
-#
-# It has to be the NON-static name. qemu-user-static ships only
-# qemu-aarch64-static, which this check used to accept -- passing here and
-# then failing inside pi-gen with a much less obvious message.
+# build-docker.sh runs `which qemu-aarch64` on the host and exits if it is
+# missing. It must be the non-static name: qemu-user-static ships only
+# qemu-aarch64-static.
 case "$(uname -m)" in
     aarch64|arm*) ;;
     *)
@@ -75,29 +72,22 @@ chmod +x "$PI_GEN_DIR/stage-otpunit/prerun.sh" \
 # it so the build produces only the print unit.
 touch "$PI_GEN_DIR/stage2/SKIP_IMAGES"
 
-# Packages come from the same manifest install.sh uses. This must live in
-# the SUB-stage directory: pi-gen looks for ${i}-packages inside each
-# sub-stage and only descends into directories, so a file at the stage root
-# is skipped without a word and the image ships with none of them.
+# Packages come from the same manifest install.sh uses. The file must live
+# in the sub-stage directory: pi-gen looks for ${i}-packages only there.
 grep -vE '^\s*(#|$)' "$REPO_DIR/device/packages.txt" | tr '\n' ' ' \
     > "$PI_GEN_DIR/stage-otpunit/01-otpunit/00-packages-nr"
-# -nr: pi-gen installs that list with --no-install-recommends, as
-# install.sh does. A plain 00-packages pulls in every Recommends, so the
-# image carried software the manifest never named and no hand-provisioned
-# unit had.
+# -nr: installed with --no-install-recommends, as install.sh does.
 rm -f "$PI_GEN_DIR/stage-otpunit/01-otpunit/00-packages"
 
-# STAGE_LIST has to be explicit. Under pi-gen's default `stage*` glob,
-# "stage-otpunit" sorts BEFORE "stage0" ('-' is 0x2D, '0' is 0x30) and would
-# run first, against an empty rootfs.
-# DEPLOY_DIR is deliberately left at pi-gen's default. It is honoured
-# *inside* the container, so pointing it at a host path just writes the
-# image somewhere the container's own `docker cp` never looks.
+# STAGE_LIST has to be explicit: under pi-gen's default `stage*` glob,
+# "stage-otpunit" sorts before "stage0" and would run against an empty
+# rootfs.
+# DEPLOY_DIR stays at pi-gen's default: it is honoured inside the container,
+# where a host path is not what `docker cp` reads.
 # FIRST_USER_PASS is required whenever DISABLE_FIRST_BOOT_USER_RENAME is
-# set. pi-gen feeds it to chpasswd as PLAINTEXT, so it is always a random
-# value nobody keeps: the account then has a password no one knows, and the
-# login prompt on tty2 is usable only by an operator who seeds their own
-# credential (userconf.txt on the boot partition; see docs/IMAGE.md).
+# set. pi-gen feeds it to chpasswd as plaintext, so it is a random value
+# nobody keeps; the tty2 login is usable only by an operator who seeds
+# userconf.txt on the boot partition (see docs/IMAGE.md).
 #
 # OTP_USER_PASS_HASH, if set, is a crypt(3) string applied by the stage with
 # `chpasswd -e`. It ships in the image, where anyone holding the .img.xz
@@ -111,23 +101,10 @@ FIRST_USER_NAME='otp'
 FIRST_USER_PASS='$(head -c 18 /dev/urandom | base64)'
 DISABLE_FIRST_BOOT_USER_RENAME=1
 ENABLE_SSH=0
-# Does NOT remove the packages, whatever the name says.
-# stage2/04-cloud-init has two halves and this knob guards one:
-# 01-run.sh, which preseeds a NoCloud datasource, checks it; the sibling
-# 00-packages, which lists cloud-init and rpi-cloud-init-mods, is collected
-# and installed with no condition anywhere in that path. So the line means
-# "do not preseed a datasource" and nothing more, and every image this
-# project built before issue #34 shipped a cloud-init that ran.
-# stage-otpunit/01-otpunit/00-run.sh is what removes them now -- an
-# apt-get purge there, guarded by a simulation that refuses to take a
-# reverse dependency with them (backticks are left out of this comment on
-# purpose: pi-gen's config is written from an unquoted heredoc, so a pair
-# of them here would be command substitution running on the build host)
-# -- and device/install.sh still writes
-# cloud-init's own kill switch afterwards, for a machine that gets the
-# package back and for the hand-provisioned Pis no purge ever ran on.
-# The knob stays because leaving the seed files off is still what is
-# wanted; it is simply not the thing that does the work.
+# Only stops pi-gen preseeding a NoCloud datasource; stage2 still installs
+# the cloud-init packages. stage-otpunit/01-otpunit/00-run.sh purges them
+# and device/install.sh writes cloud-init's kill switch. No backticks in
+# this comment: the heredoc is unquoted, so they would run on the build host.
 ENABLE_CLOUD_INIT=0
 LOCALE_DEFAULT='en_GB.UTF-8'
 KEYBOARD_KEYMAP='gb'

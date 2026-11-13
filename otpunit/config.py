@@ -42,9 +42,8 @@ PAPER_LABELS = {
 }
 
 # How long a panel-less unit waits after the status sheet before printing
-# a pair. Offered on the panel too, because the reason to change it is to
-# set a unit up now and run it headless later -- and the alternative is
-# powering down and editing a file on the SD card in another computer.
+# a pair. Offered on the panel too, so a unit can be set up now and run
+# headless later.
 AUTO_DELAY_CHOICES = (0, 60, 300, 900, 3600)
 
 
@@ -70,11 +69,9 @@ class Settings:
     font_size: float = 9.0
     paper: str = "A4"
     # --- unattended operation ------------------------------------------
-    # What the unit does when there is no panel and no buttons attached.
-    # Defaulting this ON is deliberate. A unit that can only tell you to go
-    # and find an SSD1306 is useless to someone who cannot get one, and the
-    # pads are the point -- the panel only ever chose a codeword and a page
-    # count, both of which have perfectly good defaults.
+    # What the unit does with no panel and no buttons attached. On by
+    # default: the pads are the point, and the panel only chooses a
+    # codeword and a page count, both of which have defaults.
     auto_print: bool = True
     # Seconds between the status sheet and the pad. Long enough to read the
     # sheet and pull the plug, short enough not to abandon someone.
@@ -84,10 +81,8 @@ class Settings:
     auto_swap_delay: int = 90
     # Empty means roll one. Set it to agree a codeword out of band.
     auto_codeword: str = ""
-    # Print the manual before the pads. On by default and deliberately so:
-    # a pad is useless to someone who does not know the rules, and one
-    # reused page undoes the whole scheme. Costs paper, which is the right
-    # trade for the situation this mode exists for.
+    # Print the manual before the pads. On by default: a pad is useless to
+    # someone who does not know the rules. Costs paper.
     auto_manual: bool = True
     # Live pads are refused unless the root filesystem is a RAM overlay.
     # Set this only on a machine that deliberately has none -- a laptop
@@ -105,20 +100,13 @@ class Settings:
         CUPS options: the media size, and the two defaults that would
         otherwise silently invalidate the cut geometry.
 
-        `print-scaling=none` is the important one. The imposition is baked
-        into the PDF at exact millimetre positions and the crop marks are a
-        promise about where the blade goes -- but cups-filters defaults
-        print-scaling to `auto`, which fits the page to the printable area.
-        On a printer with a 4.23mm unprintable band that is roughly a 4%
-        shrink, so every cut lands off the mark and the two halves of a pair
-        no longer match. This code used to only send `media` and rely on the
-        driver doing nothing; a comment even named the risk. Saying nothing
-        is not the same as saying no.
+        `print-scaling=none`: the imposition is baked into the PDF at exact
+        positions, and cups-filters' default `auto` shrinks the page to the
+        printable area, so every cut would land off the crop marks.
 
-        `sides=one-sided` guards a queue that defaults to duplex, which
-        would put two pad pages on one slip of paper -- and "destroy the
-        page after use" has no answer for a page with another page's key on
-        its back.
+        `sides=one-sided`: a duplex default would put two pad pages on one
+        slip of paper, and a page cannot be destroyed after use if another
+        page's key is on its back.
         """
         fixed = {"print-scaling": "none", "sides": "one-sided"}
         if self.a7:
@@ -156,12 +144,8 @@ class Settings:
         problems = []
         if self.pages < 1:
             problems.append("pages must be at least 1")
-        # The same ceiling the CLI enforces. It landed there and not here,
-        # but this is the side that reads a hand-edited file off the boot
-        # partition, so it is the side that actually receives a silly
-        # number. Above 9999 the page-number field runs to five digits while
-        # the manual's message header stays four, and the two ends stop
-        # being able to name the same page.
+        # The same ceiling the CLI enforces. Above it the page number runs
+        # to five digits while the message header stays four.
         if self.pages > MAX_PAGES:
             problems.append(f"pages cannot exceed {MAX_PAGES}")
         if self.with_auth and self.auth_size < 1:
@@ -184,12 +168,10 @@ class Settings:
         elif self.auto_codeword and gen.fit_codeword_size(
                 self.auto_codeword, self.font_size, self.a7, self.with_auth,
                 self.auth_size) is None:
-            # Unchecked, a long one printed at the minimum size straight
-            # through the AUTH group on every page of the pad.
+            # A codeword too long to fit would print through the AUTH group.
             problems.append("auto codeword too long for the page header")
-        # isfinite as well as > 0: nan compares False against BOTH bounds, so
-        # a bare `<= 0` check lets it through to calc_max_chars, which then
-        # raises out of load() before the panel exists.
+        # isfinite as well as > 0: nan compares False against both bounds
+        # and would make calc_max_chars raise below.
         if not math.isfinite(self.font_size) or self.font_size <= 0:
             # Return here: calc_max_chars divides by a font-size-derived
             # spacing, so a bad size would raise instead of reporting.
@@ -287,12 +269,10 @@ def render(settings: Settings) -> str:
         "",
     ]
     for key, value in asdict(settings).items():
-        # The unit reads auto_codeword but never writes one. A codeword is
-        # not key material, but it names a live pad, and the SD card is the
-        # part most likely to be captured together with the unit -- so the
-        # card must never learn which pad this unit produced. A human who
-        # deliberately puts one there is making their own trade; the unit
-        # does not make it for them, and does not record it afterwards.
+        # The unit reads auto_codeword but never writes one. A codeword
+        # names a live pad, and the SD card is the part most likely to be
+        # captured with the unit, so the card must never learn which pad
+        # this unit produced.
         if key == "auto_codeword":
             continue
         if isinstance(value, bool):
@@ -319,11 +299,8 @@ def save(settings: Settings, path: str = CONFIG_PATH, remount: bool = True) -> b
     if not remount:
         return False
 
-    # Only reached when the partition is genuinely read-only. Remount, write,
-    # and put it back exactly as it was -- the previous version's `finally`
-    # was attached to the wrong `try`, so a write that failed for an
-    # unrelated reason (a full boot partition, say) left the filesystem
-    # remounted read-only as a side effect.
+    # Only reached when the partition is read-only. Remount, write, and
+    # put it back as it was whether or not the write succeeded.
     if not _remount(directory, "rw"):
         return False
     try:

@@ -1,11 +1,6 @@
-"""Regression tests for defects found by adversarial review.
-
-Two themes run through these. First, this is a headless appliance: a screen
-stack that empties, or a screen with no exit, leaves an operator holding a
-dark panel and three dead buttons with nothing to do but pull the power.
-Second, the pad pair is unrecoverable: there are exactly two copies and no
-third, so anything that destroys the key mid-pair, or truncates one copy,
-loses the pad for good.
+"""Safety regressions for the print unit. Two themes: a headless appliance must
+never leave the operator at a screen with no exit, and the pad pair is
+unrecoverable, so nothing may destroy the key mid-pair or truncate one copy.
 """
 import itertools
 import sys
@@ -18,9 +13,8 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-# A path under the temp dir, not "/nonexistent": the suite runs as
-# root, where that absolute path is perfectly writable, and any test
-# reaching SAVE SETTINGS created a real file at the host's root.
+# Under the temp dir, not "/nonexistent": the suite runs as root, where that
+# path is writable.
 SCRATCH_CONFIG = str(pathlib.Path(tempfile.gettempdir()) /
                      "otp-unit-test.conf")
 
@@ -105,12 +99,8 @@ class TestTheUnitCannotBeBricked:
         assert got == []
 
     def test_no_screen_traps_the_operator(self):
-        """
-        From any reachable state, some button sequence returns to the root.
-
-        This is the property the whole navigation model has to have: an
-        appliance with three buttons and no keyboard cannot afford a screen
-        that only ever pushes.
+        """From any reachable state some button sequence returns to the root: a
+        three-button appliance cannot afford a screen that only pushes.
         """
         def escapes(prefix, depth=4):
             for combo in itertools.product(ALL_PRESSES, repeat=depth):
@@ -124,13 +114,9 @@ class TestTheUnitCannotBeBricked:
         assert escapes([Press.OK, Press.DOWN, Press.DOWN, Press.OK])
 
     def test_no_job_stage_traps_the_operator(self):
-        """
-        Every RunJob stage must have an exit, including the ones only a
-        misbehaving printer can reach.
-
-        The App-level search above cannot see these: generation drains the
-        scripted presses, so a whole-app walk never gets past a job start.
-        Drive RunJob directly instead.
+        """Every RunJob stage has an exit, including those only a misbehaving
+        printer reaches. RunJob is driven directly because a whole-app walk
+        never gets past a job start.
         """
         stages = ("confirm", "printing", "waiting", "confirm_continue",
                   "swap", "cancelled", "abandoned", "error", "done")
@@ -146,9 +132,7 @@ class TestTheUnitCannotBeBricked:
                 if screen.job is None:
                     screen.job = jobs.PadPairJob(screen.spec, cups)
 
-            # Not a trap if some press either leaves the screen or moves it
-            # to a different stage. Standing still on every button is what
-            # strands an operator with no keyboard.
+            # Not a trap if some press leaves the screen or changes its stage.
             moved = False
             for press in (Press.BACK, Press.OK):
                 before = screen.stage
@@ -173,8 +157,8 @@ class TestTheUnitCannotBeBricked:
         assert app.shutdown_requested is True
 
     def test_can_shut_down_while_waiting_for_a_printer(self):
-        # An unsupported printer would otherwise strand the operator here
-        # with every button inert.
+        # An unsupported printer must not strand the operator with every button
+        # inert.
         app = make_app([Press.BACK], cups=Cups(no_devices=True))
         assert app.wait_for_printer() is False
         assert app.shutdown_requested is True
@@ -187,13 +171,9 @@ class TestThePairIsNeverSilentlyLost:
         return ui.RunJob(spec)
 
     def test_neither_transition_proceeds_while_the_queue_is_busy(self):
-        """
-        lp returns once a job is spooled, so "the tray is clear" is the
-        operator's guess about paper, not about the queue.
-
-        Starting copy B early interleaves the two copies in one tray;
-        purging early cancels the rest of copy B and destroys the key,
-        leaving a truncated half-pair that cannot be regenerated.
+        """Neither copy B nor the purge starts while the queue is busy. lp returns
+        once a job is spooled, so starting B early interleaves the copies and
+        purging early destroys the key with copy B incomplete.
         """
         cups = Cups(busy=3)
         app, screen = make_app([]), self._job(cups)
@@ -221,13 +201,8 @@ class TestThePairIsNeverSilentlyLost:
         assert cups.purged == 1
 
     def test_waiting_always_has_a_way_out(self):
-        """
-        A queue that never drains must not trap the operator.
-
-        CUPS' default ErrorPolicy holds a job in the queue indefinitely
-        after a jam, and three buttons cannot run cupsenable. Without an
-        unconditional exit the operator has live key material on screen and
-        no option but to pull the power.
+        """A queue that never drains still offers an exit: a jammed job can sit in
+        the queue indefinitely, and three buttons cannot run cupsenable.
         """
         cups = Cups(busy=1)                # never drains
         app, screen = make_app([]), self._job(cups)
@@ -236,9 +211,8 @@ class TestThePairIsNeverSilentlyLost:
         screen.press(app, Press.OK)
         assert screen.stage == "waiting"
 
-        # Giving up asks first: this screen invites repeated OK, and a tap
-        # held a beat too long would otherwise purge the queue and zero the
-        # key with no confirmation.
+        # Giving up asks first: this screen invites repeated OK, and one press
+        # too many must not zero the key.
         screen.press(app, Press.BACK)
         assert screen.stage == "confirm_abandon"
         assert cups.purged == 0, "nothing destroyed until confirmed"
@@ -314,10 +288,8 @@ class TestCancellationIsReal:
         assert cups.purged == 1, "and must not leave key material behind"
 
     def test_the_panel_moves_during_an_imposed_job(self):
-        """
-        The imposed layouts report progress per SHEET, so a `done % 10`
-        redraw test fired once -- at the very end, after the panel had sat
-        at 0/10 for the whole job.
+        """The panel redraws during an imposed job. Imposed layouts report
+        progress per sheet, so the redraw rule must not assume per-page counts.
         """
         cups = Cups()
         app = make_app([], cups=cups)
@@ -331,11 +303,9 @@ class TestCancellationIsReal:
         assert shown[0] != shown[-1]
 
     def test_presses_banked_during_spooling_are_discarded(self):
-        # submit() blocks on a multi-megabyte PDF. Presses made at the
-        # frozen panel were aimed at what was on screen, not at what comes
-        # next; replaying them can abandon a pair. Driven at _print_copy
-        # directly, because a scripted press cannot be timed to land
-        # between generation finishing and spooling starting.
+        # submit() blocks on a multi-megabyte PDF, and presses made at the
+        # frozen panel must not replay. Driven at _print_copy directly, since a
+        # scripted press cannot be timed between generation and spooling.
         cups = Cups()
         app = make_app([], cups=cups)
         spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "X-Y", config.Settings(pages=1))
@@ -352,10 +322,9 @@ class TestCancellationIsReal:
         assert len(cups.submitted) == 2
 
     def test_presses_made_during_generation_do_not_replay_afterwards(self):
-        """
-        Generation blocks the event loop. Un-drained presses would arrive
-        immediately afterwards and skip the swap prompt, spooling both
-        copies of the pair back to back into one interleaved stack.
+        """Presses made while generation blocks the event loop are drained.
+        Replayed, they would skip the swap prompt and spool both copies into
+        one stack.
         """
         cups = Cups()
         spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "RUSTED-BADGER",
@@ -370,8 +339,7 @@ class TestCancellationIsReal:
 
 class TestConfigIsTrusted:
     def test_a_hand_edited_negative_auth_size_cannot_blank_the_pad(self):
-        # auth_size < 0 shortens the key draw instead of lengthening it,
-        # and at -chars_per_page produces entirely blank pad pages.
+        # auth_size < 0 would shorten the key draw.
         assert config.Settings(auth_size=-700).validate()
 
     def test_bad_values_fall_back_instead_of_being_used(self, tmp_path):
@@ -383,9 +351,8 @@ class TestConfigIsTrusted:
         assert loaded.pages == config.Settings().pages
 
     def test_load_never_raises_on_any_hand_edited_value(self, tmp_path):
-        # load() runs before the panel exists, so anything it raises is a
-        # crash loop into systemd's start limit: dark panel, no message.
-        # font_size = 0 used to divide by zero inside validate().
+        # load() runs before the panel exists, so anything it raises is a crash
+        # loop with a dark panel.
         path = tmp_path / "c.conf"
         for line in ("font_size = 0", "font_size = -1", "font_size = 999",
                      "pages = -1", "auth_size = -700", "paper = A3",
@@ -400,8 +367,8 @@ class TestConfigIsTrusted:
         assert config.Settings(font_size=9).validate() == []
 
     def test_letter_quarter_is_measured_against_letter(self):
-        # A Letter quarter is shorter than A6; measuring against A6 let key
-        # rows fall below the guillotine line.
+        # A Letter quarter is shorter than A6, so the fit is measured against
+        # the quarter.
         assert config.Settings(paper="LETTER", font_size=18).validate()
 
     def test_a_writable_path_needs_no_remount(self, tmp_path, monkeypatch):
@@ -424,14 +391,10 @@ class TestConfigIsTrusted:
 
 
 class TestQueueQueriesFailSafe:
-    """
-    An unanswerable queue query must never read as "nothing queued".
-
-    Cups._text swallows a wedged cupsd, a missing lpstat and an unknown
-    destination alike. Reporting all of those as an empty queue let both
-    job transitions through at once: copy B spooled while A was still
-    printing, then the spool purged, then PAIR COMPLETE on the panel over
-    an interleaved and truncated pair.
+    """An unanswerable queue query never reads as "nothing queued". Cups._text
+    swallows a wedged cupsd, a missing lpstat and an unknown destination alike,
+    and reading those as empty lets copy B and the purge through over a copy A
+    still printing.
     """
 
     def _wedged(self):
@@ -506,13 +469,9 @@ class TestManualIsHandledWhenAbsent:
 
 
 class TestCodewordNeverLeavesTheProcess:
-    """
-    The codeword must be absent from BOTH the job envelope and the document.
-
-    Checking only the envelope is what let the codeword sit in the PDF's
-    /Title for a whole review round: page content is Flate-compressed, but
-    the document Info dictionary is not, so a `strings` pass over a spooled
-    job or a printer's stored copy reads it straight out.
+    """The codeword is absent from both the job envelope and the document. Page
+    content is Flate-compressed but the PDF Info dictionary is not, so a /Title
+    would be readable from a spooled job.
     """
 
     def _submit_a_pair(self, codeword="RUSTED-BADGER", **settings):
@@ -536,8 +495,8 @@ class TestCodewordNeverLeavesTheProcess:
             assert b"BADGER" not in submission["data"]
 
     def test_the_pdf_is_not_dated(self):
-        # A timestamp in the metadata dates the pad, and lets a captured
-        # printer job be correlated with its twin.
+        # A timestamp in the metadata dates the pad and lets a captured job be
+        # correlated with its twin.
         cups = self._submit_a_pair()
         data = cups.submitted[0]["data"]
         assert b"D:2000" in data, "reportlab's invariant date should be pinned"
@@ -546,8 +505,8 @@ class TestCodewordNeverLeavesTheProcess:
 
     def test_training_state_does_not_reach_the_printer(self):
         cups = self._submit_a_pair(training=True)
-        # The watermark is drawn into the compressed page stream; what must
-        # not leak is an uncompressed metadata marker.
+        # The watermark is in the compressed page stream; what must not leak is
+        # an uncompressed metadata marker.
         assert b"/Title (OTP)" in cups.submitted[0]["data"]
 
     def test_every_job_kind_scrubs_its_metadata(self):
@@ -564,11 +523,8 @@ class TestCodewordNeverLeavesTheProcess:
 
 
 class TestSwapAsksBeforeDestroying:
-    """
-    The swap screen has the same consequence as the waiting screen -- copy
-    A on the tray, the key zeroed, the pair impossible to finish -- and
-    round four gave `waiting` a confirmation and left `swap` on a single
-    unconfirmed press.
+    """Abandoning at the swap screen asks for confirmation, as the waiting screen
+    does: it zeroes the key with only copy A printed.
     """
 
     def _at_swap(self):
@@ -591,8 +547,8 @@ class TestSwapAsksBeforeDestroying:
         assert any(buffer), "the key must not be zeroed before confirmation"
 
     def test_declining_returns_to_swap_not_to_waiting(self):
-        # Landing on `waiting` would tell an operator a job is printing
-        # when the queue is idle and copy B has not been submitted.
+        # Landing on `waiting` would claim a job is printing when the queue is
+        # idle.
         app, screen, _ = self._at_swap()
         screen.press(app, Press.BACK)
         screen.press(app, Press.BACK)
@@ -606,8 +562,8 @@ class TestSwapAsksBeforeDestroying:
         assert len(cups.submitted) == 2
 
     def test_confirming_destroys_the_key(self):
-        # Hold the buffer itself, so this checks that the bytes were
-        # overwritten rather than that a reference was dropped.
+        # Hold the buffer itself, to check the bytes were overwritten and not
+        # just dereferenced.
         app, screen, _ = self._at_swap()
         buffer = screen.job._buffer
         assert any(buffer), "precondition: the key is live"
@@ -633,17 +589,9 @@ class TestSwapAsksBeforeDestroying:
 
 
 class TestAnUnanswerableQueueHasANonDestructiveExit:
-    """
-    active_jobs returns None when the queue cannot be asked at all -- a
-    wedged cupsd, a missing lpstat, a destination that has gone away. That
-    is deliberately counted as busy, because treating it as drained would
-    spool copy B over copy A and then purge the spool.
-
-    But counting it as busy and stopping there is its own trap. If the
-    query never recovers, `waiting` never clears, and the only other exit
-    is the abandon prompt -- so an operator whose pair printed perfectly is
-    offered nothing but destroying it. There has to be a way to say "I can
-    see the tray, it is done" that does not zero the key.
+    """active_jobs returns None when the queue cannot be asked, and that counts as
+    busy. If it never recovers, the operator still needs a way to say "the tray
+    shows copy A is done" that does not zero the key.
     """
 
     def _stuck(self, pages=2):
@@ -662,7 +610,7 @@ class TestAnUnanswerableQueueHasANonDestructiveExit:
         return app, screen, cups
 
     def test_an_unanswerable_queue_still_blocks_the_transition(self):
-        # The conservative half must not have been lost in the fix.
+        # Unknown still counts as busy.
         _, screen, cups = self._stuck()
         assert screen.queue_unknown
         assert len(cups.submitted) == 1, "copy B must not be spooled over A"
@@ -682,10 +630,8 @@ class TestAnUnanswerableQueueHasANonDestructiveExit:
         assert any(buffer), "asking must not itself zero the key"
 
     def test_drumming_on_ok_can_never_reach_the_override(self):
-        # The override exists because `waiting` is otherwise a trap, but it
-        # must not be reachable by the impatience the screen invites: OK
-        # here means "check again", and walking it through to `swap` would
-        # spool copy B over a copy A that may still be printing.
+        # The override must not be reachable by repeated OK: OK here means
+        # "check again", or copy B could spool over a copy A still printing.
         app, screen, cups = self._stuck()
         for _ in range(12):
             screen.press(app, Press.OK)
@@ -728,8 +674,8 @@ class TestAnUnanswerableQueueHasANonDestructiveExit:
         assert not any(buffer)
 
     def test_a_busy_queue_is_not_treated_as_unanswerable(self):
-        # The two must stay distinguishable, or the manual override would
-        # be offered while copy A is genuinely still printing.
+        # The two must stay distinguishable, or the override would be offered
+        # while copy A is printing.
         cups = Cups(busy=3)
         spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "X-Y",
                             config.Settings(pages=1))
@@ -744,10 +690,9 @@ class TestAnUnanswerableQueueHasANonDestructiveExit:
 
 
 class TestQueueSetupNeverEscapes:
-    """
-    ensure_queue runs on the boot path, next to a cupsd that is itself
-    still starting. App.run catches only PrinterError, so anything else
-    unwinds run() into Restart=on-failure and a dark panel.
+    """ensure_queue raises nothing but PrinterError. It runs on the boot path and
+    App.run catches only that; anything else ends in a restart loop and a dark
+    panel.
     """
 
     def _cups(self, raiser):
@@ -775,10 +720,9 @@ class TestQueueSetupNeverEscapes:
 
 
 class TestAFailedSetupLeavesNoQueue:
-    """
-    lpadmin exits non-zero on a bad -m but creates the queue anyway. An
-    enabled queue with no driver accepts a whole pad and never prints it,
-    and the caller goes on using the same queue name.
+    """A failed setup removes the queue. lpadmin exits non-zero on a bad -m but
+    creates the queue anyway, and a driverless queue accepts a whole pad and
+    never prints it.
     """
 
     class Recorder:
@@ -810,10 +754,8 @@ class TestAFailedSetupLeavesNoQueue:
 
 
 class TestPurgeClearsTheFilterScratchFiles:
-    """
-    cancel -x empties RequestRoot but not TempDir, and CUPS SIGKILLs the
-    filter chain, so Ghostscript leaves its scratch file behind holding
-    plaintext key material.
+    """purge() also wipes TempDir. cancel -x empties RequestRoot only, and the
+    killed filter chain leaves a scratch file holding plaintext key material.
     """
 
     def test_temp_files_are_removed(self, tmp_path, monkeypatch):
@@ -858,14 +800,9 @@ class TestPurgeClearsTheFilterScratchFiles:
 
 
 class TestTheUnitNeverBindsALanPrinter:
-    """
-    The device is meant to be offline. Binding a printer across the network
-    sends every pad it prints to a machine in another room, and nothing on
-    the panel names the bound device.
-
-    "Accept dnssd whenever something is plugged into USB" failed in the
-    worst direction: it never checked the dnssd entry WAS the plugged-in
-    printer, and driverless endpoints sort first.
+    """Only the USB-attached printer is ever bound. A network printer would send
+    every pad to a machine in another room, so a dnssd entry is accepted only
+    when it is the plugged-in printer.
     """
 
     USB = "direct usb://Brother/HL-2030%20series?serial=A1B2C3"
@@ -907,6 +844,6 @@ class TestTheUnitNeverBindsALanPrinter:
         assert self._devices("network lpd", "network ipp", "file cups-pdf:/") == []
 
     def test_an_unparseable_usb_uri_does_not_wave_the_lan_through(self):
-        # _pretty returns "" for a URI it cannot read; an empty token list
-        # must not match every printer on the network.
+        # _pretty returns "" for a URI it cannot read; an empty token list must
+        # not match every network printer.
         assert self._devices("direct usb://", self.LAN) == ["usb://"]

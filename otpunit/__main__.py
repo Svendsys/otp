@@ -28,17 +28,9 @@ class SimulatedCups(Cups):
     """A printer that always exists and swallows jobs, for --sim."""
 
     def __init__(self):
-        # temp_dir to a scratch path, NOT the inherited /run/cups/tmp.
-        # _clear_temp is reachable from --sim without being overridden:
-        # unattended.run's finally block calls job.finish(purge=False)
-        # whenever anything raises before `purge = drained` is assigned, and
-        # finish() calls cups._clear_temp(). On the unit itself, or any dev
-        # box that has run install.sh, that unlinks every file in the REAL
-        # daemon's live spool scratch, as root, destroying another job's
-        # in-flight filter output. Overriding the DIRECTORY fixes every path
-        # that can reach it, rather than the one method someone remembered
-        # to stub -- which is how this was missed: the completeness test
-        # listed six method names by hand and _clear_temp was not among them.
+        # temp_dir is a scratch path, not the inherited /run/cups/tmp:
+        # _clear_temp is reachable from --sim and would otherwise unlink
+        # the real daemon's scratch files on a machine with CUPS installed.
         super().__init__(run=None,
                          temp_dir=tempfile.mkdtemp(prefix="otp-sim-cups-"))
         self.submitted = []
@@ -57,20 +49,13 @@ class SimulatedCups(Cups):
         return 0
 
     def printer_fault(self, name="OTP"):
-        # Stubbed for the same reason active_jobs is. RunJob consults this
-        # before it will call a copy finished, and the inherited one shells
-        # out to the host's `lpstat -p OTP` -- which on the unit itself, or
-        # any machine that has run install.sh, is a REAL queue. Left
-        # inherited, `--sim` reported the host printer's fault over a
-        # simulated pad that reached no printer at all, and blocked for up
-        # to Cups.TIMEOUT doing it.
+        # Stubbed like active_jobs: the inherited one shells out to the
+        # host's lpstat, which may be a real queue.
         return None
 
     def state_reasons(self, name="OTP"):
-        # [] and not None. None means "could not ask", which the UI is
-        # required to treat as unknown rather than as clean, and a simulated
-        # printer that reports "I could not be asked" would park --sim on
-        # the recovery path for a queue that does not exist.
+        # [] and not None: None means "could not ask", which the UI treats
+        # as unknown, not clean.
         return []
 
     def queue_stopped(self, name="OTP"):
@@ -108,15 +93,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="OTP pad print unit")
     parser.add_argument("--sim", action="store_true",
                         help="run in the terminal with a simulated printer")
-    # 1 and 3 are absent deliberately: they give a 64x128 portrait panel and
-    # the 21x8 character grid is landscape, so half of every row was being
-    # cut off. See Ssd1306Display.SQUARE_ON.
-    # luma counts rotate in NINETY-degree steps (angle = rotate * -90), so
-    # 2 is half a turn. Saying "N*180" here was arithmetically wrong and
-    # pointed at the value that is no longer accepted: someone wanting an
-    # upside-down panel reads it, computes N=1, and argparse exits 2 --
-    # which under Restart=on-failure with RestartSec=15 is an unbounded
-    # restart loop on an appliance with no console to read the error on.
+    # 1 and 3 are absent deliberately: they give a 64x128 portrait panel
+    # (see Ssd1306Display.SQUARE_ON). luma counts rotate in 90-degree
+    # steps, so 2 is half a turn.
     parser.add_argument("--rotate", type=int, default=0, choices=(0, 2),
                         help="0 for upright, 2 for upside-down (180 degrees). "
                              "90 and 270 need a portrait layout the 21x8 "
@@ -137,9 +116,8 @@ def main(argv=None):
         log(f"live pads refused -- {refuse_live}")
 
     if args.sim:
-        # allow_quit only in the simulator: on a real unit QUIT ends the
-        # process with status 0, and Restart=on-failure reads that as
-        # success and does not restart.
+        # allow_quit only in the simulator: on a real unit QUIT would end
+        # the process.
         interface = hmi.Interface(ConsoleDisplay(),
                                   KeyboardButtons(allow_quit=True),
                                   "terminal", "keyboard")
@@ -153,16 +131,11 @@ def main(argv=None):
         cups = Cups()
         log(f"interface -- {interface.describe()}")
 
-    # No menu without something to draw on AND something to press. That is
-    # not an error: it is the case this device exists for, so fall through
-    # to printing unattended, using the printer itself as the interface.
-    # An interface that nobody answers is not an interface. See
-    # Interface.prove: opening GPIO buttons proves only that a pin could
-    # be reserved, so without this a monitor plus no buttons walks into a
-    # menu that blocks forever instead of printing.
-    # --diagnostic goes headless whatever is attached, so it must not sit
-    # through the prove window first: it drew PRESS ANY BUTTON on the panel,
-    # waited twenty seconds and then discarded the answer.
+    # No menu without something to draw on and something to press. That is
+    # not an error: fall through to printing unattended, with the printer
+    # as the interface. An interface nobody answers does not count either
+    # (see Interface.prove). --diagnostic goes headless whatever is
+    # attached, so it skips the prove window.
     driven = (not args.diagnostic and interface.interactive
               and (args.sim or _prove(interface, log)))
 
@@ -204,11 +177,9 @@ def main(argv=None):
         return 0
     if args.sim:
         return 0
-    # The menu ended without anyone asking to shut down -- a hangup, a
-    # stray key, an empty screen stack. Exit NON-ZERO so systemd's
-    # Restart=on-failure brings the unit back. Returning 0 here told
-    # systemd the appliance had finished its job, and it stayed off until
-    # somebody power-cycled it.
+    # The menu ended without a shutdown request (a hangup, a stray key, an
+    # empty screen stack). Exit non-zero so systemd's Restart=on-failure
+    # brings the unit back.
     log("panel exited without a shutdown request; restarting")
     return 1
 

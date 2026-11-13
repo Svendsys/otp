@@ -1,9 +1,6 @@
-"""Tests for in-memory generation, cancellation, and the new print jobs.
-
-The load-bearing test here is test_nothing_touches_the_filesystem. The print
-unit generates key material straight into RAM and pipes it to the printer so
-that no pad ever becomes a file; if anyone reintroduces a temporary file, this
-must fail loudly.
+"""Tests for in-memory generation, cancellation and the print jobs. The print unit
+generates key material into RAM and pipes it to the printer;
+test_nothing_touches_the_filesystem fails if a temporary file is reintroduced.
 """
 import collections
 import io
@@ -80,12 +77,8 @@ class TestInMemoryGeneration:
         assert set(tmp_path.rglob("*")) == before, "generation must not create files"
 
     def test_two_runs_never_share_key_material(self):
-        """
-        Regenerating is not a way to reprint a pad.
-
-        The pair must come from one generation submitted twice; two runs
-        under one codeword produce two different pads that look identical
-        from the outside and fail authentication on first use.
+        """Two runs under one codeword produce different pads, so a pair must come
+        from one generation submitted twice: regenerating is not a reprint.
         """
         first, second = io.BytesIO(), io.BytesIO()
         for sink in (first, second):
@@ -114,14 +107,9 @@ def page_numbers_by_slot(data: bytes):
 
 
 class TestA4Imposition:
-    """
-    Four A6 pad pages per sheet, imposed for a guillotine.
-
-    The stack is cut twice, leaving four piles. Cut-and-stack order means
-    each pile is already sequential, so the pad is assembled by piling them
-    up. Reading order would force a page-by-page interleave instead, and
-    getting this wrong is silent -- the pages all print, just in an order
-    that makes the pad useless.
+    """Four A6 pad pages per sheet in cut-and-stack order, so each pile is already
+    sequential after two guillotine cuts. A wrong order is silent: every page
+    prints, but the pad is useless.
     """
 
     def _impose(self, pages, **kwargs):
@@ -280,8 +268,8 @@ class TestNewCliFlags:
         assert b"cannot be combined" in r.stderr
 
     def test_letter_rejects_a_layout_that_would_overflow_the_quarter(self, tmp_path):
-        # A Letter quarter is 139.7mm tall against A6's 148mm. Measuring
-        # against A6 let the last key rows fall below the guillotine line.
+        # A Letter quarter is 139.7mm tall against A6's 148mm, so the fit is
+        # measured against the quarter.
         r = run(["--random-codewords", "1", "--pages", "4", "--chars", "1225",
                  "--fontsize", "10", "--letter", "--output", str(tmp_path)],
                 cwd=tmp_path)
@@ -296,9 +284,7 @@ class TestNewCliFlags:
 
     def test_font_too_wide_is_rejected(self, tmp_path):
         # calc_max_chars only measures height. Above ~13pt on A6 the
-        # inter-group gap goes negative and the five-letter groups print
-        # superimposed -- inside the content box, so nothing overflows
-        # visibly and both copies of the pair are equally unreadable.
+        # inter-group gap goes negative and the groups print superimposed.
         r = run(["--random-codewords", "1", "--pages", "1", "--fontsize", "14",
                  "--output", str(tmp_path)], cwd=tmp_path)
         assert r.returncode != 0
@@ -339,9 +325,8 @@ class TestNewCliFlags:
         assert b"unsafe as a filename" in r.stdout
 
     def test_auth_group_cannot_overprint_the_page_number(self, tmp_path):
-        # codeword_space budgets the codeword against AUTH, but nothing
-        # budgeted AUTH against the page number -- and both are deliberately
-        # kept at full size because they are read character by character.
+        # AUTH and the page number are both kept at full size, so AUTH is
+        # bounded against the page number.
         r = run(["--random-codewords", "1", "--pages", "1", "--auth-size", "40",
                  "--output", str(tmp_path)], cwd=tmp_path)
         assert r.returncode != 0
@@ -355,17 +340,14 @@ class TestNewCliFlags:
                 assert space > 0, (a7, font_size, limit)
 
     def test_stdout_does_not_tell_you_to_print_the_pdf_twice(self, tmp_path):
-        # The bytes are down the pipe; re-running makes a DIFFERENT pad
-        # wearing the same codeword, which is the one thing the pair
-        # convention exists to prevent.
+        # Re-running makes a different pad wearing the same codeword.
         r = run(["--random-codewords", "1", "--pages", "1", "--stdout"],
                 cwd=tmp_path)
         assert r.returncode == 0, r.stderr
         assert b"PRINT EACH PDF TWICE" not in r.stderr
         assert b"lp -n 2" in r.stderr
-        # Without Collate the two copies come out interleaved, which is a
-        # stack to deal out by hand rather than a pair -- and mixing the two
-        # pads of a set is the failure the convention exists to prevent.
+        # Without Collate the two copies come out interleaved, inviting the two
+        # pads of a set to be mixed.
         assert b"Collate=True" in r.stderr
 
     def test_file_output_still_says_to_print_twice(self, tmp_path):
