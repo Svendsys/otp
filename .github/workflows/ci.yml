@@ -5,14 +5,8 @@ on:
     branches: [master]
   pull_request:
 
-# One run per branch. Without this, pushing a fix leaves the superseded
-# run going: two `vm` jobs booting three VMs each, for a commit nobody
-# cares about any more. Measured -- two 40-minute jobs ran concurrently
-# against the same branch, and the older one's result was worthless before
-# it started.
-#
-# NOT cancelled on master: a push there is the record of what that commit
-# does, and cancelling it to start the next one loses that permanently.
+# One run per branch: a superseded PR run is cancelled. Not cancelled on
+# master, where each push is the record of what that commit does.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -28,26 +22,13 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
-      # mtools, AND IT IS NOT OPTIONAL DECORATION. tier 3's card functions --
-      # fat_listing, fat_digest_of, fat_digests, strip_probe_droppings -- sit
-      # above the block tests/test_img_verdict.py slices, so for as long as
-      # this suite could not run them, `grep -rn "fat_digest_of" tests/*.py`
-      # returned nothing and rewriting the digest function to hand every file
-      # the same sixty-four characters left the suite passing. It now builds
-      # a real FAT partition with mformat/mcopy and runs the shipped
-      # functions against it, which needs the tools the image job already
-      # installs for the same reason. Those tests SKIP without it, so this
-      # line is what stops the coverage silently reverting;
-      # tests/test_image_workflow.py asserts the line is here.
+      # mtools: tests/test_img_verdict.py builds a real FAT partition and
+      # runs tier 3's card functions against it, and those tests skip
+      # without it. tests/test_image_workflow.py asserts this step is here.
       - name: Install mtools for the tier-3 card tests
-        # Capped and retried like every other apt call in this file. The
-        # flags are not decoration: on 2026-08-18 azure.archive.ubuntu.com
-        # stopped answering and apt sat silent for seven and a half minutes
-        # inside `update`, because its default is a 120s per-connection
-        # timeout with no retry. This step is in the two quickest jobs in
-        # the repository -- `test` finishes in about ninety seconds -- so an
-        # unbounded install here is the difference between a fast suite and
-        # a job that reports nothing for a quarter of an hour.
+        # Capped and retried like every apt call in this file: apt's
+        # default is a 120s per-connection timeout with no retry, so a
+        # stalled mirror hangs the job silently.
         timeout-minutes: 5
         run: |
           sudo apt-get -o Acquire::Retries=3 \
@@ -55,92 +36,43 @@ jobs:
                        -o Acquire::https::Timeout=15 update
           sudo apt-get install -y --no-install-recommends mtools
       # Bounded: a UI regression can make the suite spin rather than fail
-      # -- FakeButtons returns None forever at poll_seconds=0, so a screen
-      # that stops honouring BACK loops instead of raising. Unbounded, that
-      # is a runner burning for six hours and a job that never reports.
+      # (FakeButtons returns None forever at poll_seconds=0).
       - name: Run tests
         run: timeout 600 pytest -q
 
   mutation:
     # Break each load-bearing guard on purpose and require a test to go red.
-    # Five checks in this repository have been found unable to fail, one per
-    # audit round, and every one was found by hand -- see issue #14 and
-    # tests/mutations.toml.
+    # See issue #14 and tests/mutations.toml.
     #
-    # PER PR, not nightly, and that is measured rather than assumed: the fast
-    # tier is 164 mutations in 196 seconds ON THE DEVELOPMENT CONTAINER, not
-    # on this runner -- the number is a development-time figure and always has
-    # been, and a reader meeting it inside this job's own comment block will
-    # otherwise take it for this job's runtime, which is a different and
-    # usually smaller number (115s for the 145-row version of this line).
-    # Counted, not carried forward -- this line said 19 in 11 seconds for a
-    # long time after both had moved, 114 for one round after it was 115, and
-    # 124 for several rounds after it was 143. Re-run
-    # `python3 tests/mutation_gate.py --tier fast` and read its last line
-    # before touching this sentence. The seconds are noisier than the count:
-    # three runs of the same 159 rows on the same container measured 232s,
-    # 190s and 192s, and two of the 164 rows measured 196s and 198s -- so
-    # treat the figure as an order of magnitude and the row count as exact.
-    #
-    # It stopped being cheaper than the suite it audits at that count. Twelve
-    # of the rows added for the local rig (issue #22) are behavioural rather
-    # than textual: they run rig_boot against a fake emulator and TIME it,
-    # because the property under test -- the guest's marker stops the run in
-    # seconds instead of at the backstop -- is a clock, and the rows that
-    # replaced were caught by "the source contains this string" and could not
-    # fail. Four of them cost between four and twelve seconds each. That is
-    # the price of the gate being able to fail, which is the only thing it is
-    # for.
-    #
-    # The issue expected nightly or label-triggered; at this price
-    # that would be the wrong call, because a gate that reports on the commit
-    # which broke the guard is worth several that report the next morning. A
-    # separate job rather than a step in `test`, so the ordinary suite's wall
-    # clock does not move at all.
+    # Per PR, not nightly: a gate that reports on the commit that broke the
+    # guard is worth more than one that reports the next morning. A separate
+    # job so the ordinary suite's wall clock does not move.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          # 3.11+ for tomllib, which is why the table is TOML: it costs no
-          # new dependency.
+          # 3.11+ for tomllib, which is why the table is TOML.
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
-      # mtools, for the same reason the `test` job installs it and with a
-      # sharper edge here: several rows in the fast tier break the card
-      # functions and name the tests that drive them against a real FAT
-      # partition. mutation_gate.py refuses a row whose named tests SKIPPED
-      # -- "a skipped test cannot go red" -- so without this the rows do not
-      # quietly pass, they fail the job by name. That is the right direction
-      # and it is still a job nobody can read, hence the line.
+      # mtools, as in the `test` job. mutation_gate.py refuses a row whose
+      # named tests skipped, so without it the card rows fail the job.
       - name: Install mtools for the tier-3 card rows
-        # Capped and retried like every other apt call in this file. The
-        # flags are not decoration: on 2026-08-18 azure.archive.ubuntu.com
-        # stopped answering and apt sat silent for seven and a half minutes
-        # inside `update`, because its default is a 120s per-connection
-        # timeout with no retry. This step is in the two quickest jobs in
-        # the repository -- `test` finishes in about ninety seconds -- so an
-        # unbounded install here is the difference between a fast suite and
-        # a job that reports nothing for a quarter of an hour.
+        # Capped and retried like every apt call in this file.
         timeout-minutes: 5
         run: |
           sudo apt-get -o Acquire::Retries=3 \
                        -o Acquire::http::Timeout=15 \
                        -o Acquire::https::Timeout=15 update
           sudo apt-get install -y --no-install-recommends mtools
-      # Bounded like the suite above, and this one has a second way to hang:
-      # a mutation can wedge a test rather than fail it. The runner caps each
-      # mutated run itself; this is the backstop. `timeout` sends SIGTERM,
-      # which the runner turns into an unwind so the tree is put back --
-      # verified, because the first version of it did NOT and left
-      # device/install.sh mutated in the worktree.
+      # Bounded: a mutation can wedge a test rather than fail it. The runner
+      # caps each mutated run; this is the backstop. `timeout` sends SIGTERM,
+      # which the runner turns into an unwind that restores the tree.
       - name: Prove the guards can still fail
         run: timeout 600 python3 tests/mutation_gate.py --tier fast
-      # A mutated file left behind would be invisible here -- nothing else in
-      # this job reads those files -- and is the worst bug this runner could
-      # have. One line, and it is the property everything else rests on.
+      # A mutated file left behind would be invisible to the rest of this job.
       - name: The tree must be exactly as it was
         if: always()
         run: git diff --exit-code
@@ -150,38 +82,23 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      # Pinned, not apt's. The runner image's shellcheck floats, and the
-      # versions genuinely disagree: 0.9.0 emits SC2015 where 0.11.0 does
-      # not, so a local run can be clean while CI fails on the same commit.
-      # Bump this deliberately, with the scripts fixed in the same commit.
+      # Pinned, not apt's: shellcheck versions disagree (0.9.0 emits SC2015
+      # where 0.11.0 does not). Bump deliberately, with the scripts fixed in
+      # the same commit.
       - name: Check the provisioning and image scripts
         env:
           SHELLCHECK_VERSION: v0.9.0
         run: |
-          # --retry-all-errors, because plain --retry does not cover 403
-          # and 403 is what this download actually returns when it fails.
-          # Run 32168411327 got `curl: (22) The requested URL returned
-          # error: 403`, then `xz: (stdin): File format not recognized`
-          # as tar was handed the empty stream, and the job reported a
-          # shellcheck failure on a branch whose scripts shellcheck had
-          # never been run against. curl retries 408, 429 and the 5xx
-          # family on --retry alone; a rate-limited release download is
-          # none of those. Five tries with a delay, so a check that says
-          # "shellcheck failed" means shellcheck ran.
+          # --retry-all-errors: plain --retry does not cover 403, which is
+          # what a rate-limited release download returns, and tar would then
+          # be handed an empty stream.
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
             "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
             | tar -xJf - --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           ./shellcheck --version
-          # img-local-rig.sh is LINTED here and never run: it is a
-          # debugging tool with no CI wiring by design (issue #22), and
-          # running it would put a network fetch and an emulated boot on
-          # every push -- which is the cost it exists to remove.
-          #
-          # The pi-gen stage script is in the list because it stopped being
-          # a copy loop: it purges cloud-init and refuses the build if apt
-          # says the purge would take a reverse dependency with it (issue
-          # #34), and that logic reaches the image without any of it ever
-          # running here. It is `-s bash` by its own shebang.
+          # img-local-rig.sh is linted here and never run: it has no CI
+          # wiring by design (issue #22). The pi-gen stage script is listed
+          # because its cloud-init purge logic (issue #34) never runs here.
           ./shellcheck device/install.sh device/persist-identity.sh \
                        image/build.sh image/render-manual.sh \
                        image/stage-otpunit/01-otpunit/00-run.sh \
@@ -191,38 +108,12 @@ jobs:
 
   hardware:
     # Tier 1 of the harness: the real code against real kernel interfaces
-    # and a real cupsd. This is the job that would have caught `MaxJobs 1`
-    # -- six rounds of reading the code did not, and a daemon did in four
-    # seconds. See harness/README.md.
+    # and a real cupsd. See harness/README.md.
     runs-on: ubuntu-latest
-    # The cap exists so the inner `timeout 600`s below always fire first:
-    # a job killed by GitHub's timeout is CANCELLED, failure() is false on
-    # cancellation, so the CUPS error-log step is skipped and the hang
-    # loses its diagnosis. Found by the review panel, which raised the
-    # then-15 that made an inner `timeout 900` unreachable dead code.
-    #
-    # 30, NOT 18, AND THE OLD NUMBER'S ARITHMETIC NEVER CLOSED. It was set
-    # against "setup runs ~2-4 minutes", which left ~14 for a harness step
-    # capped at 600s and a mutation step capped at another 600s -- twenty
-    # minutes of inner budget inside an eighteen-minute job. The invariant
-    # this paragraph asserts has been false since the second `timeout 600`
-    # was added; it went unnoticed because the two steps really take about
-    # 2m45s and 35s, so the inner caps never fired.
-    #
-    # What made it visible was the setup assumption breaking instead. Runs
-    # 32160857598 and 32162479196 spent 15m27s in the apt step -- the same
-    # step takes 35s on master (run 32083989974) -- and the job was
-    # cancelled at 18m40s with the harness half-run and the CUPS log step
-    # skipped, exactly as the paragraph above warns. Nothing was wrong with
-    # the tests: `linux-modules-extra` is the biggest download in this
-    # workflow and the runner's throughput had collapsed, with the vm job's
-    # QEMU install slowing 16s -> 79s in the same window.
-    #
-    # So setup gets its own cap below rather than silently eating the test
-    # budget, and this number is now setup (8) + both inner caps (10 + 10)
-    # + room for the failure() diagnostics. A wedged job costs more minutes
-    # than it did; an anonymous cancellation that loses the evidence costs
-    # an afternoon.
+    # The cap must exceed setup (8) plus both inner `timeout 600`s (10 + 10)
+    # plus the failure() diagnostics, so the inner timeouts always fire
+    # first: a job killed by GitHub's timeout is cancelled, failure() is
+    # false, and the CUPS error-log step is skipped.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -230,67 +121,33 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install CUPS, the panel libraries and the simulators
-        # Setup is not test time and must not be spent out of the test
-        # budget. Measured at 35s on a healthy runner; 8 minutes is a wide
-        # margin that still fails a collapsed mirror with THIS step's name
-        # on it, in eight minutes, instead of anonymously cancelling the
-        # job twenty minutes later with the diagnostics skipped.
+        # Setup has its own cap so a collapsed mirror fails with this step's
+        # name on it instead of eating the test budget.
         timeout-minutes: 8
         run: |
-          # RETRIES AND A TIMEOUT, because the default is neither. The
-          # runners resolve the archive through /etc/apt/apt-mirrors.txt
-          # with azure.archive.ubuntu.com first, and on 2026-08-18 that
-          # host stopped answering: run 32166657980 logged `Ign:` for
-          # every suite on it, fell back to archive.ubuntu.com, fetched
-          # the four InRelease files at 17:39:03-04 and then sat in
-          # silence until the step was killed at 17:46:37. Seven and a
-          # half minutes of nothing, in `update`, before a single package
-          # was downloaded. apt's default http timeout is 120s per
-          # connection with no retry, and a mirror that accepts a socket
-          # and then stops talking can hold each index for the full two
-          # minutes; the earlier runs 32160857598 and 32162479196 spent
-          # 15m27s here the same way and were read as "a slow download",
-          # which they were not.
-          #
-          # 15s and three tries turns a dead mirror into a fast failure
-          # and, where a mirror is merely unhealthy, into a retry that
-          # usually lands. It cannot make a genuinely absent archive
-          # work, and it is not meant to: the step cap above is what
-          # says so out loud.
+          # Retries and a timeout: apt's default is 120s per connection with
+          # no retry, so a mirror that accepts a socket and stops talking
+          # stalls `update` for minutes.
           sudo apt-get -o Acquire::Retries=3 \
                        -o Acquire::http::Timeout=15 \
                        -o Acquire::https::Timeout=15 update
           # cups for the print path; the rest is what the unit imports on a
-          # real Pi, so the panel code can be exercised rather than skipped.
+          # real Pi, so the panel code is exercised rather than skipped.
           sudo apt-get install -y --no-install-recommends \
             cups cups-client cups-filters printer-driver-cups-pdf \
             i2c-tools python3-evdev
-          # gpio-sim, i2c-stub and vkms are not in the runner's base kernel
-          # -- measured: "1 of 4 up" on 6.17.0-1020-azure, with only uinput
-          # present. They live in modules-extra. Not fatal if it will not
-          # install; kernel-sim.sh reports what it got and the tests skip
-          # what is missing.
+          # gpio-sim, i2c-stub and vkms live in modules-extra, not the
+          # runner's base kernel. Not fatal: kernel-sim.sh reports what it
+          # got and the tests skip what is missing.
           sudo apt-get install -y "linux-modules-extra-$(uname -r)" \
             || echo "no modules-extra for $(uname -r); some simulators will be absent"
           pip install -r requirements-dev.txt
           pip install smbus2 luma.oled gpiozero lgpio
       - name: The panel tests that need gpiozero and lgpio
-        # tests/test_hardware.py is nobody's job otherwise. It carries no
-        # `hardware` marker, so the harness step below (`pytest -m
-        # hardware`) deselects the whole file; and the `test` job installs
-        # requirements-dev.txt, which deliberately has neither gpiozero nor
-        # lgpio. Measured in a venv with only requirements-dev.txt in it:
-        # 52 passed, 13 skipped -- the six [lgpio] parametrisations, all
-        # four TestRealGpiozero tests, and the three that need a real lgpio
-        # to kill and revive. Among them is the control that proves real
-        # gpiozero lets a callback exception straight out, which is the only
-        # thing keeping the stand-in dispatcher honest, and lgpio's own
-        # `run`. This step is the one place they run.
-        #
-        # Both libraries are installed above, so nothing in the file has a
-        # reason to skip -- and a skip is failed here rather than printed,
-        # because that is exactly how these tests came to run nowhere: a
-        # skipped test and a passing one look the same in a summary line.
+        # tests/test_hardware.py runs fully only here: it has no `hardware`
+        # marker, so the harness step deselects it, and the `test` job has
+        # neither gpiozero nor lgpio. With both installed nothing may skip,
+        # so a skip fails the step.
         run: |
           set -o pipefail
           timeout 300 python3 -m pytest -q -p no:randomly -rs \
@@ -305,30 +162,17 @@ jobs:
           fi
       - name: Stop the system CUPS and unconfine cupsd
         run: |
-          # The rig runs its own cupsd on its own socket. The distro one is
-          # not needed and only competes for the default socket.
+          # The rig runs its own cupsd on its own socket; the distro one only
+          # competes for the default socket.
           sudo systemctl stop cups cups-browsed || true
-          # Ubuntu confines cupsd with AppArmor, and the profile permits
-          # backends under /usr/lib/cups/backend and nowhere else. The rig
-          # is deliberately hermetic -- its own ServerBin in a temp
-          # directory -- which is exactly what that forbids. Measured:
-          #   apparmor="DENIED" operation="exec" profile="/usr/sbin/cupsd"
-          #   name="/tmp/.../cups/bin/backend/usb" comm="cups-deviced"
-          # so cupsd started, answered lpstat, and reported no devices.
-          #
-          # apparmor_parser rather than aa-complain: the latter needs
-          # apparmor-utils, which is not on the runner, and the `|| true`
-          # meant its absence was silent.
+          # Ubuntu's AppArmor profile lets cupsd exec backends only under
+          # /usr/lib/cups/backend, and the rig's ServerBin is a temp
+          # directory. apparmor_parser, not aa-complain, which needs
+          # apparmor-utils.
           sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.cupsd 2>/dev/null || true
-          # Assert it worked. If this step ever silently fails, the rig
-          # skips its tests for lack of a working cupsd and the job goes
-          # green having tested nothing -- which is worse than red.
-          #
-          # sudo on the grep, not just the parser. That file is root-only,
-          # so an unprivileged grep exits non-zero with "Permission denied"
-          # and the assertion reads it as "not enforcing" -- an assertion
-          # that cannot observe the state it is asserting about. It passed
-          # for the wrong reason on the first green run.
+          # Assert it worked, or the rig skips for lack of a working cupsd
+          # and the job goes green having tested nothing. sudo on the grep:
+          # the profiles file is root-only.
           PROFILES=/sys/kernel/security/apparmor/profiles
           if ! sudo test -r "$PROFILES"; then
             echo "cannot read $PROFILES; assuming no AppArmor on this runner"
@@ -340,8 +184,7 @@ jobs:
             echo "cupsd apparmor state: $(sudo grep cupsd "$PROFILES" || echo unconfined)"
           fi
       - name: Bring up the kernel simulators
-        # Never fatal: a runner kernel missing one of these should still
-        # run everything else. The script reports what it got.
+        # Never fatal: the script reports what it got.
         run: sudo ./harness/kernel-sim.sh up
       - name: What came up
         run: sudo ./harness/kernel-sim.sh status
@@ -353,13 +196,8 @@ jobs:
           sudo -E env "PATH=$PATH" \
             timeout 600 python3 -m pytest -m hardware -v -p no:randomly \
               --tb=short -rfs 2>&1 | tee /tmp/harness.log
-      # The rig's own honesty, checked the same way the fast guards are: a
-      # rig that has stopped reproducing the shipped configuration, or
-      # stopped being able to make a job fail, is a green job that tested
-      # nothing -- which is worse than a red one, and is the premise of this
-      # whole harness. Here rather than in the `mutation` job because this is
-      # the only place with a working cupsd, and it costs 36 seconds measured
-      # against a job that runs in about eight minutes.
+      # The rig's own guards, mutation-tested here because this is the only
+      # job with a working cupsd.
       - name: Prove the rig's guards can still fail
         run: |
           sudo -E env "PATH=$PATH" \
@@ -369,11 +207,8 @@ jobs:
         run: git diff --exit-code
       - name: The CUPS error log, if anything failed
         if: failure()
-        # Tightly capped. CUPS dumps its whole debug trace for a failed job
-        # regardless of LogLevel, and one rig per test meant ~1000 lines of
-        # it -- which pushed the pytest summary out of reach of anything
-        # reading the tail of this log. A diagnostic nobody can find past
-        # the noise is not a diagnostic. Two files, twenty lines each.
+        # Tightly capped: CUPS dumps its whole debug trace for a failed job
+        # regardless of LogLevel, which would bury the pytest summary.
         run: |
           sudo find /tmp -name error_log -path '*cups*' 2>/dev/null \
             | head -n 2 \
@@ -387,86 +222,37 @@ jobs:
         if: always()
         run: sudo ./harness/kernel-sim.sh down || true
       - name: Verdict
-        # Last thing in the job log, always, so the outcome is reachable
-        # from the tail without wading through the CUPS dump above.
+        # Last in the job log, always, so the outcome is at the tail.
         if: always()
         run: |
           echo "=== harness verdict ==="
-          # Not `grep ... | tail || echo`: under Actions' default shell
-          # (no pipefail) the pipeline's status is tail's, which is 0 on
-          # empty input, so a missing log read as a clean run.
+          # Not `grep ... | tail || echo`: without pipefail the pipeline's
+          # status is tail's, which is 0 on empty input.
           if [ ! -s /tmp/harness.log ]; then
             echo "no pytest output at all -- the harness did not run" >&2
             exit 1
           fi
           grep -E "^(FAILED|ERROR|SKIPPED)|passed|failed" /tmp/harness.log \
             | tail -n 40 || true
-          # A floor on what must have RUN. cupsrig.available() skips the
-          # whole CUPS half for five separate reasons -- a confined cupsd,
-          # a non-root runner, a missing binary -- and each of them left
-          # this job green at "1 passed, 20 skipped", the one pass being a
-          # bash -n syntax check. A harness that silently tests nothing is
-          # worse than a red one; that is the premise of this whole PR.
-          #
-          # 33, raised from 12 when the rig learned to FAIL. The CUPS half
-          # is now 37 tests (8 print path + 4 unattended + 12 failure-mode
-          # shapes + 7 failed-copy + 5 panel + the shipped-config check,
-          # which the first count of this forgot), and the four kernel
-          # simulators add 7 more where the runner's kernel has them.
-          # Measured on a runner-shaped container: 37 passed, 7 skipped for
-          # absent simulators, 176s. The floor sits just under the CUPS
-          # half deliberately -- it is there to catch that half vanishing,
-          # not to police the exact count, which every new test changes.
+          # A floor on what must have run: cupsrig.available() can skip the
+          # whole CUPS half and leave this job green.
           PASSED=$(grep -oE '[0-9]+ passed' /tmp/harness.log | tail -1 | cut -d' ' -f1)
           echo "harness tests passed: ${PASSED:-0}"
-          # 55, and derived from a count rather than from the tail of an
-          # old run -- the last three numbers here were all wrong, in
-          # both directions, because they were carried forward by hand
-          # while the harness kept growing. `pytest -m hardware
-          # --collect-only` on this tree collects 61.
-          #
-          # Measured on a kernel with NO simulators at all (this
-          # container: CONFIG_GPIOLIB and CONFIG_CONFIGFS_FS unset):
-          # 50 passed, 11 skipped -- the 7 gpio-sim tests, 2 i2c-stub,
-          # 1 vkms, 1 uinput. A runner with modules-extra runs all
-          # eleven, so 61 is what this job should see.
-          #
-          # 55 leaves six free to skip for a reason already seen and
-          # accepted, and no more: the debounce test on a box too slow
-          # to bounce a line inside the window, the unaided-chip-number
-          # test when gpio-sim does not land on gpiochip0, luma refusing
-          # the i2c stub, and a runner kernel without modules-extra
-          # losing i2c-stub, vkms and uinput together.
-          #
-          # If this number needs changing again, COUNT -- do not adjust
-          # it to match whatever the last run happened to print, which
-          # is how it came to claim the CUPS rig was 37 tests.
+          # 55 of the 61 that `pytest -m hardware --collect-only` collects.
+          # A kernel with no simulators skips 11; the floor leaves six free
+          # to skip for accepted reasons (slow debounce, gpio-sim not on
+          # gpiochip0, luma refusing the i2c stub, no modules-extra). If
+          # this needs changing, count again; do not copy the last run.
           if [ "${PASSED:-0}" -lt 55 ]; then
             echo "expected at least 55 passing harness tests (the CUPS rig" >&2
             echo "alone is 13); got ${PASSED:-0}. Something skipped silently." >&2
             grep -E "^SKIPPED" /tmp/harness.log >&2 || true
             exit 1
           fi
-          # The panel by name, not only by count. Every run this repository
-          # has ever done skipped these -- gpiozero will not build a pin
-          # factory on a machine with no Pi revision -- and the CUPS half is
-          # big enough to carry the total back over any floor while the
-          # entire input surface of the device quietly stops being tested.
-          # If a future runner kernel loses gpio-sim this goes red on
-          # purpose; the reason will be in the lines it prints.
-          #
-          # The last of them is the guard against lgpio's dispatch
-          # thread, which is a module-level singleton with no try around
-          # its callback call: one exception out of a button callback
-          # ends every button in the process for the life of the
-          # process, and on a 512 MiB board with no swap making
-          # 1000-page pads that exception is a MemoryError waiting to
-          # happen. The fast tier proves the same property against a
-          # stand-in dispatcher and against lgpio's own `run` fed
-          # through a pipe; this is the only place it runs with a
-          # kernel, a real gpiochip and the real gpiozero -> lgpio chain
-          # all at once, so it is named here rather than left to the
-          # count.
+          # The panel by name, not only by count: the CUPS half is big
+          # enough to clear any floor while every button test skips. The
+          # last one is the only run of the raising-callback guard against
+          # a real gpiochip and the real gpiozero -> lgpio chain.
           for named in test_a_tap_on_up_arrives_as_up \
                        test_a_tap_on_down_arrives_as_down \
                        test_a_tap_on_ok_arrives_as_ok_not_back \
@@ -485,40 +271,27 @@ jobs:
 
   vm:
     # Tier 2: boot a real system, run device/install.sh on it, and check
-    # the unit actually comes up. This is the only place otp-unit.service
-    # taking tty1 from getty is ever observed -- pi-gen never boots the
-    # image it builds, and a container has no virtual terminals.
+    # the unit comes up. The only place otp-unit.service taking tty1 from
+    # getty is observed.
     runs-on: ubuntu-latest
-    # 20, not 45 and no longer 15. The script's own timeout is 600s and
-    # MUST fire first: a job killed by GitHub's timeout skips its
-    # remaining steps, so the console dump and the verdict would never
-    # run and the diagnosis would be lost. This is the outer backstop
-    # only. 15 held that invariant only while the QEMU install stayed
-    # near its usual 16s -- it reached 79s in the same window that took
-    # the hardware job's apt step to 15m27s, and this job was cancelled
-    # at 15m19s on run 32160857598 with its console dump skipped. Setup
-    # is capped separately below for the same reason it is there.
+    # The outer backstop only. The script's own 600s timeout must fire
+    # first: a job killed by GitHub's timeout skips the console dump and
+    # the verdict. Setup is capped separately below.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install QEMU
-        # See the hardware job: setup is not test time. 16s healthy, 79s
-        # in the slow window, 8 minutes before it is called a mirror
-        # problem rather than being taken out of the boot's budget.
+        # See the hardware job: setup is not test time.
         timeout-minutes: 8
         run: |
-          # Retries and a timeout, for the reason spelled out against the
-          # hardware job's update above: this job was killed by the same
-          # stalled mirror in the same run.
+          # Retries and a timeout, as in the hardware job.
           sudo apt-get -o Acquire::Retries=3 \
                        -o Acquire::http::Timeout=15 \
                        -o Acquire::https::Timeout=15 update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 qemu-utils cloud-image-utils
-          # KVM turns half an hour of emulation into a few minutes. Not
-          # fatal if it is missing -- vm-check.sh falls back to TCG and
-          # says so -- but worth reporting, because a silent fallback
-          # looks exactly like a hang.
+          # KVM makes the boot minutes rather than half an hour. Not fatal:
+          # vm-check.sh falls back to TCG and says so.
           ls -l /dev/kvm 2>/dev/null || echo "no /dev/kvm; will use TCG"
           sudo usermod -aG kvm "$USER" || true
       - name: Cache the Debian base image
@@ -534,14 +307,12 @@ jobs:
         run: sudo -E ./harness/vm-check.sh
       - name: The guest console, if anything failed
         if: failure()
-        # Capped: the console is thousands of lines of boot chatter, and an
-        # uncapped dump pushed the verdict out of reach of anything reading
-        # the tail of this log.
+        # Capped, so the dump does not bury the verdict.
         run: |
           sudo grep -iE "error|fail|otp-" \
             ${{ runner.temp }}/otp-vm/console.log | tail -n 60 || true
       - name: Verdict
-        # Last, always, so the outcome is the first thing you see from the end.
+        # Last, always, so the outcome is at the tail of the log.
         if: always()
         run: |
           echo "=== tier 2 verdict ==="

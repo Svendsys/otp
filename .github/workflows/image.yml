@@ -1,35 +1,16 @@
 name: Build image
 
-# Deliberately not on every push: the pi-gen build needs ~10GB of disk.
-# Run it by hand, or on a tag to attach an image to a release.
+# Not on every push to a branch: the pi-gen build needs ~10GB of disk. It
+# runs on tags (to attach an image to a release), by hand, and on pull
+# requests, where the `changes` job limits the build to diffs that reach
+# the image. otpunit/** is not in that filter: a change there breaks the
+# unit, not the image build, and tiers 1 and 2 answer that in seconds.
 #
-# ...but ALSO on any pull request that touches what goes into the image.
-# Until this was added, nothing checked the image on the PR that broke it:
-# a change to install.sh or the pi-gen stage sailed through CI and was
-# found at release time, or on a Pi. Path-filtered so the cost falls only
-# on the PRs that can actually cause it -- everything else still gets the
-# five fast jobs in ci.yml and nothing here.
+# The budget is ten minutes of wall clock per PR. The image is cached on
+# its inputs and the boot is capped.
 #
-# Not otpunit/** on purpose. The image bakes the package in, but a change
-# there breaks the UNIT, not the image build, and tiers 1 and 2 answer that
-# in seconds. (It IS in the cache key below -- see the note there.)
-#
-# THE BUDGET IS TEN MINUTES. Not per job -- per PR, wall clock, for a
-# change that does not alter what goes into the image. Two things buy that,
-# and both are below: the image is CACHED on the inputs that actually
-# affect it, and the boot is CAPPED.
-#
-# There used to be an honest exception here: a PR that really changes the
-# image pays for a full pi-gen build, and on x86 that could not fit in ten
-# minutes. On a native arm64 runner it does -- measured 8m24s end to end,
-# 7m24s of it pi-gen, against 55m45s for the same work on x86. The budget
-# holds for both cases, so the exception is gone.
-#
-# `push: master` exists to populate that cache. Caches created on a PR
-# branch are visible only to that PR; caches on the base branch are visible
-# to every PR. Without a master build the first run on each new PR would
-# always miss, which is most of the cost this is trying to remove. It also
-# validates the image just after a merge, which nothing did before.
+# `push: master` populates that cache: caches created on a PR branch are
+# visible only to that PR, caches on the base branch to every PR.
 on:
   workflow_dispatch:
   push:
@@ -37,33 +18,22 @@ on:
     branches: [master]
   pull_request:
 
-# Same reasoning as ci.yml. Leaving a superseded pi-gen run going burns
-# runner time producing an image for a commit that has already been
-# replaced. Tag and dispatch runs are never cancelled -- those produce
-# artifacts people keep.
+# As in ci.yml: a superseded PR run is cancelled. Tag and dispatch runs
+# are not; they produce artifacts people keep.
 concurrency:
   group: image-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Branch protection requires a check called `image`, and this workflow
-  # used to be path-filtered at the trigger. A PR touching none of those
-  # paths therefore never ran it, the required check never reported, and
-  # the PR could not be merged at all -- not "merged without the image
-  # being built", merged never. Five were stuck behind it.
-  #
-  # Dropping the requirement would have been the easy fix and the wrong
-  # one: the tier-3 boot verdict is a release gate (issue #19) and
-  # weakening it to unblock a merge queue is the trade this repository
-  # exists to refuse. So the filter moved from the trigger, where it
-  # suppressed the report, to a job, where it only suppresses the WORK:
+  # Branch protection requires a check called `image`. Path-filtering the
+  # trigger would leave that check unreported on PRs that touch nothing in
+  # the image, so the filter is a job, which suppresses only the work:
   #
   #   changes -> did anything that goes into the image change?
   #   build   -> the expensive arm64 pi-gen build and boot, if it did
   #   image   -> always runs, always reports, and is the required check
   #
-  # The cost profile is unchanged -- a docs-only PR still pays for no
-  # pi-gen build, just for one cheap ubuntu-latest job that says so.
+  # The tier-3 boot verdict is a release gate (issue #19).
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -71,17 +41,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The diff needs a base to compare against, and the default
-          # shallow clone does not have one.
+          # The diff needs a base; the default shallow clone has none.
           fetch-depth: 0
       - name: Does anything in this change reach the image?
         id: filter
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" != "pull_request" ]; then
-            # A tag, a push to master (which populates the cache every
-            # PR then restores from), or a manual dispatch. All three
-            # want the real thing.
+            # A tag, a push to master (which populates the cache) or a
+            # manual dispatch always builds.
             echo "${{ github.event_name }}: building unconditionally"
             echo "image=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -89,18 +57,14 @@ jobs:
           base="${{ github.base_ref }}"
           git fetch --no-tags --prune origin \
             "+refs/heads/$base:refs/remotes/origin/$base"
-          # merge-base, not a two-dot diff: what THIS branch changed,
-          # not everything that landed on master since it forked.
+          # merge-base, not a two-dot diff: what this branch changed, not
+          # everything that landed on master since it forked.
           changed=$(git diff --name-only \
             "$(git merge-base "origin/$base" HEAD)" HEAD)
           echo "$changed"
-          # The same four paths the trigger used to carry.
-          # harness/img-guest-check.sh is in this list because it is IN the
-          # image: the pi-gen stage copies harness/ into the rootfs and
-          # install.sh installs the probe to /opt/otp-unit, where a unit runs
-          # it every tier-3 boot. It arrived with the overlay work and this
-          # filter was not updated, so a pull request that changed only the
-          # probe skipped the image job entirely -- the one job that runs it.
+          # harness/img-guest-check.sh is listed because it is in the image:
+          # the pi-gen stage copies harness/ into the rootfs and install.sh
+          # installs the probe to /opt/otp-unit.
           if printf '%s\n' "$changed" | grep -qE \
               '^(image/|device/|harness/img-boot\.sh$|harness/img-guest-check\.sh$|\.github/workflows/image\.yml$)'
           then
@@ -111,90 +75,43 @@ jobs:
           fi
 
   build:
-    # NATIVE arm64, not x86 emulating it. This repository is public, and
-    # GitHub's arm64 runners are free for public repositories.
-    #
-    # pi-gen builds an arm64 filesystem. On an x86 runner every binary it
-    # executes goes through qemu-user, which is where the bulk of a
-    # thirty-three minute build went -- and it needs four steps of
-    # binfmt_misc setup, with a comment block longer than most of this file,
-    # to work at all. Natively none of that applies: the steps below are
-    # kept but skipped, so the workflow still runs on x86 if it has to.
+    # Native arm64, free for public repositories. On x86 every binary pi-gen
+    # runs goes through qemu-user and needs the binfmt_misc steps below,
+    # which are kept but skipped here so the workflow still runs on x86.
     needs: changes
-    # The expensive half, and the only part that is conditional. When
-    # this is skipped the `image` job below still runs and still reports.
+    # The only conditional part. When this is skipped the `image` job below
+    # still runs and reports.
     if: needs.changes.outputs.image == 'true'
     runs-on: ubuntu-24.04-arm
-    # The job cap must always lose the race to the script timeout, or a
-    # timeout costs the diagnosis as well as the run -- learned the hard
-    # way when a 15-minute cap fired before the boot script's own timeout,
-    # cancelled qemu mid-experiment, and skipped the verdict and the
-    # evidence upload (failure() is false on cancellation).
+    # The job cap must always lose the race to the script's own timeouts: a
+    # cancelled job skips the verdict and the evidence upload, because
+    # failure() is false on cancellation.
     #
-    # THREE boots now. Two are the read-only overlay (issue #9): the second
-    # is a power-cycle of the same card. The third is the `release` boot --
-    # the same card with no otp.imgcheck token on the kernel command line,
-    # which is how a flashed unit boots -- and it is what establishes that
-    # the probe shipped in every image stays inert on a production machine.
-    # The backstop is PER BOOT, so a third boot is a third backstop.
-    #
-    # THE ARITHMETIC, worst case, where no boot ever reports:
+    # Worst case, three boots that never report:
     #
     #   3 x (600s backstop + timeout's 30s kill grace)   31.5 min
-    #   pi-gen on a cache miss, with headroom for a
-    #     slow runner (measured at 6m58s on run
-    #     31752321387; 15 taken here)                    15.0 min
-    #   checkout, apt, cache save, artifact upload,
-    #     decompress, verdict (16m16s total minus
-    #     7m59s of boots minus 6m58s of pi-gen on
-    #     that run = 1m19s; 2.5 taken here)               2.5 min
+    #   pi-gen on a cache miss, slow runner              15.0 min
+    #   checkout, apt, cache, upload, verdict             2.5 min
     #                                                    --------
     #                                                    49.0 min
     #
-    # 55 leaves six minutes over that, which is the same shape of margin 40
-    # gave two boots. 40 no longer fits: 31.5 of backstop alone against a
-    # 15-minute pi-gen is 46.5 before anything else, so a run that lost all
-    # three boots would be CANCELLED rather than reported -- and a cancelled
-    # job skips the verdict and the evidence upload, because failure() is
-    # false on cancellation. That is the failure this cap exists to avoid.
-    #
-    # Healthy runs are nowhere near it, and that is measured rather than
-    # hoped: run 31752321387, a cache MISS with two boots, took 16m16s end
-    # to end -- 6m58s of pi-gen and 7m59s for the pair of boots, because the
-    # harness stops each one the moment its guest check reports done. The
-    # release boot has no guest check to report, so it stops on
-    # multi-user.target plus a 45s settle instead: expect it to add roughly
-    # the length of one boot plus that settle, not the 600s backstop.
+    # Healthy runs are far shorter: each probe boot stops when its guest
+    # check reports done, and the release boot 45s after multi-user.target.
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
 
       # --- can we skip the expensive half entirely? -------------------
       #
-      # Keyed on what actually ends up IN the image. A change to
-      # harness/img-boot.sh, to a test, or to a doc leaves this key alone,
-      # so the boot runs against the same image the previous run built --
-      # which is exactly right, and skips the build entirely.
+      # Keyed on what ends up in the image, so a change to harness/img-boot.sh,
+      # a test or a doc boots the previously built image and skips the build.
       #
-      # harness/img-guest-check.sh is the exception in that directory, and it
-      # is named separately below rather than by widening the pattern to
-      # harness/**. The probe RUNS INSIDE the image: the pi-gen stage copies
-      # harness/ into the rootfs and install.sh installs it to /opt/otp-unit.
-      # Without it in the key, editing a check restored yesterday's image and
-      # booted yesterday's probe -- and the harness then fails the run for
-      # named checks the guest never emitted, which reads as a broken image
-      # rather than a stale cache.
-      #
-      # human_bias.png is in the key because otp.md embeds it and
-      # render-manual.sh bakes it into the manual PDFs inside the image --
-      # a chart-only change must not green-certify (or tag-release) a
-      # stale image. Found by the review panel.
-      #
-      # otpunit/ and the codewords ARE included even though they are not in
-      # the PR trigger. They are baked into the image, so an image built
-      # before they changed is the wrong image to boot, even if the build
-      # would have succeeded either way. The trigger answers "is this worth
-      # checking"; the key answers "is this image still current".
+      # harness/img-guest-check.sh is named separately because the probe runs
+      # inside the image; without it in the key an edited check would boot
+      # yesterday's probe. human_bias.png is in the key because otp.md embeds
+      # it and render-manual.sh bakes it into the manual PDFs. otpunit/ and the
+      # codewords are in the key though not in the PR filter: the filter asks
+      # "is this worth checking", the key asks "is this image still current".
       - name: Restore a previously built image
         id: imgcache
         uses: actions/cache/restore@v4
@@ -208,30 +125,19 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           df -h /
 
-      # Two separate requirements, and it takes both. They are not
-      # alternatives, which is what the previous attempt got wrong.
+      # x86 only. pi-gen needs both of:
       #
-      # 1. The registration must carry binfmt_misc's F (fix binary) flag.
-      #    pi-gen's build.sh runs `arch-test arm64` INSIDE the build
-      #    container; without F the kernel resolves the interpreter path in
-      #    the caller's mount namespace, where it does not exist, and the
-      #    test fails with "not supported on this machine/kernel".
-      #    update-binfmts does not set F, so installing binfmt-support is
-      #    not a substitute -- registering from a container is.
+      # 1. A binfmt_misc registration with the F (fix binary) flag. build.sh
+      #    runs `arch-test arm64` inside the build container, and without F the
+      #    kernel resolves the interpreter in the caller's mount namespace.
+      #    update-binfmts does not set F; registering from a container does.
       #
-      # 2. The interpreter must ALSO exist on the host PATH, because
-      #    build-docker.sh runs `which qemu-aarch64` and exits 1 without
-      #    it. Note the non-static name: qemu-user-static ships only
-      #    qemu-aarch64-static and does not satisfy this.
+      # 2. The interpreter on the host PATH under its non-static name:
+      #    build-docker.sh runs `which qemu-aarch64`.
       #
-      # Order matters. binfmt first, then the host binary, and deliberately
-      # without binfmt-support so nothing re-registers over the F entry.
-      # binfmt_misc has to be mounted ON THE HOST, not just inside the
-      # container that registers it. build-docker.sh greps
-      # /proc/sys/fs/binfmt_misc/qemu-aarch64* and, when that glob matches
-      # nothing, writes its own registration to .../register behind
-      # `2>/dev/null || true` -- so an unmounted binfmt_misc produces no
-      # error at all, just the arm64-unsupported failure two steps later.
+      # binfmt_misc must be mounted on the host: build-docker.sh otherwise
+      # writes its own registration behind `2>/dev/null || true` and fails
+      # silently.
       - name: Mount binfmt_misc on the host
         if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
@@ -240,18 +146,9 @@ jobs:
             || sudo mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc
           mountpoint /proc/sys/fs/binfmt_misc
 
-      # --no-install-recommends is load-bearing, not tidiness. qemu-user
-      # RECOMMENDS qemu-user-binfmt, which registers its own handler:
-      #
-      #   interpreter /usr/libexec/qemu-binfmt/aarch64-binfmt-P
-      #   flags: PO
-      #
-      # No F flag, so it cannot work inside the build container -- and
-      # because it is registered last it takes precedence over the one that
-      # can. That entry, pulled in by a Recommends nobody asked for, is
-      # what broke the previous two runs. It also explains the failing
-      # grep in build-docker.sh, which looks for /usr/bin/qemu-aarch64 and
-      # never sees that wrapper path.
+      # --no-install-recommends is load-bearing: qemu-user recommends
+      # qemu-user-binfmt, which registers a handler without the F flag that
+      # takes precedence over the one that works.
       - name: Install the qemu interpreter on the host PATH
         if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
@@ -263,8 +160,8 @@ jobs:
             exit 1
           } || true
 
-      # Registered LAST, so nothing can overwrite it, and with exactly one
-      # handler for the magic so there is no precedence question at all.
+      # Registered last, so nothing can overwrite it, with exactly one handler
+      # for the magic.
       - name: Register arm64 binfmt with the fix-binary flag
         if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
@@ -274,13 +171,12 @@ jobs:
           fi
           docker run --privileged --rm tonistiigi/binfmt --install arm64
           cat /proc/sys/fs/binfmt_misc/qemu-aarch64
-          # The F flag is the whole point. Assert it rather than hope.
+          # Assert the F flag.
           grep -q '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-aarch64
 
-      # Reproduce pi-gen's own check before spending half an hour on it.
-      # build.sh runs `arch-test arm64` inside the build container, and
-      # that is the only thing that actually proves the registration is
-      # usable from another mount namespace.
+      # Reproduce pi-gen's own check before spending the build on it:
+      # `arch-test arm64` inside a container proves the registration is usable
+      # from another mount namespace.
       - name: Prove arm64 emulation works from inside a container
         if: steps.imgcache.outputs.cache-hit != 'true' && runner.arch != 'ARM64'
         run: |
@@ -304,13 +200,9 @@ jobs:
         if: steps.imgcache.outputs.cache-hit != 'true'
         run: ./image/build.sh
 
-      # Saved HERE, immediately after the build -- not by actions/cache's
-      # automatic post step, which runs under `post-if: success()`. With
-      # the combined action, every run whose BOOT failed skipped the save,
-      # so the cache stayed empty precisely while tier 3 was red -- which
-      # is exactly when cheap iteration on the boot matters. Measured: two
-      # consecutive runs each built the identical image for seven minutes
-      # because the first one's save was silently skipped.
+      # Saved here, not by actions/cache's post step, which runs only on
+      # success: a run whose boot failed would skip the save, exactly when
+      # cheap iteration on the boot matters.
       - name: Save the image to the cache
         if: steps.imgcache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -318,17 +210,9 @@ jobs:
           path: image/deploy
           key: ${{ steps.imgcache.outputs.cache-primary-key }}
 
-      # The ARTIFACT is uploaded BEFORE the image is booted, so that a
-      # failing boot can be reported honestly without costing anyone the
-      # image. See the boot step below for why that ordering matters. This
-      # stays exactly where it is: debugging a red boot needs the image
-      # that failed, and needs it whether or not the boot passed.
-      #
-      # The RELEASE attachment is a different question, and it has moved to
-      # AFTER the boot. An artifact is for debugging a red run; a release
-      # asset is a thing someone flashes to a card and hands to another
-      # person. Those want opposite defaults, and for a while they shared
-      # one -- so a tagged image that could not boot shipped anyway.
+      # The artifact is uploaded before the boot, because debugging a red boot
+      # needs the image that failed. The release attachment is after the boot:
+      # a release asset is something people flash.
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
@@ -336,75 +220,31 @@ jobs:
           path: image/deploy/*.img.xz
           if-no-files-found: error
 
-      # Tier 3 of the harness: boot the artifact that was just built. Once
-      # per image, not per commit -- it is emulated, so it is slow, and its
-      # peripheral coverage is WORSE than tier 1's simulators. It answers
-      # three questions nothing else can -- it used to be one, and the
-      # overlay work added two: does the thing that gets flashed to a card
-      # actually come up, does the unit start on the read-only overlay it
-      # comes up on, and does a power-cycle discard what the session wrote
-      # while keeping the settings? pi-gen assembles a filesystem and never
-      # starts it. See harness/README.md.
+      # Tier 3 of the harness: boot the artifact that was just built. Once per
+      # image, not per commit. See harness/README.md.
       #
-      # LAST, AND ALLOWED TO FAIL LOUDLY. This step used to run before the
-      # upload with `continue-on-error: true`, so that an unvalidated check
-      # could not cost anyone the image. The effect on its first real run
-      # was worse than the problem it solved: tier 3 exited 1, and the job
-      # went green with the GitHub API reporting this step's conclusion as
-      # `success`. Anyone reading the status rather than the log would have
-      # concluded the image booted. That is a check that cannot fail --
-      # exactly what the rest of this harness exists to eliminate.
+      # After the upload and without continue-on-error, so a failed boot fails
+      # the job while the artifact is already safe.
       #
-      # Moving it after the upload gets both things: the artifact is already
-      # safe, so a red boot costs nothing, and the boot can therefore be
-      # honest about failing.
-      #
-      # 600 seconds PER BOOT, and it is a BACKSTOP, not a budget: the
-      # harness stops each boot the moment its guest check reports done, so
-      # only a boot that never gets there pays this number. It was 480 when
-      # reaching the unit still raced the cap -- run 13's success line
-      # landed ~420s in -- and the early stop is what made raising it free.
-      # If a boot does hit 600, the verdict's "guest reached" line says
-      # whether the guest was still moving, and the sampler's qemu-cpu
-      # column says whether it was idle or spinning.
+      # 600 seconds per boot is a backstop: the harness stops each boot once it
+      # has reported, so only a boot that never gets there pays it.
       - name: Boot the image
         env:
           OTP_IMG_TIMEOUT: 600
         run: |
-          # RETRIES AND A TIMEOUT, for the reason ci.yml's two update calls
-          # carry them: on 2026-08-18 azure.archive.ubuntu.com stopped
-          # answering, apt fell back through the mirrorlist, fetched the
-          # InRelease files and then sat silent for seven and a half
-          # minutes inside `update`, before a single package was fetched.
-          # apt's default is a 120s per-connection timeout with no retry,
-          # so a mirror that accepts a socket and then stops talking holds
-          # every index for two minutes each. That change went into ci.yml
-          # and missed this file, which is the workflow with the 600s
-          # per-boot backstop and the longest job in the repository.
-          #
-          # apt-get update FIRST. The runner image ships an apt index that
-          # is days stale, and qemu had moved 8.2.2-0ubuntu1.17 -> .18, so
-          # the install 404'd and the boot step died in two seconds. On the
-          # x86 path this was free -- the binfmt step ran `apt-get update`
-          # on the way past -- and making that step skip on arm64 took the
-          # update with it.
+          # Retries and a timeout, as in ci.yml: apt's default is 120s per
+          # connection with no retry. And update first: the runner image's
+          # apt index is stale enough for the install to 404.
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
-          # device-tree-compiler is for fdtput: QEMU is not the Pi firmware
-          # and supplies no board revision, so harness/img-boot.sh writes
-          # /system/linux,revision into a copy of the image's own DTB. Without
-          # it rpi-eeprom-update.service dies on `(0x >> 23) & 1` in both
-          # boots -- the emulator's fault, reported as the image's.
+          # device-tree-compiler is for fdtput, which harness/img-boot.sh uses
+          # to give the guest the board revision the Pi firmware would supply.
           sudo apt-get install -y --no-install-recommends \
             qemu-system-arm mtools xz-utils device-tree-compiler
           OTP_IMG_WORK=${{ runner.temp }}/otp-img \
             ./harness/img-boot.sh image/deploy/*.img.xz
       - name: Boot verdict
         if: always()
-        # Also to the step summary, which is on the run's landing page. The
-        # verdict being in the log was not enough: the one line that
-        # explained the first failure was thirty lines up and easy to scroll
-        # past, and this repository keeps rediscovering that a diagnostic
-        # nobody can find is not a diagnostic.
+        # Also to the step summary, which is on the run's landing page.
         run: |
           echo "=== tier 3 verdict ==="
           CACHED='${{ steps.imgcache.outputs.cache-hit }}'
@@ -424,108 +264,37 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # THE RELEASE ASSET, and it is downstream of the boot on purpose.
+      # The release asset is downstream of the boot on purpose: a tag whose
+      # image cannot boot must produce a red run and no asset.
       #
-      # This used to sit above the boot step, next to the artifact upload,
-      # and that was right when it was written: the boot gate was unproven,
-      # and an unvalidated check must not cost anyone the image. It is not
-      # right any more. Tier 3 boots the actual flashable artifact to a
-      # running otp-unit.service in ~4.5 minutes cached, judges on
-      # ANSI-stripped console evidence, and has its verdict logic under
-      # sliced-test and mutation coverage. A tag whose image cannot boot
-      # must produce a red run and NO asset, rather than a release someone
-      # writes to a card and hands to another person.
-      #
-      # No `always()`, no `continue-on-error`, and that is the whole
-      # mechanism: a step whose `if` names no status function carries an
-      # implicit success(), so a red boot skips this and the tag ships
-      # nothing. `success() &&` is written out anyway -- this is the line
-      # that decides whether a broken image reaches a human, and it should
-      # not depend on the reader remembering that rule.
-      #
-      # The `Boot verdict` step above runs under always() and therefore
-      # cannot rescue this one: always() changes whether THAT step runs, not
-      # the job's failure state.
+      # A step whose `if` names no status function carries an implicit
+      # success(); it is written out because this line decides whether a broken
+      # image ships. The always() on `Boot verdict` above does not change the
+      # job's failure state.
       - name: Attach to the release
         if: success() && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: image/deploy/*.img.xz
-          # APPENDED. An earlier version set `body` plainly, reasoning that
-          # append_body is consulted only on the action's UPDATE path and
-          # that the first tag run -- a create -- was the only one that
-          # mattered here. That weighed the wrong case. Publishing a release
-          # through the GitHub UI creates the release AND the tag, and the
-          # tag push is what starts this workflow, so by the time this step
-          # runs the release already exists and the action takes the update
-          # path (verified against src/github.ts):
-          #
-          #   if (input_append_body && workflowBody && existingReleaseBody)
-          #     body = existingReleaseBody + "\n" + workflowBody;
-          #   else
-          #     body = workflowBody || existingReleaseBody;
-          #
-          # With append_body unset and a non-empty body, that else branch
-          # REPLACES the maintainer's changelog with the paragraph below.
-          # Silently destroying someone's release notes is worse than what
-          # appending costs: this paragraph appearing twice if the same
-          # tag's workflow is re-run, which is visible and editable.
+          # Appended: publishing a release through the GitHub UI creates the
+          # release before this workflow runs, and without append_body the
+          # action replaces the maintainer's changelog with the body below.
           append_body: true
-          #
           # A folded scalar, so the note reaches GitHub as one paragraph:
-          # release bodies render hard line breaks, and a block scalar
-          # would ship this at whatever width it happens to be wrapped to
-          # in this file.
+          # release bodies render hard line breaks.
           #
-          # THE CREDENTIAL SENTENCE USED TO SAY "FOR THAT BOOT", and the
-          # clause was load-bearing rather than cautious: userconf applies
-          # with `chpasswd -e` to /etc/shadow, /etc is inside the RAM overlay
-          # this same paragraph describes, and the seed is deleted from the
-          # FAT partition, which is OUTSIDE it -- so the credential lasted
-          # exactly one boot and the file that would reapply it was destroyed
-          # in the act of applying it. The repository owner's decision is to
-          # persist it, so the sentence has changed, and it now says the
-          # STRONGER thing: the password is still there after the power
-          # cycle. That claim is backed by four named guest checks the gate
-          # requires, and tests/test_image_workflow.py holds this body
-          # against those names.
-          #
-          # AND IT NAMES THE ONE THING THAT DOES NOT SURVIVE, because leaving
-          # it out is how a reader gets locked out. `userconf-pi` RENAMES the
-          # UID-1000 account whenever a seed names another user, and that
-          # rename touches only /etc and /home -- inside the overlay -- so
-          # the next boot is `otp` again with the new password on it. A note
-          # that promised the credential without saying which username it
-          # belongs to would send an operator to a tty2 prompt to type a name
-          # this machine does not have, with no network and no sshd behind
-          # it. credential-recovers-a-store-naming-another-account is the
-          # check that makes the sentence true.
-          #
-          # AND IT SAYS WHAT THAT COSTS IN THE SAME BREATH. The hash is on a
-          # world-readable partition and can be attacked offline; a reader
-          # who learns their password now persists and not that it persists
-          # somewhere anyone can copy has been told half of it. A release
-          # note is the one place this project's claims reach someone who
-          # cannot check them.
-          #
-          # AND IT ADMITS WHAT IS IN THE IMAGE, for exactly that reason. This
-          # artifact ships a test probe that runs as root and writes to the
-          # boot partition, and the owner's decision was to KEEP it rather
-          # than strip it from release builds -- a gate run against a
-          # specially prepared image proves nothing about the one people
-          # flash. A note that quietly omitted it would be hiding the thing
-          # a reader would most want to know, and one that mentioned it
-          # without saying what backs its inertness would be asking for
-          # trust. So the sentence names the probe, names the condition that
-          # keeps it asleep, and names the boot that observed it asleep:
-          # tier 3's third phase, which boots the same card with no
-          # otp.imgcheck token at all. The clauses that make it true are
-          # imgcheck-unit-considered-and-skipped, guest-probe-silent,
-          # guest-probe-journal-tag-absent,
-          # probe-droppings-stayed-off-the-card and
-          # identity-store-unchanged; tests/test_image_workflow.py holds
-          # this body against those names, the way it already does for the
-          # credential.
+          # tests/test_image_workflow.py holds this body against the names of
+          # the checks that back it. The body must keep saying:
+          #  - the password survives the power cycle, backed by the credential
+          #    guest checks;
+          #  - the username does not: userconf-pi's rename lives in the
+          #    overlay (credential-recovers-a-store-naming-another-account);
+          #  - the hash sits on a world-readable partition and can be attacked
+          #    offline;
+          #  - the image contains the test probe, what keeps it asleep, and the
+          #    release boot that observed it (imgcheck-unit-considered-and-
+          #    skipped, guest-probe-silent, guest-probe-journal-tag-absent,
+          #    probe-droppings-stayed-off-the-card, identity-store-unchanged).
           body: >
             This image passed the tier-3 boot gate: it was booted under
             QEMU three times, `otp-unit.service` reached `Started` on all
@@ -593,11 +362,8 @@ jobs:
             the header of `harness/img-boot.sh` for exactly what it does and
             does not prove.
 
-      # The bar, stated where it can be seen. Ten minutes is the budget for
-      # a run that did not have to rebuild the image; a run that did is
-      # expected to exceed it and says so rather than failing for it.
-      # Reported rather than enforced: failing an otherwise-good job for
-      # being slow teaches people to ignore the number.
+      # Reported rather than enforced: failing an otherwise-good job for being
+      # slow teaches people to ignore the number.
       - name: Time budget
         if: always()
         run: |
@@ -622,48 +388,14 @@ jobs:
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # The job log shows the last eighty console lines per boot; this
-      # carries everything -- both UARTs of every boot in full, the verdict,
-      # and the boot partition's own cmdline.txt and config.txt, so the
-      # divergence between what the device would boot and what this harness
-      # booted is part of the record. Two diagnoses this week were built on
-      # a truncated tail; this is the end of that.
-      #
-      # The consoles moved into a directory per boot when tier 3 grew a
-      # second one, so the glob has a level in it that the old path did not.
-      #
-      # AND THE CARD EVIDENCE, WHICH THIS GLOB DID NOT MATCH. The release
-      # phase's entire new claim is about the boot partition -- what the
-      # probe had left on it, what the harness deleted, what came back, and
-      # whether the three files whose contents are the point survived -- and
-      # every one of those is decided from a file in $WORK/<phase>/ that
-      # nothing here collected: boot-files-before-strip.txt,
-      # boot-files-before.txt, boot-files-after.txt, boot-digests-before.txt
-      # and boot-digests-after.txt. A `boot-partition-unchanged FAIL` printed
-      # ten differing entries and the listings they came out of could not be
-      # retrieved after the run. `*/boot-*.txt` takes all five for all three
-      # phases and cannot collide with the `boot/` directory below it, which
-      # is a directory and not a `boot-`-prefixed file.
-      #
-      # Truncating the digest in verdict.txt is still right and is NOT
-      # softened by this: verdict.txt travels too, so the twelve characters
-      # are the trade harness/img-boot.sh describes rather than a limit on
-      # what a reader can get at. The digest files carry sha256 of a password
-      # hash, never the hash.
-      #
-      # `if: failure()` -- this is the diagnosis path. A green run publishes
-      # no card evidence, which is deliberate and is why img-boot.sh prints
-      # the twelve characters into the verdict at all.
-      #
-      # EVERY FILE A PHASE LEAVES BEHIND, and that is now held as a rule
-      # rather than as a list somebody remembered to extend.
+      # Everything a phase leaves behind: both UARTs of every boot in full, the
+      # verdict, the card listings and digests (`*/boot-*.txt`), qemu-rc and
+      # early-stop, and the boot partition's own cmdline.txt and config.txt.
       # tests/test_image_workflow.py reads the per-phase filenames out of
-      # img-boot.sh and requires each one to match a glob here, so the next
-      # evidence file the harness starts writing is red in the fast suite
-      # instead of missing from an artifact sixteen minutes into an arm64
-      # run. `qemu-rc` and `early-stop` are one line each and are what
-      # separate "the emulator was killed at the backstop" from "the harness
-      # stopped it on its marker".
+      # img-boot.sh and requires each to match a glob here.
+      #
+      # `if: failure()`: this is the diagnosis path. The digest files carry
+      # sha256 of a password hash, never the hash.
       - name: Upload the boot evidence
         if: failure()
         uses: actions/upload-artifact@v4
@@ -683,14 +415,12 @@ jobs:
   # The required check. It runs on every pull request, whatever the diff
   # touched, so branch protection always has something to read.
   #
-  # Fail-closed on purpose, in all three directions: a build that failed
-  # fails this, a `changes` job that could not work out an answer fails
-  # this, and a build that ran when it should not have fails this too.
-  # The only green path is one where the reason for it is stated.
+  # Fail-closed: a failed build, a `changes` job with no answer, and a build
+  # that ran when it should not have all fail this.
   image:
     needs: [changes, build]
-    # Without always(), a skipped `build` skips this too -- and a skipped
-    # required check never reports, which is the exact bug being fixed.
+    # Without always(), a skipped `build` skips this too, and a skipped
+    # required check never reports.
     if: always()
     runs-on: ubuntu-latest
     steps:

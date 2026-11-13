@@ -1,33 +1,19 @@
 #!/usr/bin/env bash
 #
-# Stand up kernel-level stand-ins for the hardware this unit talks to, so
-# the real driver code runs against real kernel interfaces.
+# Kernel-level stand-ins for the unit's hardware, so the real driver code
+# runs against real kernel interfaces on any Linux box.
 #
 #   ./harness/kernel-sim.sh up      bring up what this kernel can offer
 #   ./harness/kernel-sim.sh down    tear it all down
 #   ./harness/kernel-sim.sh status  what is currently up
 #
-# The point is NOT to emulate a Raspberry Pi. Emulating a Pi gives you a Pi
-# with nothing plugged into it, which is the one configuration the unit
-# already handles and the test suite already covers. What has never run is
-# the code that talks to hardware that IS present: gpiozero opening a real
-# gpiochip, luma driving a real SMBus, the DRM probe reading a real
-# connector. These simulators provide exactly that, on any Linux box, with
-# no Pi involved.
+#   gpio-sim   virtual gpiochip, line values driven from sysfs
+#   i2c-stub   fake SMBus device at 0x3C for the SSD1306 init sequence
+#   vkms       virtual DRM device, so /sys/class/drm/card*/status is real
+#   uinput     virtual keyboard, a real kbd handler in /proc/bus/input
 #
-#   gpio-sim   a virtual gpiochip whose line values are driven from sysfs.
-#              A button press through the real gpiozero -> lgpio -> kernel
-#              path.
-#   i2c-stub   a fake SMBus device at 0x3C. The SSD1306 init sequence
-#              really runs; there is simply nothing to look at.
-#   vkms       a virtual DRM device, so /sys/class/drm/card*/status is a
-#              real file with a real answer rather than a monkeypatch.
-#   uinput     a virtual keyboard, so /proc/bus/input/devices carries a
-#              real kbd handler.
-#
-# Needs root and a kernel with these modules. Everything is best effort and
-# reported individually: a kernel missing one of them should still exercise
-# the other three, and the tests skip what is not up rather than failing.
+# Needs root. Best effort: each simulator is reported individually and the
+# tests skip whatever is not up.
 set -euo pipefail
 
 STATE=/run/otp-kernel-sim
@@ -37,7 +23,7 @@ OLED_ADDRESS=0x3C
 log() { printf '%s\n' "$*" >&2; }
 
 have_module() {
-    # Built in counts as available, and modinfo does not know about builtins.
+    # modinfo does not know about builtins.
     local name="${1//-/_}"
     grep -qw "$name" /proc/modules 2>/dev/null && return 0
     modinfo "$1" >/dev/null 2>&1 && return 0
@@ -49,7 +35,6 @@ load() {
         log "  $1: not available in this kernel"
         return 1
     fi
-    # Already loaded is success, not failure.
     modprobe "$@" 2>/dev/null || {
         log "  $1: modprobe failed"
         return 1
@@ -79,10 +64,7 @@ up_gpio() {
         log "  gpio-sim: already up"
     else
         mkdir -p "$root/bank0"
-        # 32 lines so the unit's GPIO 5, 6 and 13 all exist at their real
-        # offsets. gpiozero addresses pins by BCM number, and the whole
-        # point is to exercise the shipped pin numbers rather than
-        # renumber them for the test.
+        # 32 lines so GPIO 5, 6 and 13 exist at their shipped BCM offsets.
         echo 32 > "$root/bank0/num_lines"
         echo 1 > "$root/live"
     fi
@@ -96,9 +78,8 @@ up_gpio() {
         return 1
     fi
 
-    # Buttons connect their GPIO to ground and the internal pull-up is
-    # enabled in software, so idle is HIGH. Start every line there or the
-    # first read looks like three buttons held down.
+    # Buttons pull to ground against an internal pull-up, so idle is HIGH;
+    # otherwise the first read looks like three buttons held down.
     local pin
     for pin in 5 6 13; do
         [ -w "$control/sim_gpio$pin/pull" ] && \
@@ -115,15 +96,14 @@ up_gpio() {
 
 up_i2c() {
     load i2c-stub "chip_addr=$OLED_ADDRESS" || return 1
-    # i2c-dev is what creates /dev/i2c-N, which is what smbus2 opens. The
-    # stub alone registers an adapter with no character device.
+    # i2c-dev creates /dev/i2c-N, which smbus2 opens; the stub alone registers
+    # an adapter with no character device.
     load i2c-dev || log "  i2c-dev: not available; /dev/i2c-* may be absent"
 
     local path bus
     for path in /sys/bus/i2c/devices/i2c-*; do
         [ -r "$path/name" ] || continue
-        # i2c-stub names its adapter "SMBus stub driver"; match loosely in
-        # case that wording ever shifts.
+        # The adapter is named "SMBus stub driver"; match loosely.
         case "$(cat "$path/name")" in
             *stub*)
                 bus="${path##*/i2c-}"
@@ -190,18 +170,16 @@ cmd_up() {
     fi
     mkdir -p "$STATE"
     log "Bringing up kernel simulators on $(uname -r):"
-    # Explicit if-then rather than `A && B || true`: shellcheck 0.9.0 flags
-    # that as SC2015 and CI pins 0.9.0 deliberately, because it and 0.11.0
-    # genuinely disagree. This is the second time that has bitten here.
+    # if-then, not `A && B || true`: the pinned shellcheck 0.9.0 flags that
+    # as SC2015.
     local ok=0
     if up_gpio;     then ok=$((ok + 1)); fi
     if up_i2c;      then ok=$((ok + 1)); fi
     if up_drm;      then ok=$((ok + 1)); fi
     if up_keyboard; then ok=$((ok + 1)); fi
     log "$ok of 4 up. Tests skip whatever is missing rather than failing."
-    # Deliberately exit 0 even at 0 of 4. A kernel without these modules is
-    # a reason to skip the hardware tests, not to fail the build -- and the
-    # count above is the honest report.
+    # Exit 0 even at 0 of 4: missing modules mean skipped tests, not a failed
+    # build.
 }
 
 cmd_down() {
