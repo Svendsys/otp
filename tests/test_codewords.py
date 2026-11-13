@@ -23,18 +23,8 @@ MODIFIERS, NOUNS = g.load_vocabulary()
 FLAT_NOUNS = [w for words in NOUNS.values() for w in words]
 
 
-def soundex(word):
-    codes = {**dict.fromkeys("BFPV", "1"), **dict.fromkeys("CGJKQSXZ", "2"),
-             **dict.fromkeys("DT", "3"), "L": "4",
-             **dict.fromkeys("MN", "5"), "R": "6"}
-    out, prev = word[0], codes.get(word[0], "")
-    for ch in word[1:]:
-        code = codes.get(ch, "")
-        if code and code != prev:
-            out += code
-        if ch not in "HW":
-            prev = code
-    return (out + "000")[:4]
+sys.path.insert(0, str(REPO / "codewords"))
+from build_lists import soundex  # noqa: E402  (the builder's own sound key)
 
 
 def edit_distance(a, b):
@@ -157,8 +147,19 @@ class TestNothingIsMistakenByEar:
 
     def test_dark_pictures_are_kept_on_purpose(self):
         """Nothing is filtered for taste: a macabre pair is a memorable one."""
-        assert {"SMOKED", "DROWNED", "CHARRED"} <= set(MODIFIERS)
-        assert "BABY" in FLAT_NOUNS
+        assert {"DROWNED", "CHARRED", "ROTTEN", "NAKED"} <= set(MODIFIERS)
+        assert {"SMOKED", "SMOKY"} & set(MODIFIERS)
+        assert {"BABY", "CORPSE", "CANNIBAL"} <= set(FLAT_NOUNS)
+
+    def test_sounds_a_listener_tells_apart_are_not_merged(self):
+        """The sound key folds only what a noisy channel confuses, so common
+        words are not lost to each other for nothing."""
+        assert soundex("BIG") != soundex("BUSY")
+        assert soundex("HAPPY") != soundex("HEAVY")
+        assert soundex("CAT") != soundex("GOAT")
+        assert soundex("SHEEP") != soundex("SUBWAY")
+        assert soundex("BEAR") == soundex("BOAR")
+        assert soundex("TANK") == soundex("TONGUE")
 
 
 class TestRandomCodewords:
