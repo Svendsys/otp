@@ -89,6 +89,10 @@ class Settings:
     # reused page undoes the whole scheme. Costs paper, which is the right
     # trade for the situation this mode exists for.
     auto_manual: bool = True
+    # Live pads are refused unless the root filesystem is a RAM overlay.
+    # Set this only on a machine that deliberately has none -- a laptop
+    # provisioned by hand -- and accept that the disk then remembers.
+    allow_writable_root: bool = False
 
     @property
     def imposed(self) -> bool:

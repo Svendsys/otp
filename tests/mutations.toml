@@ -861,14 +861,13 @@ tests = [
 file = "device/install.sh"
 find = '''        LISTING=$(lsinitramfs "$candidate" 2>/dev/null || true)
         case "$LISTING" in
-            *scripts/overlay*)
-                OVERLAY_INITRAMFS="$candidate"
-                break
-                ;;
+            *scripts/overlay*) OVERLAY_INITRAMFS="$OVERLAY_INITRAMFS $candidate" ;;
+            *) STALE_INITRAMFS="$STALE_INITRAMFS $candidate" ;;
         esac'''
 replace = '''        if lsinitramfs "$candidate" 2>/dev/null | grep -q "scripts/overlay"; then
-            OVERLAY_INITRAMFS="$candidate"
-            break
+            OVERLAY_INITRAMFS="$OVERLAY_INITRAMFS $candidate"
+        else
+            STALE_INITRAMFS="$STALE_INITRAMFS $candidate"
         fi'''
 
 

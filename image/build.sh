@@ -80,7 +80,12 @@ touch "$PI_GEN_DIR/stage2/SKIP_IMAGES"
 # sub-stage and only descends into directories, so a file at the stage root
 # is skipped without a word and the image ships with none of them.
 grep -vE '^\s*(#|$)' "$REPO_DIR/device/packages.txt" | tr '\n' ' ' \
-    > "$PI_GEN_DIR/stage-otpunit/01-otpunit/00-packages"
+    > "$PI_GEN_DIR/stage-otpunit/01-otpunit/00-packages-nr"
+# -nr: pi-gen installs that list with --no-install-recommends, as
+# install.sh does. A plain 00-packages pulls in every Recommends, so the
+# image carried software the manifest never named and no hand-provisioned
+# unit had.
+rm -f "$PI_GEN_DIR/stage-otpunit/01-otpunit/00-packages"
 
 # STAGE_LIST has to be explicit. Under pi-gen's default `stage*` glob,
 # "stage-otpunit" sorts BEFORE "stage0" ('-' is 0x2D, '0' is 0x30) and would
@@ -89,31 +94,21 @@ grep -vE '^\s*(#|$)' "$REPO_DIR/device/packages.txt" | tr '\n' ' ' \
 # *inside* the container, so pointing it at a host path just writes the
 # image somewhere the container's own `docker cp` never looks.
 # FIRST_USER_PASS is required whenever DISABLE_FIRST_BOOT_USER_RENAME is
-# set; pi-gen refuses to start without it, and unset it is RANDOM -- eighteen
-# bytes of /dev/urandom, base64, discarded the moment the build finishes.
-# Nobody has it, including whoever built the image.
+# set. pi-gen feeds it to chpasswd as PLAINTEXT, so it is always a random
+# value nobody keeps: the account then has a password no one knows, and the
+# login prompt on tty2 is usable only by an operator who seeds their own
+# credential (userconf.txt on the boot partition; see docs/IMAGE.md).
 #
-# "THE ACCOUNT HAS NO SSH AND NO CONSOLE USE" is what this comment used to
-# say, and the console half was never true: device/install.sh puts a login
-# getty on tty2 precisely so a unit with a keyboard and a screen can be
-# recovered. That random password was the credential on that prompt on every
-# unit whose operator had not seeded a userconf.txt, and until the credential
-# was persisted it was the credential again from the second boot onwards even
-# on units whose operator HAD.
-#
-# So set OTP_USER_PASS_HASH if you want the image itself to ship a password
-# you know -- the value is a crypt(3) string, not a password, and it goes
-# into the built image where anyone with the .img.xz can read it. The
-# supported way is the other one: write a userconf.txt to the boot partition
-# of the flashed card. See docs/IMAGE.md, which also says what keeping it
-# costs.
+# OTP_USER_PASS_HASH, if set, is a crypt(3) string applied by the stage with
+# `chpasswd -e`. It ships in the image, where anyone holding the .img.xz
+# can read it and attack it offline.
 cat > "$PI_GEN_DIR/config" <<EOF
 IMG_NAME='otp'
 RELEASE='trixie'
 STAGE_LIST='stage0 stage1 stage2 stage-otpunit'
 TARGET_HOSTNAME='otp-unit'
 FIRST_USER_NAME='otp'
-FIRST_USER_PASS='${OTP_USER_PASS_HASH:-$(head -c 18 /dev/urandom | base64)}'
+FIRST_USER_PASS='$(head -c 18 /dev/urandom | base64)'
 DISABLE_FIRST_BOOT_USER_RENAME=1
 ENABLE_SSH=0
 # Does NOT remove the packages, whatever the name says.
@@ -142,7 +137,7 @@ EOF
 
 log "Building (this takes roughly half an hour)"
 cd "$PI_GEN_DIR"
-PIGEN_DOCKER_OPTS="-e OTP_REPO_DIR=/otp-repo -v ${REPO_DIR}:/otp-repo:ro" \
+PIGEN_DOCKER_OPTS="-e OTP_REPO_DIR=/otp-repo -e OTP_USER_PASS_HASH -v ${REPO_DIR}:/otp-repo:ro" \
     ./build-docker.sh
 
 log "Collecting the image"
@@ -153,6 +148,9 @@ if ! ls "$IMAGE_DIR"/deploy/*.img.xz >/dev/null 2>&1; then
     echo "ERROR: the build produced no image. Check $PI_GEN_DIR/work/*/build.log" >&2
     exit 1
 fi
+
+# The config holds the throwaway password in plaintext.
+rm -f "$PI_GEN_DIR/config"
 
 log "Done"
 ls -lh "$IMAGE_DIR/deploy/"

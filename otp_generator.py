@@ -252,7 +252,9 @@ def _source_note(source: str) -> str:
     """One line naming the source, and what it means for the output."""
     if source == "hwrng+urandom":
         return (f"hardware TRNG ({HWRNG_PATH}) XORed with the system CSPRNG "
-                f"-- a true one-time pad")
+                f"-- never weaker than the CSPRNG, and a true one-time pad "
+                f"to the extent the TRNG delivers full entropy, which this "
+                f"program cannot measure")
     return ("system CSPRNG only -- no hardware TRNG on this machine. These "
             "pads are a very strong stream cipher, not information-"
             "theoretically secure one-time pads.")

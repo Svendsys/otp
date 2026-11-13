@@ -238,11 +238,20 @@ class Ssd1306Display(Display):
                 f"but the {COLS}x{ROWS} character grid this UI is built on "
                 f"needs {WIDTH}x{HEIGHT}; only {self.SQUARE_ON} are supported")
 
+        self._port, self._address, self._rotate = port, address, rotate
+        self._device = self._open()
+        self._font = _panel_font()
+
+    def _open(self):
         from luma.core.interface.serial import i2c
         from luma.oled.device import ssd1306
 
-        self._device = ssd1306(i2c(port=port, address=address), rotate=rotate)
-        self._font = _panel_font()
+        return ssd1306(i2c(port=self._port, address=self._address),
+                       rotate=self._rotate)
+
+    def reopen(self) -> None:
+        """Re-run the panel's init sequence after it lost power or sync."""
+        self._device = self._open()
 
     def show(self, frame: Frame) -> None:
         from luma.core.render import canvas

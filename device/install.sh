@@ -1061,7 +1061,9 @@ otp_restore_machine_id()
 	# builds has. Nothing is trusted just for mounting: the file has to be
 	# under otp-identity/, a directory only device/install.sh's own
 	# persistence puts there, so mounting the wrong thing does nothing.
-	for dev in "${ROOT%p[0-9]}p1" /dev/mmcblk0p1; do
+	# ${ROOT%[0-9]}1 swaps the final partition digit for 1, which is right
+	# for every naming scheme: mmcblk0p2, nvme0n1p2 and a USB-booted sda2.
+	for dev in "${ROOT%[0-9]}1" /dev/mmcblk0p1; do
 		[ -e "${dev}" ] || continue
 		mount -r -t vfat "${dev}" "${OTP_IDENTITY_MNT}" 2>/dev/null || continue
 		id=$(cat "${OTP_IDENTITY_MNT}/otp-identity/machine-id" 2>/dev/null)
@@ -1181,6 +1183,14 @@ OVERLAY
     # appliance has nothing to grow: what it writes is RAM, and the card is
     # never written after provisioning.
     sed -i -E 's/(^| )resize( |$)/\1/g' "$CMDLINE_TXT"
+    # tty1 is the front panel. Without `quiet` the kernel writes over it
+    # whenever a printer is plugged in.
+    grep -qE '(^| )quiet( |$)' "$CMDLINE_TXT" \
+        || sed -i -e 's|$| quiet|' "$CMDLINE_TXT"
+    # No console on the GPIO UART: it puts the kernel log and a login
+    # prompt on three header pins. For bring-up, add
+    # `console=serial0,115200` back to cmdline.txt on the card.
+    sed -i -E 's/(^| )console=(serial0|ttyAMA0|ttyS0)(,[^ ]*)?//g; s/^ +//' "$CMDLINE_TXT"
     # SYSTEMD HAS A SECOND GROWER, and until run 72 nothing here took it out.
     # rpi-resize.service pulls systemd-growfs-root.service in with a Wants=,
     # which makes disabling rpi-resize LOOK like it settles the matter --
@@ -1227,15 +1237,17 @@ OVERLAY
     # lines and scripts/overlay sorts early in it, so this would have failed
     # the build on a good image every time -- the sign-flipped version of
     # issue #14's defect, aimed at the release gate.
+    # EVERY initramfs, not the first that passes. The firmware picks one per
+    # board -- initramfs8 on a Pi 3 or 4, initramfs_2712 on a Pi 5 -- so one
+    # good file says nothing about the board this card ends up in.
     OVERLAY_INITRAMFS=""
+    STALE_INITRAMFS=""
     for candidate in "$BOOT_DIR"/initramfs*; do
         [ -f "$candidate" ] || continue
         LISTING=$(lsinitramfs "$candidate" 2>/dev/null || true)
         case "$LISTING" in
-            *scripts/overlay*)
-                OVERLAY_INITRAMFS="$candidate"
-                break
-                ;;
+            *scripts/overlay*) OVERLAY_INITRAMFS="$OVERLAY_INITRAMFS $candidate" ;;
+            *) STALE_INITRAMFS="$STALE_INITRAMFS $candidate" ;;
         esac
     done
     if [ -z "$OVERLAY_INITRAMFS" ]; then
@@ -1243,6 +1255,13 @@ OVERLAY
         echo "       boot=overlay would be read by nothing and the unit" >&2
         echo "       would come up on a writable root." >&2
         ls -la "$BOOT_DIR" >&2
+        exit 1
+    fi
+    if [ -n "$STALE_INITRAMFS" ]; then
+        echo "ERROR: these have no scripts/overlay:$STALE_INITRAMFS" >&2
+        echo "       A board that boots one of them comes up on a writable" >&2
+        echo "       root. Delete it if its kernel is gone, or reinstall" >&2
+        echo "       that kernel and rerun this script." >&2
         exit 1
     fi
     if ! grep -q "boot=overlay" "$CMDLINE_TXT"; then

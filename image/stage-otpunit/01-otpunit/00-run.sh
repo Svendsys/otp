@@ -221,6 +221,26 @@ EOF
 
 # Packages are already installed from 00-packages, so skip apt in the
 # chroot: it has no network and does not need one.
+# An image-wide login, only when the builder asked for one. -e because the
+# value is already a crypt(3) string; quoted heredoc so its `$` survive.
+if [ -n "${OTP_USER_PASS_HASH:-}" ]; then
+	case "${OTP_USER_PASS_HASH}" in
+	\$*) ;;
+	*)
+		echo "ERROR: OTP_USER_PASS_HASH is not a crypt(3) string. Make" >&2
+		echo "       one with: openssl passwd -6" >&2
+		exit 1
+		;;
+	esac
+	printf '%s:%s\n' "${FIRST_USER_NAME}" "${OTP_USER_PASS_HASH}" \
+		> "${ROOTFS_DIR}/tmp/otp-pass"
+	on_chroot <<-'EOF'
+		set -e
+		chpasswd -e < /tmp/otp-pass
+		rm -f /tmp/otp-pass
+	EOF
+fi
+
 on_chroot <<-EOF
 	set -e
 	cd ${STAGING}

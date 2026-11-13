@@ -185,7 +185,8 @@ def _entropy_source():
     has to say so on paper rather than let it pass unnoticed.
     """
     if gen.entropy_source() == "hwrng+urandom":
-        return "hardware TRNG + CSPRNG (correct)"
+        return ("hardware TRNG + CSPRNG (correct). Never weaker than the "
+                "CSPRNG; the TRNG's own quality is not measured.")
     return ("CSPRNG ONLY -- no /dev/hwrng. Pads are stream-cipher output, "
             "not true one-time pads.")
 
@@ -573,7 +574,8 @@ def _page_size(settings):
 
 
 def run_headless(cups, settings=None, poll_seconds=2.0, log=print,
-                 sleep=None, once=False, sequence=None, buttons=None) -> int:
+                 sleep=None, once=False, sequence=None, buttons=None,
+                 refuse_live: str = "") -> int:
     """
     Wait for a printer, then run the unattended sequence against it.
 
@@ -641,9 +643,12 @@ def run_headless(cups, settings=None, poll_seconds=2.0, log=print,
         # second pair on top of the first.
         printed_for = device.uri
         try:
+            # Passed only when set, so a substituted sequence need not
+            # know the parameter.
+            extra = {"refuse_live": refuse_live} if refuse_live else {}
             result = sequence(cups, settings=settings, queue=queue or "OTP",
                               log=log, sleep=sleep, buttons=buttons,
-                              driver=driver)
+                              driver=driver, **extra)
         except Exception as exc:                 # noqa: BLE001
             log(f"unattended sequence failed: {exc}")
             result = 1

@@ -46,3 +46,9 @@ training = no
 
 # Key body font size in points.
 font_size = 9.0
+
+# Live pads are refused unless the root filesystem is the read-only RAM
+# overlay, because otherwise the disk can remember what the unit did. The
+# provided image always has it. Set this to yes only on a machine that
+# deliberately has no overlay; training pads print either way.
+allow_writable_root = no

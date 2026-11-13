@@ -156,7 +156,8 @@ def drain(cups, queue, sleep, log, timeout=900.0, step=2.0,
 
 
 def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
-        sleep=None, buttons=None, vocabulary=None, driver=None) -> int:
+        sleep=None, buttons=None, vocabulary=None, driver=None,
+        refuse_live: str = "") -> int:
     """
     Status sheet, a pause, then a pad pair, with printed sheets between.
 
@@ -165,6 +166,8 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
     settings = settings or Settings()
     sleep = sleep or time.sleep
     vocabulary = vocabulary or Vocabulary()
+    # See otpunit.posture. Training pads are not secret and still print.
+    refused = refuse_live if not settings.training else ""
 
     # Every sheet carries the media size. Dropping it left the status,
     # swap and done sheets submitted with no media at all, so a LETTER or
@@ -199,7 +202,7 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
         send(diagnostics.render_bytes(
             diagnostics.collect(settings=settings, printer=_first(cups),
                                 queue=queue, driver=driver,
-                                plan=_plan(settings)),
+                                plan=_plan(settings, refused)),
             diagnostics._page_size(settings)), "OTP status")
         log("status sheet submitted")
     except Exception as exc:                     # noqa: BLE001
@@ -211,6 +214,9 @@ def run(cups, settings: Settings = None, queue: str = "OTP", log=print,
 
     if not settings.auto_print:
         log("auto_print is off; stopping after the status sheet")
+        return 1
+    if refused:
+        log(f"not printing a live pad: {refused}")
         return 1
 
     # 2. The codeword, and not one line earlier.
@@ -500,8 +506,16 @@ def sheets_needed(settings: Settings) -> int:
     return _manual_sheets(settings) + settings.sheets * 2 + 4
 
 
-def _plan(settings: Settings) -> list[str]:
+def _plan(settings: Settings, refused: str = "") -> list[str]:
     """The countdown notice printed on the status sheet."""
+    if refused and settings.auto_print:
+        return [f"THIS UNIT WILL NOT PRINT A PAD: {refused}.",
+                "Key material made on this machine could be written to its "
+                "storage, so live pads are refused. See SECURITY POSTURE "
+                "below. Reflash the card with the provided image, or rerun "
+                "the installer and reboot.",
+                "Training pads are not secret and still print: set "
+                "training = yes in otp-unit.conf."]
     if not settings.auto_print:
         return ["auto_print is off in otp-unit.conf, so this unit will print "
                 "nothing further. Set it to yes to have it produce pads on "

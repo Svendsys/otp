@@ -221,10 +221,16 @@ good stream cipher, so the generator is explicit about it.
 It draws from the machine's **hardware random number generator** when there is
 one — `/dev/hwrng`, which every Raspberry Pi has — **XORed with the OS CSPRNG**
 (`os.urandom`), and maps the result to letters with rejection sampling so every
-letter is exactly equally likely. The XOR is deliberate: if *either* source is
-good the output is good, and neither can spoil the other. That matters at both
-ends, because a raw ring oscillator can be biased and a board that has just
-booted can have a barely-seeded OS pool.
+letter is exactly equally likely. The XOR is deliberate: the output is never
+weaker than the stronger of the two, so a biased ring oscillator cannot make
+it worse than the CSPRNG alone, and a barely-seeded OS pool on a board that
+has just booted is covered by the hardware.
+
+That is a floor, not a proof. A pad is *information-theoretically* secure
+only to the extent the hardware source delivers full entropy per output bit,
+and the Pi's generator is undocumented and unmeasured here. What the unit
+guarantees is "never weaker than the CSPRNG"; the one-time pad's proof holds
+exactly as far as the chip's TRNG is as good as it is believed to be.
 
 With no hardware source the generator falls back to the CSPRNG alone and
 **says so** rather than letting it pass. An OS CSPRNG is continuously
@@ -232,8 +238,9 @@ re-seeded with physical noise and is not practically attackable, but it is
 still an algorithm expanding a seed — which makes those pads *computationally*
 secure rather than *information-theoretically* secure. For teaching and hobby
 use the distinction is academic; if your threat model disagrees, use a machine
-with a TRNG, or the manual's hand-generation methods (dice with rejection
-sampling, shake-and-draw), which keep the proof intact.
+with a TRNG, or -- for the proof itself rather than a hardware vendor's word
+-- the manual's hand-generation methods (dice with rejection sampling,
+shake-and-draw).
 
 ```bash
 python3 otp_generator.py --entropy     # which source this machine will use

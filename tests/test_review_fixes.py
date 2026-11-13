@@ -84,3 +84,90 @@ def test_the_service_cannot_start_with_swap_on_or_a_read_only_cwd():
     assert "WorkingDirectory=/run/otp-unit" in unit
     assert "RuntimeDirectory=otp-unit" in unit
     assert "systemctl mask swap.target" in INSTALL.read_text()
+
+
+# --- the posture gate -----------------------------------------------------
+
+from otpunit import posture, unattended  # noqa: E402
+
+
+def _proc(tmp_path, root="overlay", swap=False):
+    mounts = tmp_path / "mounts"
+    mounts.write_text(f"/dev/root / ext4 ro 0 0\nx / {root} rw 0 0\n")
+    swaps = tmp_path / "swaps"
+    swaps.write_text("Filename Type Size Used Priority\n"
+                     + ("/dev/zram0 partition 1 0 100\n" if swap else ""))
+    return dict(mounts=str(mounts), swaps=str(swaps))
+
+
+def test_a_healthy_unit_has_no_posture_problems(tmp_path):
+    assert posture.problems(**_proc(tmp_path)) == []
+
+
+def test_a_writable_root_and_swap_are_each_reported(tmp_path):
+    assert posture.problems(**_proc(tmp_path, root="ext4", swap=True)) == [
+        "SWAP IS ON", "ROOT DISK IS WRITABLE"]
+    # The opt-out covers the root only. Swap has none.
+    assert posture.problems(True, **_proc(tmp_path, root="ext4", swap=True)) \
+        == ["SWAP IS ON"]
+
+
+def test_unreadable_proc_is_not_read_as_safe(tmp_path):
+    assert len(posture.problems(mounts=str(tmp_path / "no"),
+                                swaps=str(tmp_path / "no"))) == 2
+
+
+class _Cups:
+    def __init__(self):
+        self.titles = []
+
+    def devices(self):
+        from otpunit.printer import Device
+        return [Device("usb://A/B", "A B")]
+
+    def active_jobs(self, queue):
+        return 0
+
+    def submit(self, data, name="OTP", title="OTP", options=None):
+        self.titles.append(title)
+        return "OTP-1"
+
+
+def test_unattended_prints_the_status_sheet_and_no_live_pad_when_refused():
+    cups = _Cups()
+    result = unattended.run(cups, settings=config.Settings(auto_delay=0),
+                            log=lambda _m: None, sleep=lambda _s: None,
+                            refuse_live="ROOT DISK IS WRITABLE")
+    assert result == 1 and cups.titles == ["OTP status"]
+
+
+def test_the_panel_refuses_a_live_pad_but_not_a_training_one():
+    from otpunit import ui
+
+    class App:
+        refuse_live = "ROOT DISK IS WRITABLE"
+        settings = config.Settings()
+
+    pad_pair = ui.main_menu().items[0][1]
+    assert isinstance(pad_pair(App), ui.Message)
+    App.settings = config.Settings(training=True)
+    assert not isinstance(pad_pair(App), ui.Message)
+
+
+def test_the_display_is_reopened_after_repeated_failures():
+    from otpunit import ui
+
+    class Dead:
+        reopened = 0
+
+        def show(self, frame):
+            raise OSError("i2c")
+
+        def reopen(self):
+            self.reopened += 1
+
+    app = ui.App(Dead(), buttons=None, cups=object(),
+                 vocabulary=object())
+    for _ in range(ui.REOPEN_AFTER * 2):
+        app.render(ui.WaitForPrinter())
+    assert app.display.reopened == 2

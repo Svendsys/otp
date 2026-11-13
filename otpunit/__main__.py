@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from otpunit import config, hmi
+from otpunit import config, hmi, posture
 from otpunit.codewords import Vocabulary
 from otpunit.hw.buttons import KeyboardButtons
 from otpunit.hw.display import ConsoleDisplay
@@ -131,6 +131,11 @@ def main(argv=None):
     settings = config.load(args.config)
     log = lambda message: print(message, file=sys.stderr)   # noqa: E731
 
+    # The simulator makes nothing secret and runs on ordinary machines.
+    refuse_live = "" if args.sim else posture.refusal(settings)
+    if refuse_live:
+        log(f"live pads refused -- {refuse_live}")
+
     if args.sim:
         # allow_quit only in the simulator: on a real unit QUIT ends the
         # process with status 0, and Restart=on-failure reads that as
@@ -172,7 +177,7 @@ def main(argv=None):
         try:
             return diagnostics.run_headless(
                 cups, settings=settings, once=args.diagnostic,
-                buttons=buttons, log=log)
+                buttons=buttons, log=log, refuse_live=refuse_live)
         finally:
             if buttons is not None:
                 buttons.close()
@@ -184,6 +189,7 @@ def main(argv=None):
         settings=settings,
         vocabulary=Vocabulary(),
         config_path=args.config,
+        refuse_live=refuse_live,
     )
 
     try:

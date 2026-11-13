@@ -19,6 +19,9 @@ from .hw.display import Frame
 
 VERSION = "1.0"
 
+# Consecutive failed draws before the display is reopened.
+REOPEN_AFTER = 3
+
 # Returned by a screen to unwind the whole stack back to the main menu.
 # Without this, any flow that pushes screens on the way to a job (picking a
 # codeword, typing one in) has no route home: a screen can only pop itself,
@@ -1015,6 +1018,13 @@ def _save(app):
 
 def main_menu():
     def pad_pair(app):
+        # See otpunit.posture. Refused before a codeword is rolled, so the
+        # operator is not walked through a flow that cannot finish.
+        if app.refuse_live and not app.settings.training:
+            return Message("NOT SAFE", wrap(
+                f"{app.refuse_live}. LIVE PADS REFUSED. TRAINING PADS "
+                f"STILL PRINT."), footer="OK TO RETURN")
+
         def chosen(app, codeword):
             spec = jobs_mod.JobSpec(jobs_mod.JobKind.PAD_PAIR, codeword, app.settings)
             return RunJob(spec)
@@ -1115,7 +1125,8 @@ class App:
     """Owns the screen stack and the hardware handles."""
 
     def __init__(self, display, buttons, cups=None, settings=None,
-                 vocabulary=None, config_path=None, poll_seconds=2.0):
+                 vocabulary=None, config_path=None, poll_seconds=2.0,
+                 refuse_live: str = ""):
         from .config import CONFIG_PATH
 
         self.display = display
@@ -1126,6 +1137,7 @@ class App:
         self.config_path = config_path or CONFIG_PATH
         self.queue = printer_mod.QUEUE
         self.poll_seconds = poll_seconds
+        self.refuse_live = refuse_live
         self.stack: list[Screen] = []
         self.running = True
         self.shutdown_requested = False
@@ -1147,8 +1159,20 @@ class App:
             return
         try:
             self.display.show(target.frame(self))
+            self.display_failures = 0
         except Exception:
             self.display_failures += 1
+            # A panel that browned out comes back with its display off and
+            # stays dark while the buttons still drive the menu. Reopening
+            # re-runs its init sequence. Every few failures, not every
+            # one: reopening a bus with nothing on it is not free.
+            if self.display_failures % REOPEN_AFTER == 0:
+                reopen = getattr(self.display, "reopen", None)
+                try:
+                    if reopen is not None:
+                        reopen()
+                except Exception:                # noqa: BLE001
+                    pass
 
     def request_shutdown(self):
         self.shutdown_requested = True
