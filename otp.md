@@ -206,11 +206,11 @@ And the padding just repeats the key from the same position.
 
 The ciphertext in the padding region is raw key, and unused truly-random key is uniformly distributed — exactly as uniform as (message + key). So a passive observer can't tell where message ends and padding begins even if the convention is public, and length stays hidden.
 
-**One caveat, and then we move on.** That sentence is about a *passive* observer. Someone who can intercept and substitute in real time is in a different position: they know the plaintext in the padding region is A, which hands them the key there, and OTP is malleable (see Critical technicalities). So they can overwrite the padding with text of their own, leave the auth group and your real words untouched, and keep the group count identical — and the auth check still passes, because it proves the *sender* held the pad, not that the message was not extended.
+**One caveat, and then we move on.** That sentence is about a *passive* observer. Someone who can intercept and substitute in real time is in a different position: they know the plaintext in the padding region is A, which hands them the key there, and OTP is malleable (see Critical technicalities). So they can overwrite the padding with text of their own, leave the auth group and your real words untouched, and keep the group count identical — and a check of the first group alone still passes, because it proves the *sender* held the pad, not that the message was not extended.
 
 Note this is not caused by padding with A. Padding with X has the same hole; any padding whose plaintext is predictable does, and predictability is what makes padding cheap in the first place.
 
-For most people this is theoretical — it needs an adversary sitting on your channel able to alter traffic in flight, not merely listen. If that is genuinely in your threat model, the answer is an end-of-text group agreed at the handover: a letter run your own traffic can never produce, written at the true end of the message, with the receiver acting on nothing past its first occurrence. Otherwise, read the padding as the end of the message and carry on.
+The procedure closes this hole rather than leaving it to judgment: every message ends its text with the page's auth group written a second time, and the receiver acts on nothing after it. Someone who has never seen the auth group cannot write it, so they can neither extend the text into the padding nor cut it short. The Authentication section has the rule in full.
 
 ### How much to pad
 
@@ -393,7 +393,7 @@ If a message fails to decrypt or arrives incomplete, do not guess and do not neg
 ## Schedules & Signals
 The simplest answer to "is there a message for me?" is a schedule: fixed times when the receiver listens or checks the drop, agreed at the handover. A schedule needs no communication at all, and a receiver who checks at the same time every day has a routine, not a behavior change. Routines are invisible.
 
-A schedule has one leak: on a channel that only transmits when something happens, the existence of traffic *is* information. Weeks of silence and then three messages the day before an operation is a story an analyst can read without decrypting a single group. The fix is dummy traffic: transmit on schedule regardless, and when there is nothing to say, send a message whose plaintext is nothing but padding (after the auth group, which every message carries as usual). Under our padding convention a dummy is indistinguishable from a real message to anyone without the pad — the receiver decrypts it, finds no content, destroys the page, and the adversary sees a perfectly steady drumbeat. Dummies cost pages; that is what the thick pad is for.
+A schedule has one leak: on a channel that only transmits when something happens, the existence of traffic *is* information. Weeks of silence and then three messages the day before an operation is a story an analyst can read without decrypting a single group. The fix is dummy traffic: transmit on schedule regardless, and when there is nothing to say, send a message whose plaintext is nothing but padding (after the opening and closing auth groups, which every message carries as usual). Under our padding convention a dummy is indistinguishable from a real message to anyone without the pad — the receiver decrypts it, finds no content, destroys the page, and the adversary sees a perfectly steady drumbeat. Dummies cost pages; that is what the thick pad is for.
 
 For unscheduled contact, use a prearranged physical signal that means "check the channel" — a chalk mark, a curtain position, a light left on. A good signal is boring, deniable, visible from a distance without stopping, and easy to reset. The signal carries no content; it only points at the channel. Content never travels outside the pad.
 
@@ -431,15 +431,17 @@ What actually works with pencil and paper is a layered procedure:
 
 This works because the auth group is uniformly random and never transmitted in any other form — an attacker cannot guess it, and any blind tampering with it is detected on arrival. As a bonus, it instantly catches page-synchronization errors: decrypt with the wrong page and the auth check fails before you have wasted effort on the rest.
 
-Be equally clear about what the auth group does *not* do: it authenticates the *origin* of the message, not the integrity of the rest of it. An attacker can leave the auth group untouched and tamper with characters after it.
+**The closing group — proving where the message ends.** The opening group on its own says nothing about what follows it. The tail of every message is padding whose plaintext an interceptor knows, which hands them the key there; a dummy message is nothing but that. So the same five letters are written a second time, immediately after the last letter of the text and before the padding. The receiver, having checked the opening group, looks for its next occurrence: the message is exactly what lies between the two, and nothing after the second is read, let alone acted on. No closing group, no message. An interceptor cannot move, remove or forge it, because doing any of those means writing the auth group at a position of their choosing, and they have never seen it. A dummy is the two groups back to back with padding after. A message that runs over several pages opens each page with that page's own auth group and closes with the last page's.
 
-**2. Redundancy — protecting the meaning.** Malleability is only useful to an attacker who can guess plaintext at a known position. So deny them that: vary your phrasing, avoid stereotyped message formats, and restate critical content in different words at an unpredictable point in the message — WE GO AT DAWN ... CONFIRM FIRST LIGHT. An attacker who edits a guessed crib cannot also fix a restatement they cannot locate, and the mismatch exposes the edit. For figures, the digit-spelling convention with repetition serves the same purpose.
+Be equally clear about what the pair does *not* do: it authenticates the *origin* of the message and its *extent*, not every letter in between. An attacker who correctly guesses a word at a known position inside the text can still swap it for another of the same length. That is what the next rule is for.
 
-**3. Rejection — the default is distrust.** A message that fails the auth check, garbles near critical content, or contradicts its own restatement is treated as hostile, not as noise. The response is a re-send on a fresh page — never a clarification in the clear, and never action on the doubtful content.
+**2. Redundancy — protecting the meaning.** Malleability is only useful to an attacker who can guess plaintext at a known position. So deny them that: vary your phrasing, avoid stereotyped message formats, and restate critical content in different words at an unpredictable point in the message — WE GO AT DAWN ... CONFIRM FIRST LIGHT. An attacker who edits a guessed crib cannot also fix a restatement they cannot locate, and the mismatch exposes the edit. For figures, spelling digits out and repeating them guards against a garble but not against an edit, since the repeat sits at a predictable offset; restate a figure that matters in different words elsewhere in the text — ZERO FIVE ZERO ZERO ... FIVE IN THE MORNING.
+
+**3. Rejection — the default is distrust.** A message that fails the auth check, lacks its closing group, garbles near critical content, or contradicts its own restatement is treated as hostile, not as noise. The response is a re-send on a fresh page — never a clarification in the clear, and never action on the doubtful content.
 
 **4. The safety word — authenticating the human.** Cryptography cannot tell a willing sender from a coerced one holding their own pad. For that, agree — in person, at the handover, never in writing — on a safety signal that appears somewhere in every genuine message: a word, a phrasing habit, anything natural. Its *absence* means the sender is under duress. Run it in that direction — present means fine, absent means trouble — because a captor cannot force the inclusion of a signal they do not know exists.
 
-Be honest about the limits: this is procedure, not mathematics. Truly unforgeable message authentication exists in theory but is impractical by hand, so we compensate with dedicated key material, unpredictable redundancy, and a standing rule of distrust. Under this procedure a forged or altered message can still *arrive* — but acting on one requires several independent failures at once, and the whole point of protocol is to make single failures survivable.
+Be honest about the limits: this is procedure, not mathematics. Truly unforgeable message authentication exists in theory but is impractical by hand, so we compensate with dedicated key material, unpredictable redundancy, and a standing rule of distrust. Under this procedure a forged or altered message can still *arrive* — but acting on one requires the attacker to have guessed your wording as well as beaten the procedure, and the whole point of protocol is to make single failures survivable.
 
 ## Tools
 ### Tabula Recta
@@ -493,7 +495,7 @@ Every one of these has broken real systems. Most of them feel harmless in the mo
 - **Worksheet leakage.** The impression on the notepad's next sheet, the worksheet in the wastebasket, the plaintext jotted beside the ciphertext. The worksheet is key material; it burns with the page.
 - **Keeping used pages.** "Just in case" retroactively un-secures a message that was already safe. An adversary who recorded the ciphertext needs exactly one thing, and it is the page you kept.
 - **Digitizing anything.** A photo of a pad, a scan, pads generated on an internet-connected machine, key material lingering in a printer's memory — each is a perfect, silent copy. Paper only, and treat every machine that ever touched key material as part of the pad.
-- **Acting on unauthenticated messages.** Ciphertext can be altered in transit by someone with no key at all. No auth group, no action — and garble near critical content is a red flag, not a shrug.
+- **Acting on unauthenticated messages.** Ciphertext can be altered in transit by someone with no key at all. No opening and closing auth group, no action — and garble near critical content is a red flag, not a shrug.
 - **Improvising through desync.** The ends disagree about which page is next, and someone starts guessing. Page numbers travel in clear in the header precisely so that this never happens.
 - **Talking.** The strongest cipher in the world does not survive an operator who mentions it. The existence of the channel, the schedule, the codeword — all of it is as secret as the pads.
 
@@ -533,17 +535,17 @@ Key:      OLHTX TKFGI HZHUB YMUBP KUBWF
 
 ## Exercise 4 — The complete message
 
-The first three left the auth group out to keep the arithmetic visible. This one is a real message, run the way the Authentication section requires: the first plaintext group is the page's auth group, and the digit convention applies.
+The first three left the auth group out to keep the arithmetic visible. This one is a real message, run the way the Authentication section requires: the first plaintext group is the page's auth group, the text ends with the auth group again, and the digit convention applies.
 
 Your copy of the page prints `AUTH KDWNP` in its header. You receive:
 
 ```
-Received: OKMHA ONECU EUONM NNXIF WJZRX RFTWT DVNOR
+Received: OKMHA ONECU EUONM NNXIF WJZRX RFDZP QKNOR QMHXB
 
-Key:      EHQUL CZJYU LVKWY IFCEG SSLST ARTWT DVNOR
+Key:      EHQUL CZJYU LVKWY IFCEG SSLST ARTWT DVNOR QMHXB
 ```
 
-Authenticate it first — if that check fails you stop there, and everything after it is wasted effort. Then decrypt and restore the spacing.
+Authenticate it first — if that check fails you stop there, and everything after it is wasted effort. Then decrypt, find the closing group, and restore the spacing of what lies between.
 
 ## Answers
 
@@ -574,16 +576,17 @@ ORCHARD GATE AT NINE PM. Two lessons ride along. First, the diagnostic: where th
 **Exercise 4.** The decrypt is:
 
 ```
-KDWNP MOVEA TZERO FIVEZ EROZE ROAAA AAAAA
+KDWNP MOVEA TZERO FIVEZ EROZE ROKDW NPAAA AAAAA
 ```
 
-The first group is `KDWNP`, matching the `AUTH` printed on your page. That is the whole authentication step: the sender holds the twin pad, and you are on the right page. Strip it, and the message is `MOVEATZEROFIVEZEROZERO` — **MOVE AT 0500**, digits spelled out by convention, then eight characters of padding.
+The first group is `KDWNP`, matching the `AUTH` printed on your page. That is the first half of authentication: the sender holds the twin pad, and you are on the right page. Now find `KDWNP` again: it closes the text after `ROKDW NP`. Everything between the two is the message, `MOVEATZEROFIVEZEROZERO` — **MOVE AT 0500**, digits spelled out by convention. The eight characters after the closing group are padding, and you act on nothing there.
 
-Two things to notice. The last eight ciphertext characters are identical to the key, exactly as in Exercise 1 — the A-padding shortcut doing its work. And the auth group cost you one group of key to buy something real: had you reached for the wrong page, `KDWNP` would not have appeared, and you would have known at once rather than puzzling over a page of garbage.
+Two things to notice. The last eight ciphertext characters are identical to the key, exactly as in Exercise 1 — the A-padding shortcut doing its work. And the auth group cost you two groups of the page to buy something real. Had you reached for the wrong page, `KDWNP` would not have appeared, and you would have known at once rather than puzzling over a page of garbage. And had someone on the channel cut the message short or written into the padding, the closing `KDWNP` would be missing or in the wrong place, because they have never seen those five letters and cannot write them.
 
 # Glossary
 
 - **Auth group** - A group of key material reserved on each page for authentication, never used for encryption. Five letters by default; the generator can produce other lengths, but both ends must agree, and shorter means weaker — a three-letter group is guessable at 1 in 17,576 rather than 1 in 11.9 million
+- **Closing group** - The page's auth group written a second time at the true end of the text; the receiver reads nothing after it. Proves the message was neither extended nor cut short
 - **A-padding** - Filling the rest of the page's key with the letter A so every message is the same length. Hides length from a passive observer; see Preparation for the rule it requires against an active one
 - **Channel** - A one-way sender-to-receiver link, secured by one pad set
 - **Cipher** - A cryptographic algorithm or scheme

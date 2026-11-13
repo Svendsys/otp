@@ -593,9 +593,11 @@ def sheet(kind, codeword="", settings=None, seconds=0, tally=None,
                        "letter down the side."),
                 # Only where the pages carry one.
                 *([(None, "Begin every message with the AUTH group printed "
-                          "in the page header, encrypted like the rest. The "
-                          "receiver decrypts it first and REJECTS the "
-                          "message if it does not match their own page.")]
+                          "in the page header, encrypted like the rest, and "
+                          "write it AGAIN straight after your last word, "
+                          "before the padding. The receiver REJECTS a "
+                          "message whose first group does not match their "
+                          "page, and reads nothing after the second.")]
                   if settings.with_auth else []),
                 (None, "Pad the message out with A to the length you agreed "
                        "at the handover, so its real length gives nothing "
