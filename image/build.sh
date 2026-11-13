@@ -16,10 +16,13 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_DIR="$REPO_DIR/image"
 PI_GEN_DIR="$IMAGE_DIR/pi-gen"
 PI_GEN_URL="${PI_GEN_URL:-https://github.com/RPi-Distro/pi-gen.git}"
-# The arm64 branch, not master. pi-gen hardcodes `export ARCH=armhf` *after*
-# sourcing config, so setting ARCH in the config file is silently ignored
-# and master always produces a 32-bit image.
-PI_GEN_BRANCH="${PI_GEN_BRANCH:-arm64}"
+# One exact commit, so the same checkout of this repository always builds
+# from the same pi-gen and nothing upstream reaches an image unreviewed. It
+# is a commit of the arm64 branch, not master: pi-gen hardcodes
+# `export ARCH=armhf` *after* sourcing config, so master always produces a
+# 32-bit image. To move it, set this to a newer arm64 commit and let the
+# image workflow boot the result.
+PI_GEN_REF="${PI_GEN_REF:-c0d2c9f2cffc08bc56850b0a3eb23178f4226e8a}"
 
 log() { printf '\n== %s\n' "$*"; }
 
@@ -59,8 +62,18 @@ fi
 # --- pi-gen ------------------------------------------------------------
 
 if [ ! -d "$PI_GEN_DIR" ]; then
-    log "Cloning pi-gen"
-    git clone --depth 1 --branch "$PI_GEN_BRANCH" "$PI_GEN_URL" "$PI_GEN_DIR"
+    log "Fetching pi-gen at $PI_GEN_REF"
+    git init -q "$PI_GEN_DIR"
+    git -C "$PI_GEN_DIR" remote add origin "$PI_GEN_URL"
+    git -C "$PI_GEN_DIR" fetch -q --depth 1 origin "$PI_GEN_REF"
+    git -C "$PI_GEN_DIR" checkout -q FETCH_HEAD
+fi
+# An existing checkout is reused, so it has to be the pinned one.
+PI_GEN_HEAD="$(git -C "$PI_GEN_DIR" rev-parse HEAD)"
+if [ "$PI_GEN_HEAD" != "$PI_GEN_REF" ]; then
+    echo "ERROR: $PI_GEN_DIR is at $PI_GEN_HEAD, not the pinned" >&2
+    echo "       $PI_GEN_REF. Delete the directory and rerun." >&2
+    exit 1
 fi
 
 log "Configuring"
