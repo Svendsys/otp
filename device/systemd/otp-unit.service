@@ -5,28 +5,26 @@ After=cups.service otp-unit-etc-cups.service
 Wants=cups.service
 Requires=otp-unit-etc-cups.service
 
-# The unit owns tty1, because that is the front panel when a monitor is
-# attached. Raspberry Pi OS Lite runs a login prompt there, and
-# StandardInput=tty-force below TAKES the console rather than failing --
-# so with both running, output interleaves and keystrokes go to whichever
-# grabbed them. A login prompt is still available on tty2 (Alt+F2).
+# The unit owns tty1 as its front panel; StandardInput=tty-force below takes
+# the console even from a getty. A login prompt is on tty2 (Alt+F2).
 #
-# NOT Conflicts=getty@tty1.service, which is what used to be here, and the
-# reason is what Conflicts= also means: ANYTHING THAT STARTS THAT GETTY
-# STOPS THIS UNIT. Something does. userconf-pi's cancel-rename is the last
-# thing the seeded-credential path runs and it ends with `systemctl
-# --no-block start getty@tty1`, so an operator who used the documented
-# /boot/firmware/userconf.txt lost the front panel for that boot -- a
-# print appliance going dark as a side effect of setting a password.
-# device/install.sh puts the answer on the getty instead, as a condition
-# that keeps it from ever starting on tty1; a unit that never starts
-# cannot take this one down with it. harness/img-guest-check.sh checks
-# both halves on the booted image, in the boot that applies a seed.
+# Not Conflicts=getty@tty1.service: anything that starts that getty would
+# then stop this unit, and userconf-pi's cancel-rename starts it after
+# applying a seeded credential. device/install.sh puts a condition on the
+# getty instead.
 
 [Service]
 Type=simple
+# No swap, enforced here as well as by install.sh's swap.target mask, before
+# any key material can exist. '-': no swap to turn off is the normal case.
+ExecStartPre=-/sbin/swapoff -a
 ExecStart=/usr/bin/python3 -m otpunit
-WorkingDirectory=/opt/otp-unit
+# Not /opt/otp-unit: lgpio creates a notification FIFO in the working
+# directory on import, and under ProtectSystem=strict that is read-only, so
+# gpiozero would silently fall back to a pin factory that cannot work.
+# LG_WD is lgpio's own name for the same setting.
+WorkingDirectory=/run/otp-unit
+Environment=LG_WD=/run/otp-unit
 Environment=PYTHONPATH=/opt/otp-unit
 Environment=PYTHONDONTWRITEBYTECODE=1
 Restart=on-failure
@@ -34,12 +32,9 @@ Restart=on-failure
 # slow to appear on the I2C bus cannot put the unit permanently into failed.
 RestartSec=15
 
-# Narrow what the process can write. Note the deliberate limits of this:
-# /boot/firmware is the one partition that survives a power cycle, and it is
-# writable here only so settings can be saved -- it is not a place key
-# material may go. PrivateTmp gives isolation, not RAM: systemd keeps its
-# backing storage on the host's /tmp and /var/tmp, so TMPDIR is pointed at
-# the unit's own tmpfs runtime directory instead.
+# /boot/firmware is writable only so settings can be saved; key material
+# never goes there. PrivateTmp is backed by the host's /tmp, not RAM, so
+# TMPDIR points at the unit's tmpfs runtime directory.
 RuntimeDirectory=otp-unit
 Environment=TMPDIR=/run/otp-unit
 PrivateTmp=yes
@@ -59,14 +54,10 @@ LimitCORE=0
 # `input` is for reading a USB keyboard when there is no GPIO button.
 SupplementaryGroups=lp gpio i2c input
 
-# Bound to tty1 so that a monitor and a USB keyboard work as a front panel
-# when no OLED is fitted -- the console renderer and the keyboard reader
-# are the same ones --sim uses, so this costs nothing but the wiring.
-#
-# This alone does NOT decide the interface. stdin is a terminal here
-# whether or not anything is plugged into the HDMI socket, so otpunit/hmi
-# checks the DRM connector status and looks for a real keyboard device
-# before choosing the console; otherwise it prints unattended.
+# Bound to tty1 so a monitor and USB keyboard work as a front panel when no
+# OLED is fitted. This alone does not pick the interface: otpunit/hmi checks
+# the DRM connector and looks for a real keyboard before choosing the
+# console; otherwise it prints unattended.
 StandardInput=tty-force
 StandardOutput=tty
 StandardError=journal

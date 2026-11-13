@@ -19,15 +19,16 @@ from .hw.display import Frame
 
 VERSION = "1.0"
 
-# Returned by a screen to unwind the whole stack back to the main menu.
-# Without this, any flow that pushes screens on the way to a job (picking a
-# codeword, typing one in) has no route home: a screen can only pop itself,
-# and the screens underneath it may not be reachable in any button sequence.
+# Consecutive failed draws before the display is reopened.
+REOPEN_AFTER = 3
+
+# Returned by a screen to unwind the whole stack back to the main menu. A
+# screen can otherwise only pop itself, and the screens beneath it may not
+# be navigable.
 HOME = object()
 
-# "no reasons supplied", distinct from None -- which state_reasons() uses
-# for "asked, could not tell" and which callers must not conflate with
-# "nothing wrong".
+# "No reasons supplied", distinct from None, which state_reasons() uses for
+# "asked, could not tell".
 _UNASKED = object()
 
 
@@ -35,15 +36,12 @@ def wrap(text: str, width: int = 21, lines: int = 4) -> list[str]:
     """
     Break a message across panel rows on word boundaries.
 
-    Slicing text into fixed 21-character chunks drops whatever does not fit
-    with no ellipsis, which turns a long driver error into a sentence that
-    stops mid-word and reads as if that were the whole message.
+    Text that does not fit is marked with a trailing ">" rather than
+    silently dropped.
     """
-    # ASCII only, INPUT INCLUDED. Pillow's default bitmap font is latin-1,
-    # and drawing anything outside it raises inside the display driver.
-    # The text here is often a CUPS error, which arrives via
-    # stderr.decode(..., "replace") -- so a truncated or localised message
-    # carries U+FFFD or accented characters straight to the panel.
+    # ASCII only: Pillow's default bitmap font is latin-1 and drawing outside
+    # it raises in the display driver. CUPS errors can carry U+FFFD or
+    # accented characters.
     text = text.encode("ascii", "replace").decode("ascii")
     ellipsis = ">"
     words, out, row = text.split(), [], ""
@@ -56,11 +54,10 @@ def wrap(text: str, width: int = 21, lines: int = 4) -> list[str]:
         if row:
             out.append(row)
         if len(out) == lines:
-            # This word and everything after it never made it onto the panel.
             tail_dropped = True
             break
-        # An over-long word is marked where it is cut; that is not the same
-        # as losing the tail, and must not also mark the final row.
+        # An over-long word is marked where it is cut; that alone must not
+        # mark the final row.
         row = word if len(word) <= width else word[:width - 1] + ellipsis
     else:
         if row and len(out) < lines:
@@ -123,9 +120,8 @@ class Message(Screen):
     """
     A static screen dismissed with OK.
 
-    BACK always just dismisses. It must never trigger on_ok: the only
-    consequential Message is the shutdown confirmation, and a screen that
-    powers the unit off whichever button you press is not a confirmation.
+    BACK only dismisses and never triggers on_ok, so the shutdown
+    confirmation cannot be confirmed by either button.
     """
 
     def __init__(self, title, lines, on_ok=None, footer="OK TO CONTINUE"):
@@ -179,12 +175,9 @@ class TextEntry(Screen):
     A-Z entry on three buttons: UP/DOWN change the letter, OK commits it and
     moves on, BACK (long OK) finishes the word.
 
-    The alphabet carries a trailing backspace symbol. Selecting it and
-    pressing OK deletes the previous letter, and deleting past the start
-    leaves the screen. Without that there is no way out at all: BACK means
-    "done" here, so every press either stays put or pushes another screen,
-    and the operator is left in the letter picker with no route back to the
-    menu and no keyboard to escape with.
+    The alphabet ends in a backspace symbol: OK on it deletes the previous
+    letter, and deleting past the start leaves the screen. BACK means
+    "done" here, so that is the only way out without entering a word.
     """
 
     DELETE = "<"
@@ -262,24 +255,18 @@ class CodewordRoll(Screen):
 
 
 def codeword_menu(on_choose):
-    """Roll or type -- the two ways to land on a codeword.
+    """Roll or type: the two ways to land on a codeword.
 
-    There is no third. This menu used to offer BROWSE CATEGORY, and that was
-    a mistake worth naming, because it looked like a convenience and behaved
-    like a leak. Choosing the noun by hand signs the pad set with the
-    operator's taste, and the category chosen is itself a hint about who the
-    twin is meant for. Rolling is uniform over every pair; a person scrolling
-    to a word they like is not, and the codeword's whole job is to identify
-    the set without identifying its holders.
-
-    Rerolling is free and unlimited, so nothing is lost: press DOWN until a
-    codeword you can carry comes up. TYPE IT IN stays because reproducing a
-    codeword agreed at an earlier handover is transcription, not selection.
+    There is deliberately no way to browse and pick. A hand-picked noun
+    reflects the operator's taste and hints at who the pad is for; rolling
+    is uniform, and the codeword must identify the set without identifying
+    its holders. Typing stays because reproducing a codeword agreed
+    earlier is transcription, not selection.
     """
 
     def type_in(app):
-        # Each half reaches exactly as far as the bundled lists do, so a
-        # codeword agreed elsewhere can always be typed back in.
+        # Each half is as long as the longest bundled word, so any rolled
+        # codeword can be typed back in.
         def got_modifier(app, modifier):
             def got_noun(app, noun):
                 return on_choose(app, cw.join(modifier, noun))
@@ -314,17 +301,14 @@ class RunJob(Screen):
         self.stage = "confirm"
         self.done_pages = 0
         self.error = ""
-        # Which stage the abandon prompt was reached from, so declining it
-        # returns where the operator was rather than to a fixed guess.
+        # Stage the abandon prompt was reached from, to return to if declined.
         self.abandon_from = "waiting"
-        # Whether the last queue query came back unanswerable, so the
-        # waiting screen can say which of the two situations it is.
+        # Whether the last queue query was unanswerable.
         self.queue_unknown = False
         # What the printer said while the queue stayed busy, if anything.
         self.queue_fault = ""
-        # Set when the operator recovers a stopped queue. cupsd re-sends
-        # the held job in full, so the stack can carry the same pages
-        # twice; the swap prompt has to say so.
+        # Set when the operator resumes a stopped queue. cupsd re-sends the
+        # held job in full, so the stack may hold the same pages twice.
         self.reprinted = False
 
     def _total_pages(self) -> int:
@@ -340,17 +324,15 @@ class RunJob(Screen):
                 settings = spec.settings
                 lines = [
                     "PAD PAIR: A AND B",
-                    # The codeword runs to 17 characters, so it gets a line
-                    # of its own rather than sharing one with a label.
+                    # Up to 17 characters, so it gets a line of its own.
                     spec.codeword,
                     f"{settings.pages} PAGES  {settings.format_label}",
-                    # Sheets, not pages: it is what tells you whether there
-                    # is enough paper in the tray for both copies.
+                    # Sheets, not pages: it is what tells the operator
+                    # whether the tray holds enough paper for both copies.
                     f"{settings.sheets * 2} SHEETS TOTAL",
                     f"AUTH {settings.auth_size if settings.with_auth else 'OFF'}",
-                    # Always stated, never blank. The absence of a word is
-                    # not a signal an operator can rely on at the last
-                    # checkpoint before a thousand pages of key material.
+                    # Always stated, never blank: absence of a word is not
+                    # a signal to rely on before printing key material.
                     "*** TRAINING ***" if settings.training else "LIVE KEY MATERIAL",
                 ]
             else:
@@ -358,10 +340,7 @@ class RunJob(Screen):
             return Frame(title="CONFIRM", lines=lines, footer="OK START  HOLD CANCEL")
 
         if self.stage == "generating":
-            # settings.pages counts PAD pages. Worksheets and tabula recta
-            # are driven by spec.count instead, so reading settings.pages
-            # for them showed a ten-copy worksheet run as "0/100 PAGES"
-            # with a progress bar that never moved off zero.
+            # Pads count pages; other job kinds count spec.count.
             total = self._total_pages()
             return Frame(
                 title="GENERATING",
@@ -372,13 +351,9 @@ class RunJob(Screen):
             )
 
         if self.stage == "swap":
-            # After a resume the stack can hold the same pages twice. CUPS
-            # re-sends the WHOLE held job when the queue is re-enabled, so
-            # a copy that was part-printed when the cover opened comes out
-            # again from page one -- measured against the rig, the backend
-            # received copy A twice. The operator is the only one who can
-            # see that, and "KEEP IT TOGETHER" over a stack with duplicate
-            # key material in it is the wrong instruction on its own.
+            # After a resume CUPS re-sends the whole held job, so a
+            # part-printed copy comes out again from page one. Only the
+            # operator can see the duplicate key material.
             if self.reprinted:
                 return Frame(
                     title="COPY A DONE",
@@ -394,17 +369,14 @@ class RunJob(Screen):
             )
 
         if self.stage == "waiting":
-            # Say WHICH copy is outstanding. The frame was previously
-            # identical whether copy A or copy B was still queued, so an
-            # operator could not tell what giving up would cost them.
+            # Say which copy is outstanding, so the operator knows what
+            # giving up would cost.
             outstanding = "A" if self.job and self.job.copies_done < 2 else "B"
             subject = (f"COPY {outstanding}"
                        if self.spec.carries_key_material else "THE JOB")
             if self.queue_fault:
-                # The queue is busy AND the printer is complaining, which
-                # is what a stopped queue looks like: the job will sit
-                # there until someone deals with the printer. Saying STILL
-                # PRINTING here is not a guess, it is wrong.
+                # Busy with a stopped queue: the job will sit there until
+                # someone deals with the printer.
                 return Frame(
                     title="PRINTER STOPPED",
                     lines=wrap(self.queue_fault, lines=2)
@@ -412,10 +384,9 @@ class RunJob(Screen):
                     footer="OK RECHECK  HOLD STOP",
                 )
             if self.queue_unknown:
-                # "STILL PRINTING" would be a guess, not a report. An
-                # unanswerable query is deliberately counted as busy, so
-                # claiming the queue is still working sends the operator to
-                # the only other exit -- which destroys the pair.
+                # An unanswerable query is counted as busy, but claiming
+                # STILL PRINTING would be a guess that leaves the operator
+                # only the exit that destroys the pair.
                 return Frame(
                     title="NO ANSWER",
                     lines=["CANNOT ASK THE", "PRINT QUEUE.", "",
@@ -446,9 +417,8 @@ class RunJob(Screen):
             )
 
         if self.stage == "abandoned":
-            # Every job kind can reach this now, and only a pad carries key
-            # material -- telling an operator to destroy an abandoned tabula
-            # recta card teaches them to ignore the warning that matters.
+            # Only a pad carries key material; telling an operator to
+            # destroy an abandoned tabula recta card devalues the warning.
             lines = (["KEY DISCARDED", "", "DESTROY ANY PAGES",
                       "ALREADY PRINTED"] if self.spec.carries_key_material
                      else ["JOB ABANDONED", "", "THE PRINTER MAY STILL",
@@ -468,12 +438,9 @@ class RunJob(Screen):
                          footer="OK TO RETURN")
 
         if self.stage == "error":
-            # If copy A is already on the tray, the operator is holding live
-            # key material for a pad that can never be completed. Say so --
-            # silently discarding the key and returning to the menu leaves
-            # them with a half-pair they may not realise is dangerous. Wrap
-            # to the space that leaves, rather than wrapping to three lines
-            # and then discarding the third.
+            # With copy A already on the tray the operator holds live key
+            # material for a pad that can never be completed, so say so,
+            # and wrap the error to the two lines that leaves.
             warn = bool(self.spec.carries_key_material
                         and self.job and self.job.copies_done)
             lines = wrap(self.error or "UNKNOWN ERROR", lines=2 if warn else 4)
@@ -482,10 +449,9 @@ class RunJob(Screen):
             return Frame(title="ERROR", lines=lines, footer="OK TO RETURN")
 
         # 21 columns is the whole panel: every string here has to fit.
-        # Deliberately not "KEY WIPED FROM RAM". The buffer is zeroed, but
-        # reportlab's intermediates and the immutable bytes handed to the
-        # subprocess are not and cannot be, so copies remain resident until
-        # the memory is reused. Power-off is the real wipe; say that.
+        # Not "KEY WIPED FROM RAM": the buffer is zeroed, but reportlab's
+        # intermediates and the bytes handed to the subprocess cannot be.
+        # Power-off is the real wipe.
         lines = ["PAIR COMPLETE", "", "POWER-CYCLE PRINTER", "THEN THIS UNIT"] \
             if self.spec.carries_key_material else ["DONE"]
         return Frame(title="FINISHED", lines=lines, footer="OK TO RETURN")
@@ -499,12 +465,9 @@ class RunJob(Screen):
             return self._generate(app)
 
         if self.stage == "swap":
-            # Asks first, exactly as `waiting` does. The consequence is
-            # identical -- copy A on the tray, the key gone, the pair
-            # impossible to finish -- and this screen also invites a
-            # confident OK, so a tap held a beat too long landed on an
-            # unconfirmed destroy. Round four guarded `waiting` and left
-            # its neighbour.
+            # Asks first, as `waiting` does: abandoning here leaves copy A
+            # on the tray with the key gone, and a tap held slightly too
+            # long must not do that unconfirmed.
             if press is Press.BACK:
                 self.abandon_from = "swap"
                 self.stage = "confirm_abandon"
@@ -519,43 +482,25 @@ class RunJob(Screen):
             return self
 
         if self.stage == "waiting":
-            # BACK is an unconditional way out. Without one this stage is a
-            # trap: lp returns as soon as a job is spooled, so the queue is
-            # busy on every pad pair, and CUPS' default ErrorPolicy holds a
-            # job in the queue indefinitely after a jam -- which three
-            # buttons cannot clear. An operator stuck here has live key
-            # material and no option but to pull the power.
-            #
-            # It asks first, though. This screen invites repeated OK, and a
-            # tap held a beat too long would otherwise purge the queue and
-            # zero the key with no confirmation at all.
+            # BACK is always a way out: CUPS can hold a job indefinitely
+            # after a jam, which three buttons cannot clear. It asks first,
+            # because this screen invites repeated OK and a tap held too
+            # long would otherwise purge the queue and zero the key.
             if press is Press.BACK:
                 self.abandon_from = "waiting"
                 self.stage = "confirm_abandon"
                 return self
-            # When the queue cannot be asked at all, retrying forever is not
-            # a way out: the only other exit destroys the key. Offer the
-            # operator -- who is standing at the printer and can see the
-            # tray -- a non-destructive way to say the copy landed.
-            #
-            # On DOWN, deliberately, and not on OK. This screen invites
-            # repeated OK, and an operator drumming on it must never be able
-            # to walk through the override and spool copy B over copy A.
-            # DOWN is otherwise unused here, and no amount of OK reaches it.
+            # When the queue cannot be asked at all, offer a non-destructive
+            # way to say the copy landed. On DOWN, not OK: an operator
+            # drumming OK must never walk through the override and spool
+            # copy B over copy A.
             if press is Press.DOWN and self.queue_unknown:
                 self.stage = "confirm_continue"
                 return self
             if press is Press.OK:
-                # On a STOPPED queue, re-enable it first. Nothing else does:
-                # CUPS_BACKEND_STOP disables the queue and holds the job
-                # until something runs `lpadmin -E`, and the only place the
-                # unit did that was ensure_queue at startup. So OK RECHECK
-                # on the PRINTER STOPPED screen rechecked a queue that could
-                # not have changed, and the operator who had just closed the
-                # cover was left with one working exit -- the one that wipes
-                # the key. Safe to do unconditionally on the recheck: it
-                # keeps the held job, and on a queue that is not stopped it
-                # is a no-op.
+                # A stopped queue holds its job until it is re-enabled, so
+                # a recheck must resume it first or nothing can change.
+                # Resuming keeps the held job.
                 if self.queue_fault:
                     self._resume(app)
                 return self._advance(app)
@@ -565,8 +510,8 @@ class RunJob(Screen):
             if press is Press.OK:
                 return self._proceed(app)
             if press is Press.BACK:
-                # "No, keep waiting" re-queries rather than parking on a
-                # stale answer, so a cupsd that comes back is picked up.
+                # "No, keep waiting" re-queries, so a cupsd that comes back
+                # is picked up.
                 return self._advance(app)
             return self
 
@@ -581,9 +526,8 @@ class RunJob(Screen):
         if self.stage in ("done", "error", "cancelled", "abandoned"):
             if press in (Press.OK, Press.BACK):
                 self._wipe()
-                # HOME, not None: the stack below may include codeword
-                # screens the operator cannot navigate out of, and dropping
-                # one frame would leave them mid-flow with a finished job.
+                # HOME, not None: the stack below may hold codeword screens
+                # that would leave the operator mid-flow with a finished job.
                 return HOME
         return self
 
@@ -605,10 +549,8 @@ class RunJob(Screen):
         last_drawn = [0]
 
         def progress(done, total):
-            # Redraw on a fraction of the total, not on `done % 10`. The
-            # imposed layouts report per SHEET, so a ten-page A4 job counts
-            # 4, 8, 10 and a modulo-10 test fires exactly once -- at the very
-            # end, after the panel has sat at 0/10 for the whole job.
+            # Redraw on a fraction of the total, not every Nth count: the
+            # imposed layouts report per sheet, so counts skip values.
             self.done_pages = done
             step = max(1, total // 50)
             if done == 1 or done >= total or done - last_drawn[0] >= step:
@@ -616,11 +558,9 @@ class RunJob(Screen):
                 app.render(self)
 
         def should_cancel():
-            # Generation blocks the event loop, so presses made during it
-            # would otherwise queue up and replay afterwards -- skipping the
-            # swap prompt and spooling both copies of a pair back to back.
-            # Draining here both honours the advertised cancel and stops
-            # those presses arriving late.
+            # Generation blocks the event loop. Draining here honours the
+            # advertised cancel and stops banked presses replaying
+            # afterwards, which would skip the swap prompt.
             while True:
                 press = app.buttons.wait(timeout=0)
                 if press is None:
@@ -635,8 +575,8 @@ class RunJob(Screen):
             self.stage = "cancelled"
             return self
         except Exception as exc:
-            # _wipe(), never finish() directly: a purge failure here would
-            # otherwise escape press() and take the whole UI down.
+            # _wipe(), never finish() directly: a purge failure must not
+            # escape press() and take the UI down.
             self._wipe()
             self.stage = "error"
             self.error = f"GENERATE FAILED: {exc}"
@@ -652,103 +592,48 @@ class RunJob(Screen):
             _drain(app)
             return self
         self.stage = "printing"
-        # Submitting a multi-megabyte PDF blocks the loop, so presses made
-        # while it ran are still queued. Replayed against the next screen
-        # they advance the flow the operator could not see -- at worst
-        # abandoning a pair they were only being impatient about.
+        # Submitting blocks the loop; presses banked meanwhile would
+        # advance a flow the operator could not see.
         _drain(app)
         return self
 
     def _advance(self, app):
         # lp returns as soon as a job is spooled, so "the tray is clear" is
-        # the operator's guess about paper, not a statement about the queue.
-        # Both transitions have to wait for it to drain: starting copy B
-        # early interleaves the two copies in one tray, and purging early
-        # cancels the rest of copy B and destroys the key, leaving a
-        # truncated half-pair that can never be regenerated.
+        # only the operator's guess. Both transitions wait for the queue to
+        # drain: starting copy B early interleaves the copies, and purging
+        # early truncates copy B and destroys the key.
         state = self.queue_state(app)
         self.queue_unknown = state == "unknown"
         if state != "idle":
-            # A busy queue is not necessarily a working one. Under
-            # CUPS_BACKEND_STOP -- an open cover, or a printer that reports
-            # an empty tray properly -- cupsd stops the queue and KEEPS the
-            # job, so active_jobs stays above zero for ever and this screen
-            # said STILL PRINTING / OK TO CHECK AGAIN at a printer that
-            # will never print. The way out (hold for BACK) exists and is
-            # deliberate, but an operator has to know to take it, and the
-            # printer has been saying why the whole time.
-            # A STOPPED queue only, not any passing state message. cupsd
-            # puts transient filter chatter in printer-state-message while a
-            # job runs -- measured mid-print on a healthy queue: "DEBUG:
-            # cfFilterChain: universal (PID 21339) exited with no errors."
-            # A busy queue is precisely when that is there, so reporting
-            # whatever printer_fault says would put PRINTER STOPPED on the
-            # panel of a printer working perfectly. It did, on the first CI
-            # run of this change.
-            #
-            # Asked of the IPP state reasons rather than the header text.
-            # The header is _cupsLangPrintf output, so "disabled" only
-            # appears in English; "paused" is an IPP keyword and does not
-            # move with the locale.
+            # A busy queue may be a stopped one, which keeps its job for
+            # ever. Only a stopped queue counts as a fault: cupsd puts
+            # transient filter chatter in the state message while a healthy
+            # job runs. Decided on the IPP state reasons, which do not vary
+            # with the locale.
             self.queue_fault = self._stopped_because(app) if state == "busy" else ""
             self.stage = "waiting"
             return self
-        # A drained queue is necessary but NOT sufficient, and this screen
-        # used to treat it as both. The unit ships ErrorPolicy abort-job,
-        # so a job that FAILED is discarded exactly as promptly as one that
-        # printed: measured against a real cupsd with the tray empty, the
-        # queue went to zero in under a second and this transition then
-        # said COPY A DONE over an empty tray, and PAIR COMPLETE after
-        # copy B, and wiped the key on the strength of it. That is the
-        # false success the whole printer_fault mechanism exists to stop,
-        # and only the unattended path was ever wired to it.
-        #
-        # On the `idle` branch, which is where the queue result is
-        # interpreted. The confirm_continue override is unaffected either
-        # way and the review panel was right to say so: active_jobs and
-        # printer_fault both go through Cups._run_text, so a daemon that
-        # cannot answer one cannot answer the other, and queue_unknown
-        # already implies no fault. The placement is therefore a matter of
-        # where the reasoning belongs, not a safety property -- and the
-        # test that pins it says the same, rather than pretending to
-        # reproduce a combination the real Cups cannot produce.
-        # The PROSE decides, and the state reasons can only excuse it. See
-        # Cups.ADVISORY_STEMS: the usb backend this unit runs never reports
-        # a media reason at all, so a decision resting on reasons was blind
-        # on the unit's own hardware -- an empty tray drained the queue and
-        # this said PAIR COMPLETE.
-        #
-        # The prose is read FIRST and the reasons only when it says
-        # something, so a healthy queue costs one query here and not two.
+        # A drained queue is necessary but not sufficient: under ErrorPolicy
+        # abort-job a failed job leaves the queue as promptly as a printed
+        # one. The printer's prose decides and the state reasons can only
+        # excuse it (see Cups.ADVISORY_STEMS; the usb backend reports no
+        # media reasons). Reasons are asked for only when there is prose,
+        # so a healthy queue costs one query.
         prose = self._fault(app)
         blocking = (printer_mod.blocking_in(prose, self._reasons(app))
                     if prose.strip() else [])
         if blocking:
             self.stage = "error"
-            # What the printer said, in its own words, with the keyword as
-            # the fallback -- the reverse of the previous order, because
-            # "MEDIA EMPTY" is what a reason boils down to and "out of
-            # paper" is what an operator can act on.
+            # The printer's own words first: "out of paper" is what an
+            # operator can act on.
             self.error = prose or _reasons_as_text(blocking)
-            # Banked presses, discarded -- the same reason _print_copy
-            # drains on ITS error path. Getting here means two lpstat
-            # subprocesses have just run while the operator was looking at
-            # `printing`, whose footer invites exactly the repeated OK this
-            # screen's own comments warn about. A press banked during those
-            # calls is replayed against the ERROR frame the instant it is
-            # drawn, and ERROR's handler wipes and returns HOME: the panel
-            # flashes the fault for one cycle and the operator is back at
-            # the menu with the key gone, never having read DESTROY
-            # PRINTED PAGES.
+            # Discard presses banked during the lpstat calls. Replayed
+            # against the ERROR frame they would wipe and return HOME
+            # before the operator read DESTROY PRINTED PAGES.
             _drain(app)
             return self
-        # And the same drain on the way THROUGH. Two blocking lpstat calls
-        # have just run here as well, and _proceed lands on `swap` -- whose
-        # OK handler spools copy B. A double-tap at `printing` therefore put
-        # copy B into a tray still holding copy A, with the operator never
-        # shown COPY A DONE / REMOVE THE STACK. Reproduced: one banked OK
-        # survived _advance into `swap`. The error path above was drained
-        # from the start; the success path was not.
+        # Drained on the success path too: a banked OK reaching `swap`
+        # would spool copy B into a tray still holding copy A.
         _drain(app)
         return self._proceed(app)
 
@@ -758,16 +643,10 @@ class RunJob(Screen):
 
     def _reasons(self, app) -> list[str] | None:
         """
-        The queue's IPP state reasons, asked for ONCE per _advance.
+        The queue's IPP state reasons. Ask once per _advance and reuse.
 
-        Every one of these is an lpstat subprocess bounded by
-        Cups.TIMEOUT = 120s, and _advance already spends one on active_jobs
-        before it gets here. Asking twice -- which the stopped-queue path
-        did, once to decide it was stopped and again to say why -- put the
-        worst case at three subprocesses, so a wedged-but-answering cupsd
-        could freeze the panel for six minutes on a single OK press while
-        the key sits resident. Measured: 3 calls on the stopped path, 2 on
-        every other. One call, two derivations.
+        Each call is an lpstat subprocess bounded by Cups.TIMEOUT, and the
+        panel is frozen with the key resident while it runs.
         """
         return printer_mod.state_reasons(app.cups, app.queue)
 
@@ -792,22 +671,14 @@ class RunJob(Screen):
         """
         Panel text for a stopped queue, or "" if it is not stopped.
 
-        The reasons, not the header. printer_fault returns lpstat's header
-        line for a disabled queue -- measured against the rig's cupsd,
-        "printer OTP disabled since Wed Aug 12 20:21:35 2026 -", with the
-        actual reason on the NEXT line, which it discards. Wrapped to two
-        panel rows that renders as "PRINTER OTP DISABLED / SINCE WED AUG 12
-        20>", so the screen whose entire job is saying what is wrong showed
-        a printer name and a truncated date. The Alerts line for the same
-        queue read "media-empty-error paused".
+        Built from the state reasons, not lpstat's header line, which is
+        only the queue name and the date it was disabled.
         """
         reasons = self._reasons(app)
         if not printer_mod.stopped_in(reasons, app.cups, app.queue):
             return ""
-        # Straight from the reasons already in hand. Going through
-        # _blocking here would re-ask for the prose -- a third lpstat on a
-        # screen the operator taps repeatedly -- and "paused" itself is not
-        # worth showing, since PRINTER STOPPED is the title.
+        # From the reasons in hand, to avoid another lpstat. "paused" is
+        # dropped because PRINTER STOPPED is already the title.
         why = [r for r in (reasons or []) if r != "paused"]
         return _reasons_as_text(why) or "QUEUE STOPPED"
 
@@ -822,19 +693,13 @@ class RunJob(Screen):
 
     def queue_state(self, app) -> str:
         """
-        "busy", "idle", or "unknown" -- and the third is not the second.
+        "busy", "idle", or "unknown".
 
-        active_jobs returns None for a wedged cupsd, a missing lpstat and an
-        unknown destination alike. Folding that into "idle" would let both
-        transitions through at once: copy B spooled while A is still
-        printing, then the spool purged and the panel reporting PAIR
-        COMPLETE over an interleaved, truncated pair.
-
-        Folding it into "busy" and leaving it there is not safe either,
-        which is what the separate value is for. If the query never
-        recovers, an operator whose pair printed perfectly is parked on a
-        screen whose only exit destroys it. The caller offers a manual way
-        on instead; see the confirm_continue stage.
+        active_jobs returns None when the queue cannot be asked. Treating
+        that as idle would spool copy B over A and then report PAIR
+        COMPLETE; treating it as permanently busy would park the operator
+        on a screen whose only exit destroys the pair. So it is its own
+        value, and the caller offers confirm_continue.
         """
         try:
             queued = app.cups.active_jobs(app.queue)
@@ -860,16 +725,11 @@ def gen_cancelled():
     return generator().GenerationCancelled
 
 
-
 def _reasons_as_text(reasons: list[str]) -> str:
     """
-    IPP state-reason keywords as something an operator can read.
+    IPP state-reason keywords as text an operator can read.
 
-    "media-empty-error" is precise and never translated, which is why the
-    decisions are made on it, but it is not what you want on a panel in
-    front of someone holding a stack of paper. The severity suffix carries
-    no information once we have already decided these are blocking, so it
-    goes; the rest becomes words.
+    The severity suffix is dropped and the rest becomes words.
     """
     words = []
     for reason in reasons:
@@ -885,10 +745,8 @@ def _drain(app) -> None:
     """
     Discard presses banked while the loop was blocked.
 
-    Anything long enough to bank presses -- generating, spooling -- leaves
-    the operator pressing at a frozen panel. Those presses were aimed at
-    what was on screen, not at whatever comes next, so replaying them is
-    always wrong; on this device it can mean abandoning a job.
+    They were aimed at what was on screen then, so replaying them is always
+    wrong; on this device it can mean abandoning a job.
     """
     while app.buttons.wait(timeout=0) is not None:
         pass
@@ -911,9 +769,8 @@ def settings_menu():
         current = app.settings.auth_size if app.settings.with_auth else 0
 
         def label(v):
-            # The manual's procedure says "the first group", and a group is
-            # five. Anything else has to be agreed at both ends, and shorter
-            # is genuinely weaker -- say so where the choice is made.
+            # The manual's procedure assumes a group of five; shorter is
+            # weaker, so say so where the choice is made.
             if v == 0:
                 return "OFF - NO AUTH"
             if v < 5:
@@ -938,10 +795,8 @@ def settings_menu():
                        render=lambda v: PAPER_LABELS[v])
 
     def set_auto_print(app):
-        # What this unit does when nobody is at the panel. It is reachable
-        # only FROM the panel, which is the point: the person setting a unit
-        # up to be left headless is holding the buttons now, and otherwise
-        # has to power down and edit the card in another computer.
+        # Settable from the panel so that a unit can be made headless
+        # without editing the card in another computer.
         return Chooser("UNATTENDED", [False, True], app.settings.auto_print,
                        lambda a, v: _apply(a, auto_print=v),
                        render=lambda v: ("PRINTS A PAIR ALONE" if v
@@ -973,10 +828,8 @@ class SettingsMenu(Menu):
     """
     A menu that says when a change has not been written to the card.
 
-    This matters because the unit tells the operator to power-cycle after
-    every pad job, and an unsaved TRAINING setting reverts to LIVE on the
-    next boot -- so the next "training" batch would print unwatermarked and
-    be indistinguishable from live key material.
+    The operator is told to power-cycle after every pad job, and an unsaved
+    TRAINING setting reverts to LIVE on the next boot.
     """
 
     def labels(self, app):
@@ -1015,6 +868,13 @@ def _save(app):
 
 def main_menu():
     def pad_pair(app):
+        # See otpunit.posture. Refused before a codeword is rolled, so the
+        # operator is not walked through a flow that cannot finish.
+        if app.refuse_live and not app.settings.training:
+            return Message("NOT SAFE", wrap(
+                f"{app.refuse_live}. LIVE PADS REFUSED. TRAINING PADS "
+                f"STILL PRINT."), footer="OK TO RETURN")
+
         def chosen(app, codeword):
             spec = jobs_mod.JobSpec(jobs_mod.JobKind.PAD_PAIR, codeword, app.settings)
             return RunJob(spec)
@@ -1026,7 +886,7 @@ def main_menu():
 
     def manual(app):
         # The manual is rendered at image-build time; a source install has
-        # none. Say so plainly rather than failing with a truncated errno.
+        # none.
         if not jobs_mod.manual_available():
             return Message("MANUAL", ["NOT INSTALLED ON THIS", "UNIT"])
         return RunJob(jobs_mod.JobSpec(jobs_mod.JobKind.MANUAL, "", app.settings))
@@ -1072,21 +932,10 @@ class WaitForEntropy(Screen):
     """
     Shown while the kernel CSPRNG is still being seeded.
 
-    The bit count sits on the footer next to a spinner because between
-    them they are the two things that move, and something moving is what
-    tells an operator the unit is alive rather than wedged. The count is
-    only ever shown in the state where it means anything: while the CRNG
-    is unseeded the kernel's estimate genuinely climbs towards the
-    threshold, and once seeded it pins at the pool size and this screen is
-    gone.
-
-    The button hint is literal advice, not reassurance. Each GPIO edge is
-    an interrupt and interrupt timings are one of the things the kernel
-    folds into the pool, so pressing them does help -- a little, which is
-    how it is worded. It also gives someone standing at a quiet box
-    something to do other than pull the power, which is the failure this
-    screen exists to prevent: a power cycle discards every bit collected
-    so far and starts the wait again from zero.
+    The spinner and the bit count move so the operator can see the unit is
+    alive and does not power-cycle it, which would discard the entropy
+    collected so far. The button hint is literal: GPIO interrupt timings
+    feed the pool.
     """
 
     def __init__(self):
@@ -1115,7 +964,8 @@ class App:
     """Owns the screen stack and the hardware handles."""
 
     def __init__(self, display, buttons, cups=None, settings=None,
-                 vocabulary=None, config_path=None, poll_seconds=2.0):
+                 vocabulary=None, config_path=None, poll_seconds=2.0,
+                 refuse_live: str = ""):
         from .config import CONFIG_PATH
 
         self.display = display
@@ -1126,6 +976,7 @@ class App:
         self.config_path = config_path or CONFIG_PATH
         self.queue = printer_mod.QUEUE
         self.poll_seconds = poll_seconds
+        self.refuse_live = refuse_live
         self.stack: list[Screen] = []
         self.running = True
         self.shutdown_requested = False
@@ -1137,18 +988,27 @@ class App:
         """
         Draw the current screen. Never raises.
 
-        An I2C error mid-job would otherwise unwind run() with the key
-        buffer live and the spool unpurged -- a complete pad left in a tmpfs
-        spool across systemd's restart. A blank panel is bad; a blank panel
-        that also abandons a running job without wiping is worse.
+        A display error mid-job must not unwind run() with the key buffer
+        live and the spool unpurged.
         """
         target = screen or (self.stack[-1] if self.stack else None)
         if target is None:
             return
         try:
             self.display.show(target.frame(self))
+            self.display_failures = 0
         except Exception:
             self.display_failures += 1
+            # A panel that browned out comes back with its display off;
+            # reopening re-runs its init sequence. Only every few failures,
+            # since reopening a bus with nothing on it is not free.
+            if self.display_failures % REOPEN_AFTER == 0:
+                reopen = getattr(self.display, "reopen", None)
+                try:
+                    if reopen is not None:
+                        reopen()
+                except Exception:                # noqa: BLE001
+                    pass
 
     def request_shutdown(self):
         self.shutdown_requested = True
@@ -1159,38 +1019,19 @@ class App:
         """
         Hold the panel here until the kernel CSPRNG is seeded.
 
-        NOT a security gate -- see otp_generator.crng_seeded. os.urandom
-        goes through getrandom(), which blocks rather than handing back
-        unseeded bytes, so a pad drawn from an unseeded pool is already
-        impossible and nothing here makes it more so. What this replaces
-        is the SYMPTOM. The first draw of the interactive flow is
-        Vocabulary.random(), called from inside CodewordRoll.frame(), so
-        the block lands BEFORE the frame is computed and the panel never
-        repaints. Measured on this code without this loop: two frames
-        drawn, then the CODEWORD menu with the caret still on ROLL RANDOM,
-        for as long as the kernel took. On three buttons and 128x64 pixels
-        that is a crash, and the remedy for a crash -- power-cycle --
-        discards the entropy collected so far.
+        Not a security gate (see otp_generator.crng_seeded): os.urandom
+        already blocks until seeded. Without this the first random draw
+        would block inside a frame() call and the panel would look frozen,
+        inviting a power cycle that discards the entropy collected.
 
-        It has its own loop rather than reusing wait_for_crng() for the
-        same reason wait_for_printer does: the buttons have to keep being
-        polled, or the wait that was meant to fix a frozen panel simply
-        freezes it somewhere else. Every poll repaints, so the spinner and
-        the bit count move.
+        Polls the buttons itself so the panel stays live. Returns False if
+        the app stopped running first.
         """
         screen = WaitForEntropy()
         while self.running:
             if generator().crng_seeded():
-                # Banked presses, discarded. This is the ONLY screen that
-                # asks to be pressed -- it tells the operator that using
-                # the buttons helps -- so it is the one most certain to
-                # leave a queue behind, and GpioButtons is a queue rather
-                # than a level. Returning with presses still in it hands
-                # them to whatever is drawn next: on a unit whose printer
-                # is already attached that is the main menu, where a
-                # banked OK selects PRINT PAD PAIR and a banked DOWN moves
-                # the caret -- from a press aimed at a waiting screen. The
-                # same reason _print_copy and _advance drain.
+                # This screen asks to be pressed, so discard the banked
+                # presses rather than hand them to the main menu.
                 _drain(self)
                 return True
             self.render(screen)
@@ -1198,9 +1039,8 @@ class App:
             if press is Press.QUIT:
                 self.running = False
             elif press is Press.BACK:
-                # The same exit wait_for_printer offers, for the same
-                # reason: a unit that can never seed must still be able to
-                # power down cleanly rather than have its plug pulled.
+                # A unit that can never seed must still be able to power
+                # down cleanly.
                 self.request_shutdown()
         return False
 
@@ -1215,30 +1055,23 @@ class App:
             if press is Press.QUIT:
                 self.running = False
             elif press is Press.BACK:
-                # An unsupported or dead printer would otherwise leave the
-                # operator on this screen with every button inert and no way
-                # to power down cleanly except pulling the plug.
+                # Without this an unsupported or dead printer leaves no way
+                # to power down cleanly.
                 self.request_shutdown()
         return False
 
     def run(self) -> None:
-        # Entropy first. Waiting for a printer is a wait an operator
-        # understands and can act on; waiting for the CRNG is not, and it
-        # is the one that has to clear before the menu can roll a codeword
-        # -- which is the very first thing PRINT PAD PAIR does.
+        # Entropy first: it has to clear before the menu can roll a
+        # codeword.
         if not self.wait_for_entropy():
             return
         if not self.wait_for_printer():
             return
         # The main menu is always the bottom of the stack, even when setup
-        # failed: an operator who dismisses a printer error still needs a
-        # route to SETTINGS and SHUT DOWN.
+        # failed, so SETTINGS and SHUT DOWN stay reachable.
         self.stack = [main_menu()]
-        # Try every device, not just the first. Driverless endpoints sort
-        # first because they need no driver, but when one fails to set up
-        # the usb:// entry for the same printer is usually right behind it
-        # -- stopping at [0] turned the preferred path into a single point
-        # of failure.
+        # Try every device, not just the first: when a driverless endpoint
+        # fails to set up, the usb:// entry for the same printer may work.
         last_error = None
         for device in self.cups.devices():
             try:
@@ -1262,11 +1095,8 @@ class App:
             if nxt is HOME:
                 self.stack = [main_menu()]
             elif nxt is None:
-                # Never pop the last screen. This is a headless appliance
-                # with three buttons: an empty stack ends run(), the panel
-                # goes dark and every button stops responding, with nothing
-                # short of a power cycle to recover. A back press at the
-                # root menu must simply do nothing.
+                # Never pop the last screen: an empty stack ends run() and
+                # leaves the panel dark until a power cycle.
                 if len(self.stack) > 1:
                     self.stack.pop()
             elif nxt is not current:

@@ -1203,7 +1203,7 @@ files end byte-for-byte as they were found and nothing needs undoing. No hash
 is invented and none is printed: the "before" password is this unit's own,
 one character changed, and only digests reach the console.
 
-The counts move with it: **23 guest checks in boot 1 and 23 in boot 2**, up
+The counts move with it: **24 guest checks in boot 1 and 24 in boot 2**, up
 from 19 and 19 — the credential work added two to each and the cloud-init
 purge below two more. The run recorded below predates all of it.
 

@@ -1,9 +1,5 @@
-"""Verify every worked number in otp.md.
-
-The manual is a teaching document: a single wrong digit in a printed
-example costs a classroom an afternoon. These tests recompute each
-example, table, and exercise directly from the file text, so any future
-edit that breaks the arithmetic fails CI.
+"""Verify every worked number in otp.md by recomputing each example, table and
+exercise from the file text, so an edit that breaks the arithmetic fails.
 """
 import re
 from pathlib import Path
@@ -123,11 +119,8 @@ class TestExercises:
         assert decrypt(ct[:9], key[:9]) + decrypt(ct[9:], key[8:24]) == plain
 
     def test_exercise_4_is_a_real_message_with_a_real_auth_group(self):
-        """
-        The manual calls the auth group mandatory -- "no auth group, no
-        action" -- and for three exercises never once demonstrated it. This
-        checks the arithmetic of the one that does, so the printed answer
-        stays the real decrypt rather than prose someone typed.
+        """The exercise that demonstrates the mandatory auth group decrypts to its
+        printed answer, so the manual's example stays real arithmetic.
         """
         sec = self._section()
         ct = degroup(re.search(r"Received: (OKMHA.+)", sec).group(1))
@@ -152,10 +145,8 @@ class TestExercises:
         assert "ACTIVATENAUGHTFIRE"[0] == "A", "why that rule was unusable"
 
     def test_padding_advice_does_not_conflate_fuzzing_with_hiding(self):
-        # Padding by an arbitrary small amount leaves the transmission
-        # length tracking the message length. The manual has to say so,
-        # because "pad a little to hide the length" is the intuitive and
-        # wrong reading.
+        # Padding by a small arbitrary amount leaves the length tracking the
+        # message; the manual must say so.
         sec = MD.split("### How much to pad")[1].split("#")[0]
         assert "fixed step" in sec.lower() or "fixed length" in sec.lower()
         assert "arbitrary" in sec.lower()

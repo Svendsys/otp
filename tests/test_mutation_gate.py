@@ -1,26 +1,16 @@
 """The mutation gate is itself a guard, so it has to be shown able to fail.
 
-A gate that reports "all caught" whatever it is fed is the defect it exists
-to catch, one level up -- and this repository has produced that exact shape
-before: a rig whose CUPS half skipped for five separate reasons and left the
-job green at "1 passed, 20 skipped".
-
-So the runner is driven against a scratch repository built for the purpose,
-with a guard, a test of that guard, and mutations whose outcome is known:
+The runner is driven against a scratch repository holding a guard, a test
+of that guard, and mutations whose outcome is known:
 
     caught       the guard is broken and the test notices          -> ok
     survivor     the edit changes nothing the tests can see        -> MISS
     rotted       the `find` string is no longer in the file        -> BROKEN
     already red  the named tests fail before any mutation          -> BROKEN
 
-and the tree is checked, byte for byte, after each one -- including a file
-with uncommitted edits in it, because restoring to HEAD instead of to what
-was there is how a previous hand-run round destroyed an uncommitted fix.
-
-The last test here is the cheap one that matters most day to day: every row
-in the real tests/mutations.toml still applies to the real files. A `find`
-that has drifted is a row that would silently stop mutating anything, so it
-is a failure in the ordinary suite and not only in the gate job.
+The tree is checked byte for byte after each one, including a file with
+uncommitted edits. The last test checks that every row in the real
+tests/mutations.toml still applies to the real files.
 """
 from __future__ import annotations
 
@@ -40,9 +30,8 @@ FAST = gate.Tier(name="fast", description="scratch", pytest_args=())
 
 # --- the scratch repository ----------------------------------------------
 #
-# A guard shaped like the ones this table really protects: it must accept
-# ONLY the exact success line, because the machine's hostname is a substring
-# of it. That is row 2 of issue #14, in eight lines.
+# A guard that must accept only the exact success line, because the machine's
+# hostname is a substring of it.
 
 GUARD = '''\
 """A verdict, in miniature."""
@@ -97,8 +86,8 @@ def scratch(tmp_path_factory):
     tests.mkdir()
     (tests / "test_verdict.py").write_text(GUARD_TESTS)
     (tests / "test_already_red.py").write_text(ALREADY_RED)
-    # conftest, not sys.path juggling: the nested pytest runs with this
-    # directory as its rootdir and must import verdict.py from it.
+    # conftest, not sys.path juggling: the nested pytest uses this directory
+    # as its rootdir and must import verdict.py from it.
     (repo / "conftest.py").write_text(
         "import sys, pathlib\n"
         "sys.path.insert(0, str(pathlib.Path(__file__).parent))\n")
@@ -139,10 +128,8 @@ class TestTheRunnerCanTellRedFromGreen:
         assert outcome.red == ("tests/test_verdict.py::test_the_hostname_is_not_the_unit",)
 
     def test_a_mutation_nothing_catches_is_reported_as_a_survivor(self, real):
-        """The control. An edit inside a function no test calls changes the
-        file and changes nothing the suite can see -- exactly the shape of a
-        guard that has stopped discriminating, and the gate must say so
-        rather than counting it."""
+        """An edit inside a function no test calls is reported as a survivor:
+        that is the shape of a guard that has stopped discriminating."""
         outcome = real.apply_and_judge(mutation(
             "dead-code",
             edits=[gate.Edit(path="verdict.py", find="return 17",
@@ -156,8 +143,8 @@ class TestTheRunnerCanTellRedFromGreen:
 
 
 class TestAMutationThatCannotBeApplied:
-    """The failure mode that would turn this gate into a no-op: a `find`
-    that no longer matches, quietly mutating nothing and quietly passing."""
+    """A `find` that no longer matches would mutate nothing and pass, so it
+    must be a failure."""
 
     def test_a_find_that_no_longer_matches_is_a_failure_not_a_skip(self, real):
         outcome = real.apply_and_judge(mutation(
@@ -169,7 +156,8 @@ class TestAMutationThatCannotBeApplied:
         assert "matches 0 time(s)" in outcome.detail
 
     def test_a_find_that_matches_twice_is_a_failure(self, real, scratch):
-        """Which of the two got mutated would depend on the file's history."""
+        """A `find` that matches twice is a failure, because which occurrence
+        gets mutated would be arbitrary."""
         outcome = real.apply_and_judge(mutation(
             "ambiguous",
             edits=[gate.Edit(path="verdict.py", find="return",
@@ -195,8 +183,8 @@ class TestAMutationThatCannotBeApplied:
 
 
 class TestTheBaseline:
-    """A test that is already red catches every mutation, including the ones
-    it cannot see. So the named tests must pass BEFORE the mutation."""
+    """The named tests must pass before the mutation: a test that is already
+    red "catches" every mutation, including ones it cannot see."""
 
     def test_tests_that_are_already_failing_are_a_broken_row(self, real):
         outcome = real.apply_and_judge(mutation(
@@ -212,9 +200,8 @@ class TestTheBaseline:
         assert "collected no tests" in outcome.detail
 
     def test_all_skipped_is_not_a_usable_baseline(self, scratch):
-        """The hardware tier on a machine with no cupsd. A skipped test
-        cannot go red, and a gate that reads that as proof is the "1 passed,
-        20 skipped" green job all over again."""
+        """An all-skipped baseline (the hardware tier with no cupsd) is
+        refused: a skipped test cannot go red."""
         one = gate.Gate(repo=scratch, tiers={"fast": FAST},
                         runner=fake(green(passed=1, skipped=3)))
         outcome = one.apply_and_judge(mutation())
@@ -229,9 +216,8 @@ class TestTheBaseline:
         assert "did not finish" in one.apply_and_judge(mutation()).detail
 
     def test_a_hang_under_mutation_is_not_read_as_a_red_test(self, scratch):
-        """A mutated run can hang rather than fail -- one here sat for ten
-        minutes before being killed from outside. A hang is not a check
-        firing, and counting it as one would credit the guard for a wedge."""
+        """A mutated run that hangs is BROKEN, not caught: a hang is not a
+        check firing."""
         answers = iter([green(passed=2),
                         gate.TestRun(returncode=gate.TIMED_OUT, counts={},
                                      failed=(), errors=(), output="",
@@ -243,9 +229,8 @@ class TestTheBaseline:
         assert "did not finish" in outcome.detail
 
     def test_red_with_no_failed_test_is_not_a_catch(self, scratch):
-        """rc=2 with an ERROR is the mutation breaking collection, not a
-        guard noticing. Counting it would let a syntax error stand in for
-        coverage."""
+        """A nonzero exit with an ERROR and no failed test is not a catch: the
+        mutation broke collection, and no guard noticed."""
         answers = iter([green(passed=2),
                         gate.TestRun(returncode=2, counts={"error": 1},
                                      failed=(), errors=("tests/test_x.py",),
@@ -261,11 +246,8 @@ class TestTheBaseline:
 
 
 class TestTheTreeIsPutBack:
-    """`git checkout` between mutations destroyed an uncommitted fix once,
-    and `git stash push` + `git stash drop` does the same thing one step
-    removed -- measured, it reverts the file to HEAD and takes the working
-    copy's edits into the dropped stash. So the restore is byte-for-byte
-    from what was read before the mutation."""
+    """The restore is byte-for-byte from what was read before the mutation,
+    because git-based restores revert uncommitted work to HEAD."""
 
     def test_a_caught_mutation_leaves_the_file_exactly_as_it_was(self, real, scratch):
         before = (scratch / "verdict.py").read_bytes()
@@ -273,7 +255,8 @@ class TestTheTreeIsPutBack:
         assert (scratch / "verdict.py").read_bytes() == before
 
     def test_uncommitted_work_in_the_mutated_file_survives(self, scratch):
-        """The case that matters and the one the git-based restores lose."""
+        """Uncommitted edits in the mutated file are still there after the
+        restore."""
         target = scratch / "verdict.py"
         original = target.read_text()
         wip = original.replace("def unused_helper():",
@@ -303,25 +286,14 @@ class TestTheTreeIsPutBack:
 
     def test_a_same_length_mutation_does_not_outlive_itself_in_the_cache(
             self, scratch):
-        """
-        Putting the BYTES back is not the same as putting the tree back.
+        """A same-length mutation leaves no cache entry behind after the
+        restore.
 
-        CPython decides a `__pycache__` entry is still valid by comparing
-        the source's mtime in whole seconds and its size, and nothing else.
-        A mutation whose replacement is the same length as what it replaced
-        -- a swapped pair of lines -- changes neither, so a mutated run
-        that finishes inside a second leaves a cache entry the RESTORED
-        file matches exactly, and the interpreter goes on running the
-        mutation out of a tree that `git diff --exit-code` calls clean.
-
-        Found the hard way: after a fast-tier run in which every row was
-        reported caught and the tree was verified clean, the next ordinary
-        `pytest` in the same checkout failed on the swapped-line mutation
-        from `panel-replacement-runs-before-anything-can-find-it`.
-
-        The mutation here is written and restored inside one call, which is
-        well inside one second, and it is length-preserving by
-        construction: `return 17` for `return 18`.
+        CPython validates a `__pycache__` entry by the source's mtime in
+        whole seconds and its size, so an entry compiled from the mutation
+        would still match the restored file and keep being executed. The
+        mutation here is length-preserving (`return 17` for `return 18`)
+        and is written and restored well inside one second.
         """
         target = scratch / "verdict.py"
         cached = pathlib.Path(importlib.util.cache_from_source(str(target)))
@@ -329,9 +301,8 @@ class TestTheTreeIsPutBack:
         original = target.read_bytes()
         stamp = target.stat().st_mtime
 
-        # A cache entry that claims to be for the file as it stands now,
-        # exactly as a mutated run leaves behind. The contents do not
-        # matter -- what is asserted is whether it is still believed.
+        # A cache entry that claims to be for the file as it stands now; only
+        # whether it is still believed matters, not its contents.
         cached.write_bytes(b"the mutated bytecode")
         os.utime(cached, (stamp, stamp))
 
@@ -350,24 +321,11 @@ class TestTheTreeIsPutBack:
 
     def test_the_mutated_run_never_starts_with_a_cache_entry_to_believe(
             self, scratch):
-        """
-        The APPLY side, which the test above cannot see.
+        """The mutated run starts with no cache entry for the mutated file.
 
-        That one plants an entry and finds it gone at the end, which the
-        restore's own `_write` satisfies on its own. Measured: reverting
-        only the apply side -- `self._write(target, ...)` back to
-        `target.write_bytes(...)` in `apply_and_judge` -- left this file
-        green at 33 passed and left
-        `mutation-gate-leaves-the-mutation-in-the-bytecode-cache` reported
-        caught, because that row mutates `cached.unlink()` and so disables
-        both sides at once.
-
-        And it is the direction that costs something. A mutation written
-        within a second of the original's cache entry is executed AS THE
-        ORIGINAL: the row survives, the report says the guard is fine, and
-        nothing anywhere is red. So the question is asked at the only
-        moment it can be answered -- when the mutated run starts -- from
-        inside the runner, where a stale entry is visible.
+        This covers the apply side, which the test above cannot see because
+        the restore's own `_write` satisfies it. A stale entry here would
+        execute the original and let the row survive with nothing red.
         """
         target = scratch / "verdict.py"
         cached = pathlib.Path(importlib.util.cache_from_source(str(target)))
@@ -398,19 +356,13 @@ class TestTheTreeIsPutBack:
 
     def test_a_mutation_the_cache_could_shadow_is_not_given_a_verdict(
             self, scratch, monkeypatch):
-        """
-        And when the entry survives the write anyway, the row is BROKEN.
+        """When the cache entry survives the write anyway, the row is BROKEN.
 
-        `_write` dropping the entry is not the same as the entry being
-        gone: `__pycache__` can be unwritable, and a second process can
-        compile the file in the window. Either way the run that follows
-        may be measuring the original, so the gate refuses to score it
-        rather than reporting a verdict it cannot stand behind -- and not
-        SURVIVED, which would send someone off to write a test that is
-        already there.
-
-        The pre-fix `_write` is put back for the duration, because that is
-        exactly what "the entry survived the write" looks like.
+        `__pycache__` can be unwritable, or a second process can recompile
+        the file, and the run that follows may then measure the original.
+        The gate refuses to score it, and does not say SURVIVED because the
+        guard was never tested. A `_write` that leaves the entry is patched
+        in to simulate this.
         """
         target = scratch / "verdict.py"
         cached = pathlib.Path(importlib.util.cache_from_source(str(target)))
@@ -500,12 +452,9 @@ replace = "return 18"
         assert "dead-code" in capsys.readouterr().err
 
     def test_a_tier_that_was_not_run_is_named_in_the_summary(self, scratch, capsys):
-        """A partial run must not read as a complete one.
-
-        The row here is deliberately one that cannot be applied, so this
-        costs no pytest launch: it exercises the summary and the loud-rot
-        path through main() at the same time.
-        """
+        """A tier that was not run is named in the summary, so a partial run
+        cannot read as a complete one. The row cannot be applied, so no
+        pytest is launched."""
         table = self.write_table(
             scratch,
             '[tiers.hardware]\ndescription = "needs a cupsd"\n'
@@ -557,12 +506,9 @@ class TestTheTableIsWellFormed:
         assert set(tiers) >= {"fast", "hardware"}
 
     def test_every_row_in_the_shipped_table_still_applies(self):
-        """The cheap half of the gate, run by the ordinary suite.
-
-        A `find` that no longer matches its file is a row that mutates
-        nothing. The gate job fails on it too, but this costs a hundredth of
-        a second and catches it on the PR that renamed the guard.
-        """
+        """Every `find` in the shipped table still matches its file. A row
+        that has drifted mutates nothing, and this catches it in the
+        ordinary suite."""
         _, mutations = gate.load()
         rotted = {m.name: gate.applies(m) for m in mutations if gate.applies(m)}
         assert not rotted, (
@@ -571,9 +517,8 @@ class TestTheTableIsWellFormed:
             f"the named tests still go red -- do not just make it match.")
 
     def test_every_named_test_file_exists(self):
-        """A node id pointing at a deleted file collects nothing, which the
-        gate calls BROKEN -- but only when it runs. This is the same check
-        for the price of a stat."""
+        """Every node id in the table points at a file that exists; a deleted
+        file collects nothing."""
         _, mutations = gate.load()
         missing = {m.name: node for m in mutations for node in m.tests
                    if not (gate.REPO / node.split("::")[0]).is_file()}
@@ -584,7 +529,7 @@ class TestTheTableIsWellFormed:
 
 
 class TestParsingPytestOutput:
-    """The verdict rests entirely on this, and -q output is a text format."""
+    """The verdict rests on parsing pytest's -q text output."""
 
     def test_failures_are_read_with_their_node_ids(self):
         counts, failed, errors = gate.parse_pytest(
@@ -607,8 +552,8 @@ class TestParsingPytestOutput:
         assert counts == {"passed": 3, "deselected": 21}
 
     def test_counts_come_from_pytest_and_not_from_a_test_s_own_output(self):
-        """A test that prints a pytest summary of its own -- this file does,
-        it drives nested runs -- must not be able to rewrite the verdict."""
+        """Counts come from pytest's own summary, so a test that prints a
+        nested run's summary cannot rewrite the verdict."""
         counts, failed, _ = gate.parse_pytest(
             "captured stdout: === 4 passed in 0.10s\n"
             "FAILED tests/test_a.py::test_b - assert '2 passed in 1.0s'\n"

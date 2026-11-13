@@ -1,15 +1,6 @@
-"""Tests that read the key material off a rendered pad page.
-
-Mutation testing found the suite's largest blind spot: nothing anywhere read
-a pad's body text. The entire key body could be replaced with the letter A,
-or os.urandom swapped for the `random` module's Mersenne Twister, and all
-218 tests still passed. Every existing randomness test calls
-generate_random_letters directly and never checks that its output is what
-lands on the page.
-
-So these tests extract the printed letters from real PDFs and assert on
-them. They are the ones that would notice if the unit started printing
-predictable pads.
+"""Tests that read the key material off a rendered pad page. They extract the
+printed letters from real PDFs, so they notice if the body stops being the
+CSPRNG's output.
 """
 import collections
 import io
@@ -51,12 +42,8 @@ SEGMENT = re.compile(
 
 
 def line_segments(data: bytes, page: int = 0) -> set[tuple]:
-    """
-    Straight strokes on a page, as (x0, y0, x1, y1) in points.
-
-    Only single-segment `m ... l` strokes, which is all the crop marks and
-    rules are. Coordinates come straight out of the content stream, so this
-    sees what the printer sees rather than what the code meant to draw.
+    """Single-segment `m ... l` strokes on a page, as (x0, y0, x1, y1) in points,
+    read from the content stream.
     """
     pypdf = pytest.importorskip("pypdf")
     content = pypdf.PdfReader(io.BytesIO(data)).pages[page] \
@@ -97,12 +84,8 @@ def a6_pad(pages=2, **kwargs) -> bytes:
 
 
 class TestTheKeyBodyIsRealKeyMaterial:
-    """
-    The body printed on the page must be the CSPRNG's output.
-
-    Every one of these fails if the body is constant, repeats a group, or is
-    drawn from a predictable source -- the mutations that previously slipped
-    through the whole suite untouched.
+    """The body printed on the page is the CSPRNG's output: not constant, not
+    repeating, not from a predictable source.
     """
 
     def test_a_page_carries_the_expected_number_of_groups(self):
@@ -119,8 +102,7 @@ class TestTheKeyBodyIsRealKeyMaterial:
 
     def test_the_printed_letters_are_roughly_uniform(self):
         # 8 pages is 5320 letters, ~205 per letter with sigma ~14, so a 40%
-        # band is about 14 sigma -- it cannot flake, while a constant body, a
-        # repeated group or a skewed mapping all fail it outright.
+        # band is about 14 sigma and cannot flake.
         letters = "".join(all_key_groups(a6_pad(8), 8))
         assert len(letters) == 8 * 665
         counts = collections.Counter(letters)
@@ -133,10 +115,9 @@ class TestTheKeyBodyIsRealKeyMaterial:
         assert key_groups(data, 0) != key_groups(data, 1)
 
     def test_the_body_comes_from_os_urandom(self):
-        """
-        Structural, not statistical. A Mersenne Twister is uniform too, so
-        no distribution test can tell the difference -- the only way to
-        catch a swapped source is to watch os.urandom itself.
+        """The body is drawn through os.urandom. Structural, because a Mersenne
+        Twister is uniform too and no distribution test can tell the
+        difference.
         """
         import os as os_mod
         calls = []
@@ -151,9 +132,10 @@ class TestTheKeyBodyIsRealKeyMaterial:
 
 
 class TestTheAuthGroupIsNeverPartOfTheBody:
-    """otp.md: the AUTH group is "generated alongside the key body but never
-    part of it". Reusing body letters would leak the authenticator to anyone
-    holding a ciphertext."""
+    """The AUTH group is generated alongside the key body but never part of it
+    (otp.md): reusing body letters would leak the authenticator to anyone
+    holding a ciphertext.
+    """
 
     def _auth_and_body(self, data, page=0):
         auth = None
@@ -175,22 +157,9 @@ class TestTheAuthGroupIsNeverPartOfTheBody:
             assert auth != body[0]
 
     def test_the_auth_group_does_not_appear_in_the_body(self):
-        """
-        Checked on the letters, not on the groups.
-
-        This used to be `auth in body`, testing membership of the list of
-        five-letter groups, so it could only see a leak that happened to
-        land group-aligned -- one offset in five. Slicing AUTH straight out
-        of the body at offset 7 left the entire suite green, and that is
-        the real leak: the authenticator becomes five letters that also
-        encrypt the message, so anyone holding a ciphertext recovers it.
-
-        Driven from a seeded stream rather than live entropy. The old form
-        was a coincidence check with a real false-failure rate, and
-        searching letters instead of groups multiplies the number of
-        positions by five, which would have made it flakier still. Seeded,
-        it is exact: eight fixed pages, no flake, and a body-slice mutation
-        fails on the first one.
+        """AUTH appears nowhere in the body's letters, at any offset and not just
+        group-aligned. Driven from a seeded stream so the check is exact and
+        cannot flake.
         """
         import os as os_mod
         import random as random_mod
@@ -209,11 +178,8 @@ class TestTheAuthGroupIsNeverPartOfTheBody:
 
 
 class TestCodewordIsScrubbedFromEveryLayout:
-    """
-    The metadata leak previously covered only the A4 path.
-
-    jobs.py picks the builder from the paper setting, so A6 and A7 are live
-    code -- putting the codeword back in either one's title went unnoticed.
+    """No layout's PDF metadata carries the codeword. jobs.py picks the builder
+    from the paper setting, so A6 and A7 are live code alongside A4.
     """
 
     def _build(self, builder, **kwargs):
@@ -247,18 +213,15 @@ class TestCodewordIsScrubbedFromEveryLayout:
 
 
 class TestTrainingIsUnmistakable:
-    """otp.md requires practice material to be unmistakably marked. Four
-    independent edits could each remove the marking with no test failing."""
+    """otp.md requires practice material to be unmistakably marked."""
 
     def _training_marks(self, data) -> int:
         text = "\n".join("".join(r) for r in glyph_rows(data))
         return text.count("TRAINING")
 
     def test_both_the_watermark_and_the_footer_are_printed(self):
-        # Two distinct marks: the large diagonal watermark and the footer
-        # line. Counting them matters -- asserting only that the word
-        # appears somewhere cannot tell the two apart, so removing the
-        # watermark alone would go unnoticed.
+        # Two distinct marks, the diagonal watermark and the footer line;
+        # counting them catches the removal of either.
         assert self._training_marks(a6_pad(1, training=True)) == 2
 
     def test_the_watermark_is_large_and_diagonal(self):
@@ -276,8 +239,8 @@ class TestTrainingIsUnmistakable:
 
 class TestLayoutsDrawWhatTheyPromise:
     def test_a7_draws_both_halves_of_the_sheet(self):
-        # Drawing only the left half would silently drop every even page of
-        # the pad; the progress counter would still report them.
+        # Drawing only the left half would drop every even page while the
+        # progress counter still reported them.
         sink = io.BytesIO()
         g.generate_set_pdf_a7(sink, "RUSTED-BADGER", 2, 375, 9,
                               progress=lambda d, t: None)
@@ -287,16 +250,9 @@ class TestLayoutsDrawWhatTheyPromise:
 
     @pytest.mark.parametrize("page_size", [g.A4, g.LETTER])
     def test_a4_sheets_carry_crop_marks(self, page_size):
-        """
-        The marks the guillotine is lined up against.
-
-        This assertion used to count " l\\n" -- PDF lineto -- across the whole
-        page and require four. The page furniture already emits four on its
-        own, so deleting every crop mark left the count at four and the test
-        passed: it never tested the thing it was named for. A mutation that
-        removed the call survived the entire suite and was committed. So
-        check the geometry instead: each mark at its own edge, the right
-        length, on the cut line.
+        """Each crop mark is at its own edge, the right length, on the cut line.
+        Geometry is checked because the page furniture emits lineto operators
+        of its own.
         """
         sink = io.BytesIO()
         g.generate_set_pdf_a4(sink, "RUSTED-BADGER", 4, 665, 9,
@@ -317,13 +273,9 @@ class TestLayoutsDrawWhatTheyPromise:
                 f"crop mark {mark} missing from {sorted(drawn)}")
 
     def test_a7_sheets_carry_a_cut_line(self):
-        """
-        The line the A7 sheet is cut down.
-
-        Same flaw as the crop marks above: this used to look for the PDF `d`
-        operator, but setDash emits that whether or not a line follows, so
-        deleting the stroke left the test green. Check the stroke itself --
-        full height, down the middle of the landscape A6 sheet.
+        """The cut line is stroked full height down the middle of the landscape A6
+        sheet. The stroke itself is checked: setDash emits `d` whether or not a
+        line follows.
         """
         sink = io.BytesIO()
         g.generate_set_pdf_a7(sink, "RUSTED-BADGER", 2, 375, 9,
@@ -338,12 +290,9 @@ class TestLayoutsDrawWhatTheyPromise:
 
 class TestGenerationReallyWritesNoFile:
     def test_no_file_appears_anywhere_under_tmp(self, tmp_path, monkeypatch):
-        """
-        The previous version of this test set TMPDIR and watched tmp_path,
-        but tempfile caches its directory at first use, so the environment
-        variable was inert and a NamedTemporaryFile would have gone to the
-        real /tmp unnoticed. Point tempfile itself at the sandbox and watch
-        that, so a stray temp file has nowhere to hide.
+        """Generation leaves no temp file. tempfile caches its directory at first
+        use, so tempfile itself is pointed at the sandbox; setting TMPDIR would
+        be inert.
         """
         import tempfile
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))

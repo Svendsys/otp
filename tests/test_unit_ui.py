@@ -1,8 +1,6 @@
-"""Tests for the print unit, driven through the real UI with fake hardware.
-
-These push scripted button presses through a real App and assert on what the
-panel would show, so the whole flow is covered without an OLED, a Pi, or a
-printer.
+"""Tests for the print unit, driven through the real UI with fake hardware:
+scripted button presses go through a real App and assertions read what the
+panel would show.
 """
 import inspect
 import io
@@ -41,9 +39,8 @@ class RecordingCups(printer.Cups):
         return f"job-{len(self.submitted)}"
 
     def active_jobs(self, name="OTP"):
-        # Must be stubbed. The real one shells out to lpstat, which fails
-        # here and now correctly reports "cannot tell" -- which the UI treats
-        # as busy, so an unstubbed fake would park every test at `waiting`.
+        # Must be stubbed: unstubbed it reports "cannot tell", which the UI
+        # treats as busy, parking every test at `waiting`.
         return 0
 
     def purge(self, name="OTP"):
@@ -99,10 +96,8 @@ class TestFrame:
 
 
 class TestEveryScreenFitsThePanel:
-    """
-    No screen may silently truncate. A 21-column panel turns an over-long
-    string into misinformation, which on this device could mean an operator
-    not reading "POWER-CYCLE THE PRINTER" to the end.
+    """No screen may truncate: on a 21-column panel an over-long string becomes
+    misinformation, such as "POWER-CYCLE THE PRINTER" not read to the end.
     """
 
     def _check(self, screen, app):
@@ -128,15 +123,9 @@ class TestEveryScreenFitsThePanel:
         self._check(ui.TextEntry("MODIFIER", lambda a, v: None), app)
 
     def test_a_codeword_cannot_be_picked_off_the_list(self):
-        """
-        The unit rolls codewords or takes one typed in, and offers no third
-        way. Browsing a category was removed deliberately: a hand-picked noun
-        carries the operator's taste, and the category picked is a hint about
-        who the twin belongs to. Both defeat the point of a codeword, which is
-        to name the set without naming its holders.
-
-        This guards the whole surface, not just the menu label -- the pool the
-        unit can draw from has to stay the undivided one.
+        """Codewords are rolled or typed, never browsed by category, and the pool
+        drawn from is the undivided one. A hand-picked noun or category hints
+        at who holds the twin.
         """
         app = make_app([])
         labels = [label for label, _ in ui.codeword_menu(lambda a, w: None).items]
@@ -431,10 +420,9 @@ class TestRunJobFlow:
         assert screen.stage == "done"
         assert cups.purged == 1
         text = "\n".join(screen.frame(app).rendered())
-        # Not "KEY WIPED": the buffer is zeroed, but reportlab's
-        # intermediates and the immutable bytes given to the subprocess are
-        # not and cannot be. Power-off is the real wipe, so that is what the
-        # panel must tell the operator to do.
+        # Not "KEY WIPED": reportlab's intermediates and the bytes given to the
+        # subprocess cannot be zeroed, so the panel must tell the operator to
+        # power off.
         assert "KEY WIPED" not in text
         assert "POWER-CYCLE PRINTER" in text
 
@@ -452,9 +440,8 @@ class TestRunJobFlow:
         screen.press(app, Press.BACK)           # ask to abandon
         screen.press(app, Press.OK)             # confirm -- swap now asks
         assert cups.purged == 1
-        # Copy A is already on the tray and the key is now gone, so the pair
-        # can never be completed. The operator must be told those sheets are
-        # live key material rather than dropped back at the menu.
+        # Copy A is on the tray and the key is gone, so the operator must be
+        # told those sheets are live key material.
         text = "\n".join(screen.frame(app).rendered())
         assert "DESTROY" in text
         assert screen.press(app, Press.OK) is ui.HOME
@@ -472,31 +459,20 @@ class TestRunJobFlow:
 
 
 class TestADrainedQueueIsNotProofOfPrinting:
-    """
-    lp accepting a job is not paper, and neither is the queue emptying.
+    """Neither lp accepting a job nor the queue emptying is paper. With
+    `ErrorPolicy abort-job` a failed job is discarded as promptly as a printed
+    one, so RunJob consults printer_fault before advancing or wiping the key.
 
-    The unit ships `ErrorPolicy abort-job` precisely so a failed job cannot
-    wedge a MaxJobs-bounded queue -- which means a job that FAILED is
-    discarded exactly as promptly as one that printed. unattended.run has
-    consulted printer_fault since that combination handed an operator "YOUR
-    PAD PAIR IS PRINTED" over an empty tray. RunJob never did: it advanced
-    on `active_jobs == 0` alone, so the panel said COPY A DONE over the
-    same empty tray, then PAIR COMPLETE, and wiped the key on the strength
-    of it.
-
-    Driven here with doubles so the fast suite owns the regression; the
-    same sequence runs against a real cupsd and a real failing backend in
-    tests/test_simulated_hardware.py.
+    Driven with doubles here; tests/test_simulated_hardware.py runs the same
+    sequence against a real cupsd.
     """
 
     class Reporting(RecordingCups):
         """A queue that drains and a printer that says it failed anyway.
 
-        Reports BOTH channels, because the real one does and they mean
-        different things: printer-state-message is the prose lpstat prints,
-        printer-state-reasons are the IPP keywords that carry severity.
-        A double that only answered the first let the panel's decision rest
-        on prose, which is how "Toner low." came to destroy a pad pair.
+        Reports both channels, as the real one does: printer-state-message is
+        lpstat's prose, printer-state-reasons are the IPP keywords that carry
+        severity.
         """
 
         def __init__(self, fault="out of paper",
@@ -531,9 +507,7 @@ class TestADrainedQueueIsNotProofOfPrinting:
             "the panel offered the swap prompt over a tray that got nothing"
         text = "\n".join(screen.frame(app).rendered())
         assert "REMOVE THE STACK" not in text
-        # The printer's own words. The IPP keyword is the fallback: "out
-        # of paper" is something an operator can act on, "MEDIA EMPTY" is
-        # what it boils down to.
+        # The printer's own words; the IPP keyword is only the fallback.
         assert "OUT OF PAPER" in text.upper()
 
     def test_a_failed_copy_b_is_not_reported_as_a_complete_pair(self):
@@ -548,12 +522,12 @@ class TestADrainedQueueIsNotProofOfPrinting:
             "the panel called a lost copy B a complete pair"
         text = "\n".join(screen.frame(app).rendered())
         assert "PAIR COMPLETE" not in text
-        # Copy A is in their hand and can never be matched. Say so.
+        # Copy A can never be matched, and the panel says so.
         assert "DESTROY PRINTED PAGES" in text
 
     def test_a_healthy_pair_is_still_reported_as_one(self):
-        # The control. Everything above is satisfied by a panel that calls
-        # every job a failure, and that panel would be useless.
+        # The control: a panel that calls every job a failure would pass
+        # everything above.
         cups = RecordingCups()
         app, screen = self._screen(cups)
         for _ in range(4):
@@ -562,10 +536,8 @@ class TestADrainedQueueIsNotProofOfPrinting:
         assert "PAIR COMPLETE" in "\n".join(screen.frame(app).rendered())
 
     def test_a_cups_that_cannot_report_faults_still_finishes(self):
-        """
-        Silence is not trouble. A wedged cupsd, and any Cups predating
-        printer_fault, must fall back to the queue result rather than send
-        someone to burn a pair that printed perfectly.
+        """A Cups that cannot report faults falls back to the queue result:
+        silence is not trouble, and must not send someone to burn a good pair.
         """
         class Old(RecordingCups):
             printer_fault = None                 # not even callable
@@ -586,17 +558,9 @@ class TestADrainedQueueIsNotProofOfPrinting:
         assert screen.stage == "done"
 
     def test_a_banked_press_cannot_dismiss_the_fault_unread(self):
-        """
-        Getting to this screen costs two lpstat subprocesses, and the
-        operator spends them looking at `printing`, whose footer is OK WHEN
-        TRAY IS CLEAR. A second tap during that wait is banked by
-        GpioButtons and replayed against whatever is drawn next -- and
-        ERROR's handler wipes the key and returns HOME. The panel would
-        flash the fault for one cycle and drop them at the menu having
-        never read DESTROY PRINTED PAGES.
-
-        _print_copy has drained on its error path since round three. This
-        is the same hazard on the path added with the fault check.
+        """Presses banked during the blocking lpstat calls are drained before the
+        fault screen, whose handler wipes the key and goes home; otherwise the
+        operator never reads DESTROY PRINTED PAGES.
         """
         cups = self.Reporting(after=1)
         app = make_app([])
@@ -614,12 +578,8 @@ class TestADrainedQueueIsNotProofOfPrinting:
             "a banked press survived and will dismiss the fault unread"
 
     def test_a_stopped_queue_is_not_reported_as_still_printing(self):
-        """
-        CUPS_BACKEND_STOP -- an open cover, or a printer that reports an
-        empty tray properly -- stops the queue and KEEPS the job, so
-        active_jobs never reaches zero. The panel said STILL PRINTING / OK
-        TO CHECK AGAIN at a printer that would never print, while the
-        printer had been saying why the whole time.
+        """A stopped queue shows the printer's reason, not STILL PRINTING.
+        CUPS_BACKEND_STOP keeps the job, so active_jobs never reaches zero.
         """
         class Stopped(RecordingCups):
             def active_jobs(self, name="OTP"):
@@ -627,9 +587,8 @@ class TestADrainedQueueIsNotProofOfPrinting:
 
             def printer_fault(self, name="OTP"):
                 # What real lpstat returns for a disabled queue: the header
-                # line, with the reason on the NEXT line, which printer.py
-                # discards. Measured against the rig's cupsd. The panel must
-                # not be reduced to showing this.
+                # line, with the reason on the next line. The panel must not be
+                # reduced to showing this.
                 return ("printer OTP disabled since Wed Aug 12 20:21:35 "
                         "2026 -")
 
@@ -642,25 +601,16 @@ class TestADrainedQueueIsNotProofOfPrinting:
         assert screen.stage == "waiting"
         shown = "\n".join(screen.frame(app).rendered()).upper()
         assert "STILL PRINTING" not in shown, shown
-        # The REASON, not the header. "or DISABLED" would have been
-        # satisfied by the timestamp row of a screen that never said what
-        # was wrong -- which is what it was doing.
+        # The reason, not the header's "disabled" and timestamp.
         assert "MEDIA EMPTY" in shown, shown
         assert "2026" not in shown, \
             f"the panel is showing lpstat's timestamp instead of a reason: {shown}"
-        # And the non-destructive retry must survive: this screen is not a
-        # trap, it is a report.
+        # And the non-destructive retry is still offered.
         assert "HOLD" in shown
 
     def test_ok_on_a_stopped_queue_re_enables_it(self):
-        """
-        OK RECHECK has to be able to succeed, or the only working exit is
-        the one that destroys the pair.
-
-        CUPS_BACKEND_STOP disables the queue and holds the job until
-        something runs `lpadmin -E`. The unit did that once, in ensure_queue
-        at startup, and never again -- so an operator who closed the cover
-        and pressed OK got PRINTER STOPPED for ever.
+        """OK RECHECK re-enables a stopped queue (it stays disabled until `lpadmin
+        -E`), so the non-destructive exit can actually succeed.
         """
         class Stopped(RecordingCups):
             def __init__(self):
@@ -691,16 +641,9 @@ class TestADrainedQueueIsNotProofOfPrinting:
             "the queue recovered and the panel stayed on PRINTER STOPPED"
 
     def test_one_ok_press_costs_at_most_two_cups_subprocesses(self):
-        """
-        Every CUPS query is a subprocess bounded by Cups.TIMEOUT = 120s, and
-        the panel is frozen with the key resident for the whole of it. The
-        count is therefore a safety property, not a performance one.
-
-        Two is the budget: one active_jobs to decide busy/idle, one
-        state_reasons to decide what the printer says about it. The
-        stopped-queue path briefly cost THREE -- asking for the reasons
-        once to decide it was stopped and again to say why -- which put a
-        wedged-but-answering cupsd at six minutes of dead panel per press.
+        """One OK press runs at most two CUPS queries: active_jobs and
+        state_reasons. Each is a subprocess bounded by Cups.TIMEOUT with the
+        panel frozen and the key resident, so the count is a safety property.
         """
         for label, busy, reasons in [
             ("busy, healthy", True, []),
@@ -734,19 +677,9 @@ class TestADrainedQueueIsNotProofOfPrinting:
                 f"frozen panel holding key material")
 
     def test_a_backend_that_reports_no_reasons_is_still_believed(self):
-        """
-        The unit's OWN hardware path, which a reasons-based decision could
-        not see at all.
-
-            $ strings /usr/lib/cups/backend/usb | grep -c 'media-'
-            0
-
-        The usb backend -- and usb:// is what Cups.devices() hands back for
-        a directly attached laser -- reports no media state ever; its only
-        state keywords are connecting-to-device. An earlier version of this
-        decided faults from printer-state-reasons alone, so on the shipped
-        printer an empty tray produced no reasons, no fault, and PAIR
-        COMPLETE over a tray holding nothing.
+        """A fault reported only in prose still stops the pair. The usb backend,
+        which is the unit's own hardware path, never reports media state
+        reasons.
         """
         cups = self.Reporting(fault="out of paper", reasons=[])
         app, screen = self._screen(cups)
@@ -758,17 +691,9 @@ class TestADrainedQueueIsNotProofOfPrinting:
         assert "OUT OF PAPER" in "\n".join(screen.frame(app).rendered()).upper()
 
     def test_a_warning_severity_media_fault_still_stops_the_pair(self):
-        """
-        CUPS' SNMP supplies code emits the conditions that mean NOTHING
-        PRINTED at "-warning" severity:
-
-            $ strings /usr/lib/cups/backend/{socket,ipp,lpd} | grep media-
-            media-empty-warning
-            media-jam-warning
-
-        Reading the suffix as the severity therefore discarded exactly the
-        faults that matter, on every SNMP-capable printer. The stem is what
-        carries the meaning.
+        """media-empty-warning and media-jam-warning stop the pair. CUPS' SNMP
+        backends emit "nothing printed" conditions at -warning severity, so the
+        stem decides, not the suffix.
         """
         for reason in ("media-empty-warning", "media-jam-warning",
                        "toner-empty-warning", "cover-open-warning"):
@@ -780,16 +705,10 @@ class TestADrainedQueueIsNotProofOfPrinting:
                 f"{reason} was treated as advisory; it means nothing printed"
 
     def test_a_sticky_reason_does_not_condemn_every_later_pair(self):
-        """
-        printer-state-reasons OUTLIVE the job that set them: after one
-        empty-tray event, `lpstat -l -p` keeps reporting media-empty-error
-        on a queue that is printing perfectly, and `lpadmin -E` clears only
-        `paused`. A decision resting on reasons therefore sent every later
-        pair to DESTROY PRINTED PAGES for the lifetime of the daemon.
-
-        The prose does not stick -- measured against the rig, printer_fault
-        returns to None once the tray is refilled -- which is the other
-        reason it is the channel that decides.
+        """A reason left over from an earlier job does not fail a pair that
+        printed. printer-state-reasons outlive their job and `lpadmin -E`
+        clears only `paused`; the prose does not stick, so it is the channel
+        that decides.
         """
         cups = self.Reporting(fault=None, reasons=["media-empty-error"])
         app, screen = self._screen(cups)
@@ -799,14 +718,9 @@ class TestADrainedQueueIsNotProofOfPrinting:
             "a stale state reason condemned a pair that printed"
 
     def test_a_resumed_job_warns_that_pages_may_repeat(self):
-        """
-        Re-enabling a stopped queue re-sends the WHOLE held job. Measured
-        against the rig: after OK RECHECK the backend had received copy A
-        twice. On real paper that is pages 1..N from before the cover
-        opened followed by pages 1..M of the same key -- and the ordinary
-        swap prompt says "REMOVE THE STACK AND KEEP IT TOGETHER", which is
-        the wrong instruction over a stack with duplicate key material in
-        it. The operator is the only one who can see the tray.
+        """After a resume the panel warns that pages may repeat. Re-enabling a
+        stopped queue re-sends the whole held job, so the stack may hold
+        duplicate key pages.
         """
         class Stopped(RecordingCups):
             def __init__(self):
@@ -836,13 +750,8 @@ class TestADrainedQueueIsNotProofOfPrinting:
             "operator to keep it together without checking"
 
     def test_the_panel_and_the_headless_run_agree(self):
-        """
-        One decision, not one helper. The two modes had a fault helper each;
-        merging them shared the helper but left the DECISION split -- the
-        panel weighed IPP reasons, unattended read raw prose -- so on the
-        same printer they disagreed in both directions: a standing "Toner
-        low." aborted the headless pair while the panel finished it, and an
-        SNMP empty tray did the reverse.
+        """The panel and unattended.run reach the same verdict on the same printer
+        state, so a fault cannot abort one mode and pass the other.
         """
         from otpunit import unattended
 
@@ -866,16 +775,9 @@ class TestADrainedQueueIsNotProofOfPrinting:
                 f"{headless}, expected {is_fault}")
 
     def test_an_advisory_reason_does_not_destroy_a_good_pair(self):
-        """
-        The severity suffix is the whole point. A laser reporting
-        toner-low-report all day is working, and cupsd puts its own filter
-        chatter in printer-state-message on a perfectly healthy queue --
-        measured mid-print: "DEBUG: cfFilterChain: universal (PID 21339)
-        exited with no errors."
-
-        Both used to reach the panel as ERROR / DESTROY PRINTED PAGES on a
-        pair that printed, and the next OK wiped the key. Deciding on any
-        non-empty printer-state-message is what made that possible.
+        """Advisory reasons (toner-low-report) and cupsd's own filter chatter in
+        printer-state-message are not faults; treating them as such wipes the
+        key of a pair that printed.
         """
         for prose, reasons in [
             ("Toner low.", ["toner-low-report"]),
@@ -892,16 +794,9 @@ class TestADrainedQueueIsNotProofOfPrinting:
                 f"{screen.stage!r}")
 
     def test_a_banked_press_cannot_spool_copy_b_over_copy_a(self):
-        """
-        The success path banks presses exactly as the error path does.
-
-        Reaching `swap` costs two blocking lpstat subprocesses, spent with
-        the operator looking at `printing` and its OK WHEN TRAY IS CLEAR
-        footer. A second tap is queued by GpioButtons and replayed against
-        SWAP the instant it is drawn -- and SWAP's OK handler spools copy B.
-        Both halves of the pair then land in one tray, with COPY A DONE /
-        REMOVE THE STACK never shown. The error path was drained from the
-        start; this one was not.
+        """Presses banked during the blocking lpstat calls are drained before the
+        swap screen, whose OK handler spools copy B; otherwise both copies land
+        in one tray.
         """
         cups = RecordingCups()
         app = make_app([])
@@ -928,42 +823,32 @@ class TestADrainedQueueIsNotProofOfPrinting:
         assert "STILL PRINTING" in "\n".join(screen.frame(app).rendered())
 
     def test_the_simulator_never_shells_out_to_a_real_printer(self):
-        """
-        `--sim` runs as a real process outside pytest, so the conftest
-        guard does not protect it. SimulatedCups must override every method
-        that would otherwise reach the host -- and printer_fault was the
-        one that got missed, so `--sim` on the unit itself, or on any dev
-        box that has run install.sh, reported the REAL OTP queue's fault
-        over a simulated pad that reached no printer at all.
+        """SimulatedCups overrides every Cups method that could reach the host.
+        `--sim` runs outside pytest, where the conftest guard does not protect
+        it.
         """
         from otpunit.__main__ import SimulatedCups
         from otpunit import printer as printer_mod
 
-        # DERIVED from Cups, not a list written out here. The hand-written
-        # version named six methods and missed _clear_temp(), which is
-        # reachable from --sim through unattended.run's finally block and
-        # unlinks every file in the host's live /run/cups/tmp as root. A
-        # completeness test that has to be kept complete by hand is not one.
+        # Derived from Cups, not listed by hand, so a new host-reaching method
+        # cannot be missed.
         reaches_host = {
             name for name, value in vars(printer_mod.Cups).items()
             if callable(value) and not name.startswith("__")
             and name not in ("_subprocess_run", "_text", "_run_text")
-            # A staticmethod has no self, so it cannot reach self._run.
-            # reason_stem is pure string work on an IPP keyword.
+            # A staticmethod has no self and cannot reach self._run.
             and not isinstance(
                 inspect.getattr_static(printer_mod.Cups, name), staticmethod)
         }
         covered = set(vars(SimulatedCups))
         # _clear_temp is neutralised by pointing temp_dir at a scratch
-        # directory rather than by overriding the method, which covers
-        # every caller instead of the one that was remembered.
+        # directory, which covers every caller.
         assert SimulatedCups().temp_dir != printer_mod.TEMP_DIR, \
             "SimulatedCups would empty the host cupsd's TempDir"
         by_temp_dir = {"_clear_temp"}
-        # Private helpers of ensure_queue, which IS overridden, so nothing
-        # in --sim can reach them. Named individually rather than excusing
-        # everything underscored, because _clear_temp is underscored too and
-        # is exactly the one that mattered.
+        # Private helpers of ensure_queue, which is overridden. Named
+        # individually, not by underscore, because _clear_temp is underscored
+        # and does reach the host.
         unreachable = {"_lpadmin", "_match_ppd", "_remove_queue"}
         for name in unreachable:
             assert name in reaches_host, \
@@ -974,29 +859,17 @@ class TestADrainedQueueIsNotProofOfPrinting:
             f"shell out to the host's CUPS")
 
     def test_a_cups_double_cannot_fall_through_to_the_host(self):
-        """
-        The conftest guard, pinned. Every double here is built as
-        `Cups(run=None)`, which means "use the real subprocess runner", so
-        any method left unstubbed reaches the host's lp or lpstat. That was
-        harmless only while nothing in the fast path called one -- and then
-        printer_fault did, and eleven tests failed on a machine whose real
-        OTP queue happened to be reporting a fault.
+        """The conftest guard holds: a `Cups(run=None)` double's unstubbed methods
+        refuse instead of reaching the host's lp or lpstat.
         """
         with pytest.raises(OSError, match="must not run"):
             printer.Cups._subprocess_run(["/usr/bin/lpstat", "-p", "OTP"])
 
     def test_the_unanswerable_queue_keeps_its_manual_override(self):
-        """
-        The override, pinned -- but honestly.
-
-        `confirm_continue` is the operator's only non-destructive way on
-        when the queue cannot be asked at all. It is NOT actually at risk
-        from the fault check: active_jobs and printer_fault both go through
-        Cups._run_text, so a daemon that cannot answer one cannot answer
-        the other, and queue_unknown already implies no fault. The double
-        below manufactures a combination the real Cups cannot produce, and
-        is here to catch someone MOVING the check into _proceed -- not
-        because the scenario occurs.
+        """With an unanswerable queue, `confirm_continue` stays reachable and
+        printer_fault is not consulted. The double combines states the real
+        Cups cannot produce; it guards against the fault check moving into
+        _proceed.
         """
         class Mute(RecordingCups):
             def active_jobs(self, name="OTP"):
@@ -1042,11 +915,9 @@ class TestSettings:
         assert config.load(str(path)).pages == 50
 
     def test_the_unit_never_writes_a_codeword_to_the_card(self, tmp_path):
-        """
-        A codeword is not key material, but it names a live pad, and the SD
-        card is the part most likely to be captured along with the unit.
-        So the unit must never record which pad it produced -- including
-        when auto_codeword was set and used.
+        """Saving settings never records a codeword, even when auto_codeword was
+        set and used: it names a live pad, and the SD card is likely to be
+        captured with the unit.
         """
         path = tmp_path / "c.conf"
         config.save(config.Settings(auto_codeword="RUSTED-BADGER"),
@@ -1059,8 +930,8 @@ class TestSettings:
         assert live == []
 
     def test_a_hand_written_codeword_is_still_honoured(self, tmp_path):
-        # Read but never written: someone who agrees a codeword out of band
-        # can still set one, they are just making that trade themselves.
+        # Read but never written: a codeword agreed out of band can still be
+        # set by hand.
         path = tmp_path / "c.conf"
         path.write_text("auto_codeword = SILENT-OSPREY\n")
         assert config.load(str(path)).auto_codeword == "SILENT-OSPREY"
@@ -1076,14 +947,9 @@ class TestSettings:
         assert config.Settings().imposed is True
 
     def test_lp_options_pin_the_geometry(self):
-        # The imposition is baked into the PDF. If CUPS also tiled or scaled
-        # it, the cut lines would no longer be where the crop marks say.
-        #
-        # This test used to assert lp_options == {"media": ...} exactly --
-        # naming that risk in a comment and then locking in the absence of
-        # the options that prevent it. cups-filters defaults print-scaling
-        # to `auto`, so "we send nothing" meant "the driver may shrink it to
-        # fit", which is precisely the failure the comment describes.
+        # The imposition is baked into the PDF. cups-filters defaults
+        # print-scaling to `auto`, so the options must forbid tiling or
+        # scaling, or the cut lines move off the crop marks.
         for paper, media in (("A4", "A4"), ("LETTER", "Letter"), ("A6", "A6")):
             options = config.Settings(paper=paper).lp_options
             assert options["media"] == media
@@ -1169,9 +1035,8 @@ class TestPrinterDiscovery:
         assert devices[0].uri.startswith("usb://Brother")
 
     def test_finds_the_ipp_usb_endpoint_too(self):
-        # ipp-usb publishes a local IPP endpoint, and that is the ONLY kind
-        # of URI `lpadmin -m everywhere` accepts. Filtering it out is what
-        # made the driverless path unreachable.
+        # ipp-usb publishes a local IPP endpoint, the only kind of URI `lpadmin
+        # -m everywhere` accepts, so it must not be filtered out.
         cups = self._cups(
             "direct usb://HP/LaserJet%20Pro%20M12w?serial=X\n"
             "network ipp://localhost:60000/ipp/print\n"
@@ -1233,9 +1098,9 @@ class TestPrinterDiscovery:
             cups.submit(bytearray(b"x"))
 
 
-# Real-shaped `lpinfo -m` output. The M12w is the interesting case: it is a
-# host-based laser with no driverless support, so it needs a Foomatic PPD
-# picked correctly out of a list where "HP" matches hundreds of lines.
+# Real-shaped `lpinfo -m` output. The M12w is a host-based laser with no
+# driverless support, so it needs a Foomatic PPD picked out of a list where
+# "HP" matches many lines.
 LPINFO_M = """\
 everywhere IPP Everywhere
 drv:///sample.drv/generic.ppd Generic PostScript Printer
@@ -1308,9 +1173,8 @@ class TestPpdMatching:
         assert used[used.index("-m") + 1] == "everywhere"
 
     def test_driverless_is_never_attempted_for_a_usb_uri(self):
-        # CUPS rejects `-m everywhere` against usb:// with "IPP Everywhere
-        # driver requires an IPP connection" AND deletes the half-made
-        # queue, so trying it is worse than useless.
+        # CUPS rejects `-m everywhere` against usb:// and deletes the half-made
+        # queue.
         cups = self._cups(driverless_ok=True)
         device = printer.Device("usb://HP/LaserJet%20Pro%20M12w?serial=X", "")
         cups.ensure_queue(device)

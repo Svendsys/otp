@@ -5,9 +5,8 @@
 # The unit rewrites this file when you choose "SAVE SETTINGS" on the panel;
 # editing it by hand works too.
 #
-# Note what is NOT here: the last codeword used. It is the one field that
-# would tie this machine to a pad it produced, and the envelope labels are
-# the real register.
+# The last codeword used is deliberately not stored here: it would tie this
+# machine to a pad it produced.
 
 # Pad pages per set.
 pages = 100
@@ -27,15 +26,12 @@ paper = A4
 # Not combinable with the 4-up imposition above.
 a7 = no
 
-# The AUTH group: five key letters per page reserved for authentication and
-# never used for encryption (see otp.md, Authentication). The letters are
-# always CSPRNG output; only the length is adjustable.
+# The AUTH group: key letters on each page reserved for authentication and
+# never used for encryption (see otp.md, Authentication).
 #
-# Five is what the manual's procedure assumes -- it says the first *group*
-# of every message is the auth group, and a group is five letters. Change
-# this only if both ends have agreed to, and know that shorter is weaker:
-# three letters is guessable at 1 in 17,576 against 1 in 11.9 million at
-# five. Setting with_auth = no produces pads on which the manual's own rule
+# Five is what the manual's procedure assumes. Change it only if both ends
+# have agreed to; shorter is weaker (three letters is guessable at 1 in
+# 17,576, five at 1 in 11.9 million). With with_auth = no, the manual's rule
 # ("no auth group, no action") means no message may ever be acted on.
 with_auth = yes
 auth_size = 5
@@ -46,3 +42,9 @@ training = no
 
 # Key body font size in points.
 font_size = 9.0
+
+# Live pads are refused unless the root filesystem is the read-only RAM
+# overlay, because otherwise the disk can remember what the unit did. The
+# provided image always has it. Set this to yes only on a machine that
+# deliberately has no overlay; training pads print either way.
+allow_writable_root = no

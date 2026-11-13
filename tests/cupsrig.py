@@ -1,35 +1,16 @@
 """A real cupsd, in a temp directory, with a printer that writes to a file.
 
-The single most valuable thing this repository can test without hardware.
-Six rounds of reading the code found real bugs; the first run against an
-actual cupsd found that the shipped unit could not print a pad at all,
-because `MaxJobs 1` makes CUPS *refuse* a second job rather than queue it.
-Nothing short of a real daemon was ever going to say so.
+It never touches the system CUPS: own ServerRoot, ServerBin, spool and domain
+socket, with CUPS_SERVER pointed at it.
 
-Two rules shape this.
+Its configuration is parsed out of `device/install.sh` at run time (MaxJobs,
+ErrorPolicy, PreserveJobHistory, PreserveJobFiles), so a change to the shipped
+value is what gets tested.
 
-**It never touches the system CUPS.** Own ServerRoot, own ServerBin, own
-spool, own port-less domain socket, and CUPS_SERVER pointed at it. Killing
-the rig leaves the host exactly as it was.
-
-**Its configuration is taken from `device/install.sh`, not restated here.**
-The directives that matter -- MaxJobs, ErrorPolicy, PreserveJobHistory,
-PreserveJobFiles -- are parsed out of the provisioning script at run time.
-A rig with its own copy of those numbers would have gone on passing after
-somebody changed the shipped value, which is exactly the class of bug this
-exists to catch.
-
-**It can fail, and in more than one shape.** For its first several rounds
-the backend recorded its bytes and exited 0, so every real printing
-failure was unexercised -- and the one that had already bitten was a false
-SUCCESS: under `ErrorPolicy abort-job` an empty tray drains the queue just
-as promptly as a finished job, so the unit printed "YOUR PAD PAIR IS
-PRINTED" over nothing and wiped the key. `set_failure()` injects the modes
-a real printer actually produces (see `CupsRig.FAILURE_MODES`), and they
-differ in shape, not only in degree: abort-job DRAINS the queue, STOP
-disables it and keeps the job, RETRY leaves it pending forever. Code that
-reads "the queue is empty" as "it printed" passes one of those three and
-fails the others.
+`set_failure()` injects the ways a real printer fails (see
+`CupsRig.FAILURE_MODES`). They differ in shape: abort-job drains the queue,
+STOP disables it and keeps the job, RETRY leaves it pending. An empty queue is
+therefore not proof of printing.
 """
 from __future__ import annotations
 
@@ -49,13 +30,10 @@ SYSTEM_SERVERBIN = Path("/usr/lib/cups")
 
 
 def _apparmor_state() -> str:
-    """
-    Whether cupsd is confined, which decides if a rig in /tmp can work.
+    """Whether cupsd is confined, which decides if a rig in /tmp can work.
 
-    Ubuntu ships /etc/apparmor.d/usr.sbin.cupsd, and it permits backends
-    under /usr/lib/cups/backend and nowhere else. A hermetic rig in a temp
-    directory is precisely what that forbids -- so on a confined host the
-    profile has to be put in complain mode first:
+    Ubuntu's profile permits backends only under /usr/lib/cups/backend, so on a
+    confined host it must be put in complain mode first:
 
         sudo aa-complain /usr/sbin/cupsd
     """
@@ -68,24 +46,14 @@ def _apparmor_state() -> str:
         return "not available (no apparmor, or securityfs not mounted)"
     return "no cupsd profile loaded"
 
-# What the fake backend advertises. Three constraints, all learned the
-# hard way against a real cupsd:
+# What the fake backend advertises. The URI must start with usb:// or
+# Cups.devices() drops it; the scheme must match the backend's filename or
+# cupsd will not route jobs to it; and the make and model must be ones
+# _match_ppd can find a PPD for.
 #
-#   - the URI must start with usb:// or Cups.devices() drops it;
-#   - the scheme must match the backend's filename or cupsd will not route
-#     jobs to it;
-#   - the make and model must be ones _match_ppd can actually find a PPD
-#     for, because the point is to exercise that matching rather than to
-#     hand the rig a queue it did not have to earn. A made-up name failed
-#     with "no driver", which is the CORRECT answer for an unknown printer
-#     and a useless one for a fixture.
-#
-# "Generic PDF Printer" is chosen deliberately over a PCL or PostScript
-# driver: its filter chain passes the PDF through unaltered, so what the
-# backend receives is byte-for-byte what the unit submitted. Copy A and
-# copy B being identical is the property that makes them a pair, and
-# asserting it through Ghostscript -- which stamps a creation date into its
-# output -- would be flaky for reasons that have nothing to do with the pad.
+# "Generic PDF Printer" passes the PDF through its filter chain unaltered, so
+# the backend receives byte-for-byte what the unit submitted and copies A and B
+# can be compared.
 DEVICE_URI = "usb://Generic/PDF%20Printer?serial=RIG001"
 DEVICE_MAKE = "Generic PDF Printer"
 
@@ -233,15 +201,10 @@ def shipped_directives() -> dict:
 
 
 def shipped_modes() -> dict:
-    """
-    The spool/tmp/cache modes device/install.sh sets, keyed by basename.
+    """The spool/tmp/cache modes device/install.sh sets, keyed by basename.
 
-    Taken from the shipped tmpfiles.d block rather than restated, for the
-    same reason as the directives -- and because these modes are load
-    bearing in a way that is easy to miss. cupsd runs its filters as `lp`,
-    so a TempDir the filters cannot write to fails every job with
-    "universal filter failed", which reads like a driver problem and is
-    really a permissions problem. That is how this rig first behaved.
+    cupsd runs its filters as `lp`; a TempDir they cannot write to fails every
+    job with "universal filter failed".
     """
     modes = {}
     try:
@@ -301,12 +264,11 @@ class CupsRig:
         return binary
 
     def _make_dirs(self) -> None:
-        """
-        The rig's directories, with the modes device/install.sh ships.
+        """Create the rig's directories with the modes device/install.sh ships.
 
         `cups` in shipped_modes() is the parent, applied to the rig root so
-        cupsd can traverse it. `jobs` is ours -- the backend runs as lp and
-        has to be able to write what it received.
+        cupsd can traverse it. `jobs` is the rig's own; the backend runs as lp
+        and must be able to write there.
         """
         modes = shipped_modes()
         import grp
@@ -333,12 +295,9 @@ class CupsRig:
             if lp_gid >= 0:
                 os.chown(self.root / name, 0, lp_gid)
 
-        # And so must every directory above it. cupsd runs its helpers as
-        # `lp`, so a rig under a 0700 parent -- which is exactly what
-        # pytest's tmp_path is -- cannot execute its own cups-driverd. The
-        # symptom is not a permission error: `lpinfo -m` simply returns
-        # nothing, _match_ppd finds no candidate, and the unit reports "no
-        # driver" for a printer whose PPD is sitting right there.
+        # And so must every directory above it: cupsd runs its helpers as `lp`,
+        # and under a 0700 parent such as pytest's tmp_path `lpinfo -m` returns
+        # nothing and the unit reports "no driver".
         self._widened = []
         for parent in self.root.parents:
             if parent == Path(parent.root):
@@ -347,9 +306,8 @@ class CupsRig:
             if mode & 0o001:
                 break                            # already traversable
             os.chmod(parent, mode | 0o011)
-            # Remembered so stop() can put them back. Leaving a 0700 tree
-            # at 0711 is permanent, and pytest keeps the last three tmp
-            # roots -- which hold complete pad PDFs.
+            # Remembered so stop() can restore them: pytest keeps old tmp
+            # roots, which hold complete pad PDFs.
             self._widened.append((parent, mode))
 
     def _write_config(self) -> None:
@@ -399,8 +357,8 @@ FileDevice Yes
 
     def start(self) -> None:
         self._write_config()
-        # cupsd -t is the same gate install.sh runs. Failing here means the
-        # rig is wrong, not the unit -- say so rather than timing out later.
+        # cupsd -t is the gate install.sh runs. Failing here means the rig is
+        # wrong, not the unit.
         check = subprocess.run(
             [CUPSD, "-t", "-c", str(self.root / "etc" / "cupsd.conf"),
              "-s", str(self.root / "etc" / "cups-files.conf")],
@@ -429,13 +387,9 @@ FileDevice Yes
         self._verify_backend()
 
     def _verify_backend(self) -> None:
-        """
-        Prove cupsd can actually run our backend before any test relies on it.
-
-        A daemon that answers `lpstat -r` but cannot execute a backend
-        reports no devices, and the failure surfaces several frames away as
-        `IndexError: list index out of range` on `devices()[0]`. That is a
-        rig whose failure mode is a riddle. Diagnose it here instead.
+        """Prove cupsd can run the backend before any test relies on it. A daemon
+        that answers `lpstat -r` but cannot execute a backend just reports no
+        devices.
         """
         listed = self.run([LPINFO, "-v"]).stdout.decode("utf-8", "replace")
         if any(line.startswith("direct usb://") for line in listed.splitlines()):
@@ -450,10 +404,8 @@ FileDevice Yes
             f"exists={usb.exists()}",
             f"backend runs standalone: {self._backend_runs(usb)}",
         ]
-        # The likeliest cause on a distro that ships one: cupsd is confined
-        # and cannot execute anything under /tmp. The profile permits
-        # /usr/lib/cups/backend/* and nothing else, so a hermetic rig in a
-        # temp directory is exactly what it forbids.
+        # The likeliest cause: cupsd is confined by AppArmor and cannot execute
+        # anything under /tmp.
         clues.append(f"apparmor: {_apparmor_state()}")
         clues.append(f"error_log tail:\n{self.error_log()[-1500:]}")
         raise RuntimeError("\n  ".join(clues))
@@ -507,10 +459,8 @@ FileDevice Yes
         """An otpunit.printer.Cups wired to this rig, otherwise untouched."""
         from otpunit import printer
 
-        # temp_dir matters: _clear_temp() used to empty the module-level
-        # /run/cups/tmp, so the harness deleted the HOST's live CUPS
-        # scratch as root and never exercised its own. Proven by dropping
-        # a sentinel in the host's /run/cups/tmp and running one test.
+        # temp_dir keeps _clear_temp() on the rig's scratch and off the host's
+        # /run/cups/tmp.
         return printer.Cups(run=self.run, temp_dir=str(self.root / "tmp"))
 
     # --- what reached the printer --------------------------------------
@@ -527,11 +477,9 @@ FileDevice Yes
     def titles(self) -> list:
         return [title for title, _ in self.printed()]
 
-    # What the backend understands, and what each mode is modelling. Kept
-    # as a table rather than bare strings at the call sites so that a typo
-    # is a ValueError here instead of a test quietly passing against a
-    # printer that never failed -- which is the same defect class as a
-    # backend that can only succeed.
+    # What the backend understands and what each mode models. A table, so a
+    # typo is a ValueError and not a test passing against a printer that never
+    # failed.
     FAILURE_MODES = {
         "media-empty": "CUPS_BACKEND_FAILED; ErrorPolicy decides, and "
                        "abort-job discards the job",
@@ -544,29 +492,17 @@ FileDevice Yes
 
     def set_failure(self, mode: str = "", *, after: int = 0,
                     until: int = 0) -> None:
-        """
-        Make the printer fail the way `mode` describes. "" refills the tray.
+        """Make the printer fail the way `mode` describes. "" refills the tray.
 
-        `after=N` lets the first N backend invocations succeed before the
-        fault begins. That is how "copy A reached paper and copy B did not"
-        is modelled, and it is the state an operator is most likely to be
-        told about wrongly: a queue that printed one of two copies drains
-        exactly like a queue that printed both.
+        `after=N` lets the first N backend invocations succeed before the fault
+        begins, which models "copy A reached paper and copy B did not".
 
-        `until=N` ends the fault after invocation N, which is what lets a
-        retry mode terminate. Required for retry-current, because cupsd
-        re-runs that one immediately and would otherwise spin for as long
-        as the test was willing to wait.
+        `until=N` ends the fault after invocation N. Required for
+        retry-current, which cupsd re-runs immediately.
 
-        Both are counted in INVOCATIONS rather than jobs, since a retry
-        re-runs the backend against a job it already saw, and both are
-        counted FROM THIS CALL -- the invocation counter is reset here.
-        They used to be absolute numbers since the rig started, so a test
-        that printed anything before calling set_failure("...", after=1)
-        got a window that had already elapsed, the fault never fired, and
-        the test asserting a failure passed while exercising nothing. That
-        is the silent green this rig exists to eliminate, so the counter
-        rebases and the docstring's "the first N invocations" is true.
+        Both count backend invocations, not jobs (a retry re-runs the backend
+        on the same job), and both count from this call: the invocation counter
+        is reset here.
         """
         if mode and mode not in self.FAILURE_MODES:
             raise ValueError(
@@ -587,14 +523,8 @@ FileDevice Yes
         (self.jobs / ".until").write_text(str(until))
         # after/until are relative to this call, so the counter rebases.
         (self.jobs / ".count").write_text("0")
-        # Plugging the printer back in is part of ANY reconfiguration, not
-        # just refilling the tray. Scoped to mode == "" it meant switching
-        # from "disconnect" straight to another mode left .unplugged on
-        # disk: lpinfo -v kept reporting nothing, devices() stayed empty,
-        # and a test that believed it was exercising CUPS_BACKEND_STOP was
-        # really exercising a disconnect -- or hung waiting for a printer
-        # the rig thought it had healed. Same for a `disconnect` with an
-        # `until` window, which by its own contract has recovered.
+        # Any reconfiguration plugs the printer back in, or a stale .unplugged
+        # would turn the next mode into a disconnect.
         unplugged = self.jobs / ".unplugged"
         if unplugged.exists():
             unplugged.unlink()
@@ -604,17 +534,8 @@ FileDevice Yes
         self.set_failure("media-empty" if failing else "")
 
     def backend_invocations(self) -> int:
-        """
-        How many times cupsd ran the backend SINCE THE LAST set_failure.
-
-        The discriminator for the retry modes: a job that was retried three
-        times and one that was submitted three times look identical from
-        the job files alone.
-
-        Rebased by set_failure, for the same reason after/until are: a
-        window expressed relative to the call is the only one a test can
-        reason about without knowing what every earlier test did to the
-        same rig.
+        """How many times cupsd ran the backend since the last set_failure. Tells
+        a job retried three times from three submitted jobs.
         """
         try:
             return int((self.jobs / ".count").read_text().strip())
@@ -652,10 +573,8 @@ def available() -> str:
     if os.geteuid() != 0:
         return "cupsd needs root here (it binds a socket and runs backends)"
     if "(enforce)" in _apparmor_state():
-        # Measured on an Ubuntu runner: AppArmor denies cupsd exec of
-        # anything under /tmp, so a hermetic rig gets a daemon that starts,
-        # answers lpstat and finds no printers. Skip with the fix rather
-        # than fail with a riddle.
+        # AppArmor denies a confined cupsd exec of anything under /tmp: the
+        # daemon starts, answers lpstat and finds no printers.
         return ("cupsd is confined by AppArmor and cannot run a backend "
                 "from a temp directory. Run: sudo apparmor_parser -R "
                 "/etc/apparmor.d/usr.sbin.cupsd")

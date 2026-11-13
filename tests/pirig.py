@@ -1,103 +1,30 @@
 """A Raspberry Pi board identity, faked in a private mount namespace.
 
-`gpio-sim` hands us a real gpiochip whose lines are driven from sysfs, and
-that is everything the button code needs -- except that gpiozero will not
-talk to it. gpiozero decides it is on a Pi by looking for a board revision,
-finds none on an ordinary machine, and refuses to build any local pin
-factory at all. Measured on the CI runner, with gpio-sim up and lgpio
-installed:
+gpiozero refuses to build a local pin factory unless it finds a Pi board
+revision, so on an ordinary machine it will not talk to a gpio-sim chip. This
+module lends the process a revision without patching gpiozero, so the shipped
+`GpioButtons` runs through the real gpiozero -> lgpio -> kernel path.
 
-    PinFactoryFallback: Falling back from lgpio: unable to locate Pi
-    revision in /proc/device-tree or /proc/cpuinfo
-    ...
-    gpiozero could not open a gpiochip here: Unable to load any default
-    pin factory!
+Where the revision comes from: gpiozero's `get_pi_revision()` reads
+`/proc/device-tree/system/linux,revision` (big-endian u32), then the
+`Revision:` line of `/proc/cpuinfo` only if the first raised ENOENT. procfs
+will not create entries under a missing /proc/device-tree, but an existing
+procfs file can be bind-mounted over, so /proc/cpuinfo is forged always and the
+device-tree file only where the kernel provides it.
 
-So the whole input surface of a device with no keyboard -- three buttons
-and a long press -- skipped, in every run this repository has ever done.
+Why a private namespace: the revision must be visible to this process alone. A
+new mount namespace inherits propagation, and on a systemd host `/` is shared,
+so the namespace is made MS_REC|MS_PRIVATE before anything is bound.
 
-This module lends the process a revision, and only the process. What it
-does NOT do is patch gpiozero: the point is to exercise the shipped
-`GpioButtons` through the real gpiozero -> lgpio -> kernel path, and a
-monkeypatched board detector would leave that path exactly as untested as
-it was.
+Teardown contract: leaving unmounts what was forged but does not setns back.
+The kernel refuses a mount-namespace setns from a multi-threaded process, and
+lgpio starts a thread at import. So after exit:
 
-## Where the revision comes from, measured rather than assumed
-
-gpiozero 2.0.1's `get_pi_revision()` reads, in this order:
-
-  1. `/proc/device-tree/system/linux,revision`, as a big-endian u32;
-  2. the `Revision:` line in `/proc/cpuinfo`, but ONLY if (1) raised
-     ENOENT.
-
-The `/proc/device-tree/model` file named in the issue is never read for
-this at all -- it appears in gpiozero only in `native.py`'s device-tree
-alias lookup. And it cannot be faked anyway on a machine that has no
-device tree: procfs will not let you create entries under it.
-
-    # unshare -m
-    # mkdir /proc/device-tree
-    mkdir: cannot create directory '/proc/device-tree': No such file
-    # mount -t tmpfs none /proc/device-tree
-    mount: /proc/device-tree: mount point does not exist.
-
-Bind-mounting over a procfs file that already exists works fine, which is
-why `/proc/cpuinfo` is the one that can be forged. Source (1) is forged
-too, but only where the kernel already provides it -- a real Pi running
-this harness would otherwise report its own revision and open its own
-chip instead of the simulated one.
-
-## Why a namespace, and why it is made private first
-
-The revision has to be visible to this process and to nothing else: a
-machine whose /proc/cpuinfo claims to be a Pi is a machine where anything
-that asks gets lied to. `unshare(CLONE_NEWNS)` alone does not achieve
-that. A new mount namespace inherits the propagation of the one it was
-copied from, and on any systemd host -- every GitHub runner included --
-`/` is *shared*, so a bind mount made inside propagates straight back out.
-Measured, in a namespace set up to look like such a host:
-
-    without MS_REC|MS_PRIVATE:  host sees Revision lines: ['Revision: 902120']
-    with    MS_REC|MS_PRIVATE:  host sees Revision lines: []
-
-## The teardown contract, stated because half of it is unusual
-
-Leaving unmounts what was forged. It does NOT go back to the namespace it
-came from, which would be the obvious way to do this -- one `setns` and
-the whole borrowed view drops at once, with no way to half-succeed. The
-kernel will not have it: `mntns_install()` requires `fs->users == 1` and
-pthreads share `fs`, so a process with a single thread anywhere in it
-cannot re-enter a mount namespace. lgpio has one from the moment it is
-imported, and never stops it: `_notify_thread = _callback_thread()` is
-module level (lgpio.py:562) and that constructor ends in `self.start()`.
-Measured in a fresh interpreter, with no panel and no gpiochip anywhere:
-
-    threads before import: ['MainThread']
-    threads after  import: ['MainThread', 'Thread-1']
-
-Which is earlier than "the first panel" would suggest. diagnostics.py
-asks `_module_version("lgpio")` for a line on the status sheet, and the
-unattended sequence prints that sheet, so the thread is running by the
-end of the CUPS tests -- before anything here has built a panel at all.
-Measured, in the teardown of the first button test:
-
-    OSError: [Errno 22] setns back: Invalid argument
-
-Doing it by hand where possible and by setns where not would give two
-paths, one of which only runs before anything spawns a thread -- which is
-to say, one that is never exercised where it matters. So there is one
-path, and this is what it promises:
-
-  * nothing this module mounted is still mounted -- checked, per exit, by
-    test_teardown_leaves_nothing_mounted, which compares the whole mount
-    table either side;
-  * every path reads exactly what the host has, /proc/cpuinfo included;
-  * the process stays in a mount namespace of its own for the rest of its
-    life. It is a private copy of the host's, so the only difference that
-    survives is that mounts made ELSEWHERE afterwards are not seen here.
-    Nothing in this harness mounts anything once pytest is running --
-    kernel-sim.sh does its configfs mount before the run starts -- and a
-    test that needed to see one would have to say so.
+* nothing this module mounted is still mounted (test_teardown_leaves_nothing_mounted
+  compares the whole mount table);
+* every path reads what the host has, /proc/cpuinfo included;
+* the process stays in a private copy of the host's mount namespace, so mounts made
+  elsewhere afterwards are not seen here.
 """
 from __future__ import annotations
 
@@ -111,26 +38,17 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-# Pi Zero 2 W rev 1.0, the board this unit ships on. Not any Pi: the
-# revision decides the pin header, and getting it wrong fails somewhere
-# far away and unhelpful. Measured, decoding each with gpiozero itself:
-#
-#   0x902120 -> Zero2W, BCM2837, header J8, GPIO5/6/13 at J8 pins 29/31/33
-#   0x2      -> B,      BCM2835, headers P1/P2/P3, GPIO5/6/13 nowhere
-#
-# and on that second board `Button(5)` dies with "PinInvalidPin: GPIO5 is
-# not a valid pin name" -- a message that says nothing about the real
-# mistake, which was three digits in a fake cpuinfo.
+# Pi Zero 2 W rev 1.0, the board this unit ships on. The revision decides the
+# pin header: on a board without GPIO5/6/13 on its header, `Button(5)` fails
+# with PinInvalidPin.
 REVISION = 0x902120
 MODEL = "Zero2W"
 
 CPUINFO_PATH = Path("/proc/cpuinfo")
 DEVICE_TREE_REVISION = Path("/proc/device-tree/system/linux,revision")
 
-# Only the Revision line is read by gpiozero. The rest is here because
-# diagnostics.py reads Model and Serial out of the same file, and a fake
-# that answers one question and contradicts itself on the next two is a
-# trap for whoever writes the next test.
+# gpiozero reads only the Revision line; diagnostics.py reads Model and Serial
+# from the same file, so the fake stays self-consistent.
 _CORE = """\
 processor\t: {n}
 BogoMIPS\t: 38.40
@@ -176,34 +94,23 @@ def available() -> str:
     if not CPUINFO_PATH.exists():
         return "there is no /proc/cpuinfo here to bind a fake over"
     if shutil.which("nsenter") is None:
-        # Only the leak check needs it, but a forgery whose containment
-        # cannot be checked is not one to go ahead with.
+        # Only the leak check needs it, but an uncheckable forgery is not one
+        # to go ahead with.
         return "nsenter (util-linux) is not installed"
     return ""
 
 
 class PiIdentity:
-    """
-    A mount namespace in which this process, alone, is a Pi Zero 2 W.
+    """A mount namespace in which this process, alone, is a Pi Zero 2 W.
 
-    Entering unshares the mount namespace, makes it private so nothing
-    escapes, and binds the forged files over the real ones. Leaving
-    unmounts each of them by hand and STAYS in the namespace -- see the
-    teardown contract at the top of this file for why setns back is not
-    available once lgpio has a thread running, and
-    test_teardown_leaves_nothing_mounted for the part that is checked.
+    Entering unshares the mount namespace, makes it private and binds the
+    forged files over the real ones. Leaving unmounts each of them and stays in
+    the namespace (see the teardown contract in the module docstring).
     """
 
-    # No `revision` parameter, deliberately. There used to be one, and it
-    # forged a board that contradicted itself: it reached the device-tree
-    # bind, but /proc/cpuinfo is CPUINFO, formatted from the module-level
-    # REVISION at import and the same for every instance. On a machine
-    # with no device tree, any non-default revision therefore made
-    # __enter__ fail its own consistency check; on one with a device
-    # tree, the two sources disagreed -- exactly the trap the comment
-    # above CPUINFO says the extra fields are there to avoid. Nothing
-    # ever passed it. A test wanting a different board should change
-    # REVISION and MODEL together, which is one place.
+    # No `revision` parameter: /proc/cpuinfo is formatted from the module-level
+    # REVISION, so a per-instance value would make the two sources disagree.
+    # Change REVISION and MODEL together.
     def __init__(self):
         self.forged: list[str] = []
         self._home = None
@@ -219,15 +126,12 @@ class PiIdentity:
         self.forged.append(str(target))
 
     def __enter__(self) -> "PiIdentity":
-        # Opened BEFORE the unshare: this descriptor is the only way back,
-        # and it is also how host_sees_a_pi() gets to look at the world
-        # from outside while the forgery is still mounted.
+        # Opened before the unshare: host_sees_a_pi() uses this descriptor to
+        # look at the host from outside.
         self._home = os.open("/proc/self/ns/mnt", os.O_RDONLY)
-        # Everything below has to be inside the same guard, the check
-        # included. An exception between the unshare and the return would
-        # otherwise leave the caller running in a namespace nothing holds
-        # a reference to any more -- for the rest of the process, not for
-        # the rest of the test.
+        # All inside one guard, the check included: an exception after the
+        # unshare must not leave the forgery mounted for the rest of the
+        # process.
         try:
             _checked(_libc.unshare(CLONE_NEWNS), "unshare(CLONE_NEWNS)")
             _mount("none", "/", MS_REC | MS_PRIVATE, "make / private")
@@ -240,10 +144,8 @@ class PiIdentity:
 
             found = get_pi_revision()
             if found != REVISION:
-                # Something is answering ahead of what we forged. Refuse,
-                # rather than let the tests run against whatever board
-                # that turns out to be: the pin header would be wrong and
-                # the failure would land somewhere unrelated to the cause.
+                # Something is answering ahead of the forgery. Refuse: the pin
+                # header would be wrong.
                 raise AssertionError(
                     f"gpiozero read revision {found:#x} with {self.forged} "
                     f"forged; expected {REVISION:#x}. Some source "
@@ -254,19 +156,11 @@ class PiIdentity:
         return self
 
     def host_sees_a_pi(self) -> bool:
-        """
-        Whether the namespace we came from has been contaminated too.
+        """Whether the namespace we came from has been contaminated too.
 
-        Asked while the forgery is still mounted, because that is the only
-        time the question means anything: checking after teardown would
-        pass just as happily for a bind mount that leaked and was then
-        cleaned up behind it.
-
-        Through nsenter rather than fork(), even though a forked child
-        could setns itself. By the time the panel exists this process has
-        lgpio's alert thread in it, and forking a multi-threaded process
-        to then allocate in the child is the recipe for a deadlock that
-        would hang the harness rather than fail it.
+        Only meaningful while the forgery is still mounted. Uses nsenter, not
+        fork(): forking a process that already has lgpio's thread risks a
+        deadlock in the child.
         """
         probe = subprocess.run(
             ["nsenter", f"--mount=/proc/self/fd/{self._home}",
@@ -275,9 +169,9 @@ class PiIdentity:
             check=False)
         count = probe.stdout.strip()
         if not count.isdigit():
-            # grep says 1 for "no matches" and nsenter says 1 for "could
-            # not get in", which are opposite answers. Anything that is
-            # not a count means the question was never asked.
+            # grep exits 1 for "no matches" and nsenter exits 1 for "could not
+            # get in", so anything that is not a count means the question was
+            # never asked.
             raise AssertionError(
                 f"could not read the host's {CPUINFO_PATH} from outside "
                 f"the namespace, so nothing was checked: "
@@ -285,27 +179,14 @@ class PiIdentity:
         return int(count) > 0
 
     def __exit__(self, *_exc) -> None:
-        # Unmounts, and stays in the namespace. See the teardown contract
-        # at the top of this file for why coming back out is not on the
-        # table, and test_teardown_leaves_nothing_mounted for the part
-        # that has to be true regardless.
-        #
-        # No try/except around the umounts. A forged /proc/cpuinfo this
-        # process could not get rid of is not something to log and move
-        # on from: everything after it would read a board revision it did
-        # not ask for, and the failures would land far from the cause.
-        #
-        # It does get a try/FINALLY, which is a different thing. A umount
-        # that raised used to take the rest of this method with it: the
-        # namespace descriptor stayed open for the life of the process
-        # and every /tmp/otp-pirig-* file stayed on disk, on top of
-        # whatever was still mounted. One failure, three leaks.
+        # Unmounts and stays in the namespace (see the module docstring). A
+        # failed umount propagates, since a forged /proc/cpuinfo left mounted
+        # would poison everything after; the finally still closes the namespace
+        # descriptor and removes the temp files.
         try:
             while self.forged:
-                # Read, umount, and only then discard. Popping first
-                # threw the path away before the call that needed it, so
-                # a failed umount left nothing to retry and nothing to
-                # name in the error.
+                # Umount before popping, so a failed umount keeps the path for
+                # the error and a retry.
                 _checked(_libc.umount(self.forged[-1].encode()), "umount")
                 self.forged.pop()
         finally:
@@ -314,11 +195,8 @@ class PiIdentity:
                 self._home = None
             for path in self._temporary:
                 try:
-                    # Safe even where the bind is still up: the mount
-                    # holds the inode, so this removes the /tmp name and
-                    # nothing else, and the mount table -- which is what
-                    # test_teardown_leaves_nothing_mounted compares -- is
-                    # still the place a survivor shows up.
+                    # Safe even if the bind is still up: the mount holds the
+                    # inode, and a survivor still shows in the mount table.
                     os.unlink(path)
                 except OSError:
                     pass
@@ -326,16 +204,9 @@ class PiIdentity:
 
 
 def mount_points() -> tuple:
-    """
-    Every mount point this process can see, from the kernel's own table.
-
-    Field 5 of /proc/self/mountinfo, sorted. Used to hold the teardown to
-    its promise: a bind mount over a file that already exists is
-    invisible in every other way -- same path, same stat, plausible
-    contents -- and the mount table is the one place it cannot hide.
-
-    A tuple rather than a set, so that a second mount stacked on a path
-    that is already a mount point still shows up as a difference.
+    """Every mount point this process can see: field 5 of /proc/self/mountinfo,
+    sorted. A tuple, not a set, so a second mount stacked on the same path
+    still shows as a difference.
     """
     seen = []
     for line in Path("/proc/self/mountinfo").read_text().splitlines():
@@ -359,14 +230,10 @@ def open_gpiochips() -> set:
 
 
 def bind_gpiozero_to(chip: int):
-    """
-    Point gpiozero at one specific gpiochip and return the factory.
+    """Point gpiozero at one specific gpiochip and return the factory.
 
-    lgpio addresses chips by NUMBER, not by name or by device path, and
-    gpiozero's default is chip 0 for every Pi but the 5. Where gpio-sim
-    lands at some other number -- it takes whatever the kernel gives it --
-    nothing about the default would find it, so the factory is built
-    against the recorded chip explicitly.
+    lgpio addresses chips by number and gpiozero defaults to chip 0, while
+    gpio-sim lands wherever the kernel puts it.
     """
     from gpiozero import Device
     from gpiozero.pins.lgpio import LGPIOFactory
@@ -376,14 +243,8 @@ def bind_gpiozero_to(chip: int):
 
 
 def stale_pins() -> list:
-    """
-    Cached pins that belong to a factory other than the current one.
-
-    Names only, so an assertion message stays readable. Empty is the
-    healthy answer and the only one a panel should ever be built on: a
-    stale pin is indistinguishable from a working one right up until a
-    press fails to arrive, and "no press arrived" is what a broken panel
-    and an untested panel both look like.
+    """Names of cached pins that belong to a factory other than the current one.
+    Empty is the only healthy answer: a stale pin receives no edges.
     """
     from gpiozero import Device
     from gpiozero.pins.local import LocalPiFactory
@@ -405,54 +266,24 @@ def notify_thread():
 
 
 def edge_callbacks() -> int:
-    """
-    How many edge callbacks lgpio is currently holding, process-wide.
-
-    Zero between panels. It is a module-level singleton's list, appended
-    to by every `Button` and pruned by nothing except an explicit cancel,
-    so a panel that does not clean up leaves its three behind for the
-    life of the process -- see silence().
+    """How many edge callbacks lgpio is holding, process-wide. Zero between
+    panels: the list is a module-level singleton's, pruned only by an explicit
+    cancel (see silence()).
     """
     thread = notify_thread()
     return 0 if thread is None else len(thread.callbacks)
 
 
 def silence(factory) -> None:
-    """
-    Cancel every edge callback belonging to `factory`, before it closes.
+    """Cancel every edge callback belonging to `factory`, before it closes.
 
-    This is the fix for the defect that made the panel work exactly
-    once. lgpio's `_callback_thread.run()` dispatches with no guard:
+    lgpio's notify thread dispatches callbacks with no guard, and it is a
+    module-level singleton: one exception kills edge delivery for the whole
+    process. A gpiozero pin whose device has been collected tries to stop
+    listening on its next edge, and raises if its factory's handle is already
+    closed. Cancelling here, while the handle is open, prevents that.
 
-        for cb in self.callbacks:
-            if cb.chip == chip and cb.gpio == gpio:
-                cb.func(chip, gpio, level, tick)
-
-    An exception out of `cb.func` therefore kills the thread -- and it
-    is a module-level singleton created at import, so once it dies no
-    edge reaches any callback anywhere in the process, for the rest of
-    the process. Measured, run 31703316190, on the tests after the
-    first:
-
-        lgpio: notify thread alive=False go=True callbacks=5
-
-    with the line itself moving perfectly (rest=1, grounded=0,
-    released=1, settled=1). Nothing was wrong with the press.
-
-    What raises is gpiozero doing the right thing at the wrong moment.
-    `PiPin._call_when_changed` holds its device by weak reference; once
-    an earlier test's `Button` is collected that reference is dead, so
-    on the next edge the pin tries to stop listening -- `when_changed =
-    None` -> `_disable_event_detect()` -> `gpio_get_mode(_handle)` --
-    and that pin's factory is closed, so `_handle` is None:
-
-        TypeError: unsupported operand type(s) for &: 'NoneType' and 'int'
-
-    raised inside the thread, reported only as a warning, and fatal to
-    every button in the process.
-
-    So the cancel happens HERE: on our terms, while the handle is still
-    open, rather than on an edge that arrives after it is not.
+    Raises RuntimeError if any pin could not be silenced.
     """
     from gpiozero.pins.local import LocalPiFactory
 
@@ -461,17 +292,14 @@ def silence(factory) -> None:
         if pin.factory is not factory:
             continue
         try:
-            # Cancels the lgpio callback and drops it from the notify
-            # thread's list -- the whole point. Through the property
-            # rather than the private method because that is the way in
-            # gpiozero itself uses.
+            # Cancels the lgpio callback and drops it from the notify thread's
+            # list.
             pin.when_changed = None
         except Exception as exc:                 # noqa: BLE001
             trouble.append(f"{info.name}: {exc!r}")
     if trouble:
-        # Not swallowed. A pin that could not be silenced is a callback
-        # still armed on a handle about to close, which is exactly what
-        # kills the notification thread later on.
+        # Not swallowed: a callback still armed on a handle about to close is
+        # what kills the notification thread.
         raise RuntimeError(
             "could not cancel edge callbacks before closing the factory, "
             "so the next edge may kill lgpio's notification thread and "
@@ -479,48 +307,19 @@ def silence(factory) -> None:
 
 
 def release_gpiozero() -> None:
-    """
-    Put gpiozero back the way an untouched process would find it.
+    """Put gpiozero back the way an untouched process would find it.
 
-    Three steps beyond dropping the factory, the first two of them
-    learned from run
-    31699840801, where the first panel worked and every panel after it
-    received no edges at all: UP passed, DOWN/OK/BACK each sat out their
-    timeout with an empty queue, and the debounce test "passed" only
-    because all it asserts is that nothing arrives.
+    Collect before closing, while the chip handle is open: `Device.__del__`
+    calls `close()`, which dereferences the factory handle, so a late finalizer
+    raises in some later test.
 
-    **Collect before closing, while the chip handle is still open.**
-    `gpiozero.Device.__del__` calls `close()`, which reaches
-    `LGPIOPin._disable_event_detect` and dereferences `factory._handle`.
-    A Device that is already unreachable but not yet collected runs that
-    finalizer whenever the collector next gets to it -- in that run, in
-    the middle of the FOLLOWING test, by which point the handle is None:
+    Then empty the pin cache by hand. `LocalPiFactory.pins` is a class
+    attribute shared across factories and `close()` clears it only if every
+    `pin.close()` returned; a stale entry hands the next factory a pin on a
+    dead handle, which receives no edges.
 
-        TypeError: unsupported operand type(s) for &: 'NoneType' and 'int'
-
-    and it surfaced as a PytestUnhandledThreadExceptionWarning, which is
-    to say nowhere the failing test would show it.
-
-    **Then empty the pin cache by hand.** `LocalPiFactory.pins` is a
-    CLASS attribute -- gpiozero deliberately shares one dict across every
-    instance so that mixing back-ends cannot drive one pin two ways --
-    and it is keyed by `PinInfo`, which compares equal across factories
-    for the same pin of the same board. `PiFactory.close()` empties it
-    only after every `pin.close()` has returned, so a single raising
-    finalizer leaves it populated. The next factory's `Button(6)` is then
-    handed back a pin belonging to the previous, closed factory; it
-    claims its alert on a dead handle, and no edge ever arrives.
-    Silently -- which is the one outcome this harness exists to refuse.
-
-    **And close the factory even when silencing it failed.** silence()
-    raising means a callback may still be armed; skipping close() over
-    that adds a leaked gpiochip handle to the same problem rather than
-    containing it. The cancel is attempted first and the close happens
-    regardless, so the worst case is one loud teardown rather than a
-    process whose next Button(5) cannot claim the line.
-
-    TestTheFactoryTeardownBetweenPanels holds every clause of this to
-    account without needing a gpiochip.
+    Close the factory even when silence() raised, so a failed cancel does not
+    also leak the gpiochip handle. Exceptions from either propagate.
     """
     from gpiozero import Device
     from gpiozero.pins.local import LocalPiFactory
@@ -532,38 +331,18 @@ def release_gpiozero() -> None:
             try:
                 silence(factory)
             finally:
-                # close() runs whatever silence() did, and the try/finally
-                # is the whole of the reason. `silence(factory)` then
-                # `factory.close()` in sequence meant a RuntimeError out
-                # of silence skipped every pin.close() and the
-                # gpiochip_close behind them, while the clear() below
-                # still emptied the shared cache -- so the lines stayed
-                # claimed by a handle no object in the process could
-                # reach any more, and the next Button(5) died "GPIO
-                # busy". Measured, with one pin refusing to be silenced:
-                # pins closed [], chip handle closed False.
-                #
-                # Worse, silence() can raise on a failure that is not
-                # dangerous at all: LGPIOPin._disable_event_detect
-                # cancels the lgpio callback FIRST and only then
-                # re-claims the line as an input, so a throw from the
-                # re-claim means the callback is already gone. Losing
-                # the handle over that would manufacture exactly the
-                # leak the RuntimeError is raised to prevent.
+                # close() runs even if silence() raised. Otherwise the cache
+                # clear below would orphan lines still claimed by an
+                # unreachable handle, and the next Button(5) fails "GPIO busy".
+                # silence() can also raise after the callback is already
+                # cancelled.
                 factory.close()
     finally:
-        # Belt and braces: close() clears these itself on the happy path.
-        # Leaving a stale pin behind costs the next panel its edges, so
-        # they do not get to depend on close() having reached the end.
+        # close() clears these on the happy path; a stale pin costs the next
+        # panel its edges, so do not depend on it.
         LocalPiFactory.pins.clear()
         LocalPiFactory._reservations.clear()
-    # Note what is deliberately NOT caught: if silence() or
-    # factory.close() raises, it comes out of here and pytest reports the
-    # teardown as an error -- and where both raise, close()'s exception
-    # is the one that propagates with silence()'s attached to it as
-    # __context__, so the traceback carries both.
-    # That is the point. The collect above is what should stop it happening,
-    # and if it happens anyway the run must say so in the open rather
-    # than in a warning nobody reads. The cache is emptied either way, so
-    # a raise here cannot spread to the next test -- it only ends this
-    # one loudly, which is the trade this repository always takes.
+    # Exceptions from silence() or factory.close() propagate so the teardown
+    # fails visibly; where both raise, close()'s carries silence()'s as
+    # __context__. The cache is emptied either way, so the next test is
+    # unaffected.

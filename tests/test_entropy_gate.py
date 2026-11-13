@@ -1,42 +1,14 @@
 """What the unit says while the kernel CSPRNG is still being seeded.
 
-Phase 4 specified `rng-tools` plus a boot gate on `entropy_avail`: refuse
-to generate until the pool is seeded. Built as specified that gate would
-be theatre twice over. `os.urandom` goes through `getrandom()`, which
-since Linux 5.6 BLOCKS until the CRNG is initialised rather than handing
-back predictable bytes -- so "a pad drawn from an unseeded pool" is not a
-state this program can reach. And `entropy_avail` is no longer a level
-anybody can wait for: it is clamped to the pool size and sits pinned at
-that maximum on any healthy machine (measured: 256, unmoving, on the idle
-6.18 kernel these tests run under).
+`os.urandom` blocks in getrandom() until the CRNG is initialised, so an
+unseeded unit cannot print a weak pad, but it can freeze: the panel stops
+repainting, or a headless unit prints nothing. A freeze is indistinguishable
+from a crash, and power-cycling restarts the wait. So every test asks whether
+the unit says something, and keeps saying it, while it waits.
 
-What the plan missed is worse in a different way, and it is what these
-tests are for. Measured against this codebase before the gate, with
-`os.urandom` made to block exactly as an unseeded kernel makes it block:
-
-  interactive  two frames drawn, then the CODEWORD menu with the caret
-               still on ROLL RANDOM, indefinitely. The first draw is
-               `Vocabulary.random()`, called from inside
-               `CodewordRoll.frame()`, so the block lands BEFORE the
-               frame is computed and the panel never repaints again.
-  headless     an empty submission list and an empty log. `run()` rolled
-               its codeword before submitting the status sheet, so a unit
-               whose only output device is a printer printed NOTHING --
-               not even the sheet whose whole job is to explain a unit
-               with no panel.
-
-On three buttons and 128x64 pixels a freeze is indistinguishable from a
-crash, and the documented remedy for a crash -- power-cycle -- discards
-the entropy collected so far and restarts the wait. So every test below
-asks one question: does the unit say something, and keep saying it, while
-it waits?
-
-WHAT IS NOT COVERED HERE. This container's CRNG is seeded and cannot be
-unseeded, so the unseeded kernel is injected at the one seam that asks
-the question -- `otp_generator.crng_seeded`. That the probe reads a real
-kernel correctly is pinned separately against a fake `os.getrandom`; that
-a real Pi seeds early enough for none of this to fire is a tier-3 console
-assertion in harness/img-boot.sh, not something provable from here.
+Not covered here: the CRNG in the test environment is always seeded, so the
+unseeded kernel is injected at `otp_generator.crng_seeded`. That a real Pi
+seeds early is asserted in harness/img-boot.sh.
 """
 import sys
 from pathlib import Path
@@ -62,12 +34,9 @@ def seeded_after(polls: int):
 
 
 class QuietButtons:
-    """
-    Nobody is pressing anything, then the run ends.
-
-    Deliberately not FakeButtons: an exhausted script answers QUIT to
-    every blocking wait, which ends the very first poll of a wait loop --
-    the opposite of the standing-at-a-silent-box case being modelled.
+    """Nobody is pressing anything, then the run ends. Not FakeButtons, whose
+    exhausted script answers QUIT to every blocking wait and would end a wait
+    loop on its first poll.
     """
 
     def __init__(self, quiet_polls: int, then=Press.QUIT):
@@ -75,17 +44,10 @@ class QuietButtons:
         self.polls = 0
 
     def wait(self, timeout=None):
-        # timeout=0 asks "is anything pending?", not "give me the next
-        # press", and this double models NOBODY PRESSING ANYTHING -- so
-        # the honest answer is None, every time, consuming nothing.
-        #
-        # It matters because a non-blocking drain loop runs until it sees
-        # None. Falling through to the scripted answers would let a drain
-        # eat the run's whole script; falling through to the trailing QUIT
-        # would hand it an endless supply and hang forever, which is
-        # exactly what happened when wait_for_entropy started draining.
-        # The real GpioButtons honours this and FakeButtons carries the
-        # same guard with the same reasoning written above it.
+        # timeout=0 asks "is anything pending?", and with nobody pressing the
+        # answer is None, consuming nothing. A non-blocking drain loop runs
+        # until it sees None, so falling through to the script or the trailing
+        # QUIT would starve or hang it.
         if timeout == 0:
             return None
         self.polls += 1
@@ -122,12 +84,8 @@ class Cups(printer.Cups):
 def make_app(buttons, cups=None):
     from otpunit import codewords as cw
 
-    # poll_seconds must NOT be 0. The doubles return immediately whatever
-    # it is, so this costs nothing -- but timeout=0 is the wire signal for
-    # "is anything pending?", which is what a non-blocking drain sends. At
-    # poll_seconds=0 the wait loop's own poll is indistinguishable from a
-    # drain probe, so a double that answers one correctly answers the
-    # other wrongly, and wait_for_entropy either starves or hangs.
+    # poll_seconds must not be 0: timeout=0 is the drain probe, and the wait
+    # loop's own poll would become indistinguishable from it.
     return ui.App(display=FakeDisplay(), buttons=buttons, cups=cups or Cups(),
                   settings=config.Settings(pages=2), vocabulary=cw.Vocabulary(),
                   config_path="/nonexistent", poll_seconds=0.01)
@@ -141,17 +99,14 @@ def panel(app) -> str:
 
 
 class TestTheProbeAsksTheKernel:
-    """
-    The question has exactly one honest form on a modern kernel, and two
-    tempting wrong ones: read `entropy_avail` and compare it to a number,
-    or draw a byte and see what happens. The first tests a pre-5.6 kernel;
-    the second IS the hang.
+    """The probe is a non-blocking getrandom(). Comparing `entropy_avail` to a
+    number tests a pre-5.6 kernel, and drawing a byte to see what happens is
+    itself the hang.
     """
 
     def test_it_asks_getrandom_without_blocking(self, monkeypatch):
-        # The whole point. A probe that omits GRND_NONBLOCK blocks in the
-        # kernel exactly as the draw it is meant to protect would, so the
-        # gate becomes the freeze it was written to replace.
+        # A probe without GRND_NONBLOCK blocks in the kernel just as the draw
+        # it protects would.
         calls = []
         monkeypatch.setattr(gen.os, "getrandom",
                             lambda n, flags=0: calls.append((n, flags)) or b"\0" * n)
@@ -169,22 +124,20 @@ class TestTheProbeAsksTheKernel:
         assert gen.crng_seeded() is False
 
     def test_a_running_kernel_reports_seeded(self):
-        # Weak on its own and kept anyway: a probe stuck at False would
-        # park every unit on the waiting screen for ever, and no injected
-        # test can catch that because they all inject the answer.
+        # Weak but kept: a probe stuck at False would park every unit on the
+        # waiting screen, and every other test injects the answer.
         assert gen.crng_seeded() is True
 
     def test_a_kernel_that_cannot_be_asked_counts_as_seeded(self, monkeypatch):
-        # Being wrong here costs the report. Being wrong the other way
-        # parks an operator in front of a screen that can never clear,
-        # on a platform where the kernel's own gate is still underneath.
+        # Reading unsupported as seeded costs only the report; the other way
+        # parks the operator at a screen that never clears, with the kernel's
+        # own gate still underneath.
         def unsupported(n, flags=0):
             raise OSError(38, "Function not implemented")
 
         monkeypatch.setattr(gen.os, "getrandom", unsupported)
         assert gen.crng_seeded() is True
-        # And the platform that has no getrandom at all -- macOS, the BSDs,
-        # anything predating 3.17 -- where the attribute is simply absent.
+        # And platforms with no os.getrandom attribute at all.
         monkeypatch.delattr(gen.os, "getrandom")
         assert gen.crng_seeded() is True
 
@@ -198,9 +151,7 @@ class TestTheBitCountIsContextNotAGate:
 
     def test_an_unreadable_estimate_is_none_rather_than_an_exception(
             self, tmp_path, monkeypatch):
-        # It is drawn on a 21-column panel while the unit is already in
-        # trouble. A traceback from the progress indicator is not a
-        # diagnosis, it is a second fault on top of the first.
+        # The progress indicator must not raise when the count is unreadable.
         monkeypatch.setattr(gen, "ENTROPY_AVAIL", str(tmp_path / "absent"))
         assert gen.entropy_bits() is None
         (tmp_path / "garbage").write_text("not a number")
@@ -208,13 +159,9 @@ class TestTheBitCountIsContextNotAGate:
         assert gen.entropy_bits() is None
 
     def test_nothing_waits_on_the_count(self, tmp_path, monkeypatch):
-        """
-        Zero bits on a seeded kernel must not hold anything up.
-
-        This is the Phase-4 gate as specified, and the reason it was not
-        built: on a post-5.6 kernel the count and the readiness are
-        different facts, and a threshold on the count would stall a unit
-        that getrandom() is perfectly willing to serve.
+        """Zero bits on a seeded kernel holds nothing up: on a post-5.6 kernel the
+        count and readiness are different facts, and a threshold would stall a
+        unit getrandom() will serve.
         """
         avail = tmp_path / "entropy_avail"
         avail.write_text("0\n")
@@ -242,9 +189,8 @@ class TestTheWaiterSaysSoThenStops:
         assert waited == 1.5
 
     def test_it_does_not_return_before_the_crng_is_up(self, monkeypatch):
-        # Returning early would hand the caller back to a draw that then
-        # blocks anyway -- the same freeze, with a reassuring log line
-        # already printed above it.
+        # Returning early would hand the caller back to a draw that then blocks
+        # anyway.
         probe = seeded_after(4)
         monkeypatch.setattr(gen, "crng_seeded", probe)
         gen.wait_for_crng(sleep=lambda s: None, poll=1.0)
@@ -263,18 +209,13 @@ class TestThePanelKeepsTalkingWhileTheCrngSeeds:
         text = panel(app)
         assert "WAITING FOR ENTROPY" in text
         assert "NOT SEEDED" in text
-        # The count, and a hint the operator can act on -- both named in
-        # the issue, both the difference between a report and a shrug.
+        # The count, and a hint the operator can act on.
         assert "BITS" in text
         assert "PRESS THE BUTTONS" in text
 
     def test_it_repaints_on_every_poll(self, monkeypatch):
-        """
-        A gate that blocks without repainting IS the bug being fixed.
-
-        One frame and then a wait is the same dead panel as before, with
-        better wording on it. The spinner is what makes "alive" visible
-        from a metre away, so the frames have to differ.
+        """Successive frames differ while waiting. One frame and then a block is a
+        dead panel; the spinner is what makes "alive" visible.
         """
         monkeypatch.setattr(gen, "crng_seeded", lambda: False)
         app = make_app(QuietButtons(5))
@@ -285,9 +226,7 @@ class TestThePanelKeepsTalkingWhileTheCrngSeeds:
 
     def test_no_key_material_is_drawn_behind_the_waiting_screen(
             self, monkeypatch):
-        # The gate exists because the draw blocks. A gate that draws
-        # anyway blocks in its own loop, and the operator is back where
-        # they started -- staring at one frame.
+        # A gate that draws key material would block in its own loop.
         drawn = []
         real = gen.os.urandom
         monkeypatch.setattr(gen.os, "urandom",
@@ -308,9 +247,8 @@ class TestThePanelKeepsTalkingWhileTheCrngSeeds:
                 assert all(len(row) == 21 for row in frame.rendered())
 
     def test_the_operator_can_still_shut_down(self, monkeypatch):
-        # The same exit wait_for_printer offers. Without it a unit that
-        # never seeds has three inert buttons and no clean power-off,
-        # which is how an SD card gets corrupted on top of everything.
+        # The same exit wait_for_printer offers: a unit that never seeds still
+        # needs a clean power-off.
         monkeypatch.setattr(gen, "crng_seeded", lambda: False)
         app = make_app(QuietButtons(1, then=Press.BACK))
         assert app.wait_for_entropy() is False
@@ -326,8 +264,8 @@ class TestThePanelKeepsTalkingWhileTheCrngSeeds:
             "the wait has to end at the menu, not park there"
 
     def test_a_seeded_unit_never_shows_the_screen(self, monkeypatch):
-        # A gate that fires on a healthy boot is a new screen between the
-        # operator and the menu on every single power-on.
+        # A gate that fires on a healthy boot would put a new screen before the
+        # menu on every power-on.
         monkeypatch.setattr(gen, "crng_seeded", lambda: True)
         app = make_app(QuietButtons(0))
         app.run()
@@ -339,10 +277,9 @@ class TestThePanelKeepsTalkingWhileTheCrngSeeds:
 
 
 class TestHeadlessPrintsBeforeItWaits:
-    """
-    With no panel the printer IS the interface, so "say something" means
-    "put a sheet in the tray" -- and it has to happen before the first
-    draw, because the first draw is where the kernel stops the unit.
+    """With no panel the printer is the interface, so the status sheet is
+    submitted before the first draw, which is where an unseeded kernel stops
+    the unit.
     """
 
     def _run(self, monkeypatch, seeded, events=None):
@@ -372,9 +309,8 @@ class TestHeadlessPrintsBeforeItWaits:
 
     def test_the_status_sheet_reaches_paper_before_the_codeword_is_rolled(
             self, monkeypatch):
-        # The ordering IS the fix. Rolling first meant an unseeded unit
-        # printed nothing at all: measured, an empty submission list and
-        # an empty log, indefinitely.
+        # Sheet before roll: rolling first means an unseeded unit prints
+        # nothing at all.
         cups, events, result = self._run(monkeypatch, seeded_after(3))
         assert result == 0
         assert events.index("submit:OTP status") < events.index("roll"), events
@@ -392,18 +328,15 @@ class TestHeadlessPrintsBeforeItWaits:
         assert any("seeded after" in e for e in events), events
 
     def test_the_waiting_is_not_logged_on_every_poll(self, monkeypatch):
-        # This unit's journal is volatile and lives in RAM. A line every
-        # half second for a wait with no upper bound is a slow leak into
-        # the one resource a headless unit cannot spare.
+        # The journal is volatile and lives in RAM, so an unbounded wait must
+        # not log on every poll.
         _, events, _ = self._run(monkeypatch, seeded_after(3))
         waiting = [e for e in events
                    if e.startswith("log:waiting for the kernel CSPRNG")]
         assert len(waiting) == 1, f"three polls produced {len(waiting)} lines"
 
     def test_a_seeded_unit_says_nothing_about_entropy(self, monkeypatch):
-        # The whole sequence is printed and logged for someone with no
-        # other channel. Adding a line to every healthy run costs that
-        # channel its signal.
+        # A healthy run gets no extra line.
         _, events, result = self._run(monkeypatch, lambda: True)
         assert result == 0
         assert not [e for e in events if "CSPRNG" in e], events
@@ -434,12 +367,9 @@ class TestTheSheetReportsTheCrngNotABitCount:
 
     def test_a_low_count_on_a_seeded_kernel_is_not_reported_as_trouble(
             self, monkeypatch):
-        """
-        The row this replaced said "LOW" below 256 bits.
-
-        That is the pre-5.6 model: on a modern kernel the estimate is not
-        a readiness signal, and printing a warning about it sends an
-        operator to wait for a number that never gates anything.
+        """A low bit count on a seeded kernel is not reported as a problem: it is
+        not a readiness signal, and a warning would send an operator to wait
+        for nothing.
         """
         monkeypatch.setattr(gen, "crng_seeded", lambda: True)
         monkeypatch.setattr(gen, "entropy_bits", lambda: 12)
@@ -453,15 +383,12 @@ class TestTheSheetReportsTheCrngNotABitCount:
         assert "unknown" in row
 
 
-# --- what review found: the wait must not eat, park, or pre-empt --------
+# --- the wait must not eat, park, or pre-empt -----------------------------
 
 
 class BankedButtons:
-    """A queue, like the real GpioButtons -- presses persist until taken.
-
-    QuietButtons models nobody pressing anything, which is the wrong
-    double for the banked-press question: the entropy screen is the one
-    screen that ASKS to be pressed.
+    """A queue, like the real GpioButtons: presses persist until taken. The
+    entropy screen asks to be pressed, so banked presses are the case to model.
     """
 
     def __init__(self, script=()):
@@ -471,12 +398,10 @@ class BankedButtons:
         self.queue.extend(presses)
 
     def wait(self, timeout=None):
-        # None when empty, for BOTH forms. A queue that answers QUIT to a
-        # blocking poll ends the wait loop on its very first iteration, so
-        # the loop under test never runs. Termination comes from the
-        # crng_seeded probe instead -- which is what the real loop waits
-        # on -- and each probe below caps its own poll count, so a broken
-        # loop fails rather than hangs.
+        # None when empty, for both forms: answering QUIT to a blocking poll
+        # would end the loop on its first iteration. Termination comes from the
+        # crng_seeded probe, and each probe caps its poll count so a broken
+        # loop fails, not hangs.
         return self.queue.pop(0) if self.queue else None
 
     def close(self):
@@ -486,12 +411,8 @@ class BankedButtons:
 class TestTheEntropyWaitDoesNotLeakPressesForward:
     def test_presses_made_at_the_waiting_screen_do_not_reach_the_menu(
             self, monkeypatch):
-        """
-        The screen tells the operator that using the buttons helps, so it
-        is the one screen guaranteed to leave a queue behind -- and
-        GpioButtons is a queue, not a level. Handing those presses to
-        whatever is drawn next means a banked OK selecting PRINT PAD PAIR
-        from a press aimed at a waiting screen.
+        """Presses banked during the wait are drained before the next screen, so
+        an OK aimed at the waiting screen cannot select PRINT PAD PAIR.
         """
         buttons = BankedButtons()
         polls = [0]
@@ -502,11 +423,9 @@ class TestTheEntropyWaitDoesNotLeakPressesForward:
                 raise AssertionError("wait_for_entropy never returned")
             if polls[0] <= 2:
                 return False
-            # The presses land during the LAST blocking wait -- after the
-            # loop's own poll has already been served, which is the only
-            # window in which a press can survive to the next screen. A
-            # test that queues them earlier has them eaten by the loop
-            # itself and passes with the drain removed.
+            # The presses land during the last blocking wait, after the loop's
+            # own poll: the only window in which a press can survive to the
+            # next screen.
             if not buttons.queue:
                 buttons.push(Press.OK, Press.OK)
             return True
@@ -519,8 +438,8 @@ class TestTheEntropyWaitDoesNotLeakPressesForward:
             f"screen: {buttons.queue}"
 
     def test_the_drain_does_not_swallow_the_shutdown(self, monkeypatch):
-        # BACK on the waiting screen must still power down: the drain runs
-        # on the way OUT, only once the kernel has seeded.
+        # BACK on the waiting screen must still power down: the drain runs only
+        # on the way out, once seeded.
         monkeypatch.setattr(gen, "crng_seeded", lambda: False)
         app = make_app(BankedButtons([Press.BACK]))
         assert app.wait_for_entropy() is False
@@ -529,11 +448,9 @@ class TestTheEntropyWaitDoesNotLeakPressesForward:
 
 class TestTheHeadlessWaitKeepsWatchingThePlug:
     def test_unplugging_during_the_wait_aborts(self, monkeypatch):
-        """
-        The status sheet is already in the tray telling the operator that
-        pulling the cable stops the run -- that is the entire control
-        surface this mode has. A wait that ignores it leaves the unit as
-        dead as the silent hang this gate replaces, one step further on.
+        """Pulling the printer cable during the entropy wait aborts the run. The
+        status sheet promises exactly that, and it is the only control a
+        headless unit has.
         """
         events = []
 
@@ -542,9 +459,7 @@ class TestTheHeadlessWaitKeepsWatchingThePlug:
                 events.append("devices")
                 return []
 
-        # Bounded, so removing the plug watch FAILS instead of hanging: an
-        # unbounded wait with nothing watching is precisely the defect, and
-        # a test that hangs to report it is unusable in CI.
+        # Bounded, so removing the plug watch fails instead of hanging.
         asked = [0]
 
         def never(*_a, **_k):
@@ -569,20 +484,17 @@ class TestTheHeadlessWaitKeepsWatchingThePlug:
         assert any("aborted" in e and "disconnect" in e for e in events), events
 
     def test_a_single_missed_answer_does_not_abort(self, monkeypatch):
-        """
-        devices() swallows every error and returns [], so a busy cupsd is
-        indistinguishable from an unplugged one. The same GONE_AFTER rule
-        countdown() and drain() use, for the same reason: one empty answer
-        is a hiccup, several in a row is a cable.
+        """One empty devices() answer does not abort the wait: a busy cupsd looks
+        the same as an unplugged cable, so the GONE_AFTER rule applies here
+        too.
         """
         waiting = [False]
         blinked = [False]
 
         class Blinks(Cups):
             def devices(self):
-                # One empty answer, and only once the entropy wait is the
-                # thing asking -- an earlier lookup would absorb it and
-                # leave the wait's own tolerance untested.
+                # One empty answer, and only once the entropy wait is the one
+                # asking, so an earlier lookup cannot absorb it.
                 if waiting[0] and not blinked[0]:
                     blinked[0] = True
                     return []

@@ -57,40 +57,33 @@ HEADER_MARGIN_H = 4 * mm
 HEADER_GAP = 2 * mm
 
 # Crop marks for the guillotine, on imposed sheets. Inset because a laser
-# leaves the outer few millimetres of a sheet unprinted -- 4.23mm on an HP
-# LaserJet Pro M12w and most of its class -- so a mark that starts at the
-# paper's edge is a mark that never appears. 5mm clears that band on every
-# printer in docs/PRINTERS.md.
+# leaves the outer few millimetres of a sheet unprinted (about 4.23mm on
+# common models); 5mm clears that on every printer in docs/PRINTERS.md.
 CROP_INSET = 5 * mm
 CROP_TICK = 7 * mm
 
-# Two-word codewords (RUSTED-BADGER) do not fit the A7 header at the body font
-# size, so the codeword shrinks to fit. It is a label, not key material — the
-# AUTH group and page number always stay at full size because those are read
-# letter by letter.
+# Two-word codewords (RUSTED-BADGER) do not fit the A7 header at the body
+# font size, so the codeword shrinks to fit. AUTH and the page number stay
+# at full size because they are read letter by letter.
 CODEWORD_MIN_FONT = 5.5
 
 
-# Every Raspberry Pi has a hardware TRNG on the SoC -- a ring oscillator,
-# sampled: BCM2835/6/7 on the Pi 1, 2, 3, Zero and Zero 2 W, and RNG200 on
-# the Pi 4 and 5. Linux exposes it here.
-# Overridable so tests can point at a fake, and so a laptop can opt out.
+# The Raspberry Pi SoC's hardware TRNG, as exposed by Linux. Overridable so
+# tests can point at a fake, and so a laptop can opt out.
 HWRNG_PATH = os.environ.get("OTP_HWRNG_PATH", "/dev/hwrng")
 
-# TRNGs are slow, and how slow varies by two orders of magnitude: a Pi's
-# BCM2835 gives on the order of 100 KiB/s, which covers a 1000-page pad in
-# seconds, while a throttled virtio-rng in a VM can manage 6 KiB/s, which
-# would make the same pad take minutes. So reads are bounded. Past the
-# deadline the whole request falls back to the CSPRNG and SAYS SO, rather
-# than leaving an operator staring at a printer that never starts.
+# TRNG throughput varies by orders of magnitude between devices, so reads
+# are bounded. Past the deadline the whole request falls back to the CSPRNG
+# and says so.
 HWRNG_TIMEOUT = float(os.environ.get("OTP_HWRNG_TIMEOUT", "60"))
-# Small enough that the deadline above is tested often on a slow device,
-# large enough not to make syscalls the bottleneck on a fast one.
+# Small enough that the deadline is checked often on a slow device, large
+# enough that syscalls are not the bottleneck on a fast one.
 _HWRNG_CHUNK = 4096
+# Pause between polls of a non-blocking TRNG that has nothing ready yet.
+_HWRNG_POLL = 0.001
 
-# A stuck TRNG is a real failure mode, and the one that matters most: it
-# fails silently, and a pad made from its output is not a pad. Anything
-# this repetitive is treated as broken rather than trusted.
+# Probe size for entropy_source: enough bytes for _looks_alive to detect a
+# stuck TRNG, which otherwise fails silently.
 _HEALTH_SAMPLE = 256
 
 
@@ -98,31 +91,17 @@ def _hwrng_bytes(n: int, path: str | None = None) -> bytes | None:
     """
     n bytes straight off the hardware TRNG, or None if there is not one.
 
-    Short reads are a None, not a partial answer: silently returning fewer
-    bytes than asked for would leave the caller padding key material with
-    something else without knowing it.
-
-    The path is resolved on each call rather than bound as a default, so
-    HWRNG_PATH stays overridable at runtime -- which is what lets a test
-    point this at a stuck or absent device and see what happens.
+    A short read, a timeout or unhealthy output is None, never a partial
+    answer: the caller must not pad key material from another source
+    without knowing it. The path is resolved per call so HWRNG_PATH stays
+    overridable at runtime.
     """
     path = path or HWRNG_PATH
     deadline = time.monotonic() + HWRNG_TIMEOUT
-    # O_NONBLOCK, because nothing else actually bounds this.
-    #
-    # Fourth attempt. Checking the deadline after a blocking read let one
-    # read sit in the kernel for 73 seconds against a 1-second budget.
-    # Chunking moved the check but wrote it `if got < n`, and every request
-    # this program makes is a single chunk, so it never ran. select() was
-    # measured returning READY instantly and unconditionally on
-    # /dev/hwrng -- the char device implements no .poll, so the VFS hands
-    # back DEFAULT_POLLMASK and the call carries no information at all;
-    # a 0.001s budget still took 0.614s.
-    #
-    # A non-blocking fd is the version that works: read() returns EAGAIN
-    # rather than sleeping in the kernel, so the deadline below is the
-    # thing that decides. On a regular file (every test fake) O_NONBLOCK
-    # is a no-op and reads behave normally.
+    # O_NONBLOCK is the only thing that bounds this: a blocking read can sit
+    # in the kernel past the deadline, and select() is useless because the
+    # hwrng char device implements no .poll and always reports ready. On a
+    # regular file (the test fakes) O_NONBLOCK is a no-op.
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
@@ -132,13 +111,15 @@ def _hwrng_bytes(n: int, path: str | None = None) -> bytes | None:
         while got < n:
             if time.monotonic() > deadline:
                 # Abandon the whole request rather than splice a CSPRNG
-                # tail onto a TRNG head: a pad half from each is neither,
-                # and nothing downstream could tell.
+                # tail onto a TRNG head; nothing downstream could tell.
                 return None
             try:
                 chunk = os.read(fd, min(_HWRNG_CHUNK, n - got))
             except BlockingIOError:
-                time.sleep(0.01)
+                # A non-blocking read returns only what the driver has
+                # buffered, so the poll interval caps throughput at
+                # buffer/sleep. Keep it short.
+                time.sleep(_HWRNG_POLL)
                 continue
             except OSError:
                 return None
@@ -156,17 +137,10 @@ def _looks_alive(data: bytes) -> bool:
     """
     Reject output no working TRNG would produce.
 
-    This cannot make a key stronger -- the result is XORed with the CSPRNG
-    either way -- so its only job is to stop the unit CLAIMING hardware
-    entropy it did not get. The previous version looked at the first 256
-    bytes and asked only whether they were all identical, which passed a
-    free-running counter, a stuck nibble, and 255 zeros after one live
-    byte. It also passed any 1-byte read unconditionally, which is what
-    made entropy_source() report hardware on a dead device.
-
-    So: the whole buffer, a distinct-value floor against the count random
-    data would actually give, and a periodicity check for a latched or
-    counting register.
+    This cannot make a key stronger, since the result is XORed with the
+    CSPRNG either way; it stops the unit claiming hardware entropy it did
+    not get. Checks the whole buffer: a floor on distinct values, and
+    periodicity for a latched or counting register.
     """
     n = len(data)
     if n < 16:
@@ -181,11 +155,9 @@ def _looks_alive(data: bytes) -> bool:
     return True
 
 
-# What get_random_bytes actually drew on, rather than what a separate
-# probe predicts it would. Two different things: the probe reads one byte
-# now, the pad is hundreds of reads over minutes, and a device that dies
-# in between made every page after it CSPRNG-only while the sheet still
-# said "hardware". Callers reset this before a job and read it after.
+# What get_random_bytes actually drew on, as opposed to what the
+# entropy_source probe predicts: a device can die mid-pad. Callers reset
+# this before a job and read it after.
 class Tally:
     """A count of which source each request was actually served from."""
 
@@ -228,13 +200,8 @@ def entropy_source(path: str | None = None) -> str:
     """
     Which source get_random_bytes would draw on right now.
 
-    Probes with a realistic amount rather than one byte. A single byte can
-    never fail the health check -- it cannot be periodic and it cannot be
-    short of distinct values -- so the old one-byte probe reported
-    "hardware" for a device stuck at zero, which is precisely the case the
-    check exists to catch.
-
-    This is still only a prediction. For what a particular pad was really
+    Probes with _HEALTH_SAMPLE bytes because a single byte can never fail
+    the health check. Only a prediction; for what a particular pad was
     made from, read TALLY.
     """
     return "hwrng+urandom" if _hwrng_bytes(_HEALTH_SAMPLE, path) is not None \
@@ -245,7 +212,9 @@ def _source_note(source: str) -> str:
     """One line naming the source, and what it means for the output."""
     if source == "hwrng+urandom":
         return (f"hardware TRNG ({HWRNG_PATH}) XORed with the system CSPRNG "
-                f"-- a true one-time pad")
+                f"-- never weaker than the CSPRNG, and a true one-time pad "
+                f"to the extent the TRNG delivers full entropy, which this "
+                f"program cannot measure")
     return ("system CSPRNG only -- no hardware TRNG on this machine. These "
             "pads are a very strong stream cipher, not information-"
             "theoretically secure one-time pads.")
@@ -253,70 +222,39 @@ def _source_note(source: str) -> str:
 
 # --- is the kernel CSPRNG up yet ---------------------------------------
 #
-# NOT a security gate, and deliberately so. os.urandom goes through
-# getrandom(), which since Linux 5.6 BLOCKS until the CRNG is seeded
-# rather than returning predictable bytes, so "a pad generated from an
-# unseeded pool" is not a thing this program can do. The kernel already
-# refuses.
-#
-# What the kernel does not do is say anything while it refuses. On a
-# freshly flashed, network-less, RTC-less Pi at first boot the block lands
-# in the middle of a synchronous UI loop, and the panel stops repainting
-# wherever it happened to be. Measured against this codebase before these
-# helpers existed: the first draw of the interactive flow is
-# Vocabulary.random(), called from inside CodewordRoll.frame(), so the
-# panel froze on the CODEWORD menu with the caret still on ROLL RANDOM --
-# two frames drawn, then nothing. Headless was worse: unattended.run()
-# rolled its codeword before submitting the status sheet, so the unit
-# printed NOTHING AT ALL, not even the sheet whose whole job is to
-# explain a unit that has no panel.
-#
-# On three buttons and 128x64 pixels a freeze is indistinguishable from a
-# crash, and the documented remedy for a crash -- power-cycle -- discards
-# the entropy accumulated so far and restarts the wait. So these probes
-# exist to convert the kernel's silent wait into a report. They never
-# decide whether key material is drawn; getrandom() still does that.
+# Not a security gate. os.urandom goes through getrandom(), which blocks
+# until the CRNG is seeded, so a pad cannot be drawn from an unseeded pool.
+# But the kernel blocks silently, and on a freshly flashed Pi that freezes
+# the panel (or prints nothing when headless), which looks like a crash and
+# invites a power cycle that discards the entropy collected so far. These
+# probes turn the silent wait into a report; they never decide whether key
+# material is drawn.
 
-# Where the kernel publishes its entropy estimate. Read for CONTEXT, never
-# as a gate. Since 5.6 the number is not a level anyone can wait for: it
-# is clamped to the pool size and sits pinned at that maximum on any
-# healthy machine (measured: 256 on an idle 6.18 kernel), and getrandom()
-# ignores it entirely once the CRNG is up. Comparing it to a threshold
-# tests a pre-5.6 model of the kernel, which is why the diagnostic sheet's
-# old "ok/LOW" verdict on this number was removed rather than reused.
+# The kernel's entropy estimate. For display only, never a gate: on modern
+# kernels it is pinned at the pool size once the CRNG is seeded and
+# getrandom() ignores it.
 ENTROPY_AVAIL = "/proc/sys/kernel/random/entropy_avail"
 
 # How often to re-ask while waiting. A boot that waits at all waits
-# seconds, not minutes -- a Pi's bcm2835-rng is builtin and the kernel
-# credits it at ~2.4s, measured under emulation in issue #17 -- so this is
-# quick enough to clear before an operator looks up and cheap enough to
-# cost nothing on the units that never wait at all.
+# seconds, so this clears promptly and costs nothing otherwise.
 CRNG_POLL_SECONDS = 0.5
 
 
 def crng_seeded() -> bool:
     """
-    Whether the kernel's CSPRNG is initialised -- asked, not estimated.
+    Whether the kernel's CSPRNG is initialised.
 
-    getrandom(GRND_NONBLOCK) returns EAGAIN if and only if the CRNG has
-    not been seeded, which is exactly the condition under which the
-    ordinary getrandom() behind os.urandom would block. That makes this
-    the only form of the question that stays true on a modern kernel;
-    see ENTROPY_AVAIL for why the bit count is not.
-
-    Unaskable counts as seeded. On a kernel or platform with no
-    getrandom() this probe has no opinion, and the alternative is parking
-    an operator in front of a WAITING screen that can never clear. The
-    kernel's own blocking is underneath either way -- being wrong here
-    costs the report, never the key material.
+    getrandom(GRND_NONBLOCK) returns EAGAIN exactly when the getrandom()
+    behind os.urandom would block. Where the question cannot be asked the
+    answer is True: the kernel's own blocking still protects the key
+    material, and a False here would be a wait that never clears.
     """
     getrandom = getattr(os, "getrandom", None)
     nonblock = getattr(os, "GRND_NONBLOCK", None)
     if getrandom is None or nonblock is None:
         return True
     try:
-        # One byte, discarded. This is a question, not a draw: nothing
-        # generated here ever reaches a pad.
+        # One byte, discarded: nothing drawn here reaches a pad.
         getrandom(1, nonblock)
     except BlockingIOError:
         return False
@@ -330,9 +268,8 @@ def entropy_bits() -> int | None:
     """
     The kernel's entropy estimate, or None where it cannot be read.
 
-    Worth showing an operator only while crng_seeded() is False, where it
-    genuinely does climb towards the seeding threshold. Once seeded it is
-    a constant and means nothing.
+    Only meaningful while crng_seeded() is False; once seeded it is a
+    constant.
     """
     try:
         with open(ENTROPY_AVAIL) as handle:
@@ -343,19 +280,14 @@ def entropy_bits() -> int | None:
 
 def wait_for_crng(on_wait=None, sleep=None, poll: float = None) -> float:
     """
-    Block until the CRNG is seeded, giving the caller something to say.
+    Block until the CRNG is seeded. Returns the seconds waited (0.0 if
+    already seeded).
 
-    Returns the seconds waited, which is 0.0 on every machine whose
-    kernel has already seeded -- every laptop, every CI runner, and every
-    Pi past its first few seconds of uptime. `on_wait(waited)` is called
-    once before each sleep, so a caller can write a log line or repaint a
-    panel. A caller with its own event loop to keep alive (the front
-    panel has buttons to poll) should poll crng_seeded() itself instead;
-    this is for callers whose only job while waiting is to say so.
+    `on_wait(waited)` is called once before each sleep. A caller with its
+    own event loop should poll crng_seeded() itself instead.
 
-    There is no timeout. Giving up would mean generating anyway, and
-    getrandom() would simply block at the first draw instead -- back to
-    the silent hang, with the report already printed and now a lie.
+    There is no timeout: giving up would mean generating anyway, and
+    getrandom() would block silently at the first draw.
     """
     sleep = sleep or time.sleep
     poll = CRNG_POLL_SECONDS if poll is None else poll
@@ -372,20 +304,13 @@ def get_random_bytes(n: int) -> bytes:
     """
     n bytes for key material: the hardware TRNG XORed with the CSPRNG.
 
-    A one-time pad has to come from a physical process. os.urandom is a
-    ChaCha20 construction -- excellent, but algorithmic, so a pad built
-    only from it is strictly a stream cipher rather than a one-time pad.
-    The Pi has a real TRNG, so use it.
+    A one-time pad has to come from a physical process; os.urandom alone
+    makes a stream cipher. The TRNG is XORed with os.urandom rather than
+    used raw because it can be biased or stuck: if either source is good
+    the output is good, and neither can weaken the other.
 
-    XORed with os.urandom rather than used raw, because a ring-oscillator
-    TRNG can be biased, correlated, or stuck, and on an embedded board
-    with no RTC the alternative failure -- a CSPRNG that is barely seeded
-    at first boot -- is just as real. XOR is safe against both: if either
-    source is good the output is good, and neither can weaken the other.
-
-    Falls back to os.urandom alone when there is no /dev/hwrng, which is
-    every laptop running the CLI. entropy_source() reports which happened,
-    and the unit prints it.
+    Falls back to os.urandom alone when there is no usable /dev/hwrng;
+    TALLY records which happened.
     """
     system = os.urandom(n)
     hardware = _hwrng_bytes(n)
@@ -508,10 +433,8 @@ def draw_pad_page(
     right = box_left + box_width - margin_h
     content_width = right - left
 
-    # Key material: body plus an optional AUTH group, reserved for
+    # Key material: the body plus an optional AUTH group, reserved for
     # authentication and excluded from the key body (see otp.md).
-    # The AUTH group's length is configurable; the key body's five-letter
-    # grouping is not — five-letter groups are the manual's convention.
     extra = auth_size if with_auth else 0
     key_chars = generate_random_letters(chars_per_page + extra)
     body_chars = key_chars[:chars_per_page]
@@ -621,12 +544,10 @@ def new_canvas(output, pagesize, title: str = "OTP"):
     """
     A canvas whose metadata gives nothing away.
 
-    PDF page content is Flate-compressed, but the document Info dictionary is
-    not -- a `strings` pass over a spooled job or a printer's stored copy
-    reads it directly. So the title must never carry the codeword, and the
-    timestamps must not date the pad. `invariant=1` pins CreationDate and
-    ModDate to a fixed value and makes the trailer /ID deterministic, which
-    also keeps copies A and B of a pair byte-identical.
+    The PDF Info dictionary is not compressed, so `strings` over a spooled
+    job reads it: the title must never carry the codeword and the
+    timestamps must not date the pad. `invariant=1` fixes the dates and the
+    trailer /ID, which also keeps copies A and B byte-identical.
     """
     c = canvas.Canvas(output, pagesize=pagesize, invariant=1)
     c.setTitle(title)
@@ -773,23 +694,18 @@ def generate_set_pdf_a4(
     """
     Generate OTP set as four A6 pad pages per A4 sheet, for guillotine work.
 
-    Imposed **cut-and-stack**, not in reading order. Four A6 pages tile onto
-    A4 exactly, so the whole printed stack is cut twice -- once down the
-    middle, once across -- giving four piles. Each pile is already in page
-    order, so the pad is assembled by dropping them on top of one another:
-    top-left pile, then top-right, then bottom-left, then bottom-right.
+    Imposed cut-and-stack, not in reading order: the printed stack is cut
+    twice into four piles, each already in page order, and the pad is
+    assembled by stacking them top-left, top-right, bottom-left,
+    bottom-right.
 
-    Reading order would be the obvious layout and the wrong one: it would
-    leave four piles that have to be interleaved page by page.
-
-    The tiling is exact rather than driver-scaled. That matters because a
-    guillotine cuts the whole stack at once, so every sheet has to have
-    identical geometry -- fit-to-page scaling would drift the cut line.
+    The tiling is exact, not driver-scaled, because a guillotine cuts the
+    whole stack at once and every sheet needs identical geometry.
     """
     if progress is None:
         progress = _printing_progress(codeword)
-    # Quartering whatever sheet is in the tray, rather than assuming A6
-    # exactly, keeps the cut lines dead centre on Letter as well as A4.
+    # Quarter whatever sheet is given, so the cut lines are centred on
+    # Letter as well as A4.
     page_w, page_h = page_size
     half_w, half_h = page_w / 2, page_h / 2
     # Cut-and-stack: position p carries pages p*sheets+1 .. (p+1)*sheets.
@@ -833,21 +749,10 @@ def _draw_crop_marks(c: canvas.Canvas, page_w: float, page_h: float):
     """
     Ticks near the sheet edges marking the two cuts.
 
-    Edge ticks rather than full rules: a line across the sheet would run
-    through the key area, and the blade only needs something collinear with
-    the cut to line up on.
-
-    They are inset rather than run to the paper's edge. A laser cannot mark
-    the outer few millimetres of a sheet -- the HP LaserJet Pro M12w and
-    most of its class reserve 4.23mm (one sixth of an inch) on every edge --
-    so ticks spanning 0 to 4mm landed entirely inside the band that never
-    receives toner, and the marks the whole cut-and-stack layout depends on
-    simply did not appear. Starting at CROP_INSET puts them on paper.
-
-    Being inset costs nothing: the tick sits ON the cut line, so any part of
-    it defines where the blade goes. Both cuts run along the boundary
-    between tiled pages, which is 4mm clear of any content on either side,
-    so the ticks cannot collide with key material at any length.
+    Edge ticks, not full rules, which would run through the key area. They
+    start at CROP_INSET because a laser cannot print the outer few
+    millimetres of a sheet. Both cuts run along page boundaries, clear of
+    any content.
     """
     c.saveState()
     c.setStrokeGray(0.45)
@@ -896,10 +801,8 @@ def generate_worksheets_pdf(output, num_pages: int):
         c.setFont("Courier-Bold", 9)
         c.drawString(margin, header_y, "OTP WORKSHEET")
         c.drawRightString(page_w - margin, header_y, "PAGE ________")
-        # The rows are labelled for encryption. Two of the manual's three
-        # exercises are decrypts, where the ciphertext goes in the top row
-        # and the plaintext comes out of the shaded one -- say so, or a
-        # student follows the labels straight into the wrong arithmetic.
+        # The rows are labelled for encryption, so say how to use them for
+        # a decrypt, where the ciphertext goes in the top row.
         c.setFont("Courier", 5.5)
         c.drawCentredString(page_w / 2, header_y - 5.5 * mm,
                             "ENCRYPT M+K=C   DECRYPT: PUT C IN THE TOP ROW, C-K=M")
@@ -1088,10 +991,8 @@ def max_auth_size(font_size: float, a7: bool = False, box_width: float = None) -
     """
     Longest AUTH group that clears the right-aligned page number.
 
-    codeword_space budgets the codeword against the AUTH group, but nothing
-    budgeted AUTH itself: at --auth-size 40 the last AUTH letter overprints
-    the first digit of the page number. Those are the two fields deliberately
-    kept at full size because they are read character by character.
+    AUTH and the page number are both kept at full size because they are
+    read character by character, so they must not overprint.
     """
     if box_width is None:
         box_width = (SHEET_HEIGHT / 2) if a7 else SHEET_WIDTH
@@ -1108,11 +1009,9 @@ def max_body_font_size(a7: bool = False, box_width: float = None) -> float:
     """
     Largest body font size at which a row of groups still fits across the page.
 
-    calc_max_chars only measures height. Without this, a larger --fontsize
-    drives the inter-group gap negative and the groups are drawn overlapping
-    one another -- letters superimposed, inside the content box, with no
-    visual tell at the margins. A pad like that is unreadable and both
-    copies are equally corrupt, so it fails silently at the far end.
+    calc_max_chars only measures height. Past this size the inter-group gap
+    goes negative and the groups overprint one another, unreadably and
+    identically on both copies.
     """
     if box_width is None:
         box_width = (SHEET_HEIGHT / 2) if a7 else SHEET_WIDTH
@@ -1141,11 +1040,9 @@ def calc_max_chars(font_size: float, a7: bool = False, box_height: float = None)
     """
     Calculate maximum characters that fit on one pad page.
 
-    `box_height` overrides the assumed page height for imposed layouts. It
-    matters for Letter: a quarter-sheet is 139.7mm tall against A6's 148mm,
-    so measuring against A6 lets a large --chars value push the last key rows
-    off the bottom of the box -- below the guillotine line, or overprinting
-    the footer.
+    `box_height` overrides the assumed page height for imposed layouts: a
+    Letter quarter-sheet is shorter than A6, and measuring against A6 would
+    push the last key rows off the box.
     """
     margin_top = 5 * mm
     margin_bottom = 4 * mm
@@ -1203,17 +1100,14 @@ def main():
                              "and exit (status 0 with a hardware TRNG, 2 without)")
     args = parser.parse_args()
 
-    # Answered before the "nothing to do" check: asking what the machine can
-    # do is a complete request on its own.
+    # Before the "nothing to do" check: --entropy is a complete request.
     if args.entropy:
         source = entropy_source()
         print(_source_note(source))
         if source != "hwrng+urandom":
             print(f"No usable {HWRNG_PATH}. Every Raspberry Pi has one; most "
                   f"laptops do not.")
-        # The other half of the question, and the one that decides whether
-        # generation would start at all: an unseeded CRNG makes the first
-        # os.urandom call block, for as long as the kernel needs.
+        # An unseeded CRNG would make the first os.urandom call block.
         if crng_seeded():
             print("Kernel CSPRNG: seeded -- generation will start at once.")
         else:
@@ -1251,8 +1145,8 @@ def main():
 
     if args.chars is not None and args.chars < 1:
         parser.error("--chars must be at least 1")
-    # The page number is a fixed-width four-digit field that both ends drill
-    # against; past 9999 it silently becomes five digits and stops being one.
+    # The page number is a fixed-width four-digit field on the page and in
+    # the message header.
     if args.pages > 9999:
         parser.error("--pages cannot exceed 9999: the page number is a "
                      "four-digit field on the page and in the message header")
@@ -1284,8 +1178,7 @@ def main():
         else:
             format_label = "A6"
 
-    # With --stdout the PDF owns the stdout stream, so all chatter goes to
-    # stderr; otherwise print() as before so the CLI output is unchanged.
+    # With --stdout the PDF owns stdout, so all chatter goes to stderr.
     stream = sys.stderr if args.stdout else sys.stdout
 
     def log(*parts):
@@ -1302,14 +1195,10 @@ def main():
             log("ERROR: --pages must be at least 1")
             sys.exit(1)
 
-        # Before the first draw, which on --random-codewords is the line
-        # below. An unseeded CRNG makes os.urandom block, and a program
-        # that stops dead with no output is a program that looks broken.
-        # Costs nothing when the kernel is up, which it is everywhere this
-        # CLI normally runs.
+        # An unseeded CRNG makes os.urandom block; say so rather than stop
+        # dead with no output.
         def announce(seconds):
-            # Once, not once per poll. The point is that the program has
-            # not died, not a running commentary on a terminal.
+            # Once, not once per poll.
             if seconds == 0.0:
                 log("Waiting for the kernel CSPRNG to be seeded. No key "
                     "material can be drawn until it is; using the machine "
@@ -1320,13 +1209,9 @@ def main():
         def ensure_entropy():
             """Block until the CRNG is seeded, at most once, saying so.
 
-            Called at each point that is genuinely the FIRST draw of its
-            path, rather than once up front. Up front was wrong for
-            --codewords: the wait ran before the file had even been read,
-            so a missing file, a duplicate word or an over-long one parked
-            the CLI in an unbounded wait and then reported an error that
-            needed no randomness to find. Deterministic checks first; the
-            wait immediately before the draw that needs it.
+            Called immediately before the first random draw of each path,
+            so deterministic errors (a missing or invalid codeword file)
+            are reported without waiting.
             """
             if waited_already[0]:
                 return
@@ -1336,7 +1221,7 @@ def main():
                 log(f"Kernel CSPRNG seeded after {waited:.0f}s.")
 
         if args.random_codewords:
-            # This IS the first draw on this path, so the wait belongs here.
+            # The first draw on this path.
             ensure_entropy()
             codewords = random_codewords(args.random_codewords)
             log(f"Random codewords: {' '.join(codewords)}")
@@ -1354,33 +1239,29 @@ def main():
                 sys.exit(1)
             seen.add(word)
             # ASCII only. str.isalnum() is true for every Unicode letter,
-            # but the Courier used on the page is a WinAnsi font: reportlab
-            # substitutes silently, so 中文-BADGER and 日本-BADGER both print
-            # the same header while remaining distinct filenames.
+            # but the page font is WinAnsi Courier and reportlab substitutes
+            # silently, so distinct codewords could print the same header.
             if not all((ch.isascii() and ch.isalnum()) or ch in "-_" for ch in word):
                 log(f"ERROR: Codeword '{word}' is unsafe as a filename (use A-Z, 0-9, '-', '_')")
                 sys.exit(1)
 
         # Imposed layouts get a quarter of the sheet, which on Letter is
-        # shorter and wider than A6 -- measure against the box the pages
-        # actually land in, not against A6.
+        # shorter and wider than A6, so measure against that box.
         box_height = box_width = None
         if args.a4 or args.letter:
             sheet_size = LETTER if args.letter else A4
             box_height, box_width = sheet_size[1] / 2, sheet_size[0] / 2
 
-        # AUTH first: an oversized AUTH group squeezes the codeword's budget
-        # to almost nothing, so checking the codeword first would blame it
-        # for a fault that is really the AUTH size.
+        # AUTH first: an oversized AUTH group squeezes the codeword's
+        # budget, and the codeword check would then blame the codeword.
         auth_limit = max_auth_size(font_size, args.a7, box_width)
         if with_auth and auth_size > auth_limit:
             log(f"ERROR: an AUTH group of {auth_size} would overprint the page "
                 f"number on {format_label}. Maximum is {auth_limit}.")
             sys.exit(1)
 
-        # Codewords must fit the page header beside the AUTH group and page
-        # number. They shrink to fit, so the limit is what fits at the smallest
-        # legible size \u2014 not what fits at the body font size.
+        # Codewords shrink to fit the header, so the limit is what fits at
+        # the smallest legible size, not at the body font size.
         codeword_limit = max_fitted_codeword_len(font_size, args.a7, with_auth, auth_size)
         for word in codewords[:args.sets]:
             if fit_codeword_size(word, font_size, args.a7, with_auth, auth_size) is None:
@@ -1388,16 +1269,11 @@ def main():
                     f"(max {codeword_limit} characters)")
                 sys.exit(1)
 
-        # Width first. calc_max_chars only measures height, so without this
-        # a larger --fontsize drives the inter-group gap negative and the
-        # groups print superimposed on one another -- inside the content
-        # box, so nothing overflows visibly, and both copies are equally
-        # unreadable.
+        # Width before height: see max_body_font_size.
         max_font = max_body_font_size(args.a7, box_width)
         if font_size > max_font:
-            # Round DOWN: printing the true maximum to one decimal would
-            # round up, and an operator retyping the number from the error
-            # message would hit the same error again.
+            # Round down, so the maximum quoted in the error is itself
+            # accepted when retyped.
             usable = math.floor(max_font * 10) / 10
             log(f"ERROR: {font_size}pt is too wide for {format_label} — "
                 f"the five-letter groups would overlap. Maximum is {usable}pt.")
@@ -1411,10 +1287,8 @@ def main():
         num_rows = -(-chars_per_page // chars_per_row)
 
         log(f"Format: {format_label}")
-        # Named up front, before any of it is generated, because it decides
-        # what these pages ARE -- a one-time pad or a stream cipher's
-        # keystream -- and because it explains why a run on a Pi takes
-        # minutes where the same run on a laptop takes seconds.
+        # Named before generating, because it decides whether these pages
+        # are a one-time pad or a stream cipher's keystream.
         log(f"Key source: {_source_note(entropy_source())}")
         log(f"Generating {args.sets} OTP sets, {args.pages} pad pages each, {chars_per_page} chars/page")
         log(f"Auth group in header: {'yes' if with_auth else 'no'}")
@@ -1437,8 +1311,8 @@ def main():
         else:
             generate = generate_set_pdf_a6
 
-        # And here for the --codewords path, whose first draw is the pad
-        # itself. A no-op when --random-codewords already waited above.
+        # The first draw on the --codewords path is the pad itself. A no-op
+        # if --random-codewords already waited.
         ensure_entropy()
 
         for i in range(args.sets):
@@ -1479,10 +1353,8 @@ def main():
         log()
 
     log("=" * 50)
-    # What the pages that just came out were actually made from, measured
-    # rather than predicted. The probe above answers "what is available";
-    # a device that dies mid-run makes every page after it CSPRNG-only,
-    # and this is the only place that difference shows up.
+    # What the pages were actually made from, as recorded, not as
+    # predicted: a TRNG that dies mid-run shows up only here.
     if generating_sets and TALLY.total:
         log(f"Key source: {TALLY.summary()}")
     log("DONE")
@@ -1490,13 +1362,10 @@ def main():
     if generating_sets:
         log("Each PDF contains one complete set.")
         if args.stdout:
-            # The bytes went down the pipe and are gone. Re-running produces
-            # DIFFERENT key material -- two pads wearing one codeword, which
-            # is the failure the whole pair convention exists to prevent.
-            # Collate=True is not optional. Without it cups-filters
-            # interleaves the copies -- page 1, page 1, page 2, page 2 --
-            # so instead of two pads you get one stack that has to be
-            # dealt out by hand, and any slip mixes the two pads of a set.
+            # Re-running produces different key material, not the twin, so
+            # both copies must come from this one job. Collate=True is
+            # required: without it cups-filters interleaves the copies
+            # into one stack.
             log("You piped one copy. A pad set is two IDENTICAL copies, so")
             log("ask the printer for both from this one job:")
             log("  ... --stdout | lp -n 2 -o Collate=True")

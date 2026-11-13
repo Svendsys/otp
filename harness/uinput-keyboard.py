@@ -1,13 +1,9 @@
 """Hold a virtual keyboard open so /proc/bus/input/devices reports one.
 
-hmi.keyboard_connected() looks for a udev-named `kbd` handler, which is the
-signal a real USB keyboard produces. A uinput device produces the same
-signal through the same kernel path, so this makes that probe testable for
-real rather than by monkeypatching the file it reads.
-
-The device exists only while this process lives. It writes the event node's
-path to the file named on the command line once the device is up, so the
-caller can wait for it rather than sleeping and hoping.
+A uinput device gives hmi.keyboard_connected() the same udev-named `kbd`
+handler a real USB keyboard does. The device exists only while this process
+lives; once it is up, the event node's path is written to the file named on
+the command line.
 """
 import signal
 import sys
@@ -17,9 +13,8 @@ from evdev import UInput, ecodes
 
 
 def main(ready_path):
-    # The arrow keys and Enter are what the unit's KeyboardButtons maps, so
-    # advertise those: a device with no EV_KEY capability would not get a
-    # kbd handler, which is the whole thing being tested.
+    # The keys KeyboardButtons maps. A device with no EV_KEY capability
+    # would not get a kbd handler.
     capabilities = {
         ecodes.EV_KEY: [
             ecodes.KEY_UP, ecodes.KEY_DOWN, ecodes.KEY_LEFT, ecodes.KEY_RIGHT,

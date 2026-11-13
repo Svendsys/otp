@@ -1,8 +1,6 @@
-"""Tests for the pad generator.
-
-The most important tests here guard generate_random_letters: any future
-edit that reintroduces modulo bias (e.g. a naive `byte % 26` over all 256
-values, which skews the last four letters by about -8.6%) must fail loudly.
+"""Tests for the pad generator. The uniformity test guards generate_random_letters
+against modulo bias (a naive `byte % 26` skews the last four letters by about
+-8.6%).
 """
 import collections
 import string
@@ -39,9 +37,8 @@ class TestRandomLetters:
         assert g.generate_random_letters(0) == ""
 
     def test_uniformity(self):
-        # 520k draws: expected 20k per letter, sigma ~140 (0.7%).
-        # A 5% tolerance is ~7 sigma — effectively cannot flake — while a
-        # naive mod-26 mapping biases W-Z by -8.6% and fails immediately.
+        # Expected 20k per letter, sigma ~140: 5% is ~7 sigma, while mod-26
+        # bias on W-Z is -8.6%.
         n = 520_000
         counts = collections.Counter(g.generate_random_letters(n))
         assert len(counts) == 26
@@ -126,8 +123,8 @@ class TestCliValidation:
         assert "unsafe as a filename" in r.stdout
 
     def test_codeword_too_long_for_a7_header(self, tmp_path):
-        # The codeword shrinks to fit, so the limit is what still renders at
-        # CODEWORD_MIN_FONT — 18 characters on A7. This one is past it.
+        # The codeword shrinks to fit; 18 characters is the A7 limit at
+        # CODEWORD_MIN_FONT.
         words = tmp_path / "words.txt"
         words.write_text("EXTRAORDINARILYLONGCODEWORD\n")
         r = run(["--codewords", str(words), "--sets", "1", "--pages", "1",
@@ -136,8 +133,7 @@ class TestCliValidation:
         assert "too long" in r.stdout
 
     def test_two_word_codeword_fits_a7_by_shrinking(self, tmp_path):
-        # 13 characters exceeds the 11 that fit at 9pt, but prints fine
-        # smaller — this is what makes <MODIFIER>-<NOUN> codewords possible.
+        # 13 characters exceeds the 11 that fit at 9pt but prints smaller.
         words = tmp_path / "words.txt"
         words.write_text("RUSTED-BADGER\n")
         r = run(["--codewords", str(words), "--sets", "1", "--pages", "2",

@@ -861,14 +861,13 @@ tests = [
 file = "device/install.sh"
 find = '''        LISTING=$(lsinitramfs "$candidate" 2>/dev/null || true)
         case "$LISTING" in
-            *scripts/overlay*)
-                OVERLAY_INITRAMFS="$candidate"
-                break
-                ;;
+            *scripts/overlay*) OVERLAY_INITRAMFS="$OVERLAY_INITRAMFS $candidate" ;;
+            *) STALE_INITRAMFS="$STALE_INITRAMFS $candidate" ;;
         esac'''
 replace = '''        if lsinitramfs "$candidate" 2>/dev/null | grep -q "scripts/overlay"; then
-            OVERLAY_INITRAMFS="$candidate"
-            break
+            OVERLAY_INITRAMFS="$OVERLAY_INITRAMFS $candidate"
+        else
+            STALE_INITRAMFS="$STALE_INITRAMFS $candidate"
         fi'''
 
 
@@ -2518,8 +2517,8 @@ tests = [
 ]
 [[mutation.edit]]
 file = "otpunit/hmi.py"
-find = '            log(f"no OLED ({exc})")'
-replace = '            log(f"no display ({exc})")'
+find = """        log(f"no OLED ({'; '.join(failures)})")"""
+replace = """        log(f"no display ({'; '.join(failures)})")"""
 
 
 # --- issue #21: the identity, the emulator's board revision, and the panel
@@ -5154,8 +5153,8 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/README.md"
-find = "**23 guest checks in boot 1 and 23 in boot 2**"
-replace = "**21 guest checks in boot 1 and 21 in boot 2**"
+find = "**24 guest checks in boot 1 and 24 in boot 2**"
+replace = "**22 guest checks in boot 1 and 22 in boot 2**"
 
 
 [[mutation]]

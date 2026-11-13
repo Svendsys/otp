@@ -1,10 +1,6 @@
-"""Tests for the codeword vocabulary and the header fit that constrains it.
-
-The wordlist tests are the only thing standing between a curated vocabulary
-and a slow drift into obscure, confusable, or unpronounceable words. A
-codeword gets read aloud over a noisy channel and carried in someone's head
-from a handover to a radio, so "sayable and picturable" is a functional
-requirement, not a style preference.
+"""Tests for the codeword vocabulary and the header fit that constrains it. A
+codeword is read aloud over a noisy channel, so sayable and distinct is a
+functional requirement.
 """
 import re
 import string
@@ -54,18 +50,16 @@ def edit_distance(a, b):
 
 
 class TestVocabularyShape:
-    # The printed header fits 17 characters at the tightest format, split
-    # 7 + 1 + 9 rather than 8 + 1 + 8: the noun carries the picture, so it
-    # gets the spare character and BUTTERFLY, CROCODILE and ACCORDION fit.
+    # The header fits 17 characters at the tightest format, split 7 + 1 + 9:
+    # the noun carries the picture.
     MODIFIER_MAX = 7
     NOUN_MAX = 9
 
     def test_lists_are_populated(self):
         assert len(MODIFIERS) > 300
         assert len(FLAT_NOUNS) > 600
-        # Categories are an authoring device, not a UI surface -- the unit
-        # never draws from one. They keep the curation legible and give
-        # build_lists.py the tiers it spends its phonetic budget across.
+        # Categories are an authoring device giving build_lists.py its tiers;
+        # the unit never draws from one.
         assert len(NOUNS) >= 13, "the lists must stay curated, not one blob"
 
     def test_every_word_is_plain_uppercase(self):
@@ -75,8 +69,8 @@ class TestVocabularyShape:
             assert re.fullmatch(r"[A-Z]{3,%d}" % self.NOUN_MAX, word), word
 
     def test_the_header_budget_is_spent_but_not_overspent(self):
-        # Both halves reach their cap, so the split is actually in use, and
-        # the longest pair still lands on the 17 characters the header has.
+        # Both halves reach their cap and the longest pair still fits the
+        # header.
         assert max(len(w) for w in MODIFIERS) == self.MODIFIER_MAX
         assert max(len(w) for w in FLAT_NOUNS) == self.NOUN_MAX
         assert self.MODIFIER_MAX + 1 + self.NOUN_MAX == 17
@@ -167,10 +161,9 @@ class TestHeaderFitsTheVocabulary:
             assert g.fit_codeword_size(word, 9, False, True, auth_size) == 9
 
     def test_a7_trades_auth_size_against_codeword_length(self):
-        # A7 is the tight format: a bigger AUTH group eats the header room the
-        # codeword shrinks into. Up to 6 the longest codeword still prints;
-        # past that it is rejected outright, which is the right failure — an
-        # illegible codeword is worse than a refusal at generation time.
+        # On A7 a bigger AUTH group eats the room the codeword shrinks into;
+        # past 6 the longest codeword is rejected rather than printed
+        # illegibly.
         word = self._longest_possible()
         for auth_size in range(3, 7):
             assert g.fit_codeword_size(word, 9, True, True, auth_size) is not None
@@ -194,11 +187,8 @@ class TestHeaderFitsTheVocabulary:
 
 
 class TestSessionDoesNotRepeatItself:
-    """
-    Two pads printed in one sitting must not carry the same name. The unit
-    keeps no memory across a power cycle -- see the note in otpunit/codewords
-    on why a stored list cannot be made safe by hashing -- so this is scoped
-    to the power-on session and dies with it.
+    """Two pads printed in one power-on session never carry the same name. The
+    unit keeps no memory across a power cycle (see otpunit/codewords).
     """
 
     def _vocab(self):
@@ -211,11 +201,8 @@ class TestSessionDoesNotRepeatItself:
         assert len(set(drawn)) == len(drawn)
 
     def test_two_sessions_are_independent(self):
-        # A fresh Vocabulary is a fresh power-on: it starts empty and keeps
-        # its own set, so nothing carries across a power cycle. Asserted on
-        # the state rather than by looking for a repeat between two runs --
-        # with 261,000 pairs a repeat is rare enough that such a test would
-        # fail far more often than it passed.
+        # A fresh Vocabulary is a fresh power-on. Asserted on state: with
+        # 261,000 pairs a repeat between two runs is too rare to test for.
         first = self._vocab()
         for _ in range(200):
             first.random()

@@ -1,20 +1,7 @@
-"""Tests for the mutations a second audit round found still surviving.
-
-The first round's blind spot was the printed page, and test_pad_contents.py
-closed it. This round's is everything either side of that page: the argv
-handed to `lp`, the geometry the paper setting is supposed to produce, the
-guards that keep a hand-edited config or a mistyped flag from printing a
-useless pad, and the navigation that decides whether an operator can get
-back to the menu.
-
-The shape of the gap was consistent. Most of these paths had a test that
-touched them and asserted something weaker than the thing that matters:
-crop marks were counted by looking for four line segments on a page that
-draws eight, a font size too wide for the page was caught by a height check
-that happened to reject it too, and --training was verified by reading the
-log line rather than the watermark. Each assertion here is chosen to fail
-for the one reason it names.
-"""
+"""Tests for the paths either side of the printed page: the argv handed to
+`lp`, the geometry the paper setting produces, the guards against a
+hand-edited config or mistyped flag printing a useless pad, and the panel
+navigation. Each assertion is chosen to fail for the one reason it names."""
 import collections
 import io
 import re
@@ -29,9 +16,8 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-# A path under the temp dir, not "/nonexistent": the suite runs as
-# root, where that absolute path is perfectly writable, and any test
-# reaching SAVE SETTINGS created a real file at the host's root.
+# Under the temp dir, not "/nonexistent": the suite runs as root, where that
+# path is writable and SAVE SETTINGS would create a real file.
 SCRATCH_CONFIG = str(pathlib.Path(tempfile.gettempdir()) /
                      "otp-unit-test.conf")
 
@@ -200,13 +186,8 @@ def lpstat_p(text, returncode=0):
 
 
 class TestTheQueueIsAskedWhetherItActuallyPrinted:
-    """
-    ErrorPolicy is abort-job, so a job that failed leaves `lpstat -o` as
-    empty as one that printed. Measured against a real cupsd with no paper:
-    seven jobs aborted, the queue drained in four seconds, and the unit
-    declared a matching pair over an empty tray. The queue's own state is
-    the only thing that tells the two apart.
-    """
+    """ErrorPolicy is abort-job, so a failed job leaves `lpstat -o` as empty
+    as one that printed; only the queue's own state tells the two apart."""
 
     def test_an_idle_printer_reports_no_fault(self):
         cups = lpstat_p("printer OTP is idle.  enabled since Thu 07 Aug 2026\n")
@@ -228,10 +209,8 @@ class TestTheQueueIsAskedWhetherItActuallyPrinted:
         assert "disabled" in (cups.printer_fault() or "")
 
     def test_an_unanswerable_query_is_not_a_fault(self):
-        """
-        Silence must not be read as trouble: it would send someone to burn
-        a pair that printed perfectly.
-        """
+        """An unanswerable query is not a fault: reading silence as trouble
+        would send someone to burn a pair that printed perfectly."""
         assert exploding_cups().printer_fault() is None
         assert lpstat_p("", returncode=1).printer_fault() is None
         assert lpstat_p("").printer_fault() is None
@@ -241,11 +220,8 @@ class TestTheQueueIsAskedWhetherItActuallyPrinted:
 
 
 class TestTheArgvHandedToLp:
-    """
-    Everything the printer is told about a job travels in this one argv.
-    Nothing downstream of it is under our control, so a dropped argument is
-    invisible until a pad comes out on the wrong paper.
-    """
+    """Everything the printer is told about a job travels in this argv, so a
+    dropped argument shows only as a pad on the wrong paper."""
 
     def test_the_title_and_every_option_reach_lp(self):
         seen, run = recording_run()
@@ -254,27 +230,20 @@ class TestTheArgvHandedToLp:
         argv = seen["argv"]
 
         assert job == "OTP-3"
-        # The title is the IPP job-name. It is deliberately not the codeword,
-        # but it still has to be set: it is how the operator tells copy A
-        # from copy B in the queue, and how the panel's labelling matches
-        # what CUPS shows.
+        # The title is the IPP job-name: how the operator tells copy A from
+        # copy B in the queue. It is deliberately not the codeword.
         assert "-t" in argv, "the job title never reached lp"
         assert argv[argv.index("-t") + 1] == "OTP A"
-        # Without the media option lp falls back to the queue default, so a
-        # Letter tray would be asked for A4 -- the sheet the imposed cut
-        # lines were calculated for is not the sheet that comes out.
+        # Without the media option lp falls back to the queue default, and
+        # the cut lines were imposed for a different sheet.
         assert "-o" in argv, "the media option never reached lp"
         assert argv[argv.index("-o") + 1] == "media=Letter"
         assert seen["stdin"] == b"%PDF-fake", "key material goes over stdin"
 
     def test_a_missing_lp_leaves_as_a_printer_error(self):
-        """
-        The first submit in the unattended sequence is the status sheet,
-        and it is outside every try in run(). A bare FileNotFoundError from
-        subprocess went straight past every caller that catches
-        PrinterError. _lpadmin has guarded this since it was written; this
-        did not, and it is the one on the hot path.
-        """
+        """A missing `lp` surfaces as PrinterError, the only error callers
+        catch; the first submit (the status sheet) is outside every try in
+        run()."""
         def missing(argv, stdin=None):
             raise FileNotFoundError(2, "No such file or directory", "/usr/bin/lp")
 
@@ -292,10 +261,8 @@ class TestTheArgvHandedToLp:
 
     @pytest.mark.real_cups_runner
     def test_every_cups_call_is_bounded_by_a_timeout(self, monkeypatch):
-        """
-        A wedged cupsd must not block the UI forever with the key buffer
-        still resident and no way out but pulling the power.
-        """
+        """Every CUPS call carries a timeout, so a wedged cupsd cannot block
+        the UI with the key buffer still resident."""
         seen = {}
 
         class Result:
@@ -310,24 +277,16 @@ class TestTheArgvHandedToLp:
         monkeypatch.setattr(printer.subprocess, "run", fake_run)
         printer.Cups()._run([printer.LPSTAT, "-p"])
         assert seen.get("timeout") == printer.Cups.TIMEOUT
-        # And the locale, one line further on. Half of what lpstat prints is
-        # _cupsLangPrintf output, so on a unit installed in a non-English
-        # locale every English match against it silently stops matching --
-        # which is how the whole PRINTER STOPPED screen would disappear.
-        # Deleting the env kwarg left the entire fast suite green: this was
-        # the only test that saw the call at all, and it stopped one line
-        # short of pinning it.
+        # And the locale: much of lpstat's output is localised, so without
+        # LC_ALL=C the English matches stop matching.
         assert (seen.get("env") or {}).get("LC_ALL") == "C", (
             "CUPS is being queried in the host's locale; lpstat's header is "
             "translated and nothing that reads it will match")
 
 
 class TestAdvisoryQueriesNeverEscape:
-    """
-    Queries are advisory. Letting a wedged cupsd's timeout out of one turns
-    a slow printer into a crash loop with no panel message -- and the panel
-    is the only place an operator can be told anything.
-    """
+    """Queries are advisory, so a wedged cupsd's timeout must not escape one
+    and turn a slow printer into a crash loop with no panel message."""
 
     def test_a_wedged_cupsd_reads_as_nothing_to_report(self):
         cups = exploding_cups()
@@ -339,11 +298,8 @@ class TestAdvisoryQueriesNeverEscape:
 
 
 class TestOnlyLocallyAttachedPrintersAreAdopted:
-    """
-    The unit's whole point is being offline. Silently binding to a printer
-    across the LAN would put key material on a network, and disabling the
-    radios does not cover wired or USB ethernet.
-    """
+    """The unit must stay offline: binding to a printer across the LAN would
+    put key material on a network."""
 
     def _cups(self, listing):
         class Result:
@@ -364,17 +320,14 @@ class TestOnlyLocallyAttachedPrintersAreAdopted:
             assert [d.uri for d in self._cups(f"network {uri}\n").devices()] == [uri]
 
     def test_a_dnssd_endpoint_on_its_own_is_the_network(self):
-        # dnssd:// is how ipp-usb's local endpoint appears AND how a printer
-        # across the LAN appears. With nothing plugged into USB, it is the
-        # LAN, and adopting it would send a pad off the device.
+        # dnssd:// is how both ipp-usb's local endpoint and a LAN printer
+        # appear. With nothing plugged into USB, it is the LAN.
         assert self._cups("network dnssd://Office%20Laser._ipp._tcp.local/\n") \
             .devices() == []
 
     def test_a_dnssd_endpoint_is_ipp_usb_only_when_it_names_the_usb_device(self):
-        # This test as first written asserted that ANY usb:// device makes
-        # ANY dnssd entry trustworthy, which is the LAN-binding bug itself:
-        # "Office Laser" is not the plugged-in HP, and driverless endpoints
-        # sort first, so that is what the queue would have bound.
+        # A usb:// device does not make an unrelated dnssd entry trustworthy,
+        # and driverless endpoints sort first.
         uris = [d.uri for d in self._cups(
             "network dnssd://Office%20Laser._ipp._tcp.local/\n"
             "direct usb://HP/LaserJet?serial=1\n").devices()]
@@ -390,12 +343,9 @@ class TestOnlyLocallyAttachedPrintersAreAdopted:
 
 class TestEveryDeviceIsTried:
     def test_a_failed_driverless_setup_falls_through_to_the_usb_entry(self):
-        """
-        Driverless endpoints sort first because they need no driver, but when
-        one fails to set up, the usb:// entry for the same printer is usually
-        right behind it. Stopping at devices()[0] turns the preferred path
-        into a single point of failure.
-        """
+        """When the preferred driverless endpoint fails to set up, the usb://
+        entry for the same printer is tried instead of stopping at
+        devices()[0]."""
         class TwoWays(FakeCups):
             def devices(self):
                 return [printer.Device("ipp://localhost:60000/ipp/print", ""),
@@ -419,11 +369,8 @@ class TestEveryDeviceIsTried:
 
 
 class TestPanelMessagesAreWholeWords:
-    """
-    A 21-column panel turns an over-long string into misinformation. Fixed
-    slicing stops a driver error mid-word with no ellipsis, and it reads as
-    if that were the whole message.
-    """
+    """Panel messages are cut at word boundaries: on a 21-column panel a
+    message sliced mid-word reads as if it were the whole message."""
 
     MESSAGE = "no driver for a printer with a long name"
 
@@ -449,12 +396,9 @@ class TestPanelMessagesAreWholeWords:
 
 class TestHomeUnwindsTheWholeStack:
     def test_home_returns_to_the_root_from_any_depth(self, monkeypatch):
-        """
-        HOME exists because a screen can only pop itself, and the screens
-        underneath a finished job may not be reachable by any button
-        sequence. Popping one frame drops the operator back into the middle
-        of a codeword flow with the job already done.
-        """
+        """HOME returns to the root from any depth. Popping one frame would
+        leave the operator inside a codeword flow whose job is already
+        done."""
         class GoesHome(ui.Screen):
             def frame(self, app):
                 return Frame(title="DEEP", lines=["DEEP"])
@@ -478,10 +422,9 @@ class TestHomeUnwindsTheWholeStack:
 
 class TestSettingsTheUnitCannotUseAreNeverCommitted:
     def test_an_out_of_range_value_is_reported_and_discarded(self):
-        # The panel's own choosers only offer usable values, but _apply is
-        # the gate in front of app.settings and the config file is not the
-        # only way in. Committing a value validate() rejects is what puts
-        # the unit into a state its own loader would have refused.
+        # _apply is the gate in front of app.settings, so it must refuse a
+        # value validate() rejects even though the panel's choosers never
+        # offer one.
         app = make_app([])
         before = app.settings
         screen = ui._apply(app, font_size=99)
@@ -500,12 +443,9 @@ class TestSettingsTheUnitCannotUseAreNeverCommitted:
 
 class TestUnsavedSettingsAreVisible:
     def test_the_panel_says_when_a_change_is_not_on_the_card(self):
-        """
-        The unit tells the operator to power-cycle after every pad job, and
-        an unsaved TRAINING setting reverts to LIVE on the next boot -- so
-        the next "training" batch prints unwatermarked and is
-        indistinguishable from live key material.
-        """
+        """The panel says when a change is not saved to the card: an unsaved
+        TRAINING setting reverts to LIVE on the next boot and the next
+        batch prints unwatermarked."""
         app = make_app([])
         menu = ui.settings_menu()
         assert "UNSAVED" not in menu.frame(app).title
@@ -520,11 +460,8 @@ class TestUnsavedSettingsAreVisible:
 
 class TestAWipedJobIsFinished:
     def test_a_finished_job_cannot_spool_another_copy(self):
-        """
-        finish() drops the buffer as well as zeroing it. Keeping the
-        reference leaves a job that still answers print_next_copy() -- and
-        what it would spool is a pad's worth of zeroes.
-        """
+        """finish() drops the buffer as well as zeroing it, so a finished job
+        cannot answer print_next_copy() and spool a pad of zeroes."""
         cups = FakeCups()
         spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "RUSTED-BADGER",
                             config.Settings(pages=1, paper="A6"))
@@ -541,12 +478,9 @@ class TestAWipedJobIsFinished:
 
 class TestBankedPressesAreAlwaysDrained:
     def test_a_short_job_still_empties_the_press_queue(self):
-        """
-        Generation blocks the event loop, so presses made while it ran
-        arrive afterwards aimed at a screen that is no longer there. One
-        drain has to empty the queue however few pages the job had --
-        draining one press per page leaves the rest to replay.
-        """
+        """One drain empties the press queue however few pages the job had, so
+        presses made while generation blocked the event loop are not
+        replayed."""
         cups = FakeCups()
         spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "X-Y",
                             config.Settings(pages=1, paper="A6"))
@@ -563,12 +497,9 @@ class TestBankedPressesAreAlwaysDrained:
 
 class TestTheJournalNeverSeesAJob:
     def test_generating_a_pad_prints_nothing_at_all(self, capsys):
-        """
-        The generator's own default progress reporter prints the codeword to
-        stdout, which on the unit is the systemd journal -- the one place a
-        codeword must never be written. jobs._silent exists only to stop
-        that default applying, so nothing here may print.
-        """
+        """Generating a pad prints nothing: stdout on the unit is the systemd
+        journal, and the generator's default progress reporter prints the
+        codeword."""
         spec = jobs.JobSpec(jobs.JobKind.PAD_PAIR, "RUSTED-BADGER",
                             config.Settings(pages=2, paper="A6"))
         jobs.generate(spec)
@@ -582,12 +513,8 @@ class TestTheJournalNeverSeesAJob:
 
 
 class TestChoicesAreDrawnWithoutBias:
-    """
-    random_choice picks the codeword, and a codeword is how a pad is named
-    and found. No distribution test can catch modulo bias over a 2**32 range
-    -- the skew is one part in ten million -- so the rejection itself has to
-    be observed.
-    """
+    """Modulo bias over a 2**32 range is too small for a distribution test to
+    catch, so the rejection step itself is observed."""
 
     def test_a_draw_in_the_biased_tail_is_redrawn(self, monkeypatch):
         seq = list("ABCDEFG")                    # n = 7
@@ -620,9 +547,8 @@ class TestChoicesAreDrawnWithoutBias:
 
     def test_codewords_are_distinct_even_when_the_space_is_nearly_exhausted(
             self, tmp_path):
-        # Nine combinations exist. Asking for all nine can only succeed if a
-        # repeat is rejected and redrawn -- and two pads wearing one codeword
-        # is exactly what the naming convention exists to prevent.
+        # Only nine combinations exist, so asking for all nine succeeds only
+        # if a repeat is rejected and redrawn.
         base = tiny_vocabulary(tmp_path)
         for _ in range(5):
             words = g.random_codewords(9, base)
@@ -633,11 +559,8 @@ class TestChoicesAreDrawnWithoutBias:
 
 
 class TestThePaperSettingReachesTheGeometry:
-    """
-    The imposition is baked into the PDF, so the paper setting is the only
-    thing standing between the operator and a stack that cannot be cut. Both
-    ways of getting it wrong are silent: every page still prints.
-    """
+    """The imposition is baked into the PDF, so a wrong paper setting silently
+    yields a stack that cannot be cut."""
 
     def test_the_default_is_four_pad_pages_per_a4_sheet(self):
         pages = pdf_pages(pad_pdf(pages=8))
@@ -655,9 +578,8 @@ class TestThePaperSettingReachesTheGeometry:
         assert round(float(pages[0].mediabox.width)) == round(g.A6[0])
 
     def test_a7_asks_the_driver_for_a6_whatever_the_paper_setting(self):
-        # A7 emits landscape-A6 sheets with their own cut line. Sending
-        # media=A4 would ask the driver to scale a sheet that is already the
-        # right size, and the cut line would no longer be down the middle.
+        # A7 emits landscape-A6 sheets with their own cut line; media=A4
+        # would make the driver rescale them and move the cut.
         for paper in ("A4", "LETTER", "A6"):
             assert config.Settings(a7=True, paper=paper).lp_options["media"] == "A6"
 
@@ -668,17 +590,10 @@ class TestThePaperSettingReachesTheGeometry:
 
 class TestImposedSheetsCarryTheirCutMarks:
     def test_both_cuts_are_marked_at_both_ends(self):
-        """
-        Counting line segments is not enough: an imposed sheet draws eight,
-        and four of those are the pad pages' own header rules. What makes a
-        crop mark a crop mark is that it lies ON a cut line -- so look for
-        segments collinear with the two cuts, and nowhere else.
-
-        Deliberately not pinned to the exact tick length or inset. Those are
-        printer-dependent (a laser cannot mark the outer few millimetres of
-        a sheet), and a test that fixes them breaks on a legitimate change
-        while saying nothing about whether the blade has anything to follow.
-        """
+        """Both cuts are marked at both ends, found as segments collinear with
+        the cut lines, since the page's header rules are line segments too.
+        Tick length and inset are printer-dependent and deliberately not
+        pinned."""
         segments = line_segments(content_stream(pad_pdf(pages=4)))
         page_w, page_h = g.A4
 
@@ -693,8 +608,8 @@ class TestImposedSheetsCarryTheirCutMarks:
         assert len(vertical) == 2, "the vertical cut needs a mark at each end"
         assert len(horizontal) == 2, "the horizontal cut needs a mark at each side"
 
-        # Edge ticks, not full rules: a line across the sheet would run
-        # through the key area. Each mark stays inside the outer quarter.
+        # Edge ticks, not full rules: each mark stays in the outer quarter so
+        # no line crosses the key area.
         for x1, y1, x2, y2 in vertical:
             assert max(y1, y2) < page_h / 4 or min(y1, y2) > 3 * page_h / 4, \
                 "a crop mark must not run through the key area"
@@ -705,12 +620,8 @@ class TestImposedSheetsCarryTheirCutMarks:
 
 class TestThePageNumberIsAFourDigitField:
     def test_a_five_digit_page_number_is_not_silently_wrapped(self):
-        """
-        Both ends drill against a fixed four-digit page number, so it must
-        never wrap: page 10001 printing as 0001 puts two different pages
-        under one label, and the pair would decrypt to nonsense with nothing
-        on the page to say why.
-        """
+        """A five-digit page number is refused, not wrapped: page 10001
+        printing as 0001 would put two different pages under one label."""
         sink = io.BytesIO()
         canvas = g.new_canvas(sink, g.A6)
         g.draw_pad_page(canvas, "RUSTED-BADGER", 10001, 35, 9,
@@ -726,12 +637,9 @@ class TestThePageNumberIsAFourDigitField:
 
 class TestTheDocumentGivesNothingAway:
     def test_no_field_of_the_info_dictionary_carries_anything(self):
-        """
-        The Info dictionary is not compressed, so a `strings` pass over a
-        spooled job reads it directly. Pinning the title and the dates but
-        leaving reportlab's defaults in Author, Subject and Creator leaves
-        three fields saying something about where the pad was made.
-        """
+        """No field of the Info dictionary carries anything: it is
+        uncompressed, so `strings` over a spooled job reads it, reportlab's
+        defaults included."""
         pypdf = pytest.importorskip("pypdf")
         metadata = pypdf.PdfReader(io.BytesIO(pad_pdf(pages=1))).metadata
 
@@ -741,12 +649,9 @@ class TestTheDocumentGivesNothingAway:
 
 
 class TestTrainingMaterialIsMarkedWhereverItIsAskedFor:
-    """
-    otp.md requires practice material to be unmistakably marked. Both ways
-    of asking for it -- the CLI flag and the unit's setting -- pass the flag
-    down a chain, and a break anywhere in either chain prints an unmarked
-    pad that is indistinguishable from live key material.
-    """
+    """Practice material is marked whether asked for by the CLI flag or the
+    unit's setting; a break in either chain prints a pad indistinguishable
+    from live key material."""
 
     def test_the_units_training_setting_reaches_the_page(self):
         assert training_marks(pad_pdf(pages=1, paper="A6", training=True)) == 2
@@ -784,10 +689,8 @@ class TestTheWorksheetTeachesBothDirections:
         return sink.getvalue()
 
     def test_it_says_how_to_decrypt_not_only_how_to_encrypt(self):
-        # Two of the manual's three exercises are decrypts, where the
-        # ciphertext goes in the top row and the plaintext comes out of the
-        # shaded one. A student following the M/K/C labels alone walks
-        # straight into the wrong arithmetic.
+        # Two of the manual's three exercises are decrypts, so the worksheet
+        # must label which row is which beyond the M/K/C letters.
         text = page_text(self._worksheet())
         assert "ENCRYPT M+K=C" in text
         assert "DECRYPT" in text and "C IN THE TOP ROW" in text
@@ -796,8 +699,8 @@ class TestTheWorksheetTeachesBothDirections:
         data = self._worksheet()
         blocks = [row for row in glyph_rows(data) if row == "C"]
         assert blocks, "the worksheet must have C rows at all"
-        # One wide grey fill per block. The narrow rectangles are the
-        # letter cells, which are about 13pt across.
+        # One wide grey fill per block; the narrow rectangles are the letter
+        # cells.
         shaded = [rect for rect in rectangles(content_stream(data))
                   if rect[2] > 100]
         assert len(shaded) == len(blocks), "the answer row must be findable"
@@ -807,12 +710,9 @@ class TestTheWorksheetTeachesBothDirections:
 
 
 class TestAHandEditedConfigCannotPrintAUselessPad:
-    """
-    The config file's own header invites the operator to edit it by hand, so
-    every bound the panel enforces has to be enforced again on load. These
-    two are the ones whose failure is invisible: the pad prints, and it is
-    the printing that is wrong.
-    """
+    """The config file invites hand editing, so the panel's bounds are
+    enforced again on load. These two failures still print, and print
+    wrongly."""
 
     def test_a_font_that_only_overflows_sideways_is_still_rejected(self):
         settings = config.Settings(font_size=14)
@@ -820,14 +720,14 @@ class TestAHandEditedConfigCannotPrintAUselessPad:
         assert settings.chars_per_page <= g.calc_max_chars(
             settings.font_size, settings.a7, settings._box_height()), \
             "this size must be caught by the width check, not the height one"
-        # It is the width that fails: the inter-group gap goes negative and
-        # the five-letter groups print superimposed, inside the content box,
-        # so nothing overflows visibly and both copies are equally unreadable.
+        # The width is what fails: the inter-group gap goes negative and the
+        # groups overprint inside the content box, so nothing overflows
+        # visibly.
         assert settings.validate() == ["font size too large for the page width"]
 
     def test_an_auth_group_that_would_overprint_the_page_number_is_rejected(self):
-        # AUTH and the page number are the two fields deliberately kept at
-        # full size, because they are read character by character.
+        # AUTH and the page number are kept at full size because they are
+        # read character by character.
         assert config.Settings(auth_size=36).validate() == \
             ["auth group too wide for the header"]
         assert config.Settings(auth_size=8).validate() == []
@@ -842,9 +742,8 @@ class TestAHandEditedConfigCannotPrintAUselessPad:
 
 class TestTheCliRejectsWhatItCannotDraw:
     def test_fontsize_must_be_a_positive_number(self, tmp_path):
-        # nan is the interesting one: it compares False against every bound,
-        # so a bare `<= 0` check lets it through to calc_max_chars, which
-        # raises int(nan) with a traceback instead of a message.
+        # nan compares False against every bound, so a bare `<= 0` check lets
+        # it through.
         for bad in ("0", "-3", "nan"):
             result = cli(["--random-codewords", "1", "--pages", "1",
                           "--fontsize", bad, "--output", str(tmp_path)],
@@ -868,13 +767,9 @@ class TestTheCliRejectsWhatItCannotDraw:
 
 class TestAStalePressTimeCannotReFire:
     def test_a_second_release_does_not_replay_the_last_press(self, monkeypatch):
-        """
-        The press time is cleared as it is read. Leaving it set means a
-        stray release -- bounce on the way up, or a press edge lost to the
-        debounce window -- is timed against the previous press and emits a
-        second event. While a job is printing OK and BACK mean opposite
-        things, so a phantom BACK purges the spool.
-        """
+        """The press time is cleared as it is read, so a stray release emits
+        no second event. While a job prints, a phantom BACK would purge the
+        spool."""
         import queue
         from otpunit.hw import buttons as buttons_mod
 

@@ -1,20 +1,7 @@
-"""The systemd unit and the provisioning script have to agree.
-
-These are static checks over two files, so they cost nothing and run in
-the fast suite -- but the defect they guard against is only observable on
-a booted system, which is the expensive place to find it.
-
-What was found there: otp-unit.service names four supplementary groups and
-install.sh created none of them. systemd refuses to start a unit whose
-SupplementaryGroups reference a group that does not exist --
-
-    Failed at step GROUP spawning /usr/bin/python3
-    Main process exited, code=exited, status=216/GROUP
-
--- and with Restart=on-failure the unit loops forever. On a device whose
-journal is volatile by design, that is a dark panel and no evidence.
-Raspberry Pi OS ships gpio and i2c so the intended platform worked, which
-is exactly why nothing caught it.
+"""Static checks that the systemd unit and the provisioning script agree. systemd
+refuses to start a unit whose SupplementaryGroups name a missing group, and
+with Restart=on-failure and a volatile journal that is a dark panel with no
+evidence.
 """
 import os
 import re
@@ -68,19 +55,10 @@ class TestTheUnitCanActuallyStart:
         assert declared_groups(), "no SupplementaryGroups to check"
 
     def test_install_sh_creates_every_group_the_service_needs(self, tmp_path):
-        """
-        Every group named in the unit must be one install.sh really creates.
+        """Every group named in the unit is one install.sh really creates.
 
-        RUN the script rather than pattern-match it. The first version of
-        this test matched the text of a `for group in ...; do` header and
-        never looked at the body: replacing the body with `:` -- which
-        leaves the device with no groups and the unit in a permanent
-        restart loop -- still reported 4 passed. It was also brittle in the
-        wrong direction, failing on a hoisted variable or a wrapped line,
-        both behaviourally identical.
-
-        So: stub groupadd and getent onto PATH, run install.sh far enough
-        to execute the loop, and see which groups it actually asks for.
+        The script is run with groupadd and getent stubbed onto PATH, not
+        pattern-matched, so an empty loop body cannot pass.
         """
         script = INSTALL.read_text()
         block = re.search(r"log \"Ensuring the groups.*?\ndone\n", script, re.S)
@@ -110,61 +88,34 @@ class TestTheUnitCanActuallyStart:
             f"Restart=on-failure loops it forever. Created: {created}")
 
     def test_the_unit_still_bans_core_dumps_itself(self):
+        """The unit sets LimitCORE=0. coredump.conf only binds when
+        systemd-coredump is the registered handler, so the unit-level limit is
+        the one that holds regardless.
         """
-        LimitCORE=0 is what actually protects THIS process.
-
-        install.sh also sets Storage=none in coredump.conf, but that only
-        binds when systemd-coredump is the registered handler -- measured
-        in a booted VM, kernel.core_pattern was plain `core`, so dumps
-        would have gone to a file in the working directory and the
-        coredump.conf would never have been consulted. The unit-level
-        limit is the one that holds regardless.
-        """
-        # Parsed, not a substring search over the whole file: commenting
-        # the directive out (`#LimitCORE=0`) satisfied `in unit_text()`
-        # while systemd ignored the line entirely.
+        # Parsed, not a substring search: a commented-out `#LimitCORE=0` must
+        # not pass.
         assert directive("LimitCORE") == "0", (
             f"LimitCORE is {directive('LimitCORE')!r}, so the process can "
             f"dump the pad it is holding")
 
     def test_nothing_can_stop_the_panel_by_starting_a_getty_on_tty1(self):
+        """The unit has no Conflicts= on the tty1 getty, and install.sh keeps the
+        login prompt off tty1 with a condition on the getty instead. Conflicts=
+        is symmetric: anything starting that getty (userconf-pi does) would
+        stop the panel.
         """
-        Conflicts= is symmetric, and that is what made it wrong here.
-
-        The unit holds /dev/tty1 as the front panel, and the line that used
-        to keep a login prompt off it was Conflicts=getty@tty1.service --
-        which also means "anything that starts that getty stops this unit".
-        Something does: userconf-pi's cancel-rename is the last thing a
-        successful credential apply runs, and it ends with `systemctl
-        --no-block start getty@tty1`. An operator who set their password
-        through the documented /boot/firmware/userconf.txt lost the print
-        unit until the next power-cycle.
-
-        install.sh keeps the prompt off tty1 with a condition on the getty
-        instead, so it never starts rather than being stopped, and
-        harness/img-guest-check.sh gates both halves on the booted image.
-        """
-        # Parsed, not searched: the comment above the directive names the
-        # line it removed, and a substring test would match that instead --
-        # passing or failing on prose either way.
+        # Parsed, not searched: the unit's own comments mention the directive.
         assert directive("Conflicts") is None, (
             f"Conflicts={directive('Conflicts')} is back: a getty started "
             f"by cancel-rename after a credential apply stops the panel")
-        # The replacement has to be in the file that provisions the machine,
-        # or removing the conflict just hands tty1 to the login prompt.
-        #
-        # The messages are real messages. `install[:0]` was here, which is
-        # the empty string -- a failing assert printed its own source and
-        # nothing else, on the one test that says why tty1 belongs to the
-        # panel.
+        # The replacement must be in install.sh, or removing the conflict hands
+        # tty1 to the login prompt.
         install = INSTALL.read_text()
         assert "/etc/systemd/system/getty@tty1.service.d" in install, (
             "install.sh writes no drop-in for getty@tty1, so with Conflicts= "
             "gone there is nothing keeping a login prompt off the panel's tty")
-        # The condition keys on the panel being GOING TO RUN. Pointed at the
-        # unit file alone it read false on a masked panel too -- mask writes
-        # a symlink to /dev/null there -- and left tty1 with no getty and no
-        # panel. tests/test_overlay_root.py has the four-state truth table.
+        # The condition keys on the panel going to run, so a masked panel still
+        # gets a getty. tests/test_overlay_root.py has the truth table.
         for directive_line in (
                 "ConditionPathExists=|!/etc/systemd/system/"
                 "multi-user.target.wants/otp-unit.service",
@@ -174,15 +125,11 @@ class TestTheUnitCanActuallyStart:
                 f"getty drop-in does not say what it is conditional on")
 
     def test_restart_on_failure_is_paired_with_a_backoff(self):
-        # Without RestartSec above systemd's burst limit, a unit that
-        # cannot start goes permanently `failed` after five tries in ten
-        # seconds -- which on this device means it never comes back.
+        # Without RestartSec above systemd's burst limit, a unit that cannot
+        # start goes permanently `failed` after five tries in ten seconds.
         assert directive("Restart") == "on-failure"
-        # Seconds, honouring systemd's suffixes. A bare \\d+ regex read
-        # `RestartSec=500ms` as 500 and passed it -- five restarts in 2.5s
-        # is inside the default burst window, so the unit goes permanently
-        # `failed`, which is exactly what this test says it prevents. The
-        # same regex failed `RestartSec=1min`, which is correct.
+        # Seconds, honouring systemd's suffixes: `500ms` must not read as 500
+        # and `1min` must pass.
         raw = directive("RestartSec") or ""
         assert seconds(raw) >= 10, (
             f"RestartSec={raw!r} is under systemd's 5-in-10s burst limit, "

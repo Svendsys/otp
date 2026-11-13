@@ -15,82 +15,33 @@ WIDTH = 128
 HEIGHT = 64
 
 # The 6x8 bitmap font this panel's geometry is built on: 21 columns, 8 rows.
-# See _panel_font() -- it is no longer what PIL hands out by default, and
-# every number in this file depends on it.
+# Every number in this file depends on it; see _panel_font().
 COLS = 21
 ROWS = 8
 # Pixels between the tops of consecutive rows. 8 * 8 = 64, exactly the panel.
 ROW_HEIGHT = 8
-# And two pixels up, which is not a fudge -- it is the only offset that
-# fits. Measured over the whole printable set in this font: ink occupies
-# cell rows 2..9 for capitals, digits and the punctuation the panel uses,
-# and 1..10 once lowercase descenders are counted. Eight rows at a pitch of
-# 8 therefore span 7*8 + 8 = 64 pixels of capital ink, which is the panel
-# exactly -- but only if the block starts at -2. At the shipped 0 the last
-# row ran to 67 and every footer lost its bottom pixels.
-#
-#   ROW_TOP    0    -1    -2    -3
-#   off bottom 3     2     1     0
-#   off top    0     0     0     2
-#
-# -2 is the minimum, and the pixel it still loses belongs to a lowercase
-# descender on the LAST row only -- where the unit only ever puts an
-# uppercase footer. tests/test_panel_pixels.py asserts the RESULT over
-# every real screen rather than this reasoning, so a font change is caught
-# even if the comment rots.
+# Rows start two pixels above the panel. Capital and digit ink occupies
+# cell rows 2..9 in this font, so eight rows at a pitch of 8 fit the 64px
+# panel only from -2. The one pixel still lost is a lowercase descender on
+# the last row, which only ever holds an uppercase footer.
+# tests/test_panel_pixels.py asserts the result over every real screen.
 ROW_TOP = -2
 
 
 def _panel_font():
     """
-    The 6x8 bitmap font, explicitly -- NOT ImageFont.load_default().
+    The 6x8 bitmap font, explicitly, not ImageFont.load_default().
 
-    Pillow 10.1 changed what load_default() returns: where FreeType is
-    available it now hands back Aileron, a PROPORTIONAL TrueType face. The
-    unit installs python3-pil from apt (device/packages.txt), so it gets
-    whatever the distro ships. Measured against Aileron on Pillow 12.3:
+    Since Pillow 10.1 load_default() may return Aileron, a proportional
+    TrueType face, and the 21-column grid is only correct for a monospace
+    one. load_default_imagefont() (Pillow 10.4+) returns the bitmap font;
+    on 10.1-10.3 there is nothing to fall back to.
 
-        'X' * 21    126 px   fits
-        'M' * 21    189 px   61 px past the right edge
-        'W' * 21    210 px   82 px past the right edge
-
-    Frame.rendered() truncates to 21 CHARACTERS, which is the correct unit
-    only for a monospace font. With a proportional one the panel silently
-    cut lines off at the right edge -- and the taller face also pushed 43
-    pixels of the footer off the bottom of a 64-pixel screen.
-
-    Three eras, and the middle one is the trap:
-
-        Pillow < 10.1    load_default() is already the bitmap font.
-        Pillow 10.1-10.3 load_default() is Aileron and there is NO
-                         load_default_imagefont() to ask for instead.
-        Pillow >= 10.4   load_default_imagefont() returns the bitmap font.
-
-    load_default_imagefont() arrived in 10.4, not 11 -- verified against the
-    sdists: absent from 10.3.0/src/PIL/ImageFont.py, present at line 909 of
-    10.4.0's. So on 10.1-10.3 there is nothing to fall back TO, and a
-    getattr() fallback lands on the exact face this function exists to
-    refuse. Ubuntu 24.04's python3-pil is 10.2.0, squarely inside the window.
-
-    A type check rather than a version check, because the version boundary
-    is not the thing that matters -- whatever we are handed has to BE the
-    bitmap face. FreeTypeFont and ImageFont are siblings rather than parent
-    and child, so isinstance is exact and not a subclass accident.
-
-    And it RETURNS the wrong font rather than raising on it. Raising was
-    tried and was worse: hmi.open_display wraps this construction in a bare
-    `except Exception` and reports "no OLED", so a working panel on Pillow
-    10.2 was deleted from the interface, Interface.interactive went False,
-    and __main__ fell through to the unattended path -- which prints a
-    status sheet claiming the unit "booted with no display attached" and
-    then, five minutes later, a whole pad pair with a codeword nobody
-    chose. The guard against a slightly-wrong panel became unprompted
-    emission of key material on exactly the versions it was written for.
-
-    draw_frame fits each row to the panel instead, so a proportional face
-    degrades to visible truncation rather than ink off the right-hand edge,
-    and the unit keeps its menu. On the correct font this changes nothing:
-    21 columns is 126px of a 128px panel.
+    In that case the wrong font is returned, not refused: raising here is
+    reported as "no OLED", which drops a working panel and sends the unit
+    down the unattended path to print a pad nobody asked for. draw_frame
+    fits each row in pixels, so a proportional face degrades to visible
+    truncation. is_panel_font() tells which was returned.
     """
     from PIL import ImageFont
 
@@ -192,10 +143,8 @@ class ConsoleDisplay(Display):
 
     def __init__(self, stream=None, hint=True):
         self.stream = stream or sys.stdout
-        # The key hint is simulator furniture. On a real unit it told the
-        # operator to press [q], which ended the process with status 0 --
-        # and Restart=on-failure reads that as success and does not
-        # restart. One advertised keystroke turned the appliance off.
+        # The key hint is simulator furniture: on a real unit [q] must not
+        # be advertised, since quitting ends the process.
         self.hint = hint
 
     def show(self, frame: Frame) -> None:
@@ -219,30 +168,34 @@ class ConsoleDisplay(Display):
 class Ssd1306Display(Display):
     """The real panel: 128x64 SSD1306 over I2C, via luma.oled."""
 
-    # 90 and 270 degrees turn the 128x64 panel into a 64x128 one, and every
-    # number above -- COLS=21, ROWS=8, the whole grid -- is landscape. luma
-    # swaps width and height for odd rotations, so draw_frame's 126px rows
-    # were being cut to 64px: measured against a rotated dummy device, the
-    # ink bbox for a full screen is (64,0,127,64) at rotate=1 and (1,0,64,64)
-    # at rotate=3, i.e. half of every line gone and the other half of the
-    # panel dark. Refused rather than half-drawn.
+    # 90 and 270 degrees turn the panel into 64x128, and the whole
+    # character grid is landscape, so half of every line would be lost.
+    # Refused, not half-drawn.
     SQUARE_ON = (0, 2)
 
     def __init__(self, port: int = 1, address: int = 0x3C, rotate: int = 0):
-        # Before the hardware imports: a bad argument should be rejected
-        # without opening a bus, and the check is worth testing on a machine
-        # that has no luma.oled at all.
+        # Before the hardware imports, so a bad argument is rejected
+        # without opening a bus.
         if rotate not in self.SQUARE_ON:
             raise ValueError(
                 f"rotate={rotate} gives a {HEIGHT}x{WIDTH} portrait panel, "
                 f"but the {COLS}x{ROWS} character grid this UI is built on "
                 f"needs {WIDTH}x{HEIGHT}; only {self.SQUARE_ON} are supported")
 
+        self._port, self._address, self._rotate = port, address, rotate
+        self._device = self._open()
+        self._font = _panel_font()
+
+    def _open(self):
         from luma.core.interface.serial import i2c
         from luma.oled.device import ssd1306
 
-        self._device = ssd1306(i2c(port=port, address=address), rotate=rotate)
-        self._font = _panel_font()
+        return ssd1306(i2c(port=self._port, address=self._address),
+                       rotate=self._rotate)
+
+    def reopen(self) -> None:
+        """Re-run the panel's init sequence after it lost power or sync."""
+        self._device = self._open()
 
     def show(self, frame: Frame) -> None:
         from luma.core.render import canvas
@@ -254,57 +207,36 @@ class Ssd1306Display(Display):
         """
         Put a frame on a PIL draw context.
 
-        Split out of show() so a test can drive the real drawing against a
-        framebuffer it can read back. Everything above this module deals in
-        characters; this is the only place the panel becomes pixels, and
-        until tests/test_panel_pixels.py it was the only place with no
-        coverage at all -- the SSD1306 init sequence ran under i2c-stub and
-        nothing was ever drawn.
-
-        Each row is fitted to the panel in PIXELS as well as characters.
-        Frame.rendered() cuts to 21 CHARACTERS, which is the right unit only
-        for a monospace face; with the proportional font some Pillow
-        versions hand out, 21 characters is up to 210px on a 128px panel and
-        the overflow is simply lost off the right-hand edge with nothing to
-        show for it. Fitting here means the worst a wrong font can do is
-        visible truncation. On the correct font it is a no-op -- 21 columns
-        is 126px -- so this costs the shipped configuration nothing.
+        Separate from show() so a test can draw into a framebuffer it can
+        read back. Each row is fitted to the panel in pixels as well as
+        characters, so a proportional font degrades to visible truncation
+        instead of ink lost off the right edge. A no-op on the bitmap font.
         """
         for row, text in enumerate(frame.rendered()):
+            # The bitmap face is Latin-1 and Pillow raises on anything
+            # outside it, which would blank the whole frame over one
+            # character in a printer's name.
+            text = text.encode("latin-1", "replace").decode("latin-1")
             fitted, left = self._fit(text.rstrip())
             draw.text((left, row * ROW_HEIGHT + ROW_TOP), fitted,
                       font=self._font, fill=255)
 
     def _fit(self, text: str):
-        """The longest prefix of `text` whose INK stays on the panel.
+        """The longest prefix of `text` whose ink stays on the panel.
 
-        Free on the shipped configuration: the 6x8 face puts 21 columns at
-        126px of a 128px panel by construction, so there is nothing to
-        measure and this returns immediately. The measuring path exists for
-        the substituted-font case, where being slow is not a concern
-        because the alternative is an unreadable panel.
-
-        RENDERED ink, not font metrics. Both getlength (the advance) and
-        getbbox (the metric ink box) under-report what actually reaches the
-        raster for a proportional face -- measured on Aileron, getbbox said
-        the row "HOLD OK TO SHUT DOWN" ended at x=121 and it rasterised to
-        x=130. Trimming on either left ink at x=129 on a 128px panel, which
-        is the whole defect. The only reliable answer is to draw it and
-        look.
-
-        Returns the text AND the x it must be drawn at. A glyph can have a
-        negative left bearing -- ink to the left of its own origin -- and no
-        amount of trimming from the right fixes ink at x=-1, so the row gets
-        nudged instead.
+        Returns (text, x). Immediate for the bitmap face, which fits by
+        construction. For a substituted font the row is rendered and the
+        actual ink measured, because getlength and getbbox under-report
+        what a proportional face rasterises. x is nudged right when a
+        glyph has a negative left bearing, which trimming cannot fix.
         """
         if is_panel_font(self._font):
             return text, 0
 
         from PIL import Image, ImageDraw
 
-        # Drawn at an offset, because PIL discards negative coordinates:
-        # measuring at x=0 would silently hide the very bearing being
-        # measured, which is the same blindness that let ROW_TOP=-3 through.
+        # Drawn at an offset, because PIL discards negative coordinates and
+        # would hide a negative bearing.
         margin = WIDTH
         def ink(candidate: str):
             probe = Image.new("1", (WIDTH * 8, ROW_HEIGHT * 4), 0)

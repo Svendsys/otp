@@ -1,26 +1,9 @@
 """The read-only root overlay: what install.sh does, and what proves it.
 
-Issue #9. Nothing enabled the overlay -- install.sh printed advice, the
-pi-gen stage printed the same advice, and the image booted read-write -- so
-the property the whole design rests on, that pulling the plug erases the
-session, was true only of units whose owner had run a command they were told
-about in a paragraph of output.
-
-The advice was also broken on trixie, which is why install.sh does not call
-raspi-config. On bookworm and later `enable_overlayfs` installs Debian's
-overlayroot package, whose initramfs script moves the root aside with
-`mount --move`; the mount(8) an initramfs-tools initrd actually contains is
-klibc's, which prints `mount: invalid option --` and takes init down with
-it. That is the panic recorded in issue #9's first comment, and it is a
-property of the package rather than of the guest it was first seen in.
-
-These tests RUN the shipped blocks rather than pattern-matching them, for
-the reason test_service_unit.py gives: the first version of the group guard
-matched the text of a `for` header and never executed the body. Where a
-block writes to absolute paths that a test has no business touching, it is
-sliced at the boundary where its behaviour is still parameterised -- the
-boot directory and the command-line file are variables, and the verification
-that decides whether provisioning fails is entirely inside that boundary.
+install.sh ships its own initramfs overlay script (issue #9) rather than
+calling raspi-config, whose overlayroot package needs a `mount --move` that
+klibc's mount lacks. These tests run the shipped blocks rather than
+pattern-matching them, sliced where their paths are still variables.
 """
 import hashlib
 import os
@@ -40,9 +23,7 @@ IMGCHECK_UNIT = REPO / "device" / "systemd" / "otp-unit-imgcheck.service"
 IDENTITY_SH = REPO / "device" / "persist-identity.sh"
 IDENTITY_UNIT = REPO / "device" / "systemd" / "otp-unit-identity.service"
 
-# What a machine-id looks like once systemd has generated one: 32 lower-case
-# hex characters. Both ends of the persistence -- the initramfs restore and
-# the guest check that reads it back -- are written around that shape.
+# Shape of a generated machine-id: 32 lower-case hex characters.
 LIVE_ID = "0f9c2b4d6e8a1c3f5b7d9e0a2c4e6f81"
 
 
@@ -57,12 +38,8 @@ def run_block(block: str, tmp_path, *, env=None, preamble=""):
     """Run a slice of install.sh with a stub PATH and a fake boot directory."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    # systemctl is stubbed rather than allowed through: the block disables a
-    # first-boot service and masks another, and a test must not touch the
-    # machine it runs on. It RECORDS what it was asked to do, because
-    # "install.sh masks systemd-growfs-root.service" is a claim about a
-    # command that was issued, and a stub that only exits 0 cannot tell a
-    # block that issued it from one that never did.
+    # Stubbed so a test never touches the host; it records its arguments so a
+    # test can tell that a command was issued.
     (bin_dir / "systemctl").write_text(
         '#!/bin/sh\n'
         'if [ -n "${SYSTEMCTL_LOG:-}" ]; then printf \'%s\\n\' "$*" >> "$SYSTEMCTL_LOG"; fi\n'
@@ -114,58 +91,36 @@ def cmdline_after(tmp_path, before: str) -> str:
 def test_the_overlay_token_is_added_to_the_command_line(tmp_path):
     after = cmdline_after(tmp_path, PI_GEN_CMDLINE)
     assert after.startswith("boot=overlay "), after
-    # Everything else survives. Losing root= here would be an unbootable
-    # card, and the token is prepended precisely so nothing else moves.
+    # Everything else survives: losing root= would be an unbootable card.
     assert "root=PARTUUID=1a2b3c4d-02" in after
     assert "rootfstype=ext4" in after
 
 
 def test_adding_the_token_twice_does_not_add_it_twice(tmp_path):
-    # install.sh says "safe to rerun" at the top of the file, and the
-    # documented iteration loop is edit, rerun, reboot.
+    # install.sh is documented as safe to rerun.
     once = cmdline_after(tmp_path, PI_GEN_CMDLINE)
     twice = cmdline_after(tmp_path, once)
     assert twice.count("boot=overlay") == 1, twice
 
 
 def test_the_first_boot_resize_token_is_removed(tmp_path):
-    """
-    An online resize cannot grow a filesystem mounted read-only as the
-    overlay's lower layer, and a first-boot service that fails and reboots
-    is a loop rather than a message. The appliance has nothing to grow.
-    """
+    """The `resize` token is removed: an online resize cannot grow a read-only
+    lower layer, and a failing first-boot service is a reboot loop."""
     after = cmdline_after(tmp_path, PI_GEN_CMDLINE)
     assert " resize" not in after and not after.endswith("resize\n"), after
-    # Not a blanket deletion of the substring: fsck.repair and rootwait are
-    # neighbours here and a sloppier sed would have taken part of one.
+    # Not a blanket substring deletion: the neighbouring tokens survive.
     assert "fsck.repair=yes" in after
     assert "rootwait" in after
 
 
 def test_systemds_own_grower_is_masked_as_well_as_pi_gens(tmp_path):
-    """
-    Two units grow the root filesystem on a Pi OS image, and disabling one
-    of them is what shipped.
-
-    rpi-resize.service is the pi-gen one and it is disabled above.
-    systemd-growfs-root.service is systemd's, and nothing enables it: it is
-    hooked onto the root mount by systemd-fstab-generator on every boot, so
-    there is no symlink for `disable` to remove and it ran on every boot of
-    every image this project has built. On an overlay root it cannot
-    succeed -- `/` is an overlayfs, systemd-growfs wants a block device --
-    and run 72's tier-3 console carries the result in both boots:
-
-        systemd-growfs[293]: File system "/" not backed by block device.
-        systemd[1]: systemd-growfs-root.service: Failed with result 'exit-code'.
-
-    It was invisible until issue #21 put the journal on the console. The
-    verb has to be `mask`: `disable` is a no-op against a generator.
-    """
+    """systemd-growfs-root.service is masked, not disabled: a generator hooks
+    it onto the root mount, so there is no symlink for `disable` to remove, and
+    it cannot succeed on an overlay root."""
     cmdline_after(tmp_path, PI_GEN_CMDLINE)
     calls = systemctl_calls(tmp_path)
     assert "mask systemd-growfs-root.service" in calls, calls
-    # The pi-gen half is still done -- this is an addition to that decision,
-    # not a replacement for it.
+    # The pi-gen grower is still disabled as well.
     assert any(c.startswith("disable rpi-resize.service") for c in calls), calls
 
 
@@ -174,9 +129,8 @@ def test_systemds_own_grower_is_masked_as_well_as_pi_gens(tmp_path):
 def kernels_guard_block() -> str:
     """The empty-kernel-list guard, ending at its own `fi`.
 
-    The end is computed rather than quoted for the same reason the build
-    loop's is: an edit inside the block has to surface as a behavioural
-    failure, not as a slice that stopped matching.
+    The end is computed so an edit inside the block fails behaviourally rather
+    than breaking the slice.
     """
     text = INSTALL.read_text()
     start = text.index('    if [ -z "$KERNELS" ]; then')
@@ -184,12 +138,10 @@ def kernels_guard_block() -> str:
 
 
 def initramfs_build_block() -> str:
-    """The per-kernel build loop, sliced without its trailing flag.
+    """The per-kernel build loop, ending at its `done`.
 
-    The end anchor deliberately stops at `done` rather than quoting the
-    `update-initramfs` line, so a change to that line shows up as a failed
-    assertion about what was RUN rather than as a slice that no longer
-    matches.
+    The update-initramfs line is not quoted, so a change to it fails an
+    assertion about what was run.
     """
     text = INSTALL.read_text()
     start = text.index("    for kern in $KERNELS; do")
@@ -209,37 +161,23 @@ def run_initramfs_build(tmp_path, kernels):
 
 
 def test_the_initramfs_is_created_and_not_merely_updated(tmp_path):
-    """
-    `-c`, and the shipped comment names the exact defect: pi-gen sets
-    update_initramfs=no in update-initramfs.conf so kernel installs build
-    nothing, and update-initramfs honours that setting on its UPDATE path
-    only. `-u` therefore prints "Not updating initramfs." and exits 0,
-    leaving the overlay script out of an initramfs that already exists, has
-    the right name and is the right size -- the firmware loads it,
-    boot=overlay is read by nothing, and the unit comes up on a writable
-    root. Nothing was red for that edit until this test.
-    """
+    """`-c`, not `-u`: pi-gen sets update_initramfs=no, which update-initramfs
+    honours on its update path only, so `-u` exits 0 and leaves the overlay
+    script out of the initramfs."""
     kernels = "6.12.96+rpt-rpi-v8 6.12.96+rpt-rpi-2712"
     proc, argv = run_initramfs_build(tmp_path, kernels)
     assert proc.returncode == 0, proc.stderr
-    # Every installed kernel, not just one: the image carries a second one
-    # for the Pi 5, and an initramfs missing for the kernel that boots is
-    # the same read-write root by another route.
+    # Every installed kernel: the image carries a second one for the Pi 5.
     assert argv.split() and argv.splitlines() == [
         f"-c -k {kern}" for kern in kernels.split()], argv
 
 
 def test_no_kernel_under_lib_modules_stops_provisioning(tmp_path):
-    """
-    In pi-gen's chroot `uname -r` is the BUILD HOST's kernel, for which
-    there are no modules and no initramfs can be built -- so the kernel list
-    is read out of /lib/modules, and an empty list means the overlay cannot
-    be enabled at all. Building nothing and carrying on leaves the later
-    verification to catch it, which is one guard rather than two.
+    """An empty kernel list stops provisioning: with no initramfs the overlay
+    cannot be enabled.
 
-    KERNELS is set here rather than discovered: the discovery loop reads
-    /lib/modules on the machine running the test, and what it finds there
-    is not this repository's business.
+    KERNELS is set rather than discovered, since discovery reads the test
+    machine's /lib/modules.
     """
     proc = run_block(kernels_guard_block(), tmp_path, preamble='KERNELS=""')
     assert proc.returncode != 0, proc.stdout
@@ -247,8 +185,8 @@ def test_no_kernel_under_lib_modules_stops_provisioning(tmp_path):
 
 
 def test_a_kernel_list_passes_the_guard(tmp_path):
-    # The positive control: a guard that stopped everything would satisfy
-    # the test above.
+    # Positive control: a guard that stopped everything would pass the test
+    # above.
     proc = run_block(kernels_guard_block(), tmp_path,
                      preamble='KERNELS=" 6.12.96+rpt-rpi-v8"')
     assert proc.returncode == 0, proc.stderr
@@ -260,14 +198,9 @@ VERIFY_BLOCK = ('    OVERLAY_INITRAMFS=""',
                 '    log "  overlay initramfs: $OVERLAY_INITRAMFS"')
 
 
-# A REAL-SIZED listing, with scripts/overlay early in it and a long tail
-# after. Both details are load-bearing. install.sh runs under pipefail, and
-# the first version of the check piped lsinitramfs into `grep -q`: grep
-# closes the pipe on its first match, the producer dies of SIGPIPE, and the
-# pipeline returns 141 -- so the check failed on exactly the initramfs that
-# should pass. A three-line listing never reproduces it, because the producer
-# is finished before grep can exit. Measured with the piped form and this
-# fixture: NO MATCH, rc 141.
+# A real-sized listing with scripts/overlay early and a long tail: under
+# pipefail, a check that pipes lsinitramfs into `grep -q` dies of SIGPIPE (rc
+# 141) only while the producer is still writing.
 GOOD_LISTING = ("scripts/local\nscripts/overlay\n"
                 + "".join(f"usr/lib/modules/6.12.96/kernel/drivers/x{i}.ko\n"
                           for i in range(20000)))
@@ -284,10 +217,13 @@ def run_verification(tmp_path, *, initramfs_names=("initramfs8",),
     (boot / "cmdline.txt").write_text(cmdline)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    # The real lsinitramfs unpacks a compressed cpio; what matters here is
-    # what install.sh does with the listing, so the listing is the stub.
+    # The listing is the stub: what matters is what install.sh does with it.
     (bin_dir / "lsinitramfs").write_text(
-        "#!/bin/sh\ncat %s\n" % (tmp_path / "listing.txt"))
+        # Not `cat`: whether cat fails on a closed pipe varies by
+        # implementation, and that failure is what the pipefail case needs.
+        "#!/bin/sh\nwhile IFS= read -r line; do\n"
+        "    printf '%%s\\n' \"$line\" || exit 141\n"
+        "done < %s\n" % (tmp_path / "listing.txt"))
     (bin_dir / "lsinitramfs").chmod(0o755)
     (tmp_path / "listing.txt").write_text(listing)
     block = slice_between(INSTALL.read_text(), *VERIFY_BLOCK)
@@ -297,8 +233,7 @@ def run_verification(tmp_path, *, initramfs_names=("initramfs8",),
 
 
 def test_a_good_initramfs_passes_the_verification(tmp_path):
-    # The positive control. Everything below asserts that provisioning
-    # STOPS, and "it stopped" is also what a broken rig produces.
+    # Positive control: everything below asserts that provisioning stops.
     proc = run_verification(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert "initramfs8" in proc.stdout, proc.stdout
@@ -311,13 +246,9 @@ def test_no_initramfs_at_all_fails_the_install(tmp_path):
 
 
 def test_an_initramfs_without_the_overlay_script_fails_the_install(tmp_path):
-    """
-    The silent case, and the reason this check reads the archive rather than
-    stat()ing the file. An initramfs built before the overlay script existed
-    is the right size, has the right name, and is loaded by the firmware --
-    and boot=overlay is then read by nothing, so the unit comes up on a
-    writable root and says nothing about it.
-    """
+    """The check reads the archive rather than stat()ing the file: an initramfs
+    without the overlay script has the right name and size, and the unit would
+    silently come up on a writable root."""
     proc = run_verification(tmp_path, listing=NO_OVERLAY_LISTING)
     assert proc.returncode != 0
     assert "would come up on a writable root" in proc.stderr, proc.stderr
@@ -338,9 +269,7 @@ def overlay_script() -> str:
 
 
 def test_the_lower_layer_is_mounted_read_only():
-    # The line that makes the card read-only for the life of the boot. An
-    # overlay whose lower layer is writable is a slower way of writing to
-    # the SD card, not a reset-on-power-cycle appliance.
+    # An overlay whose lower layer is writable still writes to the SD card.
     lower = [line for line in overlay_script().splitlines()
              if "/lower" in line and "mount " in line]
     assert lower, "nothing in the overlay script mounts a lower layer"
@@ -348,26 +277,17 @@ def test_the_lower_layer_is_mounted_read_only():
 
 
 def test_a_failed_overlay_panics_rather_than_booting_writable():
-    """
-    The direction of the failure is a safety decision, so it is asserted.
-
-    A unit that quietly came up without the overlay would keep on the card
-    everything the session wrote -- the one outcome this mechanism exists to
-    prevent -- and would look identical from the outside. Panicking is loud;
-    tier 3 catches it before a release.
-    """
+    """A failed overlay panics: a unit that quietly booted without it would
+    keep the session on the card and look identical from outside."""
     script = overlay_script()
     assert "panic \"Failed to assemble the root overlay.\"" in script
     assert "panic \"Failed to mount the overlay's upper layer in RAM.\"" in script
 
 
 def test_install_sh_no_longer_tells_the_operator_to_run_raspi_config():
-    """
-    Not tidiness. On trixie that command installs overlayroot, whose
-    initramfs script calls `mount --move` -- an option klibc's mount, the
-    one in the initrd, does not have. Following the old advice is how a
-    provisioned unit stops booting.
-    """
+    """install.sh gives no raspi-config advice: on trixie enable_overlayfs
+    installs overlayroot, whose `mount --move` klibc's mount lacks, so the unit
+    stops booting."""
     text = INSTALL.read_text()
     instructions = [line for line in text.splitlines()
                     if "enable_overlayfs" in line and not line.lstrip().startswith("#")]
@@ -378,10 +298,8 @@ def test_install_sh_no_longer_tells_the_operator_to_run_raspi_config():
 
 MACHINE_ID_FN = ("otp_restore_machine_id()\n{", "\treturn 0\n}")
 
-# The initrd has klibc's mount, which really mounts. Here it does not: the
-# test lays the fake card's contents at the mountpoint itself and this stands
-# in for the syscall, so what is exercised is the function's own logic --
-# which candidate it tries, what it accepts, and where it writes.
+# Stands in for the initrd's mount: the test lays the fake card's contents at
+# the mountpoint, so only the function's own logic is exercised.
 MOUNT_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$MOUNT_LOG"
 [ -z "${MOUNT_REFUSES-}" ] || exit 1
@@ -403,9 +321,8 @@ def run_machine_id_restore(tmp_path, *, stored=LIVE_ID, mountable=True,
         (mnt / "otp-identity" / "machine-id").write_text(stored + "\n")
     rootmnt = tmp_path / "root"
     (rootmnt / "etc").mkdir(parents=True, exist_ok=True)
-    # The device the first candidate resolves to. `${ROOT%p[0-9]}p1` turns
-    # .../mmcblk0p2 into .../mmcblk0p1, which is the derivation the shipped
-    # line makes on a Pi.
+    # The device the first candidate resolves to: `${ROOT%p[0-9]}p1` turns
+    # .../mmcblk0p2 into .../mmcblk0p1.
     (tmp_path / "mmcblk0p1").write_text("")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -433,22 +350,16 @@ def run_machine_id_restore(tmp_path, *, stored=LIVE_ID, mountable=True,
 
 
 def test_the_initramfs_puts_the_stored_machine_id_where_pid_1_will_read_it(tmp_path):
-    """
-    The positive control. PID 1 reads /etc/machine-id before it looks at a
-    single unit, so this is the last moment anything can put it there -- and
-    the file has to land inside the assembled overlay, not beside it.
-    """
+    """Positive control: the stored id lands inside the assembled overlay,
+    where PID 1 reads /etc/machine-id before any unit runs."""
     proc, restored = run_machine_id_restore(tmp_path)
     assert "rc=0" in proc.stdout, proc.stderr
     assert restored == LIVE_ID, proc.stdout
 
 
 def test_the_identity_partition_is_mounted_read_only(tmp_path):
-    """
-    The whole point of the mechanism this rides in is that the boot never
-    holds a writable handle on storage it is not writing to. Reading a
-    machine-id needs none.
-    """
+    """Reading a machine-id needs no writable handle on the card, so every
+    mount is read-only."""
     run_machine_id_restore(tmp_path)
     calls = (tmp_path / "mount.log").read_text().splitlines()
     mounts = [c for c in calls if not c.startswith("umount")]
@@ -457,12 +368,8 @@ def test_the_identity_partition_is_mounted_read_only(tmp_path):
 
 
 def test_a_machine_id_that_is_not_32_hex_characters_is_not_written(tmp_path):
-    """
-    systemd rejects a malformed id and calls the boot a first boot -- which
-    is the state this exists to leave, arrived at by a longer route. Anything
-    that is not exactly the shape systemd accepts must be dropped here, where
-    the image's own file is still standing.
-    """
+    """Anything not exactly 32 hex characters is dropped: systemd rejects a
+    malformed id and treats the boot as a first boot."""
     for bad in ("uninitialized", "", "deadbeef", LIVE_ID + "0", LIVE_ID[:-1] + "Z"):
         proc, restored = run_machine_id_restore(tmp_path / f"bad-{len(bad)}-{bad[:4]}",
                                                 stored=bad)
@@ -471,9 +378,8 @@ def test_a_machine_id_that_is_not_32_hex_characters_is_not_written(tmp_path):
 
 
 def test_a_card_with_no_stored_identity_leaves_the_boot_alone(tmp_path):
-    """Never fatal. The overlay panics when it fails because a unit that
-    booted writable is the one thing it exists to prevent; an identity is
-    not that, and a first boot is what this machine did before."""
+    """A missing identity is never fatal: unlike a writable root, a first boot
+    is harmless."""
     proc, restored = run_machine_id_restore(tmp_path, make_store=False)
     assert "rc=0" in proc.stdout, proc.stderr
     assert restored is None
@@ -486,12 +392,9 @@ def test_a_partition_that_will_not_mount_leaves_the_boot_alone(tmp_path):
 
 
 def test_the_overlay_restores_the_machine_id_after_it_is_assembled(tmp_path):
-    """
-    Ordering, and it is not cosmetic: the write goes THROUGH the overlay into
-    its tmpfs upper layer, so a call placed before the mount would write to
-    the initrd's own root and vanish at pivot -- silently, with the boot
-    looking exactly the same.
-    """
+    """The restore runs after the overlay is mounted: the write goes through
+    the overlay into its upper layer, and an earlier call would write to the
+    initrd's root and vanish at pivot."""
     script = overlay_script()
     assert "otp_restore_machine_id" in script, \
         "the overlay script no longer restores the machine-id, so every " \
@@ -505,10 +408,8 @@ def test_the_overlay_restores_the_machine_id_after_it_is_assembled(tmp_path):
 
 # --- the userspace half: recording the machine-id -------------------------
 
-# persist-identity.sh asks findmnt the same question the guest probe does:
-# which filesystem contains the store. The stub answers out of the
-# environment, so a test can put the store inside the overlay without needing
-# two real filesystems -- which no CI runner reliably has under /tmp.
+# The stub answers findmnt out of the environment, so a test can put the store
+# inside the overlay without two real filesystems.
 IDENTITY_FINDMNT_STUB = """#!/bin/sh
 case "$*" in
     *--target*) printf '%s\\n' "${FAKE_STORE_SRC-/dev/mmcblk0p1}" ;;
@@ -518,16 +419,9 @@ esac
 """
 
 
-# chpasswd, which is the one command the script runs that a test must not let
-# through: the real one edits the machine's own /etc/shadow, and --root would
-# make it chroot into a tmp_path. The stub does what chpasswd does to the tree
-# it is pointed at -- rewrites field 2 of the named account -- so the script's
-# read-back after the apply is a read-back of a file that really changed. It
-# also records its argv, because "--root reached it" is a claim about an
-# argument list and a stub that only exits 0 cannot support one.
-#
-# APPLY=no turns it into the failure this repository keeps finding: a command
-# that exits 0 having done nothing at all.
+# Stands in for chpasswd, which would edit the host's /etc/shadow: it rewrites
+# field 2 of the named account in the fake tree and records its argv.
+# CHPASSWD_APPLY=no makes it exit 0 having done nothing.
 CHPASSWD_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$CHPASSWD_ARGV"
 line=$(cat)
@@ -540,9 +434,8 @@ mv "$CHPASSWD_SHADOW.new" "$CHPASSWD_SHADOW"
 exit "${CHPASSWD_RC-0}"
 """
 
-# What pi-gen leaves in /etc/shadow before an operator ever seeds anything:
-# FIRST_USER_PASS, hashed with a random salt, and image/build.sh makes the
-# password itself random when OTP_USER_PASS_HASH is unset. Nobody has it.
+# What pi-gen leaves in /etc/shadow before any seed: a random password nobody
+# has.
 BUILD_TIME_HASH = "$6$aVJ7yQ2mKp0xRt4d$" + "B" * 43
 # The hash an operator's own userconf.txt carried, applied by the wizard.
 SEEDED_HASH = "$6$otpimgcheck$" + "A" * 86
@@ -555,20 +448,10 @@ def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
                          first_user="otp", mode=None, chpasswd_env=None):
     """Run the shipped script against a fake boot partition and a fake /etc.
 
-    `etc_keys` puts real-looking host keys in the fake /etc/ssh. They are not
-    there to be persisted -- they are there so that "nothing copies them" is a
-    statement about a tree that HAD them.
-
-    `credential` is what the card already holds; `live_hash` is what
-    /etc/shadow holds for the UID-1000 account this boot. The default pair is
-    the interesting one: a card with nothing on it and an account carrying the
-    random build-time password.
-
-    `partial` is a `credential.new` left on the card -- the fragment
-    `credential_record` writes beside the store before renaming it into place.
-    A card that still has one is a card whose record lost the power or the
-    room mid-write, and it is the one tell that tells that state apart from a
-    card nobody ever seeded.
+    `etc_keys` puts host keys in the fake /etc/ssh, so "nothing copies them" is
+    tested against a tree that has them. `credential` is what the card holds,
+    `live_hash` what /etc/shadow holds for the UID-1000 account, and `partial`
+    a `credential.new` fragment left by an interrupted record.
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     boot = tmp_path / "boot"
@@ -587,9 +470,8 @@ def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
         (root / "etc" / "ssh" / f"ssh_host_{name}_key").write_text(f"live {name}\n")
         (root / "etc" / "ssh" / f"ssh_host_{name}_key.pub").write_text(f"pub {name}\n")
 
-    # A passwd/shadow pair with a root account in it as well, so that "the
-    # store may only name the UID-1000 user" is a statement about a tree that
-    # HAS another account to name.
+    # A root account is present so "only the UID-1000 user" has another account
+    # to name.
     (root / "etc" / "passwd").write_text(
         "root:x:0:0:root:/root:/bin/bash\n"
         "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
@@ -614,14 +496,8 @@ def run_persist_identity(tmp_path, *, machine_id=LIVE_ID, stored_id=None,
 
 def invoke_persist_identity(tmp_path, *, mode=None, store_src="/dev/mmcblk0p1",
                             chpasswd_env=None):
-    """Run the script AGAINST A TREE THAT ALREADY EXISTS.
-
-    Split out of the builder above so that a test can boot the same fake unit
-    more than once. The ordering this change is about -- a restore at sysinit,
-    a fresh seed applied over it at multi-user, and the store replaced after
-    that -- is a sequence, and a fixture that rebuilt /etc between the steps
-    could not express it.
-    """
+    """Run the script against a tree that already exists, so a test can boot
+    the same fake unit more than once."""
     boot, root = tmp_path / "boot", tmp_path / "root"
     return subprocess.run(
         ["bash", str(IDENTITY_SH), "--boot-dir", str(boot), "--root", str(root)]
@@ -660,14 +536,10 @@ def chpasswd_argv(tmp_path) -> list:
 
 
 def power_cycle(root, *, user="otp", live_hash=BUILD_TIME_HASH):
-    """WHAT THE OVERLAY HANDS THE NEXT BOOT: /etc back out of the image.
+    """What the overlay hands the next boot: /etc back out of the image.
 
-    Not `set_shadow_hash`, which edits the tree in place. Everything under
-    /etc is inside the read-only overlay, so a power cycle throws away the
-    WHOLE of it -- the shadow entry the wizard wrote AND any rename
-    userconf-pi performed -- and the account comes back with the name and the
-    random FIRST_USER_PASS image/build.sh built in. Only the FAT partition
-    survives, which is the entire reason this store exists.
+    A power cycle discards all of /etc, including any rename userconf-pi
+    performed; only the FAT partition survives.
     """
     (root / "etc" / "passwd").write_text(
         "root:x:0:0:root:/root:/bin/bash\n"
@@ -686,32 +558,17 @@ def card_note(boot) -> str:
 
 
 def test_a_first_boot_records_what_it_has(tmp_path):
-    # The positive control: the store starts empty and comes out holding this
-    # machine's identity.
+    # Positive control: an empty store comes out holding this machine's
+    # identity.
     proc, boot, _ = run_persist_identity(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert (boot / "otp-identity" / "machine-id").read_text().strip() == LIVE_ID
 
 
 def test_no_private_key_is_written_to_the_boot_partition(tmp_path):
-    """
-    THE OWNER'S DECISION, held against the shipped script rather than against
-    the comment that announces it.
-
-    An earlier version of this script copied /etc/ssh/ssh_host_*_key onto the
-    FAT partition so the fingerprint of a key printer stopped changing on
-    every power cycle. image/build.sh sets ENABLE_SSH=0, so pi-gen leaves
-    ssh.service disabled and this appliance never runs sshd -- the only thing
-    that ever started it was the first-boot `preset-all` that persisting the
-    machine-id ends, and run 32020772161's boot2 console does not mention
-    ssh.service, ssh.socket or OpenBSD once while still reaching
-    multi-user.target. So the fingerprint was one nobody could ever be shown,
-    and the private keys were on a partition every local account can read.
-
-    The fake /etc/ssh here HAS keys. Nothing may end up on the card, and
-    nothing may create a place to put them either -- an empty `ssh` directory
-    on the boot partition is the next person's invitation.
-    """
+    """No SSH host key reaches the boot partition, nor a directory to hold one:
+    the appliance never runs sshd, and the partition is readable by every local
+    account."""
     proc, boot, _ = run_persist_identity(
         tmp_path, etc_keys=("ed25519", "rsa", "ecdsa"))
     assert proc.returncode == 0, proc.stderr
@@ -719,10 +576,8 @@ def test_no_private_key_is_written_to_the_boot_partition(tmp_path):
     assert [p.name for p in landed] == ["machine-id"], landed
     assert not (boot / "otp-identity" / "ssh").exists(), \
         "the store still has somewhere to put private keys"
-    # And the script must not be reading them either, which is the half a
-    # listing of the card cannot see. Comments are stripped first: the header
-    # names regenerate_ssh_host_keys.service precisely to explain why none of
-    # this is here any more.
+    # Nor may the script read them. Comments are stripped first, since the
+    # header mentions the host-key service.
     code = "\n".join(line for line in IDENTITY_SH.read_text().splitlines()
                      if not line.lstrip().startswith("#"))
     for gone in ("ssh_host", "ssh-keygen", "SSH_STORE"):
@@ -731,17 +586,9 @@ def test_no_private_key_is_written_to_the_boot_partition(tmp_path):
 
 
 def test_the_unit_that_runs_it_no_longer_orders_itself_around_sshd():
-    """
-    The orderings that existed only for the host-key half, deleted with it.
-
-    `After=regenerate_ssh_host_keys.service` was there because that unit
-    opens with `rm -f /etc/ssh/ssh_host_*_key*` and would have deleted a
-    restore placed before it; `Before=ssh.service ssh.socket` named the
-    consumers; `ConditionPathIsReadWrite=/etc` covered the restore's writes.
-    Nothing here writes to /etc any more and no sshd starts on this image, so
-    all three are edges nobody can check -- and an unreachable ordering is
-    the shape of thing this repository keeps finding green.
-    """
+    """The unit carries no ordering around sshd or the host-key service:
+    nothing here writes /etc and no sshd starts, so those edges would be
+    uncheckable."""
     unit = IDENTITY_UNIT.read_text()
     body = "\n".join(line for line in unit.splitlines()
                      if not line.startswith("#"))
@@ -751,11 +598,8 @@ def test_the_unit_that_runs_it_no_longer_orders_itself_around_sshd():
 
 
 def test_the_unit_still_runs_before_anything_that_reads_the_identity():
-    """
-    The positive control for the test above: a unit stripped of every
-    ordering would satisfy it perfectly and record the machine-id after the
-    boot had finished using it.
-    """
+    """Positive control for the test above: the unit still runs at sysinit,
+    before anything reads the identity."""
     unit = IDENTITY_UNIT.read_text()
     for required in ("After=local-fs.target",
                      "Before=sysinit.target",
@@ -769,12 +613,9 @@ def test_the_unit_still_runs_before_anything_that_reads_the_identity():
 
 
 def test_a_store_inside_the_overlay_is_refused_rather_than_written(tmp_path):
-    """
-    The guard that stops the whole script being a no-op nobody notices.
-    If /boot/firmware never mounted, $BOOT_DIR is a directory on the
-    overlay's tmpfs: every copy agrees with its original, on every boot, and
-    nothing survives any of them.
-    """
+    """A store on the overlay's tmpfs is refused: if /boot/firmware never
+    mounted, every copy would agree with its original and nothing would
+    survive."""
     proc, boot, _ = run_persist_identity(tmp_path, store_src="overlay")
     assert proc.returncode != 0, proc.stdout
     assert not (boot / "otp-identity" / "machine-id").exists(), \
@@ -782,46 +623,26 @@ def test_a_store_inside_the_overlay_is_refused_rather_than_written(tmp_path):
 
 
 def test_a_kept_machine_id_is_not_overwritten_by_a_boot_that_lost_it(tmp_path):
-    """
-    A stored id that does not match the running one means the initramfs
-    restore did not happen. The stored value is the one that still has a
-    chance of being restored, so replacing it with this boot's random id
-    would make the store chase a value that changes every boot.
-    """
+    """A stored id that differs from the running one is kept: the mismatch
+    means the initramfs restore did not happen, and overwriting would make the
+    store chase a value that changes every boot."""
     other = "ffffffffffffffffffffffffffffffff"
     proc, boot, _ = run_persist_identity(tmp_path, stored_id=other)
     assert proc.returncode != 0, proc.stdout
     assert (boot / "otp-identity" / "machine-id").read_text().strip() == other
 
 
-# --- the operator's login, which used to last one boot --------------------
+# --- the operator's login, kept across power cycles -----------------------
 #
-# WHAT WAS BROKEN. userconf-service applies /boot/firmware/userconf.txt with
-# `chpasswd -e` into /etc/shadow and then deletes the seed. /etc is inside
-# the overlay and the FAT partition is not, so the credential died with the
-# power while the only file that could reapply it was destroyed by the boot
-# that consumed it -- and the account reverted to the random FIRST_USER_PASS
-# image/build.sh:101 generates when OTP_USER_PASS_HASH is unset, which nobody
-# has. The owner's decision out of {refuse the seed loudly, persist it, keep
-# the seed file} is "persist it".
-#
-# WHAT THESE TESTS ARE FOR, and it is not only "the password comes back".
-# Every guard below exists because the failure it catches is silent: a store
-# that is a tmpfs file agreeing with itself, a truncated line that would make
-# the account PASSWORDLESS, a `chpasswd` that exits 0 having written nothing,
-# and a hash landing on the card of a unit whose operator never asked for
-# one. None of those produces a message on a running machine.
+# Each guard below catches a silent failure: a store on tmpfs, a truncated line
+# that would leave the account passwordless, a chpasswd that exits 0 having
+# written nothing, a hash on the card of a unit nobody seeded.
 
 
 def test_a_seeded_password_is_kept_and_comes_back_after_the_power_cycle(tmp_path):
-    """
-    The whole loop, and the positive control every negative below leans on.
-
-    Boot 1: the account carries the random build-time hash, the operator's
-    seed is applied by the wizard, and the wizard's ExecStartPost records it.
-    Boot 2 is a fresh /etc -- which is what the overlay gives you -- and the
-    restore has to put the seeded hash back before any login is possible.
-    """
+    """The whole loop, and the positive control for the negatives below: the
+    wizard's hash is recorded on boot 1 and restored over a fresh /etc on boot
+    2."""
     proc, boot, root = run_persist_identity(tmp_path)
     assert proc.returncode == 0, proc.stderr
     # Nothing is kept until the wizard applies something.
@@ -838,32 +659,18 @@ def test_a_seeded_password_is_kept_and_comes_back_after_the_power_cycle(tmp_path
     assert proc.returncode == 0, proc.stderr
     assert shadow_hash(root) == SEEDED_HASH, \
         "the operator's password did not survive the power cycle"
-    # Through chpasswd, and with the tree the script was pointed at. A restore
-    # that edited /etc/shadow by hand would pass the line above and corrupt a
-    # real one: chpasswd is what takes the lock and keeps the file consistent.
+    # Through chpasswd, which takes the lock, and against the tree the script
+    # was pointed at.
     assert any(f"-e --root {tmp_path}/root" in line
                for line in chpasswd_argv(tmp_path)), chpasswd_argv(tmp_path)
 
 
 def test_an_unseeded_boot_puts_no_password_hash_on_the_boot_partition(tmp_path):
-    """
-    THE EXPOSURE GUARD, and the reason persisting costs no more than the seed
-    file it replaces.
+    """A unit nobody seeded never has a password hash on its boot partition;
+    only --record-credential writes one.
 
-    The store is written by --record-credential and by nothing else, and that
-    phase runs only as an ExecStartPost on the wizard -- so the only hash that
-    ever reaches the card is one the operator's own userconf.txt had already
-    put on that same card. A unit whose operator never seeded a credential
-    must never have a password hash on its boot partition, and the hash it
-    would leak is the worst possible one to leak by accident: pi-gen's random
-    FIRST_USER_PASS is the same on no two units, so its appearance on a card
-    would be pure loss with nothing gained.
-
-    THE POSITIVE CONTROL IS IN THIS TEST AND ON THIS FIXTURE, because "no hash
-    on the card" is satisfied perfectly by a script that writes nothing ever,
-    by a --boot-dir that does not exist, and by a chpasswd stub that is never
-    reached. The second half runs the recording phase over the identical tree
-    and requires the identical hash to land.
+    The second half is the positive control: the recording phase on the same
+    tree must land the hash.
     """
     proc, boot, root = run_persist_identity(tmp_path)
     assert proc.returncode == 0, proc.stderr
@@ -881,15 +688,9 @@ def test_an_unseeded_boot_puts_no_password_hash_on_the_boot_partition(tmp_path):
 
 
 def test_a_truncated_store_does_not_leave_the_account_passwordless(tmp_path):
-    """
-    `chpasswd -e` writes its second field into /etc/shadow verbatim, and an
-    EMPTY second field is an account that logs in with NO PASSWORD -- on an
-    appliance that boots to a console with a keyboard and a screen attached.
-    A card pulled mid-write is all it takes to produce one.
-
-    The positive control is the same fixture with the line complete: the
-    refusal has to be about the truncation and not about the tree.
-    """
+    """A truncated store is refused: `chpasswd -e` would write an empty field
+    verbatim, leaving an account that logs in with no password. The complete
+    line on the same fixture is the positive control."""
     proc, _, root = run_persist_identity(tmp_path, credential="otp:\n")
     assert proc.returncode != 0, proc.stdout
     assert shadow_hash(root) == BUILD_TIME_HASH, \
@@ -906,53 +707,29 @@ def test_a_truncated_store_does_not_leave_the_account_passwordless(tmp_path):
 
 @pytest.mark.parametrize("kept", ["!", "*", "!!", "$6$short$x", ""])
 def test_a_store_that_is_not_a_crypt_string_is_refused(tmp_path, kept):
-    """
-    The locked forms and the runts, all refused by one clause.
-
-    `!` and `*` are what /etc/shadow holds for an account that cannot log in,
-    and a store carrying one is a store that can TAKE AWAY the recovery path
-    this whole change exists to provide -- the mirror of the empty field
-    above, and just as quiet.
-    """
+    """Locked forms (`!`, `*`) and runts are refused: a store carrying one
+    would take away the operator's login."""
     proc, _, root = run_persist_identity(tmp_path, credential=f"otp:{kept}\n")
     assert proc.returncode != 0, proc.stdout
     assert shadow_hash(root) == BUILD_TIME_HASH
-    # And it never says what it refused. This script's stderr is the journal,
-    # the journal is forwarded to the tier-3 serial console, and that console
-    # is uploaded as a CI artifact.
+    # It never echoes what it refused: stderr reaches the journal and the
+    # uploaded tier-3 console.
     assert kept not in proc.stderr or kept == "", proc.stderr
 
 
 def test_a_zero_length_store_is_not_read_as_a_card_that_was_never_seeded(tmp_path):
-    """
-    THE ONE MALFORMED SHAPE THAT USED TO EXIT 0.
-
-    Every other bad store below fails the unit loudly. A zero-length one
-    returned 0 with a note that reads exactly like a fresh card -- and it is
-    not one. `credential_record` writes `credential.new` and renames it over
-    `credential`; vfat has no atomic rename, so a power cut mid-record or a
-    partition with no room left can leave a zero-length `credential` where a
-    working credential used to be. The operator then loses the login they had,
-    with nothing on the machine having failed and nothing in the journal to
-    read.
-
-    THE TELL IS THAT THE FILE IS THERE AT ALL. A card nobody has seeded has no
-    `credential` and no `credential.new`; this one has a `credential`. That
-    costs one `-e` and it is the difference between a failed unit somebody can
-    diagnose and a silent revert.
-    """
+    """A zero-length `credential` fails the unit instead of reading as a fresh
+    card: vfat has no atomic rename, so an interrupted record can leave one
+    where a working credential was."""
     proc, boot, root = run_persist_identity(tmp_path, credential="")
     assert proc.returncode != 0, proc.stdout
     assert shadow_hash(root) == BUILD_TIME_HASH
     assert chpasswd_argv(tmp_path) == [], chpasswd_argv(tmp_path)
-    # And it does NOT tell the operator their card was never seeded, which is
-    # the specific wrong answer this is about.
+    # It must not claim the card was never seeded.
     assert "no credential kept" not in proc.stderr, proc.stderr
 
-    # THE POSITIVE CONTROL, and it is the whole point: a card that really was
-    # never seeded still comes out quiet and green on the identical fixture.
-    # Without it this passes on a script that fails every unseeded unit ever
-    # built.
+    # Positive control: a card that really was never seeded stays quiet and
+    # green.
     proc, boot, _ = run_persist_identity(tmp_path / "fresh")
     assert proc.returncode == 0, proc.stderr
     assert "no credential kept" in proc.stderr, proc.stderr
@@ -960,33 +737,20 @@ def test_a_zero_length_store_is_not_read_as_a_card_that_was_never_seeded(tmp_pat
 
 
 def test_a_record_fragment_with_no_store_beside_it_is_not_a_fresh_card(tmp_path):
-    """
-    The other half of the same interrupted write, and the half that leaves no
-    `credential` at all: the power went off between the redirect that creates
-    `credential.new` and the `mv` that puts it in place, on the very first
-    record a unit ever did. `credential` is absent -- which is exactly what a
-    fresh card looks like -- and `credential.new` is the only thing that says
-    otherwise.
-    """
+    """A `credential.new` with no `credential` beside it is an interrupted
+    first record, not a fresh card, and fails the unit."""
     proc, boot, root = run_persist_identity(
         tmp_path, partial=f"otp:{SEEDED_HASH}\n")
     assert proc.returncode != 0, proc.stdout
     assert "no credential kept" not in proc.stderr, proc.stderr
-    # NOT applied out of the fragment, either. A file the record never
-    # committed is a file nothing checked, and the whole reason for writing
-    # beside and renaming is that its contents may be half a line.
+    # The fragment is never applied: its contents may be half a line.
     assert chpasswd_argv(tmp_path) == [], chpasswd_argv(tmp_path)
     assert shadow_hash(root) == BUILD_TIME_HASH
 
 
 def test_a_record_fragment_beside_a_good_store_is_cleared_and_the_store_wins(tmp_path):
-    """
-    The third arrangement the interrupted write can leave: the previous
-    credential intact and a fragment beside it. That is the outcome
-    write-beside-and-rename is FOR, so the restore has to be an ordinary one
-    -- and the fragment has to go, or every boot for the rest of the unit's
-    life reports an interruption that has already been dealt with.
-    """
+    """A fragment beside an intact store is cleared and the store is restored
+    normally, so later boots do not keep reporting the interruption."""
     proc, boot, root = run_persist_identity(
         tmp_path, credential=f"otp:{SEEDED_HASH}\n",
         partial="otp:$6$halfwritten$")
@@ -998,47 +762,26 @@ def test_a_record_fragment_beside_a_good_store_is_cleared_and_the_store_wins(tmp
 
 
 def test_every_refusal_is_left_on_the_card_a_locked_out_operator_can_read(tmp_path):
-    """
-    WHERE A REFUSAL GOES ON A MACHINE NOBODY CAN LOG IN TO.
-
-    Each note above goes to stderr, otp-unit-identity.service sends stderr to
-    the journal, device/install.sh sets `Storage=volatile`, and
-    `systemd.journald.forward_to_console=1` is on the tier-3 harness's
-    command line and NOT in the image's cmdline.txt. So on a shipped unit
-    every one of these reasons died with the power -- on the machine whose
-    operator is locked out of the only shell that could have read it. The unit
-    file now carries `StandardError=journal+console` so the notes reach the
-    screen while the boot is happening; this is the copy that is still there
-    afterwards.
-
-    THE CARD IS THE RIGHT PLACE because it is the only thing the locked-out
-    operator can still do: take it out and put it in another machine, which
-    they have to do anyway to write a new userconf.txt. The note carries no
-    hash -- nothing here ever prints one -- so it adds no exposure to a
-    partition that already holds the hash in full.
-    """
+    """Each refusal is also written to the card, without the hash: the journal
+    is volatile, and a locked-out operator can only read the card in another
+    machine. A restore that works clears the note."""
     proc, boot, _ = run_persist_identity(tmp_path, credential="otp:!\n")
     assert proc.returncode != 0, proc.stdout
     note = card_note(boot)
     assert "userconf.txt" in note, note
     assert "crypt(3) string" in note, note
-    # The reason is the journal's own words rather than a summary that can
-    # drift away from them: a second channel saying something different from
-    # the first is one nobody can act on. The header above it is the part an
-    # operator holding a card in another machine needs and the journal does
-    # not.
+    # The reason is the journal's own lines under a three-line header, so the
+    # two channels cannot drift apart.
     header, _, reason = note.partition("\n\n")
     assert len(header.splitlines()) == 3, note
     assert reason.strip(), note
     for line in reason.splitlines():
         assert f"otp-identity: {line}" in proc.stderr, (line, proc.stderr)
-    # NEVER THE HASH, on a partition every local account can read and anyone
-    # with a card reader can mount.
+    # Never the hash: the partition is readable by every local account.
     assert SEEDED_HASH not in note and BUILD_TIME_HASH not in note
 
-    # AND IT IS CLEARED BY A RESTORE THAT WORKS. A stale "your login could not
-    # be restored" on the card of a unit that is fine is a fault report for a
-    # fault that is over, and this appliance has no clock to date it with.
+    # A restore that works clears the note; the appliance has no clock to date
+    # a stale one.
     (boot / "otp-identity" / "credential").write_text(f"otp:{SEEDED_HASH}\n")
     proc = invoke_persist_identity(tmp_path)
     assert proc.returncode == 0, proc.stderr
@@ -1046,20 +789,8 @@ def test_every_refusal_is_left_on_the_card_a_locked_out_operator_can_read(tmp_pa
 
 
 def test_the_operator_documentation_says_which_account_the_login_comes_back_on():
-    """
-    THE DOCUMENT IS WHERE THIS CHANGE REACHES SOMEBODY WHO CANNOT READ THE
-    CODE, and it was the last place still promising the old thing.
-
-    Its precedence table said "a kept credential only -> the kept one wins",
-    unconditionally, next to a paragraph telling an operator to write
-    `username:hash` with no word about which username. Follow both and
-    userconf-pi renames the UID-1000 account, the rename dies with the
-    overlay, and the operator stands in front of a tty2 prompt typing a name
-    the machine does not have -- on a unit with no network and no sshd.
-
-    Three claims held against the things that make them true: the account the
-    image really ships, the file persist-identity.sh really writes, and the
-    rule the script really applies.
+    """docs/IMAGE.md names the account the kept login comes back on, qualifies
+    the precedence row by UID 1000, and names the note file the script writes.
     """
     doc = (REPO / "docs" / "IMAGE.md").read_text()
     first_user = re.search(r"^FIRST_USER_NAME='([^']+)'",
@@ -1067,14 +798,12 @@ def test_the_operator_documentation_says_which_account_the_login_comes_back_on()
     assert first_user, "image/build.sh no longer sets FIRST_USER_NAME"
     assert f"log in as `{first_user.group(1)}`" in doc, \
         "docs/IMAGE.md does not say which account the kept password lands on"
-    # The table row itself, which is the sentence QA read and believed.
     row = next((line for line in doc.splitlines()
                 if line.startswith("| a kept credential only")), "")
     assert "UID-1000" in row, \
         f"the precedence table still promises the kept credential " \
         f"unconditionally: {row!r}"
-    # And the durable channel is named by the name the script writes, not by
-    # a description of it that can drift.
+    # The note is named by the filename the script writes.
     note = re.search(r'^CRED_NOTE="\$STORE/(\S+)"', IDENTITY_SH.read_text(), re.M)
     assert note, "persist-identity.sh no longer leaves a refusal on the card"
     assert note.group(1) in doc, \
@@ -1082,40 +811,23 @@ def test_the_operator_documentation_says_which_account_the_login_comes_back_on()
 
 
 def test_the_identity_units_notes_reach_the_console_and_not_only_the_journal():
-    """
-    The systemd half of the finding above, which no fake tree can show.
-
-    `StandardError=journal` plus `Storage=volatile` plus no forwarding in the
-    image's cmdline.txt is three settings in three files that add up to
-    "nothing this script says is readable on a shipped unit". `journal+console`
-    is the one of the three that can be changed for THIS UNIT ALONE: it puts
-    these notes on /dev/console at sysinit, before any getty exists, without
-    making the rest of the machine narrate itself to whoever is watching the
-    serial header.
-    """
+    """The identity unit's stderr goes to journal+console: the journal is
+    volatile and not forwarded on a shipped unit, so the notes would otherwise
+    be unreadable."""
     unit = IDENTITY_UNIT.read_text()
     assert "StandardError=journal+console" in unit, unit
-    # And it stays scoped to this unit: journald's machine-wide forwarding is
-    # a harness-only lever, and turning it on in the image would put every
-    # unit's output on the console of a device that prints key material.
+    # Scoped to this unit: machine-wide forwarding would put every unit's
+    # output on the console of a device that prints key material.
     for shipped in (REPO / "device" / "install.sh", REPO / "image" / "build.sh"):
         assert "forward_to_console" not in shipped.read_text(), shipped
 
 
 def test_the_store_may_only_ever_set_the_uid_1000_accounts_password(tmp_path):
-    """
-    Whoever can write this store can already write userconf.txt, and this must
-    hand them no account the documented path would not. userconf-pi refuses
-    `root` outright and RENAMES the UID-1000 user to whatever a seed names, so
-    the only account /boot/firmware/userconf.txt can ever set a password on is
-    the UID-1000 one. Keying on the uid says exactly that, and says it without
-    re-transcribing three validation rules that could drift.
+    """The store can only set the UID-1000 account's password, the one account
+    userconf.txt can reach.
 
-    WHICH ACCOUNT THE RULE NAMES IS THE UID, NOT THE STRING IN THE STORE. A
-    card that says `root:` is a card whose LABEL is wrong; the hash still goes
-    to UID 1000 and nowhere else, so `root` here must come out of this
-    untouched while the operator's own account is set. Refusing instead was
-    the shape the lockout in the test below came in.
+    The name in the store is a label: a card saying `root:` still applies its
+    hash to UID 1000 and leaves root untouched.
     """
     proc, boot, root = run_persist_identity(
         tmp_path, credential=f"root:{SEEDED_HASH}\n")
@@ -1123,35 +835,24 @@ def test_the_store_may_only_ever_set_the_uid_1000_accounts_password(tmp_path):
     assert shadow_hash(root, "root") == "!", "root's password was set"
     assert shadow_hash(root) == SEEDED_HASH, \
         "the kept hash did not reach the UID-1000 account"
-    # chpasswd was handed the UID-1000 account and only it: the store's own
-    # user field never reaches the command, which is what makes the line
-    # above a property of the script rather than of the stub.
+    # chpasswd ran, and the store is relabelled for the live account.
     assert chpasswd_argv(tmp_path), "chpasswd never ran"
     assert (boot / "otp-identity" / "credential").read_text() \
         == f"otp:{SEEDED_HASH}\n", "the store kept the label it could not use"
 
-    # AND THE NAME IT QUOTES BACK IS STRIPPED FIRST. That field comes off a
-    # partition anyone with a card reader can write, and this script's stderr
-    # is the journal -- forwarded to the serial console under the tier-3
-    # harness, which uploads it, and now written to the console of the unit
-    # itself. An escape sequence there is one `tr` to refuse.
+    # The name quoted back is stripped first: it comes off a partition anyone
+    # can write and ends up on a console.
     proc, _, _ = run_persist_identity(
         tmp_path / "escape",
         credential="ro\x1b[2Jot:" + SEEDED_HASH + "\n")
     assert proc.returncode == 0, proc.stderr
     for gone in ("\x1b", "["):
         assert gone not in proc.stderr, repr(proc.stderr)
-    # The positive control for the stripping: what is left of the name IS
-    # reported, so "no escape in the output" is not satisfied by a note that
-    # says nothing about which account the card named. `2J` survives because
-    # digits and letters are not escapes -- the ESC byte and the bracket that
-    # made them a clear-screen sequence are what had to go.
+    # Positive control: what is left of the name is still reported.
     assert "'ro2Jot'" in proc.stderr, proc.stderr
 
-    # The negative control the rule actually rests on: with no UID-1000 line
-    # in /etc/passwd there is no account this store may be applied to, and
-    # `root` is still sitting there to be picked instead. Refused, and
-    # chpasswd never runs.
+    # With no UID-1000 account the store is refused and chpasswd never runs,
+    # even with `root` there to pick.
     proc, _, root = run_persist_identity(tmp_path / "nobody", first_user=None,
                                          credential=f"root:{SEEDED_HASH}\n")
     assert proc.returncode != 0, proc.stdout
@@ -1161,43 +862,12 @@ def test_the_store_may_only_ever_set_the_uid_1000_accounts_password(tmp_path):
 
 
 def test_a_store_naming_the_pre_rename_account_still_logs_the_operator_in(tmp_path):
-    """
-    THE LOCKOUT, DRIVEN AS THE DOCUMENTED HAPPY PATH THAT PRODUCES IT.
-
-    docs/IMAGE.md tells an operator to write `username:hash` to the boot
-    partition. Nothing tells them the username has to be `otp`, and
-    /usr/lib/userconf-pi/userconf does not require it either -- read out of
-    the real userconf-pi_0.19_all.deb:
-
-        FIRSTUSER="$(getent passwd 1000 | cut -d: -f1)"
-        ...
-        if [ "$FIRSTUSER" != "$NEWNAME" ]; then rename_user; fi
-        ...
-        echo "$NEWNAME:$NEWPASS" | chpasswd -e
-
-    so a seed naming `pi` RENAMES the UID-1000 account and then sets the
-    password on the new name. `rename_user` touches /etc/{passwd,shadow,group,
-    gshadow,subuid,subgid,sudoers.d} and /home -- every one of them inside the
-    read-only overlay. The rename therefore dies with the power. The store, on
-    the FAT partition, does not.
-
-    So the next boot found a store naming an account that no longer exists,
-    and the script REFUSED it: no network, no sshd, tty1 held by the front
-    panel, and a tty2 prompt that took neither the operator's chosen username
-    nor `otp`. A unit with one-time-pad key material on it, bricked by the
-    documented path, recoverable only by pulling the card. The same sequence
-    destroyed a WORKING persisted login if an operator later seeded
-    `alice:...` to rename themselves.
-
-    THE FIX IS THE FILE'S OWN RULE, APPLIED. Only the UID-1000 account may
-    ever be touched -- so the name in the store is a LABEL, not an
-    authorisation, and the hash belongs on whatever account holds UID 1000
-    this boot. That grants the store no account `userconf.txt` could not
-    already reach, which is the whole test above.
-    """
-    # Boot 1. The image ships FIRST_USER_NAME='otp'; the operator's seed names
-    # `pi`, so userconf-pi renames the account and applies the hash to it, and
-    # the wizard's own ExecStartPost records what it finds live.
+    """A store naming a pre-rename account still restores the login:
+    userconf-pi's rename of the UID-1000 user dies with the overlay while the
+    store survives, so the hash goes to whoever holds UID 1000 and the store is
+    relabelled."""
+    # Boot 1: the seed names `pi`, userconf-pi renames the account, and the
+    # record keeps what is live.
     proc, boot, root = run_persist_identity(tmp_path, first_user="pi",
                                             live_hash=SEEDED_HASH)
     assert proc.returncode == 0, proc.stderr
@@ -1206,36 +876,30 @@ def test_a_store_naming_the_pre_rename_account_still_logs_the_operator_in(tmp_pa
     assert (boot / "otp-identity" / "credential").read_text() \
         == f"pi:{SEEDED_HASH}\n", "the record did not keep the renamed account"
 
-    # The power cycle. /etc comes back out of the image: the rename is gone,
-    # UID 1000 is `otp` again, and the password is the build-time one nobody
-    # has. The card still holds `pi:<hash>`.
+    # The power cycle: UID 1000 is `otp` again; the card still holds
+    # `pi:<hash>`.
     power_cycle(root)
     assert "pi:" not in (root / "etc" / "passwd").read_text()
 
     proc = invoke_persist_identity(tmp_path)
     assert proc.returncode == 0, proc.stderr
-    # THE PROPERTY, and it is a WORKING LOGIN rather than a tidy exit status:
-    # the operator's own hash is what /etc/shadow holds for the account they
-    # can actually type at the tty2 prompt.
+    # The operator's hash is on the account they can actually type at the
+    # prompt.
     assert shadow_hash(root) == SEEDED_HASH, \
         "the operator is locked out: the kept password did not reach otp"
-    # Through chpasswd, and named for the LIVE account -- not the store's.
+    # Through chpasswd, for the live account.
     assert any(f"-e --root {tmp_path}/root" in line
                for line in chpasswd_argv(tmp_path)), chpasswd_argv(tmp_path)
-    # And it SAYS so, because a unit that silently re-points a credential at
-    # another account is one nobody can audit afterwards.
+    # It says so, so the re-pointing can be audited.
     assert "'pi'" in proc.stderr, proc.stderr
 
-    # THE STORE IS REWRITTEN, so the stale name does not persist: without this
-    # every boot for the rest of the unit's life repeats the mismatch, and the
-    # tier-3 check that the store names the live account could never be true.
+    # The store is rewritten, or every later boot repeats the mismatch.
     assert (boot / "otp-identity" / "credential").read_text() \
         == f"otp:{SEEDED_HASH}\n"
     assert not (boot / "otp-identity" / "credential.new").exists()
     assert card_note(boot) == "", "a working restore left a refusal on the card"
 
-    # The boot after that is an ordinary one: the store now matches, so there
-    # is nothing to say and nothing to rewrite.
+    # The next boot is ordinary: nothing to say, nothing to rewrite.
     power_cycle(root)
     proc = invoke_persist_identity(tmp_path)
     assert proc.returncode == 0, proc.stderr
@@ -1244,17 +908,9 @@ def test_a_store_naming_the_pre_rename_account_still_logs_the_operator_in(tmp_pa
 
 
 def test_a_stale_label_is_rewritten_even_when_the_password_already_matches(tmp_path):
-    """
-    The other way into the rewrite, and the reason it is not enough to do it
-    only after a `chpasswd`.
-
-    This is the boot AFTER a rewrite that could not be written -- the card was
-    full, or an operator had it in a reader read-only. The hash is already on
-    the UID-1000 account, so there is nothing for chpasswd to do and the
-    restore takes its early exit; the label is still wrong. Skip the rewrite
-    here and a unit that once failed to relabel never gets another chance,
-    because from now on every boot lands on this branch.
-    """
+    """A stale label is rewritten even when the hash already matches and
+    chpasswd has nothing to do; otherwise a unit that once failed to relabel
+    never gets another chance."""
     proc, boot, root = run_persist_identity(
         tmp_path, credential=f"pi:{SEEDED_HASH}\n", live_hash=SEEDED_HASH)
     assert proc.returncode == 0, proc.stderr
@@ -1265,21 +921,11 @@ def test_a_stale_label_is_rewritten_even_when_the_password_already_matches(tmp_p
 
 
 def test_a_rewrite_the_card_will_not_take_does_not_cost_the_login(tmp_path):
-    """
-    The rewrite above is a convenience; the login is the job.
+    """A card that refuses the store rewrite does not cost the login: the
+    failure is reported and the exit status still describes the restore.
 
-    A card that has gone read-only, or filled up, can take the `chpasswd` --
-    that lands in /etc/shadow, inside the overlay -- and refuse the store. If
-    that failed the restore, an operator whose password DID come back would be
-    handed a failed unit and, worse, a script that had already decided the
-    boot was lost. So the write is attempted, its failure is said out loud,
-    and the exit status still describes the login.
-
-    Driven by putting a DIRECTORY where the fragment goes, because this suite
-    runs as root and `chmod` on a directory root owns stops nothing. What the
-    script sees is what a full or read-only vfat gives it: the redirect into
-    `credential.new` fails, so the rename never happens and the store keeps
-    the bytes it had.
+    A directory in place of `credential.new` simulates the full or read-only
+    card, since the suite runs as root and chmod stops nothing.
     """
     proc, boot, root = run_persist_identity(
         tmp_path, credential=f"pi:{SEEDED_HASH}\n")
@@ -1297,20 +943,14 @@ def test_a_rewrite_the_card_will_not_take_does_not_cost_the_login(tmp_path):
     assert shadow_hash(root) == SEEDED_HASH, \
         "a store that could not be rewritten cost the operator the login"
     assert "could not rewrite" in proc.stderr, proc.stderr
-    # And the store still holds what it held: a rewrite that cannot finish
-    # must not be a rewrite that half-finished.
+    # The store keeps what it held: no half-finished rewrite.
     assert (boot / "otp-identity" / "credential").read_text() \
         == f"pi:{SEEDED_HASH}\n"
 
 
 def test_the_uid_1000_account_is_found_by_uid_and_not_by_name(tmp_path):
-    """
-    The other half of the rule above. `otp` is image/build.sh's
-    FIRST_USER_NAME today, and a script that matched that string would do the
-    right thing on this image and the wrong thing on a renamed one -- silently
-    refusing to restore anything, on the machine whose operator had customised
-    it most.
-    """
+    """The account is found by UID 1000, not by the name `otp`: matching the
+    string would silently restore nothing on a renamed image."""
     proc, boot, root = run_persist_identity(
         tmp_path, first_user="keyprinter",
         credential=f"keyprinter:{SEEDED_HASH}\n")
@@ -1323,12 +963,8 @@ def test_the_uid_1000_account_is_found_by_uid_and_not_by_name(tmp_path):
 
 
 def test_a_second_line_in_the_store_is_refused_rather_than_applied(tmp_path):
-    """
-    `chpasswd` reads EVERY line it is handed. A two-line store is a store that
-    sets two accounts' passwords, on a partition anyone with a card reader can
-    write -- and the first line being perfectly valid is what would make the
-    second one arrive unnoticed.
-    """
+    """A two-line store is refused: chpasswd applies every line it is handed,
+    and the partition is writable by anyone with a card reader."""
     proc, _, root = run_persist_identity(
         tmp_path, credential=f"otp:{SEEDED_HASH}\nroot:{SEEDED_HASH}\n")
     assert proc.returncode != 0, proc.stdout
@@ -1338,24 +974,15 @@ def test_a_second_line_in_the_store_is_refused_rather_than_applied(tmp_path):
 
 
 def test_a_chpasswd_that_exits_zero_without_writing_is_caught(tmp_path):
-    """
-    The read-back, which is the difference between "the command ran" and "the
-    password is back".
-
-    chpasswd's exit status says the former. A chpasswd that is missing from
-    the image, that is a stub, or that was pointed at another tree gives a
-    boot where the restore reported success and the operator still cannot log
-    in -- and on this appliance nobody finds out until they are standing in
-    front of it with a keyboard.
-    """
+    """The restore reads /etc/shadow back: chpasswd's exit status says the
+    command ran, not that the password is in place."""
     proc, _, root = run_persist_identity(
         tmp_path, credential=f"otp:{SEEDED_HASH}\n",
         chpasswd_env={"CHPASSWD_APPLY": "no"})
     assert proc.returncode != 0, proc.stdout
     assert "does not hold the" in proc.stderr, proc.stderr
     assert shadow_hash(root) == BUILD_TIME_HASH
-    # The positive control: the same store, the same fixture, a chpasswd that
-    # does its job. Without it this passes on a script that always fails.
+    # Positive control: the same store with a chpasswd that does its job.
     proc, _, root = run_persist_identity(tmp_path / "control",
                                          credential=f"otp:{SEEDED_HASH}\n")
     assert proc.returncode == 0, proc.stderr
@@ -1363,8 +990,8 @@ def test_a_chpasswd_that_exits_zero_without_writing_is_caught(tmp_path):
 
 
 def test_a_chpasswd_that_fails_is_not_reported_as_a_restore(tmp_path):
-    """The other exit: a chpasswd that says so. `set -e` is not in force in
-    this script, so a pipeline whose status nobody read would sail past."""
+    """A failing chpasswd fails the restore; the script has no `set -e`, so its
+    status must be read explicitly."""
     proc, _, root = run_persist_identity(
         tmp_path, credential=f"otp:{SEEDED_HASH}\n",
         chpasswd_env={"CHPASSWD_APPLY": "no", "CHPASSWD_RC": "1"})
@@ -1374,21 +1001,13 @@ def test_a_chpasswd_that_fails_is_not_reported_as_a_restore(tmp_path):
 
 
 def test_neither_phase_writes_a_credential_into_the_overlay(tmp_path):
-    """
-    #35's guard, asked of the phase that did not exist when it was written.
-
-    If /boot/firmware never mounted, $BOOT_DIR falls back to a directory on
-    the overlay's tmpfs: the record would write a hash into RAM, the restore
-    would read it back happily, and both would agree with each other on every
-    boot while nothing survived any of them. The recording phase is a separate
-    entry point into this script and has to honour the refusal on its own.
-    """
+    """The recording phase also refuses a store on the overlay's tmpfs, where
+    record and restore would agree on every boot while nothing survived."""
     proc, boot, _ = run_persist_identity(tmp_path, store_src="overlay",
                                          mode="--record-credential")
     assert proc.returncode != 0, proc.stdout
     assert not (boot / "otp-identity" / "credential").exists()
-    # The positive control, same fixture and same phase, with the store on the
-    # card: two absences are not a refusal.
+    # Positive control: the same phase with the store on the card.
     proc, boot, _ = run_persist_identity(tmp_path / "control",
                                          mode="--record-credential")
     assert proc.returncode == 0, proc.stderr
@@ -1396,12 +1015,8 @@ def test_neither_phase_writes_a_credential_into_the_overlay(tmp_path):
 
 
 def test_a_locked_account_is_not_recorded_over_a_good_credential(tmp_path):
-    """
-    The recording phase's own refusal. An account whose /etc/shadow field is
-    `!` has no password to keep, and writing that to the store would replace a
-    working credential with one the restore must refuse -- costing the
-    operator the login on the next power cycle rather than this one.
-    """
+    """A locked account (`!`) is not recorded: it would replace a working
+    credential with one the restore must refuse."""
     kept = f"otp:{SEEDED_HASH}\n"
     proc, boot, _ = run_persist_identity(tmp_path, credential=kept,
                                          live_hash="!",
@@ -1411,21 +1026,10 @@ def test_a_locked_account_is_not_recorded_over_a_good_credential(tmp_path):
 
 
 def test_a_fresh_seed_this_boot_beats_the_credential_that_was_restored(tmp_path):
-    """
-    THE ORDERING DECISION, run as the sequence it is.
-
-    A boot where the store is restored AND a fresh userconf.txt is on the card
-    is a boot where the operator is CHANGING their password. The restore
-    happens at sysinit and the wizard applies the new seed over it at
-    multi-user, so the new password is in force by the end of that boot -- and
-    the wizard's own ExecStartPost then replaces the store, so it is also the
-    one the NEXT boot puts back. Precedence: fresh seed, then store, then the
-    image's random build-time password.
-
-    Get the last step wrong and the failure is the nastiest kind: the operator
-    sets a new password, it works all session, and the next power cycle
-    silently reverts them to the old one.
-    """
+    """Precedence is fresh seed, then store, then the build-time password: the
+    wizard applies a new seed over the sysinit restore and its ExecStartPost
+    replaces the store, so the next boot restores the new password rather than
+    the old."""
     old = "$6$oldoldold$" + "C" * 86
     proc, boot, root = run_persist_identity(tmp_path, credential=f"otp:{old}\n")
     assert proc.returncode == 0, proc.stderr
@@ -1445,39 +1049,24 @@ def test_a_fresh_seed_this_boot_beats_the_credential_that_was_restored(tmp_path)
 
 
 def test_the_restore_runs_before_any_login_is_possible():
-    """
-    The systemd half of the ordering above, which no fake tree can show.
-
-    The restore rides otp-unit-identity.service, which is Before=sysinit.target
-    -- and every getty on this machine is pulled in at multi-user, so there is
-    no window in which a login prompt exists and the password is still the
-    build-time one. Unlike the machine-id, this needs no initramfs: nothing
-    reads /etc/shadow before PID 1 has started units, which is the entire
-    reason the credential is not a second exception in the overlay script.
-    """
+    """The restore runs Before=sysinit.target, before any getty exists, and
+    needs no initramfs hook because nothing reads /etc/shadow before PID 1
+    starts units."""
     unit = IDENTITY_UNIT.read_text()
     assert "Before=sysinit.target" in unit, unit
     assert "ExecStart=/opt/otp-unit/persist-identity.sh" in unit
-    # And the RESTORE is the default phase, so the shipped ExecStart gets it
-    # without an argument. A unit that passed --record-credential here would
-    # write the build-time hash to the card on every unseeded boot and restore
-    # nothing, ever.
+    # The restore is the default phase: a unit passing --record-credential
+    # would write the build-time hash to the card and restore nothing.
     assert "--record-credential" not in unit, unit
     code = IDENTITY_SH.read_text()
     assert "/scripts/overlay" not in code
     assert "shadow" in code, "the script no longer touches the credential"
 
 
-# --- and the four lines that put it on the machine ------------------------
+# --- and the lines that put it on the machine ------------------------------
 #
-# THE HALF NOTHING WATCHED. Everything above drives persist-identity.sh
-# directly, so the script could be perfect while install.sh never shipped it:
-# deleting the install block outright left the whole fast suite green, and so
-# did gutting the unit -- no [Install] section, no ExecStart worth running.
-# An image that installs and enables nothing boots, prints, and loses its
-# identity on every power cycle, and the only thing that would have said so
-# is a sixteen-minute tier-3 build. Same shape as the probe install above,
-# which is watched for the same reason.
+# The tests above drive persist-identity.sh directly; these check that
+# install.sh ships and enables it.
 
 IDENTITY_INSTALL_BLOCK = (
     '    install -m 0755 "$REPO_DIR/device/persist-identity.sh" \\',
@@ -1487,10 +1076,8 @@ IDENTITY_INSTALL_BLOCK = (
 def run_identity_install(tmp_path, *, repo_dir=None):
     """Run install.sh's identity-install block against a substitute REPO_DIR.
 
-    `install` is shadowed by a shell function rather than stubbed on PATH,
-    for the reason run_probe_install shadows it: the block writes into
-    /etc/systemd/system and /opt/otp-unit, and a test has no business
-    touching either.
+    `install` is shadowed by a shell function so nothing is written to
+    /etc/systemd/system or /opt/otp-unit.
     """
     block = slice_between(INSTALL.read_text(), *IDENTITY_INSTALL_BLOCK)
     return run_block(block, tmp_path,
@@ -1500,11 +1087,8 @@ def run_identity_install(tmp_path, *, repo_dir=None):
 
 
 def test_the_identity_script_and_its_unit_are_both_installed(tmp_path):
-    """
-    Both files, and to the paths the unit and the harness name. The unit's
-    ExecStart is an absolute /opt/otp-unit/persist-identity.sh, so a script
-    installed anywhere else is a unit that fails to start.
-    """
+    """Script and unit are installed to the paths the unit names: ExecStart is
+    an absolute /opt/otp-unit/persist-identity.sh."""
     proc = run_identity_install(tmp_path)
     assert proc.returncode == 0, proc.stderr
     installed = [ln for ln in proc.stdout.splitlines() if ln.startswith("INSTALL")]
@@ -1517,18 +1101,14 @@ def test_the_identity_script_and_its_unit_are_both_installed(tmp_path):
 
 
 def test_the_identity_unit_is_enabled_and_not_merely_dropped_in_place(tmp_path):
-    """
-    A unit file in /etc/systemd/system with no symlink pointing at it is a
-    unit systemd never runs. Nothing else on this image enables it -- and the
-    accident that used to, first-boot `preset-all`, is precisely what this
-    unit exists to end, so it cannot be relied on to enable its own cure.
-    """
+    """The unit is enabled, after a daemon-reload: a unit file with no symlink
+    never runs, and nothing else on the image enables it."""
     proc = run_identity_install(tmp_path)
     assert proc.returncode == 0, proc.stderr
     calls = systemctl_calls(tmp_path)
     assert "enable otp-unit-identity.service" in calls, calls
-    # And after the unit file lands, or systemd enables a file it has not
-    # read: `enable` resolves [Install] out of the unit on disk.
+    # After the unit file lands: `enable` resolves [Install] from the unit on
+    # disk.
     assert "daemon-reload" in calls, calls
     assert calls.index("daemon-reload") < calls.index(
         "enable otp-unit-identity.service"), calls
@@ -1545,9 +1125,8 @@ CREDENTIAL_DROPIN_DIR = "/etc/systemd/system/userconfig.service.d"
 def run_credential_dropin(tmp_path):
     """Write the shipped credential drop-in into a substituted unit directory.
 
-    Rewritten rather than stubbed, for the reason run_dropin gives: a test has
-    no business writing into the machine's own /etc/systemd/system, and
-    everything that decides what the file SAYS stays the shipped bytes.
+    Only the directory is rewritten; the file's content stays the shipped
+    bytes.
     """
     etc = tmp_path / "etc"
     block = slice_between(INSTALL.read_text(), *CREDENTIAL_DROPIN_BLOCK)
@@ -1559,78 +1138,46 @@ def run_credential_dropin(tmp_path):
 
 
 def test_the_wizard_records_the_credential_it_just_applied(tmp_path):
-    """
-    The other half of "persist it", and the half with no other trigger.
-
-    Without this line the restore has nothing to restore, forever: the store
-    is written by --record-credential and by nothing else. The image would
-    then boot, apply an operator's seed, delete it, and lose the password at
-    the power cycle exactly as before -- with a persistence mechanism
-    installed, enabled, and reporting success every boot.
-    """
+    """The wizard's ExecStartPost records the credential: nothing else writes
+    the store, so without it the restore has nothing to restore."""
     text = run_credential_dropin(tmp_path)
     assert "ExecStartPost=" in text, text
     assert "/opt/otp-unit/persist-identity.sh --record-credential" in text, text
-    # The path the identity install above really writes the script to. An
-    # ExecStartPost naming anything else is a line systemd cannot run -- and
-    # with the `-` below, cannot complain about either.
+    # The path the identity install writes the script to.
     assert "ExecStartPost=-/opt/otp-unit/" in text, text
 
 
 def test_a_record_that_fails_does_not_cost_the_operator_the_apply(tmp_path):
-    """
-    The leading `-`, stated as a property rather than left to be noticed.
-
-    Stock userconfig.service carries Restart=on-failure. Without the `-` a
-    full boot partition -- or any other reason the record fails -- turns into
-    a restart loop printing `Failed with result` and `Scheduled restart job`,
-    two of the strings harness/img-boot.sh fails a release on, on the one boot
-    that was applying the operator's password successfully.
-    """
+    """The ExecStartPost has a leading `-`: stock userconfig.service is
+    Restart=on-failure, so a failed record would otherwise restart-loop the
+    boot that applied the password."""
     text = run_credential_dropin(tmp_path)
     assert "ExecStartPost=-" in text, text
 
 
 def test_the_credential_is_recorded_only_on_an_overlay_machine():
-    """
-    The drop-in is inside install.sh's `if` on cmdline.txt, next to the unit
-    and the script it names -- not beside the wizard drop-in written on every
-    machine this script provisions.
-
-    A writable root keeps /etc/shadow by itself and has nothing to persist,
-    and persist-identity.sh is not installed there at all: an ExecStartPost
-    pointing at a script that does not exist is what the tier-2 Debian guest
-    would get, on a unit whose userconfig.service would then be carrying a
-    command it can never run.
-    """
+    """The drop-in is written only inside the overlay branch, after the script
+    it names: a writable root has nothing to persist and no persist-identity.sh
+    installed."""
     text = INSTALL.read_text()
     dropin = text.index("otp-credential.conf")
     identity = text.index('install -m 0755 "$REPO_DIR/device/persist-identity.sh"')
     overlay_branch = text.index('log "Enabling the read-only root overlay"')
-    # After the branch opens, and after the script it names is installed.
     assert overlay_branch < identity < dropin, (overlay_branch, identity, dropin)
-    # And before the branch closes. The `fi` that ends it is the one directly
-    # ahead of the summary this script prints for the operator.
+    # Before the branch closes, just ahead of the operator summary.
     assert dropin < text.index("# WHAT THIS SCRIPT DID TO SOMEONE ELSE'S MACHINE")
 
 
-# --- ssh.socket, which turned a documented reload into a dead sshd --------
+# --- ssh.socket, which breaks sshd's reload ---------------------------------
 
 SSH_SOCKET_BLOCK = ("# --- AND THE RELOAD AT THE END OF THAT SAME SCRIPT",
                     "systemctl mask ssh.socket")
 
 
 def test_the_socket_that_kept_sshd_from_rebinding_is_masked(tmp_path):
-    """
-    cancel-rename ends a seeded first boot with `systemctl --quiet reload
-    ssh`. With ssh.socket holding :22, sshd runs on an inherited descriptor,
-    its SIGHUP re-exec has nothing left to adopt, and RestartPreventExitStatus
-    =255 keeps it down for the rest of the boot -- run 72, boot 1.
-
-    MASKED rather than disabled, and that is the half worth asserting: the
-    enable symlinks live in /etc/systemd/system, which is inside the overlay,
-    so a disable lasts one boot and the next first-boot preset-all puts the
-    socket straight back.
+    """ssh.socket is masked: with the socket holding :22, the `reload ssh` that
+    ends a seeded first boot leaves sshd dead. Masked rather than disabled
+    because enable symlinks live in the overlay and a disable lasts one boot.
     """
     block = slice_between(INSTALL.read_text(), *SSH_SOCKET_BLOCK)
     proc = run_block(block, tmp_path)
@@ -1640,12 +1187,8 @@ def test_the_socket_that_kept_sshd_from_rebinding_is_masked(tmp_path):
 
 
 def test_ssh_service_itself_is_left_alone(tmp_path):
-    """
-    Masking the SERVICE would be the other way to stop the reload -- the
-    guard in cancel-rename is `systemctl --quiet is-active ssh` -- and it is
-    refused. It leaves ssh.socket listening on :22 for a service that can
-    never start, and takes SSH off a machine as a side effect of a bug fix.
-    """
+    """ssh.service itself is not masked: that would leave the socket listening
+    for a service that can never start."""
     block = slice_between(INSTALL.read_text(), *SSH_SOCKET_BLOCK)
     run_block(block, tmp_path)
     for call in systemctl_calls(tmp_path):
@@ -1656,18 +1199,14 @@ def test_ssh_service_itself_is_left_alone(tmp_path):
 # --- the harness end ------------------------------------------------------
 
 def test_the_harness_copies_the_overlay_token_and_never_invents_one(tmp_path):
-    """
-    Adding boot=overlay to -append when the image's own cmdline.txt does not
-    carry it would make tier 3 prove its own command line rather than the
-    artifact. An image built without the overlay has to boot without it here
-    too, and fail.
-    """
+    """The harness copies boot=overlay from the image's own cmdline.txt and
+    never adds it, so tier 3 proves the artifact rather than its own command
+    line."""
     block = slice_between(IMG_BOOT.read_text(), 'OVERLAY_TOKENS=""', "esac")
     for cmdline, expected in (
         ("boot=overlay console=tty1 root=PARTUUID=1a2b-02", "boot=overlay"),
         ("console=tty1 root=PARTUUID=1a2b-02", ""),
-        # Not a substring match: a token that merely contains the word is
-        # not the token.
+        # Whole-token match, not substring.
         ("console=tty1 noboot=overlayfs", ""),
     ):
         runner = tmp_path / "tokens.sh"
@@ -1682,10 +1221,8 @@ REVISION_BLOCK = ("# --- the board revision the firmware would have supplied",
                   'log "board revision $BOARD_REVISION synthesised into $DTB '
                   '(the firmware\'s job)"')
 
-# fdtput/fdtget come from device-tree-compiler, which the image workflow
-# installs next to qemu and mtools and the fast suite does not have. Stubbed
-# so this runs anywhere: the "blob" is a text file and the property is a line
-# in it, which is enough for every branch under test.
+# fdtput/fdtget come from device-tree-compiler, which the fast suite does not
+# have. The stub "blob" is a text file with one line per property.
 FDTPUT_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$FDT_LOG"
 [ -z "${FDTPUT_DEAF-}" ] || exit 0
@@ -1696,9 +1233,7 @@ case "$1" in
 esac
 exit 1
 """
-# Shell builtins only: PATH below is cut down to the tools the block itself
-# uses, and reaching for sed here would make the stub depend on something the
-# code under test does not.
+# Shell builtins only: the test PATH holds just the tools the block uses.
 FDTGET_STUB = """#!/bin/sh
 # fdtget <blob> <node> <prop>, printing the value as a decimal integer.
 value=""
@@ -1717,10 +1252,8 @@ def run_revision_block(tmp_path, *, have_fdtput=True, fdtput_deaf=False):
     (work / "boot").mkdir(parents=True, exist_ok=True)
     dtb = work / "boot" / "bcm2710-rpi-3-b.dtb"
     dtb.write_text("")
-    # A PATH with nothing on it but the tools the block uses, so
-    # `have_fdtput=False` really means absent -- on a developer's machine the
-    # real device-tree-compiler is usually installed, and inheriting PATH
-    # would make that test pass for the wrong reason there and fail in CI.
+    # A PATH holding only the tools the block uses, so `have_fdtput=False`
+    # means absent even where device-tree-compiler is installed.
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     for tool in ("cp", "basename"):
@@ -1738,8 +1271,6 @@ def run_revision_block(tmp_path, *, have_fdtput=True, fdtput_deaf=False):
         f'WORK="{work}"\nDTB="{dtb}"\n'
         + slice_between(IMG_BOOT.read_text(), *REVISION_BLOCK) + "\n"
         'printf "DTB=%s\\n" "$DTB"\n')
-    # PATH without the real device-tree-compiler even when the host has one,
-    # so `have_fdtput=False` really means absent.
     proc = subprocess.run(
         [shutil.which("bash") or "/bin/bash", str(runner)],
         capture_output=True, text=True, timeout=60,
@@ -1750,58 +1281,42 @@ def run_revision_block(tmp_path, *, have_fdtput=True, fdtput_deaf=False):
 
 
 def test_the_harness_supplies_the_board_revision_the_firmware_would_have(tmp_path):
-    """
-    QEMU is not the Pi firmware, so no /system/linux,revision reaches the
-    guest and rpi-eeprom-update.service dies on `(0x >> 23) & 1`. Measured on
-    a stock card under -M raspi3b: absent without this, 00a02082 with it, and
-    the service goes rc=2 to rc=0.
-    """
+    """The harness writes /system/linux,revision into a copy of the DTB: QEMU
+    is not the Pi firmware, and without it rpi-eeprom-update.service fails."""
     proc, log = run_revision_block(tmp_path)
     assert proc.returncode == 0, proc.stderr
     calls = log.read_text()
     assert "linux,revision 0xa02082" in calls, calls
-    # The image's own DTB is left alone, so the evidence can still show what
-    # a device would have booted.
+    # The image's own DTB is left alone.
     assert "otp-harness-" in proc.stdout, proc.stdout
 
 
 def test_a_revision_that_did_not_reach_the_blob_stops_the_boot(tmp_path):
-    """
-    A write that did nothing looks exactly like one that worked from here,
-    and the cost of not noticing is a red release gate blamed on the image
-    rather than on the emulator. So the property is read back.
-    """
+    """The property is read back: a write that did nothing would surface as a
+    failed release gate blamed on the image."""
     proc, _ = run_revision_block(tmp_path, fdtput_deaf=True)
     assert proc.returncode != 0
     assert "linux,revision" in proc.stderr, proc.stderr
 
 
 def test_no_device_tree_compiler_stops_the_boot_rather_than_booting_without_it(tmp_path):
-    """
-    Booting without the property is booting the configuration this exists to
-    fix. A hard requirement, like mcopy: the failure has to name the missing
-    package rather than arrive half an hour later as a failed unit.
-    """
+    """A missing device-tree-compiler stops the boot and names the package,
+    rather than booting without the property."""
     proc, _ = run_revision_block(tmp_path, have_fdtput=False)
     assert proc.returncode != 0
     assert "device-tree-compiler" in proc.stderr, proc.stderr
 
 
 def test_the_synthesised_revision_is_the_board_the_emulator_models():
-    """
-    A code for hardware `-M raspi3b` does not model is the run-1 DTB mistake
-    in a smaller font -- and gpiozero builds its whole board description from
-    these bits. Decoded against the scheme rpi-eeprom-update itself reads.
-    """
+    """The synthesised revision decodes to the board `-M raspi3b -m 1024`
+    models; gpiozero builds its board description from these bits."""
     text = IMG_BOOT.read_text()
     code = int(shell_assignment(text, "BOARD_REVISION"), 16)
     assert (code >> 23) & 1, "new-style flag clear: rpi-eeprom-update would " \
                              "call this a pre-2016 board and skip"
     assert (code >> 12) & 0xF == 2, "processor is not BCM2837"
     assert (code >> 4) & 0xFF == 0x08, "board type is not 3 Model B"
-    # 1GB, in the same units `-m 1024` gives the guest. A revision claiming
-    # more memory than the emulator provides is a description of a machine
-    # that is not there.
+    # 1GB, matching `-m 1024`.
     assert 256 * (2 ** ((code >> 20) & 7)) == 1024
     assert "-M raspi3b -m 1024" in text, \
         "the emulated machine moved; the revision above describes the old one"
@@ -1815,36 +1330,19 @@ def shell_assignment(text: str, name: str) -> str:
 
 
 def test_the_harness_hands_the_initramfs_to_qemu():
-    # Without -initrd the kernel boots with no initramfs, boot=overlay is
-    # read by nothing, and every overlay check would fail for a reason that
-    # is the harness's fault rather than the image's.
+    # Without -initrd nothing reads boot=overlay and every overlay check fails
+    # through the harness's fault.
     assert '${INITRD:+-initrd "$INITRD"}' in IMG_BOOT.read_text()
 
 
 def test_the_guest_probe_cannot_run_on_a_flashed_unit():
-    """
-    The probe ships in the image, so what keeps it off a real appliance is
-    this one condition. systemd matches a bare word against both the word
-    and the left hand side of an assignment, so otp.imgcheck=boot1 starts
-    it and a device command line that says nothing about it does not.
+    """The probe's unit is conditioned on the kernel command-line word the
+    harness builds its token from, and the release phase gets no token.
 
-    THIS TEST IS A SPELLING CHECK AND THAT IS ALL IT EVER WAS. It reads one
-    string out of the unit file and finds it in the harness. It cannot see a
-    drop-in, a preset, an install.sh that starts the unit another way, or a
-    systemd release that reads the condition differently, and it says nothing
-    whatever about what a booted machine does. What backs the claim now is
-    tier 3's `release` phase -- a third boot of the same card with no
-    otp.imgcheck token, which requires systemd's own condition-skip line
-    naming this unit, no output from the probe, and the probe's two records
-    staying off the card after the harness deletes them. This stays as the
-    cheap half of that pair: it goes red in seconds rather than in sixteen
-    minutes.
-
-    DERIVED FROM THE UNIT FILE, in both directions. The condition's parameter
-    is read out of the shipped unit and the harness is required to build its
-    token out of that exact word -- so renaming the condition cannot leave the
-    harness supplying a token nothing looks for, which would make every probe
-    boot silently inert and every release boot trivially green.
+    A spelling check only: tier 3's `release` phase is what shows a flashed
+    unit does not run the probe. The word is read from the unit file, so
+    renaming the condition cannot leave the harness supplying a token nothing
+    matches.
     """
     unit = IMGCHECK_UNIT.read_text()
     condition = re.search(r"^ConditionKernelCommandLine=(\S+)$", unit, re.M)
@@ -1853,14 +1351,12 @@ def test_the_guest_probe_cannot_run_on_a_flashed_unit():
     assert word == "otp.imgcheck", word
 
     harness = IMG_BOOT.read_text()
-    # The token the two probe phases get is the condition's own word plus the
-    # phase; the release phase gets nothing at all, and the -append line
-    # carries only the variable, so no phase can have the token forced on it.
+    # The probe phases get the condition's word plus the phase; -append carries
+    # only the variable, so no phase has the token forced on it.
     assert f'imgcheck_token="{word}=$phase"' in harness, harness
     append = next(line for line in harness.splitlines()
                   if line.strip().startswith("-append "))
     assert "$imgcheck_token" in append and word not in append, append
-    # And the release phase is the arm that leaves it empty.
     assert re.search(r"case \"\$phase\" in\n\s*release\) ;;\n", harness), \
         "no phase gets an empty imgcheck token, so nothing boots this image " \
         "the way a flashed unit boots it"
@@ -1879,9 +1375,8 @@ STAGE_COPY_BLOCK = ("for item in otpunit codewords device harness",
 def run_probe_install(tmp_path, *, repo_dir, image_build):
     """Run install.sh's probe-install block against a substitute REPO_DIR.
 
-    `install` is shadowed by a shell function rather than stubbed on PATH:
-    the block installs into /etc/systemd/system and /opt/otp-unit, and a
-    test has no business writing to either.
+    `install` is shadowed by a shell function so nothing is written to
+    /etc/systemd/system or /opt/otp-unit.
     """
     block = slice_between(INSTALL.read_text(), *PROBE_INSTALL_BLOCK)
     return run_block(block, tmp_path,
@@ -1892,14 +1387,9 @@ def run_probe_install(tmp_path, *, repo_dir, image_build):
 
 
 def test_an_image_build_without_the_probe_fails(tmp_path):
-    """
-    Every other overlay precondition exits 1 under --image-build; this one
-    printed a NOTE and carried on, so a build could ship an image whose
-    overlay nothing can observe. Deleting the install line survived the
-    whole fast suite, and the miss only appeared after a pi-gen build and
-    two emulated boots -- as a guest that never reported, which reads as a
-    boot failure rather than a packaging one.
-    """
+    """An image build without the probe fails rather than printing a NOTE: the
+    image's overlay would be unobservable, and the miss would read as a boot
+    failure in tier 3."""
     empty = tmp_path / "repo"
     (empty / "harness").mkdir(parents=True)
     proc = run_probe_install(tmp_path, repo_dir=empty, image_build=1)
@@ -1908,8 +1398,7 @@ def test_an_image_build_without_the_probe_fails(tmp_path):
 
 
 def test_a_hand_provisioned_machine_without_the_probe_only_says_so(tmp_path):
-    # Not an image build: someone running install.sh from a partial copy on
-    # a Pi gets a working unit and a note, which is what they had before.
+    # Outside an image build, a partial copy gets a working unit and a note.
     empty = tmp_path / "repo"
     (empty / "harness").mkdir(parents=True)
     proc = run_probe_install(tmp_path, repo_dir=empty, image_build=0)
@@ -1918,7 +1407,7 @@ def test_a_hand_provisioned_machine_without_the_probe_only_says_so(tmp_path):
 
 
 def test_the_probe_is_installed_when_it_is_there(tmp_path):
-    # The positive control, against the real repository.
+    # Positive control, against the real repository.
     proc = run_probe_install(tmp_path, repo_dir=REPO, image_build=1)
     assert proc.returncode == 0, proc.stderr
     assert "img-guest-check.sh" in proc.stdout, proc.stdout
@@ -1957,12 +1446,8 @@ def test_the_stage_copies_everything_install_sh_reads(tmp_path):
 
 
 def test_a_missing_item_stops_the_stage_instead_of_being_skipped(tmp_path):
-    """
-    The copy was `if [ -e ]`, so dropping a name from the list -- or from
-    the repository -- was a silent no-op. `harness` is the one that did not
-    even fail in the chroot: install.sh printed a NOTE and built an image
-    whose overlay nothing could probe.
-    """
+    """Every listed item except `assets` must exist: a silently skipped
+    `harness` yields an image whose overlay nothing can probe."""
     for missing in ALL_ITEMS:
         if missing == "assets":
             continue
@@ -1973,8 +1458,8 @@ def test_a_missing_item_stops_the_stage_instead_of_being_skipped(tmp_path):
 
 
 def test_the_assets_directory_stays_optional(tmp_path):
-    # install.sh guards its own use of the manual PDFs, and an image
-    # without them boots and prints pads. The warning is the whole penalty.
+    # install.sh guards its own use of the manual PDFs; the warning is the
+    # whole penalty.
     present = [i for i in ALL_ITEMS if i != "assets"]
     proc = run_stage_copy(tmp_path, present=present)
     assert proc.returncode == 0, proc.stderr
@@ -1982,34 +1467,21 @@ def test_the_assets_directory_stays_optional(tmp_path):
 
 # --- and the build refuses to purge more than it meant to ----------------
 
-# The end marker is the heredoc terminator and not the purge command, which
-# it used to be. A mutation that edits the last line -- `|| true` on the
-# purge, say -- would then stop the SLICE matching, every test here would
-# die on a ValueError out of slice_between, and the mutation gate would
-# count that as the guard noticing. A harness that fails for its own reasons
-# cannot report on anything.
+# The end marker is the heredoc terminator, not the purge command, so a
+# mutation of the last line fails a test rather than breaking the slice.
 STAGE_PURGE_BLOCK = ("# --- cloud-init, removed rather than left switched off",
                      "\nEOF\n")
 
-# What `apt-get -s purge` prints for the two packages alone: `Purg` for what
-# it purges, one line each, in apt's own format. Anything else in that
-# listing is a package this image depends on that would have gone with them.
+# What `apt-get -s purge` prints for the two packages alone. Any other line is
+# a package that would go with them.
 PURGE_SIM_CLEAN = ("Reading package lists...\n"
                    "Building dependency tree...\n"
                    "Purg cloud-init [25.2-1~bpo13+1+rpt20]\n"
                    "Purg rpi-cloud-init-mods [1:20260119]\n")
 
-# The apt-get every case here runs. It RECORDS its arguments, because "the
-# build did not purge anything" and "the build purged and the stub said
-# nothing" are different runs and only the log can tell them apart -- the
-# same reason run_block's systemctl records rather than merely exiting 0.
-#
-# It can also FAIL, on either call, and that is not decoration. The block's
-# first version read apt's plan through a pipeline ending in `|| true`, so a
-# simulation that exited 100 having printed nothing -- what real apt does
-# for a package name that is in no index -- reached the refusal as an empty
-# string and was passed as clean. A stub that could only succeed could not
-# have told anyone.
+# Records its arguments, so a run that never purged can be told from one that
+# did. Either call can be made to fail: a simulation that exits non-zero with
+# no plan must not read as clean.
 APT_GET_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$APT_LOG"
 case " $* " in
@@ -2027,18 +1499,9 @@ def run_stage_purge(tmp_path, *, simulation=PURGE_SIM_CLEAN, sim_rc=0,
                     sim_stderr="", purge_rc=0):
     """Run the pi-gen stage's cloud-init purge against a simulated apt.
 
-    `on_chroot` is a shell function here rather than pi-gen's capsh: what
-    the block puts on its stdin is the thing under test, and the heredoc
-    has to reach the interpreter untouched.
-
-    THE INTERPRETER IS `sh` ON PURPOSE, and this docstring used to say `sh`
-    because it believed pi-gen's was. pi-gen's is not: scripts/common:107
-    ends on_chroot in a capsh call whose `--` execs /bin/bash unless
-    `--shell=` overrides it, and pi-gen passes no `--shell`, so the real
-    thing is `bash -e`. The block is POSIX, so both accept it; dash is the
-    stricter of the two and catches a bashism the day somebody adds one,
-    which is why the choice stands after the correction rather than being
-    reversed by it.
+    `on_chroot` is a shell function so the heredoc reaches the interpreter
+    untouched. pi-gen's on_chroot runs bash; `sh` is used here because the
+    block is POSIX and dash would catch a bashism.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -2061,31 +1524,21 @@ def run_stage_purge(tmp_path, *, simulation=PURGE_SIM_CLEAN, sim_rc=0,
 def assert_nothing_was_removed(log):
     """Every apt call in this log carried -s, so the rootfs is untouched.
 
-    A refusal that fires after the purge has run is a build that stops with
-    the packages already gone. Each refusal below asserts this rather than
-    only its exit status.
+    A refusal must fire before the real purge, not after the packages are gone.
     """
     assert "-s" in log, log
     assert [ln for ln in log.splitlines() if "-s" not in ln.split()] == [], log
 
 
 def test_the_stage_purges_both_cloud_init_packages(tmp_path):
-    """
-    The positive control for the two refusals below, and the change itself.
-
-    ENABLE_CLOUD_INIT=0 in image/build.sh only skips pi-gen's seed files;
-    stage2/04-cloud-init/00-packages installs cloud-init and
-    rpi-cloud-init-mods with no condition on that variable anywhere in the
-    path, so every image this project built carried a provisioning agent
-    whose Raspberry Pi datasource config reads user-data out of
-    /boot/firmware. See issue #34.
-    """
+    """Positive control for the refusals below: cloud-init and
+    rpi-cloud-init-mods are simulated, then purged. ENABLE_CLOUD_INIT=0 only
+    skips pi-gen's seed files; the packages are installed regardless (issue
+    #34)."""
     proc, log = run_stage_purge(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert "purge -y cloud-init rpi-cloud-init-mods" in log, log
-    # The simulation and then the real removal, both of them and in that
-    # order: a build that only simulated would ship the packages, and one
-    # that only purged would ship whatever apt took with them.
+    # Simulation first, then the real removal.
     lines = [line for line in log.splitlines() if "purge" in line]
     assert len(lines) == 2, log
     assert "-s" in lines[0].split(), log
@@ -2093,16 +1546,8 @@ def test_the_stage_purges_both_cloud_init_packages(tmp_path):
 
 
 def test_a_purge_that_would_take_something_else_stops_the_build(tmp_path):
-    """
-    `apt-get purge -y` removes reverse dependencies without a prompt.
-
-    The one thing issue #34 said had to be confirmed before the packages
-    went is that nothing in Raspberry Pi OS Lite depends on them. Read off
-    the archives that holds -- nothing declares any relationship on
-    rpi-cloud-init-mods, and only debian-cloud-images-packages depends on
-    cloud-init in Debian -- but an index is not the rootfs, and the rootfs
-    is what would lose the dependent. Silently: the deletion would surface
-    as a unit that no longer boots, two emulated boots later.
+    """`apt-get purge -y` removes reverse dependencies without a prompt, so a
+    plan naming any other package stops the build before anything is removed.
     """
     proc, log = run_stage_purge(tmp_path, simulation=(
         PURGE_SIM_CLEAN + "Remv raspberrypi-sys-mods [20260101]\n"))
@@ -2112,27 +1557,9 @@ def test_a_purge_that_would_take_something_else_stops_the_build(tmp_path):
 
 
 def test_the_filter_reads_a_remv_apt_would_not_print_here(tmp_path):
-    """
-    A SHAPE TODAY'S APT CANNOT PRODUCE UNDER `purge`, kept as cheap defence,
-    and this test used to claim the opposite.
-
-    It said `Remv` was the word apt prints for a package taken out on the
-    way to the named ones, and therefore the branch that catches a
-    dependent. The stage script's comment said it too. Both were wrong.
-    `apt-get purge` re-marks EVERY scheduled deletion as a purge before it
-    prints -- apt 3.0.3, apt-private/private-install.cc:222-225 -- so under
-    `purge` the `Remv` arm is unreachable. Measured on apt 2.8.3 against a
-    package with nine reverse dependencies, none named on the command line:
-    `apt-get -s purge` printed ten `Purg` lines and no `Remv`, and the same
-    command as `remove` printed ten `Remv` lines. The fixture below is
-    output apt would not give us.
-
-    The arm stays: it is one awk clause, and it is what would still read the
-    plan if a later apt stopped re-marking or if that line were ever edited
-    to `remove`. What it is not is the reason the refusal works -- that is
-    test_a_purge_that_would_take_something_else_stops_the_build, whose
-    fixture is the one apt actually prints.
-    """
+    """A `Remv` line also stops the build. apt re-marks every deletion as
+    `Purg` under `purge`, so this arm is defence against a later apt or an edit
+    to `remove`."""
     proc, log = run_stage_purge(tmp_path, simulation=(
         "Remv netplan.io [1.1.2-7]\n" + PURGE_SIM_CLEAN))
     assert proc.returncode != 0, proc.stdout
@@ -2141,18 +1568,8 @@ def test_the_filter_reads_a_remv_apt_would_not_print_here(tmp_path):
 
 
 def test_a_simulation_that_names_nothing_stops_the_build(tmp_path):
-    """
-    THE POSITIVE CONTROL THE REFUSAL DID NOT HAVE, and the reason it needed
-    one.
-
-    The refusal reads apt's plan for names it did not expect. An apt that
-    printed no plan at all satisfies that perfectly, and the first version
-    of this block ran the real purge on the strength of it -- the whole
-    pipeline ended in `|| true`, so silence about everything else was
-    indistinguishable from silence about everything. An absence with no
-    positive control, on the one guard whose job is to stop a silent
-    deletion. Issue #14's defect class, inside the fix for #34.
-    """
+    """An empty plan stops the build: silence about unexpected packages must
+    not be read as a clean plan."""
     proc, log = run_stage_purge(tmp_path, simulation="")
     assert proc.returncode != 0, proc.stdout
     assert "did not schedule" in proc.stderr, proc.stderr
@@ -2160,18 +1577,9 @@ def test_a_simulation_that_names_nothing_stops_the_build(tmp_path):
 
 
 def test_a_simulation_that_fails_stops_the_build(tmp_path):
-    """
-    apt's exit status, which the first version of this block discarded.
-
-    This is the case that is not hypothetical. `apt-get -s purge -y <name in
-    no index>` exits 100 with `E: Unable to locate package` and prints no
-    plan -- measured on apt 2.8.3 -- which is exactly what the day either
-    package leaves the Raspberry Pi archive looks like, and that day is the
-    outcome one would hope for. Through a pipeline ending in `|| true` it
-    read as a clean plan, the gate passed, and the build then died on apt's
-    raw error from the unguarded real purge instead of on the refusal
-    somebody had carefully written.
-    """
+    """A simulation that exits non-zero stops the build, which is what a
+    package leaving the archive looks like (`E: Unable to locate package`, no
+    plan)."""
     proc, log = run_stage_purge(
         tmp_path / "no-plan", simulation="Reading package lists...\n",
         sim_rc=100, sim_stderr="E: Unable to locate package rpi-cloud-init-mods")
@@ -2179,12 +1587,7 @@ def test_a_simulation_that_fails_stops_the_build(tmp_path):
     assert "failed in the chroot" in proc.stderr, proc.stderr
     assert_nothing_was_removed(log)
 
-    # And the case only the status check can catch, which is why it is not
-    # enough to require both names. An apt that printed a perfectly clean
-    # plan and then failed is synthetic -- real apt 2.8.3 fails before it
-    # prints -- but without it, dropping the status check leaves the refusal
-    # above still firing on the missing names and nothing goes red for the
-    # right reason.
+    # A clean plan with a failing status: only the status check catches this.
     proc, log = run_stage_purge(
         tmp_path / "clean-plan", sim_rc=100,
         sim_stderr="E: Sub-process returned an error code")
@@ -2194,17 +1597,8 @@ def test_a_simulation_that_fails_stops_the_build(tmp_path):
 
 
 def test_a_simulation_that_names_only_one_of_the_two_stops_the_build(tmp_path):
-    """
-    Half a plan is not a plan, and this one is reachable without any fault.
-
-    A pi-gen that stopped installing rpi-cloud-init-mods leaves apt with
-    nothing to say about it: the plan names cloud-init alone and apt exits
-    0. Under the old gate that passed -- correctly, as it happens, but for
-    no reason anybody could read off it, since a plan naming neither package
-    passed identically. The stage refuses instead, loudly and with the name
-    in the message, because the alternative is not being able to tell the
-    two apart.
-    """
+    """A plan naming only one of the two packages stops the build and names the
+    missing one, so a partial plan cannot be mistaken for a clean one."""
     proc, log = run_stage_purge(tmp_path, simulation=(
         "Reading package lists...\n"
         "Building dependency tree...\n"
@@ -2216,18 +1610,9 @@ def test_a_simulation_that_names_only_one_of_the_two_stops_the_build(tmp_path):
 
 
 def test_a_removal_whose_name_merely_contains_cloud_init_stops_the_build(tmp_path):
-    """
-    `-vxE`, WHOLE LINE, and the anchor is doing all of the work.
-
-    CLOUD_PACKAGES_RE carries no `^` and no `$` -- `-x` is what makes it an
-    exact match. Drop the `x` and the filter is a substring test, so any
-    package apt schedules whose name merely CONTAINS one of ours reads as
-    expected and is passed through. Debian trixie/main really ships
-    cloud-initramfs-growroot, cloud-initramfs-dyn-netconf and
-    cloud-initramfs-rescuevol. None of the three depends on cloud-init
-    today, which is the point: the anchor holds against a live archive
-    rather than against a live bug, and a guard like that rots unnoticed.
-    """
+    """The filter is a whole-line match (`-x`): a package whose name merely
+    contains cloud-init, such as cloud-initramfs-growroot, is not passed as
+    expected."""
     proc, log = run_stage_purge(tmp_path, simulation=(
         PURGE_SIM_CLEAN + "Purg cloud-initramfs-growroot [0.18.debian8]\n"))
     assert proc.returncode != 0, proc.stdout
@@ -2236,35 +1621,17 @@ def test_a_removal_whose_name_merely_contains_cloud_init_stops_the_build(tmp_pat
 
 
 def test_a_purge_that_fails_fails_the_build(tmp_path):
-    """
-    The real purge's own exit status.
-
-    It reaches the build today because that call is the last command in the
-    heredoc and a shell returns its status -- not because of the `set -e`
-    above it, which is inert in a block where every other failure is caught
-    by name. Append one line after the purge and that stops being true, so
-    the property is pinned here rather than left to the block's shape: a
-    purge that fails must fail the build, and must not leave a stage that
-    exits 0 with the provisioning agent still installed.
-    """
+    """A purge that fails must fail the build. Today that holds only because
+    the purge is the heredoc's last command, so it is pinned here."""
     proc, log = run_stage_purge(tmp_path, purge_rc=1)
     assert proc.returncode != 0, proc.stdout
-    # It got as far as trying: this is the purge failing, not a refusal
-    # before it, and those are different bugs.
+    # The real purge was attempted: this is not a refusal before it.
     assert [ln for ln in log.splitlines() if "-s" not in ln.split()] != [], log
 
 
 def test_the_purge_runs_before_install_sh_writes_the_kill_switch():
-    """
-    Ordering, because dpkg's purge sweeps the directories a package owned.
-
-    /etc/cloud is cloud-init's and install.sh's kill switch lives in it.
-    dpkg will not delete a directory still holding a file it does not own,
-    so the marker survives a purge that runs afterwards -- but that is
-    upstream behaviour standing between an air-gapped printer and a
-    re-armed provisioning agent, and the ordering that does not lean on it
-    costs nothing.
-    """
+    """The purge runs before install.sh writes its kill switch into /etc/cloud,
+    so the marker does not depend on dpkg sparing unowned files."""
     text = STAGE_RUN.read_text()
     assert text.index("apt-get purge -y ${CLOUD_PACKAGES}") \
         < text.index("./device/install.sh --image-build"), \
@@ -2275,8 +1642,8 @@ def test_the_purge_runs_before_install_sh_writes_the_kill_switch():
 
 PHASE_GUARD_BLOCK = ('PHASE=""', "\nesac")
 
-# What a provisioned unit actually boots with: install.sh prepends
-# boot=overlay and strips `resize`, and nothing anywhere adds otp.imgcheck.
+# What a provisioned unit boots with: boot=overlay, no `resize`, no
+# otp.imgcheck.
 DEVICE_CMDLINE = ("boot=overlay console=serial0,115200 console=tty1 "
                   "root=PARTUUID=1a2b3c4d-02 rootfstype=ext4 fsck.repair=yes "
                   "rootwait\n")
@@ -2285,9 +1652,7 @@ DEVICE_CMDLINE = ("boot=overlay console=serial0,115200 console=tty1 "
 def run_phase_guard(tmp_path, cmdline, *, cwd=None):
     """Run the shipped phase parse and guard against a substituted cmdline.
 
-    The path is rewritten rather than the file stubbed, so the test still
-    describes the shipped bytes: everything else in the block -- the `set
-    -f`, the token match, the case -- is the code that ships.
+    Only the /proc/cmdline path is rewritten; the rest is the shipped code.
     """
     block = slice_between(GUEST_CHECK.read_text(), *PHASE_GUARD_BLOCK)
     assert block.count("/proc/cmdline") == 1, block
@@ -2304,14 +1669,9 @@ def run_phase_guard(tmp_path, cmdline, *, cwd=None):
 
 
 def test_the_probe_is_inert_on_a_command_line_without_the_token(tmp_path):
-    """
-    The HIGH one. This script ships 0755 in /opt/otp-unit on every unit and
-    its service is enabled unconditionally, and what it does is WRITE: a
-    sentinel to /, and pages=137 through config.save() into
-    /boot/firmware/otp-unit.conf, which is outside the overlay and therefore
-    permanent. The version before this guard read no token, set
-    PHASE=unknown and ran every check anyway -- run against a realistic
-    device command line it took an operator's page count from 500 to 137.
+    """Without the otp.imgcheck token the probe refuses to run: it ships
+    enabled on every unit and writes a sentinel to / and a page count into
+    /boot/firmware/otp-unit.conf, which is outside the overlay and permanent.
     """
     proc = run_phase_guard(tmp_path, DEVICE_CMDLINE)
     assert proc.returncode != 0, proc.stdout
@@ -2328,11 +1688,8 @@ def probe_phases() -> list:
 
 
 def test_the_probe_runs_for_the_phases_the_harness_supplies(tmp_path):
-    # The positive control: everything else here asserts a refusal, and a
-    # script that refused everything would satisfy all of them. The phase
-    # names come off the guard's own case arm rather than being restated, so
-    # a guard that quietly stopped accepting one is a red here and not a
-    # sixteen-minute tier-3 run reporting a guest that never spoke.
+    # Positive control: the refusals alone would pass on a script that refused
+    # everything. Phase names are read from the guard's own case arm.
     accepted = probe_phases()
     assert accepted == ["boot1", "boot2"], accepted
     for phase in accepted:
@@ -2343,16 +1700,9 @@ def test_the_probe_runs_for_the_phases_the_harness_supplies(tmp_path):
 
 
 def test_a_phase_that_is_not_one_of_the_two_is_refused(tmp_path):
-    # `otp.imgcheck` bare is the interesting one: systemd's
-    # ConditionKernelCommandLine matches a bare word as well as an
-    # assignment, so that token starts the unit and names no phase.
-    #
-    # `otp.imgcheck=release` is here because tier 3 now has a third phase of
-    # that name, and it is the phase in which NOTHING is supposed to happen.
-    # The harness gives it no token at all -- that is the point of it -- but
-    # if a future change ever did hand it one by accident, the probe's own
-    # guard has to be the thing that still refuses. Two locks on the same
-    # door, and this is the second one being asked about the new key.
+    # A bare `otp.imgcheck` satisfies systemd's condition but names no phase.
+    # `release` is the phase the harness gives no token; the guard must refuse
+    # it if one ever arrives.
     for token in ("otp.imgcheck", "otp.imgcheck=", "otp.imgcheck=boot3",
                   "otp.imgcheck=release", "otp.imgcheck=unknown"):
         proc = run_phase_guard(tmp_path, f"{DEVICE_CMDLINE.strip()} {token}\n")
@@ -2361,13 +1711,9 @@ def test_a_phase_that_is_not_one_of_the_two_is_refused(tmp_path):
 
 
 def test_the_command_line_is_split_but_not_glob_expanded(tmp_path):
-    """
-    The unit runs as root with a working directory of /, and the token loop
-    reads an unquoted command substitution. With pathname expansion left on,
-    a bare `*` in the command line is replaced by the listing of the current
-    directory before the case sees it -- so a FILE whose name begins
-    otp.imgcheck= chooses the phase, and the probe starts writing.
-    """
+    """The command line is split with globbing off: the unit runs as root in /,
+    and an expanded `*` would let a file named otp.imgcheck=... choose the
+    phase."""
     root = tmp_path / "fake-root"
     root.mkdir()
     (root / "otp.imgcheck=boot2").write_text("")
@@ -2379,8 +1725,8 @@ def test_the_command_line_is_split_but_not_glob_expanded(tmp_path):
 
 
 def test_the_refusal_comes_before_anything_the_probe_writes():
-    # Position, not behaviour: a guard that refuses AFTER the first write
-    # has already rewritten the operator's settings.
+    # Position: a guard that refuses after the first write has already changed
+    # the operator's settings.
     text = GUEST_CHECK.read_text()
     guard = text.index('case "$PHASE" in')
     for later, what in (("check root-is-overlay", "the first check"),
@@ -2391,10 +1737,8 @@ def test_the_refusal_comes_before_anything_the_probe_writes():
 
 # --- the drop-in that keeps the first-boot wizard usable ------------------
 
-# The end anchor is the heredoc's LAST line, not the delimiter's first
-# appearance: `slice_between` takes the first match, and "DROPIN\n" first
-# appears on the `cat <<DROPIN` line itself -- which cut the body off and
-# wrote an empty drop-in that these tests then passed judgement on.
+# The end anchor is the heredoc's last line: "DROPIN\n" first appears on the
+# `cat <<DROPIN` line itself.
 DROPIN_BLOCK = ("systemctl unmask userconfig.service",
                 "systemctl enable userconfig.service 2>/dev/null || true")
 DROPIN_DIR = "/etc/systemd/system/userconfig.service.d"
@@ -2403,10 +1747,8 @@ DROPIN_DIR = "/etc/systemd/system/userconfig.service.d"
 def run_dropin(tmp_path, *, boot_dir):
     """Write the shipped drop-in into a substituted /etc/systemd/system.
 
-    The unit directory is rewritten rather than stubbed: a test has no
-    business writing into the machine's real /etc/systemd/system, and
-    everything that decides what the file SAYS -- the two conditions, the
-    directory they name, StandardInput -- stays the shipped bytes.
+    Only the unit directory is rewritten; the file's content stays the shipped
+    bytes.
     """
     etc = tmp_path / "etc"
     block = slice_between(INSTALL.read_text(), *DROPIN_BLOCK)
@@ -2427,66 +1769,35 @@ def run_dropin(tmp_path, *, boot_dir):
 
 
 def test_the_wizard_runs_only_when_an_operator_seeded_it(tmp_path):
-    """
-    Both spellings, both as `|=`, or the unit is worse than before.
-
-    A single ConditionPathExists is an AND with itself and would demand BOTH
-    files; the pair with `|` is an OR group, which is what makes "either
-    spelling of the seed" work. And the file has to be one an operator
-    actually writes -- userconf-pi reads `userconf` first and `userconf.txt`
-    second, and Raspberry Pi Imager writes the latter.
-    """
+    """Both seed spellings are `ConditionPathExists=|`, an OR group; without
+    the `|` both files would be required. userconf-pi reads `userconf` then
+    `userconf.txt`, and Raspberry Pi Imager writes the latter."""
     text, log = run_dropin(tmp_path, boot_dir="/boot/firmware")
     assert "ConditionPathExists=|/boot/firmware/userconf\n" in text, text
     assert "ConditionPathExists=|/boot/firmware/userconf.txt\n" in text, text
-    # Not masked. Masking is the fix that was tried and reverted: it stops the
-    # prompt and silently discards every credential file too.
+    # Not masked: masking stops the prompt but discards every credential file.
     assert "unmask userconfig.service" in log, log
     assert "mask userconfig.service" not in log.replace("unmask", ""), log
 
 
 def test_the_wizard_is_enabled_in_the_image_and_not_by_accident(tmp_path):
-    """
-    Run 32020772161, boot 2, the first boot pair with the machine-id
-    persisted:
-
-      OTP-CHECK boot2 userconf-unseeded-boot-skips-the-wizard FAIL
-        condition=no checked-at='never' is-active=inactive is-enabled=disabled
-
-    `is-enabled=disabled` on a boot where nothing disabled anything -- /etc is
-    the overlay, so boot1's `systemctl disable userconfig` died with the
-    power. That is the IMAGE's state, and it always was: what had been hiding
-    it is that every boot used to be a first boot, so `preset-all` re-enabled
-    the unit every time. The same run shows the change directly, in the
-    targets it reached: boot1 has first-boot-complete.target, boot2 does not.
-
-    userconfig.service is the ONLY consumer of the documented headless
-    credential file, so leaving it disabled means a userconf.txt an operator
-    writes to the card is ignored in silence on every boot after the first --
-    which is exactly the trade the drop-in above replaced a `mask` to avoid.
-    Enabling it is what that drop-in was written for: the condition pair costs
-    an unseeded boot two ConditionPathExists and a skip.
-    """
+    """userconfig.service is enabled by install.sh: it is the only consumer of
+    the headless credential file, and on a persisted machine-id no first-boot
+    `preset-all` re-enables it."""
     _, log = run_dropin(tmp_path, boot_dir="/boot/firmware")
     assert "enable userconfig.service" in log, log
 
 
 def test_the_wizard_cannot_reach_a_terminal(tmp_path):
-    # Without this a malformed seed falls back to the interactive prompt and
-    # holds multi-user.target open on a machine with no visible tty.
+    # Otherwise a malformed seed falls back to the interactive prompt and holds
+    # multi-user.target open.
     text, _ = run_dropin(tmp_path, boot_dir="/boot/firmware")
     assert "StandardInput=null" in text, text
 
 
 def test_the_condition_follows_the_boot_directory_that_exists(tmp_path):
-    """
-    install.sh falls back to BOOT_DIR=/boot when /boot/firmware is not a
-    directory, and userconf-service's own get_fw_loc makes the same choice.
-    Hardcoded, the pair named a path that cannot exist on that layout: the
-    condition is false on every boot, the unit never runs, and the operator's
-    credentials are ignored in silence -- the exact outcome masking the unit
-    produced, arriving by a different route.
-    """
+    """The conditions follow BOOT_DIR: on a layout without /boot/firmware a
+    hardcoded path never exists and the seed is silently ignored."""
     text, _ = run_dropin(tmp_path, boot_dir="/boot")
     assert "ConditionPathExists=|/boot/userconf\n" in text, text
     assert "ConditionPathExists=|/boot/userconf.txt\n" in text, text
@@ -2495,13 +1806,9 @@ def test_the_condition_follows_the_boot_directory_that_exists(tmp_path):
 
 # --- the two things that kept the wizard from ever running ----------------
 
-# Run 31968966879 is the first run that seeded a real userconf.txt, and it
-# found that the drop-in above had never been the deciding factor: the unit's
-# start job never came up for execution at all. It was ordered behind
-# cloud-init's config stage, which waits on network-online.target, which waits
-# on systemd-networkd-wait-online.service -- TimeoutStartSec=infinity on a box
-# whose links NetworkManager owns. Both boots ended with that job still
-# running and multi-user.target never reached.
+# The wizard is ordered behind cloud-init's config stage, which waits on
+# network-online.target and so on systemd-networkd-wait-online.service:
+# TimeoutStartSec=infinity on a machine whose links NetworkManager owns.
 
 BOOT_FINISHES_BLOCK = ("systemctl mask systemd-networkd-wait-online.service",
                        ": > /etc/cloud/cloud-init.disabled")
@@ -2510,9 +1817,7 @@ BOOT_FINISHES_BLOCK = ("systemctl mask systemd-networkd-wait-online.service",
 def run_boot_finishes(tmp_path):
     """Run the shipped block that clears the two blockers, into a fake /etc.
 
-    /etc/cloud is rewritten to a temporary directory; nothing else is, so
-    the unit name masked and the kill switch's own filename stay the bytes
-    that ship.
+    Only /etc/cloud is rewritten to a temporary directory.
     """
     cloud = tmp_path / "cloud"
     block = slice_between(INSTALL.read_text(), *BOOT_FINISHES_BLOCK)
@@ -2532,44 +1837,22 @@ def run_boot_finishes(tmp_path):
 
 
 def test_the_unbounded_network_wait_is_masked(tmp_path):
-    """
-    The job both boots of run 31968966879 ended on, in the console's own
-    words: `systemd-networkd-wait-online.service/start running (2min 37s /
-    no limit)`. "No limit" is the unit's TimeoutStartSec=infinity, and this
-    appliance has no networkd configuration for it to ever be satisfied by.
-    Everything ordered after network-online.target -- cloud-init's config
-    stage, and through it the credential wizard -- waits for the life of
-    the boot.
-    """
+    """systemd-networkd-wait-online.service is masked: it has no start timeout
+    and nothing here can satisfy it, so everything after network-online.target
+    would wait for the life of the boot."""
     log, _ = run_boot_finishes(tmp_path)
     assert "mask systemd-networkd-wait-online.service" in log, log
 
 
 def test_cloud_init_is_switched_off_on_an_air_gapped_printer(tmp_path):
-    """
-    The other end of the same chain, and worth doing on its own account.
+    """install.sh writes /etc/cloud/cloud-init.disabled: cloud-init pulls
+    network-online.target into the boot and reads user-data off the boot
+    partition of an air-gapped device.
 
-    cloud-init is what pulls network-online.target into the transaction
-    here; it spent 57 seconds of every boot finding no datasource; and it
-    is a provisioning agent that takes user-data off the boot partition --
-    the one partition an operator is told to write files on -- on a device
-    that prints one-time pads and has no network by design.
-
-    THE PACKAGES ARE PURGED OUT OF THE IMAGE NOW (issue #34) and this line
-    still has to be written, on the two machines a purge cannot reach: one
-    that gets cloud-init back as somebody's later dependency, and the
-    hand-provisioned Pi this script is mostly run on, which never meets a
-    pi-gen stage at all.
-
-    /usr/lib/cloud-init/ds-identify is what reads the file, not the
-    generator directly: `is_disabled()` returns 0 on
-    `[ -f /etc/cloud/cloud-init.disabled ]` before any datasource search,
-    `_main` returns 2 at that, and the generator's rc=2 branch is what
-    leaves cloud-init.target out of multi-user.target's wants -- so
-    cloud-config.service is not in the transaction at all and
-    userconfig.service's `After=` on it becomes void. Read off cloud-init
-    25.2-1~bpo13+1+rpt20; nothing here runs either script, and the tier-3
-    checks say what they measure instead.
+    The image build also purges the packages (issue #34); the kill switch
+    covers hand-provisioned machines and a later reinstall. ds-identify reads
+    the file, and the generator then leaves cloud-init.target out of
+    multi-user.target's wants.
     """
     _, cloud = run_boot_finishes(tmp_path)
     assert (cloud / "cloud-init.disabled").exists(), sorted(
@@ -2577,35 +1860,18 @@ def test_cloud_init_is_switched_off_on_an_air_gapped_printer(tmp_path):
 
 
 def test_the_closing_summary_names_what_was_done_to_the_whole_machine():
-    """
-    The documented path is "run this on a Pi you already have", and four of
-    the steps above are not confined to the unit: three shared systemd units
-    are MASKED and cloud-init is switched off permanently. All four outlive
-    this script, all four change how software installed later behaves, and
-    none of them was in the summary the operator reads at the end -- which
-    listed the overlay and stopped, reading as though nothing else had been
-    touched.
+    """The closing summary names every unit install.sh masks, the cloud-init
+    kill switch, and how to undo each; these changes are machine-wide and
+    outlive the script.
 
-    EVERY MASK THIS SCRIPT ISSUES, and that is what the list is derived from
-    rather than restated. The summary said "three machine-wide changes" while
-    the script made four: systemd-growfs-root.service was masked in the same
-    round that added the ssh.socket mask and never reached the paragraph an
-    operator reads, so the one persistent change with no undo instruction was
-    the newest one. A hand-written list is a list that goes stale exactly
-    that way.
-
-    The summary is what someone gets instead of a diff. Undo instructions
-    are required with them: a machine-wide change nobody can find again is
-    the part that hurts, six months later, when networkd's wait-online is
-    the thing that mysteriously never blocks.
+    The mask list is derived from the script, so a new mask cannot go unlisted.
     """
     install = INSTALL.read_text()
     summary = install[install.index('log "Done. Reboot to start the unit."'):]
     body = install[:install.index('log "Done. Reboot to start the unit."')]
-    # Indentation allowed: the growfs mask is inside the overlay branch, and
-    # a pattern anchored at column one is exactly how it went unlisted.
+    # Indentation allowed: the growfs mask is inside the overlay branch.
     masked = sorted(set(re.findall(r"^[ \t]*systemctl mask (\S+)$", body, re.M)))
-    assert len(masked) == 3, masked
+    assert len(masked) == 4, masked
     for unit in masked:
         assert unit in summary, (
             f"install.sh masks {unit} on any machine it touches and the "
@@ -2619,9 +1885,8 @@ def test_the_closing_summary_names_what_was_done_to_the_whole_machine():
     assert "/etc/cloud/cloud-init.disabled" in summary, (
         "the summary names a permanent change without telling the operator "
         "how to reverse it: /etc/cloud/cloud-init.disabled")
-    # And the count in the prose, which is the half a list of names cannot
-    # keep honest -- it said "Three" while naming three of four.
-    assert "Four machine-wide changes" in summary, summary
+    # The count in the prose must match as well.
+    assert "Five machine-wide changes" in summary, summary
 
 
 GETTY_BLOCK = ("install -d /etc/systemd/system/getty@tty1.service.d",
@@ -2651,31 +1916,20 @@ def run_getty_dropin(tmp_path):
 
 
 def test_no_login_prompt_can_start_on_the_front_panels_tty(tmp_path):
-    """
-    tty1 is the front panel, and the thing that starts a getty on it is the
-    credential path itself: /usr/lib/userconf-pi/userconf ends in
-    cancel-rename, which ends in `systemctl --no-block start getty@tty1` on
-    every console-boot machine. A condition, evaluated at start time, is
-    what keeps that from ever producing a prompt.
+    """tty1 is the front panel, so the getty there is conditioned on the panel
+    not being healthy: cancel-rename runs `systemctl --no-block start
+    getty@tty1` at the end of the credential path.
 
-    THE SPELLING IS THE PROPERTY here, which is why this reads the exact
-    directives rather than "a condition mentioning otp-unit". The form that
-    shipped first --
-    `ConditionPathExists=!/etc/systemd/system/otp-unit.service` -- keys on
-    the unit FILE, and `systemctl mask` writes a symlink to /dev/null at
-    exactly that path while `systemctl disable` leaves the file alone. Both
-    therefore left the condition false and tty1 with no getty at all, on a
-    machine whose panel was not going to run either. The truth table is in
-    the test below; this is the always-runs half of it.
+    The exact directives are asserted. A condition on the unit file alone is
+    wrong for both `mask` (a symlink to /dev/null at that path) and `disable`
+    (file untouched).
     """
     text, _ = run_getty_dropin(tmp_path)
     assert ("ConditionPathExists=|!/etc/systemd/system/multi-user.target"
             ".wants/otp-unit.service" in text), text
     assert ("ConditionFileNotEmpty=|!/etc/systemd/system/otp-unit.service"
             in text), text
-    # The `|` on both is what makes them an OR. Un-prefixed, systemd ANDs
-    # them and the prompt comes back only on a panel that is disabled AND
-    # masked -- neither of the two states this exists for.
+    # The `|` on both makes them an OR; un-prefixed, systemd ANDs them.
     assert "\nConditionPathExists=!" not in text, (
         "an un-prefixed condition is ANDed with the other one: " + text)
     assert text.lstrip().startswith("[Unit]"), text
@@ -2691,20 +1945,12 @@ GETTY_STATES = ("healthy", "masked", "disabled", "absent")
 @pytest.mark.parametrize("state", GETTY_STATES)
 def test_masking_or_disabling_the_panel_gives_tty1_its_login_back(
         tmp_path, state):
-    """
-    The four states a machine can be in, evaluated by real systemd.
+    """The four panel states, evaluated by real systemd: only a healthy panel
+    may skip the getty, since a tty with neither panel nor login is
+    unreachable.
 
-    Only the healthy one may skip the getty. On the other three the panel is
-    not going to take tty1, and a tty with neither a panel nor a login is a
-    device an operator cannot reach -- the exact half-provisioned case the
-    drop-in's own comment says the prompt exists for. The shipped form got
-    two of the three wrong: `systemctl mask` REPLACES the unit file with a
-    symlink to /dev/null and ConditionPathExists follows symlinks, and
-    `systemctl disable` does not touch the unit file at all.
-
-    The conditions are lifted out of the drop-in install.sh writes and only
-    the /etc prefix is rewritten, so what systemd is handed here is the
-    shipped directive with a different root.
+    The conditions come from the drop-in install.sh writes, with only the /etc
+    prefix rewritten.
     """
     text, _ = run_getty_dropin(tmp_path)
     etc = tmp_path / "sysroot" / "etc" / "systemd" / "system"
@@ -2732,20 +1978,11 @@ def test_masking_or_disabling_the_panel_gives_tty1_its_login_back(
 
 
 def test_a_getty_already_running_on_tty1_is_stopped(tmp_path):
-    """
-    The half a condition cannot do, and tier 2 is where it was measured.
+    """A getty already running on tty1 is stopped, because a condition only
+    acts at start time; left running, it takes /dev/tty1 back off the panel.
 
-    `sudo ./device/install.sh` on a Pi that is already up meets a getty that
-    started at boot, before any of this existed. otp-unit.service's
-    Conflicts= used to stop it as a side effect of the unit starting; with
-    the conflict gone and nothing in its place, the run went 11/15 with
-    `getty1-stopped FAIL getty@tty1=active` and the unit `Started` then
-    `Deactivated successfully` a second later -- the getty's Restart=always
-    and TTYVHangup take /dev/tty1 back off the panel, whose Python exits.
-
-    After the reload, not before it: the condition has to be in force before
-    the getty is stopped, or anything that pokes it in between starts a new
-    one.
+    The stop comes after the daemon-reload, so the condition is in force before
+    anything can restart it.
     """
     _, log = run_getty_dropin(tmp_path)
     assert "stop getty@tty1.service" in log, log
@@ -2753,30 +1990,21 @@ def test_a_getty_already_running_on_tty1_is_stopped(tmp_path):
 
 
 def test_the_getty_is_conditioned_rather_than_masked(tmp_path):
-    """
-    Masking looks equivalent and is not. `systemctl start` on a masked unit
-    FAILS, cancel-rename's exit status is that command's, `userconf` hands
-    it up, and userconf-service runs under `sh -e` -- so it dies before
-    `rm`-ing the applied seed. Stock userconfig.service's Restart=on-failure
-    then loops, printing "Failed with result" and "Scheduled restart job",
-    two of the strings img-boot.sh fails a release on. A condition-skipped
-    start returns success and does nothing.
-    """
+    """The getty is conditioned, not masked: starting a masked unit fails,
+    which fails cancel-rename and userconf-service before the seed is removed,
+    and userconfig.service then restart-loops. A condition-skipped start
+    returns success."""
     _, log = run_getty_dropin(tmp_path)
     assert "mask getty@tty1" not in log, log
 
 
 # --- the seeded userconf.txt path, as the guest sees it -------------------
 
-# The stock unit is `StandardInput=tty`, `TTYPath=/dev/tty8` and
-# `Restart=on-failure` (RPi-Distro/userconf-pi, debian/*.userconfig.service),
-# and userconf-service goes INTERACTIVE whenever raspi-config's get_boot_cli
-# says the machine boots to a console -- which this image does. That is the
-# whiptail run 12's boot parked on. device/install.sh's drop-in is what stops
-# it: the ConditionPathExists pair keeps the unit out of an unseeded boot
-# entirely, and StandardInput=null turns a malformed seed into a fast failure
-# instead of a prompt nobody can answer. These run the shipped block that
-# checks all of that, against a systemd that says whatever the case needs.
+# Stock userconfig.service is StandardInput=tty with Restart=on-failure, and
+# userconf-service goes interactive on a console-boot machine. install.sh's
+# drop-in keeps the unit out of an unseeded boot and turns a malformed seed
+# into a fast failure. These run the shipped block that checks that, against a
+# stubbed systemd.
 
 HELPERS = ('check() {',
            'yesno() { if "$@" >/dev/null 2>&1; then echo yes; else echo no; fi; }')
@@ -2810,17 +2038,12 @@ case "$1 $2" in
 esac
 """
 
-# The wizard's own log, which is the only account of it that survives the
-# apply: cancel-rename disables the unit, systemd collects it, and every
-# `systemctl show` after that describes a freshly loaded default. The
-# default text is what run 31972140190's console recorded, verbatim.
+# The wizard's own log is the only account of it that survives the apply:
+# cancel-rename disables the unit and `systemctl show` then describes a freshly
+# loaded default.
 #
-# A JOURNAL THAT REMEMBERS, because the real one is one config line away from
-# doing so. `-b` scopes the read to this boot; without it journalctl answers
-# out of every boot it still holds, and device/install.sh's Storage=volatile
-# is the only reason that is harmless today. UC_JOURNAL_LAST_BOOT is what a
-# persistent journal would add, and the shipped `-b` is what keeps it out --
-# so a test can set it and watch the check stay red.
+# UC_JOURNAL_LAST_BOOT is what a persistent journal would add to a read not
+# scoped with `-b`.
 JOURNALCTL_STUB = """#!/bin/sh
 case "$*" in
     *userconfig.service*) ;;
@@ -2835,10 +2058,8 @@ Aug 16 22:05:01 otp-unit systemd[1]: Starting userconfig.service - User configur
 Aug 16 22:06:11 otp-unit systemd[1]: Finished userconfig.service - User configuration dialog.}"
 """
 
-# What upstream does to a seed it will not accept: append the reason, rename
-# it out of the way, and -- with no tty for the whiptail that comes next --
-# die rather than prompt. The probe measures three things about this: that it
-# ENDED, that userconf.txt is gone, and that the evidence is there.
+# What upstream does to a seed it will not accept: append the reason, rename it
+# out of the way, and exit non-zero rather than prompt.
 USERCONF_SERVICE_STUB = """#!/bin/sh
 cat "$BOOTDIR/userconf.txt" >> "$BOOTDIR/failed_userconf.txt"
 rm -f "$BOOTDIR/userconf.txt"
@@ -2849,23 +2070,16 @@ exit 1
 
 # --- the journal on the console, and the panel that is not there ----------
 
-# systemd-cat writes its stdin to the journal and NOTHING to stdout. Here the
-# journal is a file, so a test can also model the machine where the write
-# never lands -- which is the case that separates "forwarding is off" from
-# "the marker was never made" when the host finds nothing on the console.
+# systemd-cat writes stdin to the journal and nothing to stdout. Here the
+# journal is a file, and SYSTEMD_CAT_DEAF models a write that never lands.
 SYSTEMD_CAT_STUB = """#!/bin/sh
 if [ -n "${SYSTEMD_CAT_DEAF-}" ]; then cat > /dev/null; exit 0; fi
 cat >> "$FAKE_TAGGED_JOURNAL"
 """
 
-# Answers the probe's two reads and refuses everything else, for the reason
-# SYSTEMCTL_STUB does: a stub that returned "" for an unexpected question
-# would let a check pass by accident.
-#
-# A JOURNAL THAT REMEMBERS PREVIOUS BOOTS, because the real one is one config
-# line away from doing so. `-b` scopes both reads to this boot;
-# UNIT_JOURNAL_LAST_BOOT is what a persistent journal would add, and the
-# shipped `-b` is what keeps it out.
+# Answers the probe's two reads and refuses everything else.
+# UNIT_JOURNAL_LAST_BOOT is what a persistent journal would add to a read not
+# scoped with `-b`.
 JOURNAL_READ_STUB = """#!/bin/sh
 case "$*" in
     *"-t otp-imgcheck"*|*"-u otp-unit.service"*) ;;
@@ -2881,24 +2095,10 @@ case "$*" in
 esac
 """
 
-# What a unit with no panel logs on the way to printing unattended, in the
-# order otpunit/hmi.detect and otpunit/__main__ produce it.
-#
-# THE EMULATED MACHINE AS IT IS, quoted from the console rather than reasoned
-# about. Run 32020772161, boot1 console-text.log:713-714:
-#
-#   no GPIO buttons ([Errno 22] Invalid argument)
-#   interface -- display: none, input: none
-#
-# harness/img-boot.sh writes /system/linux,revision into the DTB so
-# rpi-eeprom-update.service stops failing on an empty BOARD_INFO, and
-# gpiozero reads the same property -- so the pin factory LOADS here, which is
-# why the exception in the brackets is an OSError and not BadPinFactory. It
-# does not follow that a Button constructs: claiming GPIO5 on QEMU's gpiochip
-# fails EINVAL, hmi.open_buttons() falls through to (None, "none"), and this
-# machine has neither half of an interface. An earlier version of this
-# fixture said `input: GPIO buttons` and called itself the machine as it is
-# now; it was the machine nothing has ever booted.
+# What a unit with no panel logs before printing unattended, as the emulated
+# machine produces it: the harness-supplied board revision lets gpiozero's pin
+# factory load, but claiming a pin on QEMU's gpiochip fails EINVAL, so both
+# display and input are none.
 HEADLESS_JOURNAL = (
     "Aug 17 00:04:02 otp-unit systemd[1]: Started otp-unit.service.\n"
     "Aug 17 00:04:09 otp-unit python3[412]: no OLED (FileNotFoundError: "
@@ -2910,12 +2110,9 @@ HEADLESS_JOURNAL = (
     "Aug 17 00:04:09 otp-unit python3[412]: no usable interface; printing "
     "unattended\n")
 
-# A REAL Pi with lgpio, which is every unit this project targets. gpiozero
-# only reserves and configures a pin -- there is no presence detection at all
-# -- so `Button(5)` succeeds on a board with nothing wired to it and the unit
-# reports `input: GPIO buttons`. That is the normal case on hardware, not a
-# fault, and the check must go on passing for it: if it did not, the first
-# unit anyone assembled would fail a check about its screen.
+# A real Pi with lgpio: gpiozero has no presence detection, so `Button(5)`
+# succeeds with nothing wired and the unit reports `input: GPIO buttons`. The
+# check must pass for it.
 BUTTONS_JOURNAL = (HEADLESS_JOURNAL
                    .replace("Aug 17 00:04:09 otp-unit python3[412]: no GPIO "
                             "buttons ([Errno 22] Invalid argument)\n", "")
@@ -2923,19 +2120,14 @@ BUTTONS_JOURNAL = (HEADLESS_JOURNAL
                             "interface -- display: none, "
                             "input: GPIO buttons"))
 
-# And a machine where gpiozero cannot build a pin factory at all -- a Pi with
-# lgpio uninstalled, or an emulator that stops providing a gpiochip. A third
-# shape of "no buttons", reported differently, and the check must pass for it
-# too.
+# A machine where gpiozero cannot build a pin factory at all; the check must
+# pass for it too.
 NO_FACTORY_JOURNAL = HEADLESS_JOURNAL.replace(
     "no GPIO buttons ([Errno 22] Invalid argument)",
     "no GPIO buttons (BadPinFactory: Unable to load any default pin factory!)")
 
-# And a machine that DID find something to draw on. An HDMI monitor with no
-# buttons: hmi.open_display still logs "no OLED (" because the SSD1306 probe
-# raised, and __main__ still logs the headless line because
-# Interface.interactive needs both halves -- so the two strings this check
-# used to be made of are both there on a unit that has a screen.
+# A machine with a screen but no buttons: it still logs "no OLED (" and the
+# headless line, because Interface.interactive needs both halves.
 SCREEN_JOURNAL = HEADLESS_JOURNAL.replace(
     "interface -- display: none, input: none",
     "interface -- display: HDMI console, input: none")
@@ -2962,11 +2154,9 @@ def run_journal(tmp_path, *, phase="boot1", unit_journal=HEADLESS_JOURNAL,
         (bin_dir / name).chmod(0o755)
 
     block = journal_block()
-    # Only the two waits are shortened, and only the waits: every condition
-    # and every string the block prints is the code that ships. Both are real
-    # time in a real boot, and
-    # test_the_probe_is_given_longer_than_its_own_bounded_wait is what holds
-    # them against the unit's TimeoutStartSec.
+    # Only the two waits are shortened;
+    # test_the_probe_is_given_longer_than_its_own_bounded_wait holds them
+    # against the unit's TimeoutStartSec.
     for interval, why in (("sleep 1", "the marker poll"),
                           ("sleep 2", "the panel poll")):
         assert block.count(interval) == 1, f"{why}'s interval moved"
@@ -2988,9 +2178,7 @@ def run_journal(tmp_path, *, phase="boot1", unit_journal=HEADLESS_JOURNAL,
 
 
 def test_a_headless_boot_reports_the_marker_and_the_missing_panel(tmp_path):
-    # The positive control for everything below: every other test here
-    # asserts a FAIL, and a block that failed unconditionally would satisfy
-    # all of them.
+    # Positive control: every other test here asserts a FAIL.
     proc, _ = run_journal(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert results(proc) == {"journal-marker-accepted": "PASS",
@@ -2998,19 +2186,9 @@ def test_a_headless_boot_reports_the_marker_and_the_missing_panel(tmp_path):
 
 
 def test_the_marker_is_never_written_where_the_console_would_get_it_anyway(tmp_path):
-    """
-    The one thing that makes the host's gate mean anything.
-
-    This probe's stdout IS the console: otp-unit-imgcheck.service carries
-    StandardOutput=journal+console, so anything printed here reaches the
-    serial port whether or not journald is forwarding. If the marker text
-    ever appeared in a check's detail -- quoted back out of the journal, or
-    echoed for debugging -- the host would find it on the console with
-    forwarding switched off and pass a boot that proved nothing.
-
-    So the block may say how MANY journal lines carry it and never what they
-    say.
-    """
+    """The marker text never appears in the probe's own output: its stdout goes
+    to the console directly, so echoing the marker would let the host find it
+    there with journal forwarding off."""
     proc, tagged = run_journal(tmp_path)
     assert "OTP-JOURNAL-FORWARDED" in tagged.read_text(), \
         "the marker never reached the fake journal, so this proves nothing"
@@ -3019,26 +2197,15 @@ def test_the_marker_is_never_written_where_the_console_would_get_it_anyway(tmp_p
 
 
 def test_a_journal_that_never_took_the_marker_fails(tmp_path):
-    """
-    The positive control the host cannot supply for itself.
-
-    From outside the guest, a console with no marker on it is equally
-    "forwarding is off" and "systemd-cat is missing, or wrote nothing". This
-    check is what tells those apart, so it has to be able to say no.
-    """
+    """A journal that never took the marker fails the check, which lets the
+    host tell "forwarding is off" from "the marker was never written"."""
     proc, _ = run_journal(tmp_path, env={"SYSTEMD_CAT_DEAF": "1"})
     assert results(proc)["journal-marker-accepted"] == "FAIL", proc.stdout
 
 
 def test_a_unit_that_never_looked_for_a_panel_fails(tmp_path):
-    """
-    Both halves of the headless decision, because either alone is a
-    different machine.
-
-    Without "no OLED (" the unit never probed the display at all -- the log
-    below is what a unit that walked straight into the menu would leave, and
-    it still says it is printing unattended.
-    """
+    """Without "no OLED (" the unit never probed the display, so the check
+    fails even though the log says it is printing unattended."""
     journal = "\n".join(line for line in HEADLESS_JOURNAL.splitlines()
                         if "no OLED" not in line) + "\n"
     proc, _ = run_journal(tmp_path, unit_journal=journal)
@@ -3046,13 +2213,8 @@ def test_a_unit_that_never_looked_for_a_panel_fails(tmp_path):
 
 
 def test_a_unit_that_saw_no_panel_and_went_on_anyway_fails(tmp_path):
-    """
-    The other half. otpunit/hmi.Interface.prove exists because opening GPIO
-    buttons proves nothing about whether buttons exist: a unit that noticed
-    the missing OLED and still entered the menu blocks on an empty button
-    queue forever, with no pad, no log line and no timeout. That machine
-    logs the first string and never the second.
-    """
+    """A unit that saw no OLED but never logged the headless decision fails: it
+    would block in the menu on an empty button queue."""
     journal = "\n".join(line for line in HEADLESS_JOURNAL.splitlines()
                         if "no usable interface" not in line) + "\n"
     proc, _ = run_journal(tmp_path, unit_journal=journal)
@@ -3060,36 +2222,16 @@ def test_a_unit_that_saw_no_panel_and_went_on_anyway_fails(tmp_path):
 
 
 def test_a_unit_that_found_a_screen_is_not_a_unit_with_no_panel(tmp_path):
-    """
-    THE HOLE the third clause closes, and it belongs to a machine no tier of
-    this harness boots -- which is the reason it had to be written down.
-
-    An HDMI monitor with no buttons logs BOTH of the strings this check used
-    to be made of: hmi.open_display reports "no OLED (" because the SSD1306
-    probe raised, and __main__ reports "printing unattended" because
-    Interface.interactive wants a display AND buttons. So a machine with a
-    screen passed a check called unit-detects-no-panel.
-
-    Not a hypothetical: a unit with a monitor plugged into it and nothing
-    wired to the GPIO header is exactly this, and docs/HARDWARE.md describes
-    that as a supported way to run one. The check has to key on the display
-    side, said out loud, whatever the emulator does or does not provide.
+    """A unit with an HDMI screen and no buttons logs both "no OLED (" and
+    "printing unattended", so the check must key on the display kind and fail.
     """
     proc, _ = run_journal(tmp_path, unit_journal=SCREEN_JOURNAL)
     assert results(proc)["unit-detects-no-panel"] == "FAIL", proc.stdout
 
 
 def test_a_unit_whose_buttons_constructed_still_reports_no_panel(tmp_path):
-    """
-    The other direction, and the proof the third clause did not narrow what
-    this check accepts.
-
-    On every real Pi with lgpio installed `Button(5)` succeeds -- gpiozero
-    reserves a pin and has no presence detection at all -- so a unit
-    reporting `input: GPIO buttons` with nothing wired to those pins is the
-    normal case on hardware, not a fault. The check must still pass for it,
-    or the first unit anyone assembles fails a check about its screen.
-    """
+    """A real Pi reports `input: GPIO buttons` with nothing wired, since
+    gpiozero has no presence detection; the check still passes."""
     assert "input: GPIO buttons" in BUTTONS_JOURNAL, \
         "this fixture is supposed to be the machine whose buttons constructed"
     assert "no GPIO buttons" not in BUTTONS_JOURNAL, BUTTONS_JOURNAL
@@ -3098,16 +2240,9 @@ def test_a_unit_whose_buttons_constructed_still_reports_no_panel(tmp_path):
 
 
 def test_the_machine_tier_3_boots_has_neither_and_still_reports_no_panel(tmp_path):
-    """
-    The emulated unit, quoted from run 32020772161's boot1 console: the pin
-    factory loads because the harness supplies a board revision, and the pin
-    claim then fails EINVAL, so BOTH halves are none.
-
-    This is the default fixture for everything in this section, and it is
-    asserted here rather than assumed: for a while it said
-    `input: GPIO buttons` and described itself as the machine as it is now,
-    which meant six tests were driving a machine that has never booted.
-    """
+    """The emulated unit has neither display nor input and passes. The
+    fixture's two key lines are asserted, since it is the default for this
+    section."""
     assert "no GPIO buttons ([Errno 22] Invalid argument)" in HEADLESS_JOURNAL
     assert "interface -- display: none, input: none" in HEADLESS_JOURNAL
     proc, _ = run_journal(tmp_path, unit_journal=HEADLESS_JOURNAL)
@@ -3115,23 +2250,15 @@ def test_the_machine_tier_3_boots_has_neither_and_still_reports_no_panel(tmp_pat
 
 
 def test_a_unit_whose_pin_factory_never_loaded_still_reports_no_panel(tmp_path):
-    """
-    A third shape of "no buttons": gpiozero could not build a pin factory at
-    all -- a Pi with lgpio uninstalled reports exactly this. No one of the
-    three may be the only shape the check accepts.
-    """
+    """A pin factory that never loaded is a third shape of "no buttons", and it
+    passes too."""
     proc, _ = run_journal(tmp_path, unit_journal=NO_FACTORY_JOURNAL)
     assert results(proc)["unit-detects-no-panel"] == "PASS", proc.stdout
 
 
 def test_a_unit_that_never_said_what_it_settled_on_fails(tmp_path):
-    """
-    The interface line is the one that carries the display kind, so a unit
-    that never printed it leaves the new clause with nothing to read. An
-    absence must be a FAIL rather than a shrug: the alternative is a check
-    that goes green on a boot where the unit died between probing the display
-    and deciding what to do about it.
-    """
+    """A missing interface line is a FAIL: it carries the display kind, and its
+    absence means the unit died between probing and deciding."""
     journal = "\n".join(line for line in HEADLESS_JOURNAL.splitlines()
                         if "interface --" not in line) + "\n"
     proc, _ = run_journal(tmp_path, unit_journal=journal)
@@ -3139,19 +2266,12 @@ def test_a_unit_that_never_said_what_it_settled_on_fails(tmp_path):
 
 
 def journal_from_the_real_hmi(monkeypatch, *, oled_present, buttons_present=False):
-    """
-    The lines otpunit's own detection writes, on the machine tier 3 boots.
+    """The lines otpunit's own detection writes on the machine tier 3 boots.
 
-    Not a fixture of what it is believed to log -- the real
-    hmi.detect/open_display/open_buttons, with only the two pieces of
-    hardware stubbed, so the strings come from the code that ships.
-
-    The conditions are the measured ones, from run 32020772161's boot1
-    console: no /dev/i2c-* so the SSD1306 probe raises FileNotFoundError,
-    /sys/class/drm empty, and a Button whose pin claim raises OSError EINVAL
-    -- `no GPIO buttons ([Errno 22] Invalid argument)` is the line that
-    console carries. `buttons_present=True` is the real-Pi case instead,
-    where gpiozero reserves the pin and succeeds.
+    Runs the real hmi.detect with only the hardware stubbed: no OLED
+    (FileNotFoundError), no screen or keyboard, and a Button that raises
+    OSError EINVAL. `buttons_present=True` is the real-Pi case, where the pin
+    claim succeeds.
     """
     import sys
     sys.path.insert(0, str(REPO))
@@ -3179,12 +2299,11 @@ def journal_from_the_real_hmi(monkeypatch, *, oled_present, buttons_present=Fals
 
     lines = []
     interface = hmi.detect(log=lines.append)
-    # The one line __main__ adds around describe(). Held against __main__'s
-    # own source by tests/test_img_verdict.py.
+    # The line __main__ adds around describe(); tests/test_img_verdict.py holds
+    # it against __main__'s source.
     lines.append(f"interface -- {interface.describe()}")
-    # And the decision. Given to the mutant as well, deliberately: a check
-    # that only failed because the headless line went missing would be
-    # proving something weaker than "the detection is what it reads".
+    # The headless decision is appended even for the mutant, so the check must
+    # fail on the detection lines themselves.
     lines.append("no usable interface; printing unattended")
     return "".join(
         f"Aug 17 00:04:09 otp-unit python3[412]: {line}\n" for line in lines)
@@ -3192,12 +2311,8 @@ def journal_from_the_real_hmi(monkeypatch, *, oled_present, buttons_present=Fals
 
 def test_the_check_reads_what_the_shipped_detection_actually_logs(tmp_path,
                                                                   monkeypatch):
-    """
-    End to end, with no fixture in the middle: the real hmi produces the
-    lines, the shipped probe judges them -- and what it produces has to be
-    the console this harness recorded, character for character in the parts
-    the check reads.
-    """
+    """End to end: the real hmi produces the lines and the shipped probe judges
+    them."""
     journal = journal_from_the_real_hmi(monkeypatch, oled_present=False)
     assert "no GPIO buttons ([Errno 22] Invalid argument)" in journal, journal
     assert "interface -- display: none, input: none" in journal, journal
@@ -3206,12 +2321,8 @@ def test_the_check_reads_what_the_shipped_detection_actually_logs(tmp_path,
 
 
 def test_the_fixture_is_the_journal_the_shipped_detection_produces(monkeypatch):
-    """
-    HEADLESS_JOURNAL is the default for six tests in this section, so it is
-    the fixture most worth holding against the code rather than against
-    somebody's reading of a console. The timestamps and the OLED exception's
-    wording are this file's; the two lines the check keys on are hmi's.
-    """
+    """HEADLESS_JOURNAL's three key lines are the ones the shipped detection
+    produces."""
     journal = journal_from_the_real_hmi(monkeypatch, oled_present=False)
     for line in ("no GPIO buttons ([Errno 22] Invalid argument)",
                  "interface -- display: none, input: none",
@@ -3232,16 +2343,8 @@ def test_the_buttons_fixture_is_the_journal_a_real_pi_produces(monkeypatch):
 
 def test_breaking_the_panel_absence_detection_still_turns_the_check_red(
         tmp_path, monkeypatch):
-    """
-    THE PROOF the emulator fix is allowed to ship. `unit-detects-no-panel`
-    had to stop being able to pass for the wrong reason, and the way to show
-    that is to break the thing it watches and see it go red.
-
-    The break is the panel-absence detection itself: the SSD1306 probe
-    succeeds, so the unit has a display where the emulated machine has none.
-    Everything else is identical to the test above -- same function, same
-    stubs, same headless line handed over for free -- and the only difference
-    in the journal is what the shipped code said about the panel.
+    """With the SSD1306 probe succeeding, the same journal otherwise must turn
+    `unit-detects-no-panel` red, so the check cannot pass for the wrong reason.
     """
     healthy = journal_from_the_real_hmi(monkeypatch, oled_present=False)
     broken = journal_from_the_real_hmi(monkeypatch, oled_present=True)
@@ -3251,16 +2354,8 @@ def test_breaking_the_panel_absence_detection_still_turns_the_check_red(
 
 
 def test_a_previous_boots_headless_decision_does_not_answer_for_this_one(tmp_path):
-    """
-    `-b`, and why it is load bearing three hundred lines from the file that
-    makes it safe.
-
-    device/install.sh sets Storage=volatile, so today an unscoped
-    `journalctl -u` sees only this boot anyway. Delete that one line and a
-    PREVIOUS boot's "no usable interface" satisfies a boot on which the unit
-    never got that far -- which is precisely the reading this check exists to
-    make impossible.
-    """
+    """The read is scoped with `-b`: without Storage=volatile, a previous
+    boot's headless decision would otherwise answer for this one."""
     proc, _ = run_journal(
         tmp_path, unit_journal="",
         env={"UNIT_JOURNAL_LAST_BOOT": HEADLESS_JOURNAL})
@@ -3271,15 +2366,12 @@ def test_a_previous_boots_headless_decision_does_not_answer_for_this_one(tmp_pat
 
 IDENTITY_BLOCK = (
     "# --- the identity, which is the one thing allowed to survive",
-    # Through the closing `fi` of the boot2 branch, or the slice is a shell
-    # fragment that will not parse -- which is a syntax error rather than a
-    # test, and would have been one either way.
+    # Through the closing `fi` of the boot2 branch, so the slice parses.
     '"boot1: $(short_id "$MACHINE_ID_BOOT1") | '
     'boot2: $(short_id "$LIVE_MACHINE_ID")"\nfi')
 
-# The probe asks findmnt exactly one thing here: which filesystem contains the
-# identity store. Anything else is a stub being asked a question nobody wrote
-# an answer for, and it says so rather than returning "".
+# The probe asks findmnt only which filesystem contains the identity store;
+# anything else is refused loudly.
 FINDMNT_STUB = """#!/bin/sh
 case "$*" in
     *--target*) printf '%s\\n' "${FAKE_STORE_SRC-/dev/mmcblk0p1}" ;;
@@ -3287,8 +2379,7 @@ case "$*" in
 esac
 """
 
-# A different machine's id, and the one every "this is not the same box"
-# fixture below uses. 32 hex characters, like the real thing.
+# A different machine's id.
 OTHER_ID = "ffffffffffffffffffffffffffffffff"
 
 
@@ -3297,9 +2388,7 @@ def run_identity(tmp_path, *, phase="boot1", live_id=LIVE_ID, stored_id=LIVE_ID,
                  make_boot=True, root_source="overlay"):
     """Run the shipped identity checks against a tree this test builds.
 
-    Everything the block reads is a path it takes from a variable -- $BOOTDIR,
-    $ETC_MACHINE_ID -- so the SHIPPED lines run here rather than a copy of
-    them.
+    Every path the block reads comes from a variable, so the shipped lines run.
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     boot = tmp_path / boot_dir
@@ -3336,9 +2425,7 @@ def run_identity(tmp_path, *, phase="boot1", live_id=LIVE_ID, stored_id=LIVE_ID,
 
 
 def test_a_boot_that_kept_its_identity_says_so(tmp_path):
-    # The positive control for everything below: every other test here
-    # asserts a FAIL, and a block that failed unconditionally would satisfy
-    # all of them.
+    # Positive control: every other test here asserts a FAIL.
     proc, _ = run_identity(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert results(proc) == {
@@ -3347,8 +2434,8 @@ def test_a_boot_that_kept_its_identity_says_so(tmp_path):
 
 
 def test_the_first_boot_writes_its_id_where_the_second_can_read_it(tmp_path):
-    """The record is the whole mechanism boot2's check rests on, so boot1 has
-    to leave it on the boot partition rather than merely read it."""
+    """Boot1 writes its id to the boot partition; boot2's check rests on that
+    record."""
     proc, boot = run_identity(tmp_path)
     written = (boot / "otp-imgcheck-machine-id").read_text().strip()
     assert written == LIVE_ID, written
@@ -3356,17 +2443,9 @@ def test_the_first_boot_writes_its_id_where_the_second_can_read_it(tmp_path):
 
 
 def test_the_record_is_not_the_store_the_shipped_script_writes(tmp_path):
-    """
-    THE FINDING this pair was added for, stated as a property of the file
-    names rather than of a comment.
-
-    `machine-id-persisted-outside-the-overlay` compares the live id with
-    /boot/firmware/otp-identity/machine-id -- and otp-unit-identity.service
-    has already filled that in from the live id by the time the probe looks,
-    so on a card whose store was wiped the two agree because one was copied
-    from the other seconds earlier. The record has to be a DIFFERENT file,
-    written by the probe, or boot2 is held against a value boot2 produced.
-    """
+    """The probe's record is a different file from the store:
+    otp-unit-identity.service fills the store from the live id, so comparing
+    against it would hold boot2 to a value boot2 produced."""
     _, boot = run_identity(tmp_path)
     record = boot / "otp-imgcheck-machine-id"
     store = boot / "otp-identity" / "machine-id"
@@ -3375,23 +2454,16 @@ def test_the_record_is_not_the_store_the_shipped_script_writes(tmp_path):
 
 
 def test_a_machine_with_no_id_at_all_records_nothing_and_says_so(tmp_path):
-    """
-    The positive control has to be able to fail, or boot2's "identical"
-    means nothing. A machine with no readable /etc/machine-id writes an empty
-    record and reads it back -- empty equals empty, which is exactly the shape
-    of agreement this check exists to refuse.
-    """
+    """A machine with no readable id fails the record check: an empty record
+    read back equals itself."""
     proc, _ = run_identity(tmp_path, live_id=None)
     assert results(proc)["machine-id-recorded-for-the-next-boot"] == "FAIL", \
         proc.stdout
 
 
 def test_an_id_that_never_reached_the_card_fails(tmp_path):
-    """
-    Reading it is not recording it. With no writable boot directory the
-    record never lands, and boot2 would have nothing to compare against --
-    which must be boot1's failure rather than boot2's mystery.
-    """
+    """With no writable boot directory the record never lands, and that is
+    boot1's failure."""
     proc, _ = run_identity(tmp_path, make_boot=False)
     assert results(proc)["machine-id-recorded-for-the-next-boot"] == "FAIL", \
         proc.stdout
@@ -3404,17 +2476,9 @@ def test_the_second_boot_accepts_the_same_machine(tmp_path):
 
 
 def test_an_id_regenerated_by_the_power_cycle_fails_the_second_boot(tmp_path):
-    """
-    THE FAILURE THE OLD CHECK COULD NOT SEE, and the reason this pair exists.
-
-    The FAT store was truncated or deleted between the boots, so systemd
-    generated a fresh id and otp-unit-identity.service wrote THAT into the
-    store: the live id and the store agree perfectly, and
-    machine-id-persisted-outside-the-overlay is green on a unit that is a
-    different machine than it was an hour ago. The record boot1 left is the
-    only thing that disagrees -- so both checks are asked of the same
-    fixture here, and exactly one of them is allowed to be satisfied.
-    """
+    """If the store is lost between boots, systemd generates a new id and the
+    store is refilled from it, so the store check passes; only boot1's record
+    disagrees, and the cross-boot check must fail."""
     proc, _ = run_identity(tmp_path, phase="boot2", live_id=OTHER_ID,
                            stored_id=OTHER_ID, recorded=LIVE_ID)
     assert results(proc)["machine-id-persisted-outside-the-overlay"] \
@@ -3424,19 +2488,16 @@ def test_an_id_regenerated_by_the_power_cycle_fails_the_second_boot(tmp_path):
 
 
 def test_two_absences_are_not_an_identical_machine_id(tmp_path):
-    """
-    THE reading this check has to be unable to make. No id in boot2 and
-    nothing recorded by boot1 compare equal as strings, and a machine that
-    lost its identity entirely would then certify that it kept it.
-    """
+    """No id in boot2 and no record from boot1 compare equal as strings; that
+    must fail."""
     proc, _ = run_identity(tmp_path, phase="boot2", live_id=None, recorded=None)
     assert results(proc)["machine-id-identical-across-the-power-cycle"] \
         == "FAIL", proc.stdout
 
 
 def test_a_second_boot_with_an_id_but_no_record_fails(tmp_path):
-    """Half of that absence on its own: boot1 never recorded anything, so
-    there is nothing this boot's id can be identical TO."""
+    """With no boot1 record there is nothing for this boot's id to be identical
+    to."""
     proc, _ = run_identity(tmp_path, phase="boot2", recorded=None)
     assert results(proc)["machine-id-identical-across-the-power-cycle"] \
         == "FAIL", proc.stdout
@@ -3449,48 +2510,32 @@ def test_a_machine_id_that_was_never_kept_fails(tmp_path):
 
 
 def test_a_kept_machine_id_that_is_not_the_one_in_use_fails(tmp_path):
-    """
-    Which is what a failed initramfs restore looks like from userspace: the
-    store holds an id, systemd generated a different one because it never saw
-    it, and the boot was a first boot all over again.
-    """
+    """A stored id that differs from the live one is what a failed initramfs
+    restore looks like from userspace."""
     proc, _ = run_identity(tmp_path, stored_id="ffffffffffffffffffffffffffffffff")
     assert results(proc)["machine-id-persisted-outside-the-overlay"] \
         == "FAIL", proc.stdout
 
 
 def test_a_machine_with_no_machine_id_at_all_fails(tmp_path):
-    """
-    Two absences again, in the other half. An unreadable /etc/machine-id and
-    an empty store compare equal, and "the identity persisted" would be
-    certified of a machine that has no identity.
-    """
+    """An unreadable /etc/machine-id and an empty store compare equal; that
+    must fail."""
     proc, _ = run_identity(tmp_path, live_id=None, stored_id="")
     assert results(proc)["machine-id-persisted-outside-the-overlay"] \
         == "FAIL", proc.stdout
 
 
 def test_a_store_inside_the_overlay_is_not_persistence(tmp_path):
-    """
-    The clause that stops the whole check being self-satisfying. If
-    /boot/firmware never mounted, the store is a directory on the overlay's
-    tmpfs: the copy and the original agree on every boot and nothing survives
-    any of them. findmnt then reports the ROOT's source for the store, which
-    is the state named here.
-    """
+    """A store on the overlay's tmpfs is not persistence: findmnt then reports
+    the root's source for the store."""
     proc, _ = run_identity(tmp_path, store_src="overlay")
     assert results(proc)["machine-id-persisted-outside-the-overlay"] \
         == "FAIL", proc.stdout
 
 
 def test_a_root_nothing_could_describe_does_not_make_the_store_separate(tmp_path):
-    """
-    The other end of the same comparison. If findmnt could not answer for
-    `/`, $ROOT_SOURCE is empty and "the store is not on the root's
-    filesystem" is true of every store there is. `root-is-overlay` would be
-    red on that machine too, but a check that is only correct because a
-    different check failed is a coincidence with a name.
-    """
+    """An empty $ROOT_SOURCE must not make every store look separate from the
+    root."""
     proc, _ = run_identity(tmp_path, root_source="")
     assert results(proc)["machine-id-persisted-outside-the-overlay"] \
         == "FAIL", proc.stdout
@@ -3506,20 +2551,17 @@ def sheet_block() -> str:
     return text[start:text.index("\n# --- the seeded userconf.txt path", start)]
 
 
-# What the shipped heredoc prints when the image can draw the sheet and cupsd
-# takes it. test_the_sheet_program_prints_what_the_probe_reads runs the real
-# program and holds these shapes against it.
+# What the shipped heredoc prints when the sheet renders and cupsd takes it;
+# test_the_sheet_program_prints_what_the_probe_reads holds these shapes against
+# the real program.
 SHEET_HEALTHY = "RENDER ok bytes=4632 magic=%PDF-\nSUBMIT ok job=otpimgcheck-1\n"
 
 
 def run_sheet(tmp_path, *, says=SHEET_HEALTHY, lpadmin_rc=0):
     """Run the shipped sheet block with the Python and CUPS tools stubbed.
 
-    The interpreter and the two CUPS binaries are rewritten rather than put
-    on PATH, because the block names them by absolute path -- on purpose, the
-    way otpunit/printer.py does. Everything else, including both `check`
-    calls' conditions and the `case` patterns that read the program's output,
-    is the code that ships.
+    The interpreter and the two CUPS binaries are rewritten in the block, which
+    names them by absolute path; everything else is the shipped code.
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     calls = tmp_path / "lpadmin-calls"
@@ -3533,8 +2575,7 @@ def run_sheet(tmp_path, *, says=SHEET_HEALTHY, lpadmin_rc=0):
     lpstat.write_text("#!/bin/sh\necho 'device for otpimgcheck: usb://OTP/imgcheck'\n")
     lpstat.chmod(0o755)
     program = tmp_path / "python3"
-    # Reads the heredoc off stdin and throws it away, exactly as a python3
-    # that ran it and printed nothing else would.
+    # Discards the heredoc on stdin and prints the canned output.
     program.write_text("#!/bin/sh\ncat > /dev/null\n"
                        f'printf "%s" "$SHEET_SAYS"\n')
     program.chmod(0o755)
@@ -3561,44 +2602,34 @@ def run_sheet(tmp_path, *, says=SHEET_HEALTHY, lpadmin_rc=0):
 
 
 def test_a_sheet_that_rendered_and_was_accepted_passes(tmp_path):
-    # The positive control, and the only test here that does not assert a
-    # FAIL.
+    # Positive control: the only test here that does not assert a FAIL.
     proc, calls = run_sheet(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert results(proc) == {"diagnostic-sheet-renders": "PASS",
                              "diagnostic-sheet-reaches-cups": "PASS"}, proc.stdout
-    # And the machine is left as a unit rather than as a rig.
+    # The temporary queue is removed afterwards.
     assert "-x otpimgcheck" in calls.read_text(), calls.read_text()
 
 
 def test_an_image_that_cannot_draw_the_sheet_fails(tmp_path):
-    """
-    The half nothing else in this repository can ask. tier 1 renders this
-    sheet against the host's reportlab; only a booted image can say whether
-    the thing that gets flashed has one.
-    """
+    """Only a booted image can say whether the flashed system has reportlab;
+    tier 1 renders against the host's."""
     proc, _ = run_sheet(tmp_path, says="RENDER failed ModuleNotFoundError: reportlab\n")
     assert results(proc) == {"diagnostic-sheet-renders": "FAIL",
                              "diagnostic-sheet-reaches-cups": "FAIL"}, proc.stdout
 
 
 def test_a_sheet_that_is_not_a_pdf_fails(tmp_path):
-    """
-    Bytes are not a page. reportlab writing an empty or truncated file
-    raises nothing, and "no exception" is the whole of what a bare rc=0
-    would prove -- so the magic number is checked, which is the cheapest
-    thing that separates a sheet from an artefact.
-    """
+    """The PDF magic number is checked: reportlab writing an empty or truncated
+    file raises nothing."""
     proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=0 magic=\n"
                                        "SUBMIT ok job=otpimgcheck-1\n")
     assert results(proc)["diagnostic-sheet-renders"] == "FAIL", proc.stdout
 
 
 def test_a_sheet_cupsd_would_not_take_fails_with_the_render_still_green(tmp_path):
-    """
-    Two checks, because they fail for entirely different reasons and a
-    single one would report "the print path is broken" for either.
-    """
+    """Render and submit are separate checks because they fail for different
+    reasons."""
     proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=4632 magic=%PDF-\n"
                                        "SUBMIT failed PrinterError: lp: Bad destination\n")
     assert results(proc) == {"diagnostic-sheet-renders": "PASS",
@@ -3606,43 +2637,27 @@ def test_a_sheet_cupsd_would_not_take_fails_with_the_render_still_green(tmp_path
 
 
 def test_an_lp_that_returned_no_job_id_is_not_an_enqueued_sheet(tmp_path):
-    """
-    ENQUEUED means cupsd gave it an id, not that lp exited 0.
-
-    Cups.submit() pulls "request id is <id>" out of lp's stdout and returns
-    "" when it is not there -- an lp that succeeded and said nothing useful
-    is a job nobody can point at, and the queue this ran against has no
-    printer behind it to notice either way.
-    """
+    """Enqueued means cupsd returned a job id, not that lp exited 0:
+    Cups.submit() returns "" when lp's output carries no id."""
     proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=4632 magic=%PDF-\n"
                                        "SUBMIT ok job=<no id>\n")
     assert results(proc)["diagnostic-sheet-reaches-cups"] == "FAIL", proc.stdout
 
 
 def test_a_job_on_somebody_elses_queue_is_not_this_experiment(tmp_path):
-    """
-    The id has to name the queue the probe made. `lp` reports the id as
-    <queue>-<n>, so a job id from anywhere else -- the unit's own OTP queue,
-    say, if one ever existed on this machine -- would otherwise read as this
-    experiment having worked.
-    """
+    """The job id must name the probe's own queue; a job on any other queue is
+    not this experiment."""
     proc, _ = run_sheet(tmp_path, says="RENDER ok bytes=4632 magic=%PDF-\n"
                                        "SUBMIT ok job=OTP-7\n")
     assert results(proc)["diagnostic-sheet-reaches-cups"] == "FAIL", proc.stdout
 
 
 def test_the_sheet_program_prints_what_the_probe_reads(tmp_path):
-    """
-    The shipped Python, run for real, against the shipped otpunit.
+    """Runs the shipped heredoc program against the shipped otpunit, so the
+    `case` patterns in the block are held to what the program really prints.
 
-    Everything above stubs the interpreter, so the `case` patterns the block
-    matches on are only as good as the guess about what the program prints.
-    This runs the actual heredoc: diagnostics.collect() over this machine and
-    render_bytes() through reportlab, which is also the only place in the
-    fast suite where the sheet the headless design rests on is drawn at all.
-
-    The submit half is expected to FAIL here -- there is no cupsd on a test
-    runner -- and that it fails in the shape the block reads is the point.
+    There is no cupsd here, so the submit half is expected to fail, in the
+    shape the block reads.
     """
     block = sheet_block()
     opener = "<<'PY' 2>&1\n"
@@ -3650,14 +2665,9 @@ def test_the_sheet_program_prints_what_the_probe_reads(tmp_path):
     start = block.index(opener) + len(opener)
     program = block[start:block.index("\nPY\n", start)]
     assert "diagnostics.render_bytes" in program, program[:200]
-    # /opt/otp-unit does not exist here; the repository root is on sys.path
-    # already, so the shipped `sys.path.insert` is simply inert.
-    #
-    # CUPS_SERVER at a socket that cannot exist, so the submit half is
-    # hermetic: `lp` fails against nothing rather than reaching whatever
-    # daemon happens to be running on the machine the fast suite is on. The
-    # rig in tests/cupsrig.py is the hardware tier's job and carries a marker
-    # for it; this test must not touch a real queue by accident.
+    # /opt/otp-unit does not exist here, so the shipped `sys.path.insert` is
+    # inert. CUPS_SERVER names a socket that cannot exist, so `lp` never
+    # reaches a real daemon on the test machine.
     proc = subprocess.run(
         ["python3", "-c", program], capture_output=True, text=True, timeout=180,
         cwd=REPO, env={**os.environ, "SHEET_QUEUE": "otpimgcheck",
@@ -3666,9 +2676,8 @@ def test_the_sheet_program_prints_what_the_probe_reads(tmp_path):
     said = proc.stdout
     assert re.search(r"^RENDER ok bytes=\d+ magic=%PDF-", said, re.M), said
     assert re.search(r"^SUBMIT (ok job=|failed )", said, re.M), said
-    # And what it printed is what the shipped block reads as a rendered
-    # sheet. The glob is taken out of the probe rather than restated here:
-    # its quoted literals have to appear, in order, in what the program said.
+    # The render glob is taken from the probe: its quoted literals must appear,
+    # in order, in what the program printed.
     glob = re.search(r"(\*\".*magic=%PDF\"\*)\) SHEET_RENDERED=yes",
                      sheet_block())
     assert glob, "the render pattern is gone from the probe"
@@ -3696,10 +2705,8 @@ def shadow_field(shadow_text: str, user: str) -> str:
 def sha256_of(text: str) -> str:
     """What the probe's `sha256sum` answers for the same bytes.
 
-    The probe digests the hash rather than carrying it between the boots
-    because its console is uploaded as a CI artifact and a crypt string is
-    offline-crackable at leisure. Recomputed here rather than pasted, so the
-    fixture cannot drift away from the thing under test.
+    The probe carries a digest between boots because its console is uploaded
+    and a crypt string is crackable offline.
     """
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -3711,22 +2718,16 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
                  root_source="overlay", sha256sum=True):
     """Run the shipped userconf block with a substituted systemd and shadow.
 
-    Three absolute paths are rewritten rather than stubbed on the filesystem
-    -- /etc/shadow, the userconf-service the experiment runs, and the boot
-    directory -- for the reason run_phase_guard gives: everything else in the
-    block, including both `check` calls' conditions and the wording they
-    print, is the code that ships. The two waits are shortened, and only
-    those: the 30s condition poll and the 60s bound on the experiment are
-    real time in a real boot, and test_the_probe_is_given_longer_than_its_own
-    _bounded_wait is what holds them against the unit's TimeoutStartSec.
+    /etc/shadow, the userconf-service path and the boot directory are rewritten
+    in the block; everything else is the shipped code. The two waits are
+    shortened; test_the_probe_is_given_longer_than_its_own_bounded_wait holds
+    them against the unit's TimeoutStartSec.
     """
     bootdir = tmp_path / "firmware"
     bootdir.mkdir(parents=True, exist_ok=True)
-    # A whole fake /etc rather than a lone shadow file, because boot2's
-    # relabel experiment runs the SHIPPED device/persist-identity.sh and that
-    # script reads passwd, shadow and machine-id out of one tree. Pointing the
-    # probe's reads and the script's --root at the same tree is what makes the
-    # experiment a sequence rather than two rigs agreeing with each other.
+    # A whole fake /etc: boot2's relabel experiment runs the shipped
+    # persist-identity.sh, which reads passwd, shadow and machine-id from one
+    # tree.
     etc = tmp_path / "root" / "etc"
     etc.mkdir(parents=True, exist_ok=True)
     shadow_file = etc / "shadow"
@@ -3734,9 +2735,8 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
         "root:!:20000:0:99999:7:::\n"
         + (shadow if shadow is not None
            else "otp:$6$otpimgcheck$hashbytes:20000:0:99999:7:::\n"))
-    # `pi` is deliberately NOT here: it is the name boot2's experiment plants
-    # in the store, and a fixture where it is a real account is testing
-    # something else. `otp` holds UID 1000, the way image/build.sh builds it.
+    # `pi` is absent on purpose: it is the name boot2's experiment plants in
+    # the store. `otp` holds UID 1000, as image/build.sh builds it.
     (etc / "passwd").write_text(passwd if passwd is not None else (
         "root:x:0:0:root:/root:/bin/bash\n"
         "otp:x:1000:1000:,,,:/home/otp:/bin/bash\n"))
@@ -3752,50 +2752,37 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
     (bin_dir / "journalctl").write_text(JOURNALCTL_STUB)
     (bin_dir / "journalctl").chmod(0o755)
     if not sha256sum:
-        # THE MISSING COMMAND, which is the question every guard here has to
-        # answer: what exit code, empty output or absent binary makes this
-        # pass silently? `cred_digest` pipes into sha256sum and takes what
-        # comes back, so one that is absent or broken answers the empty
-        # string -- in BOTH boots, which is how "the password survived the
-        # power cycle" turns into "there was never a password". Exits 0, like
-        # a command that is not there behind a `2>/dev/null`.
+        # A sha256sum that prints nothing and exits 0: `cred_digest` would then
+        # be empty in both boots, and two empty digests must not compare as a
+        # kept password.
         (bin_dir / "sha256sum").write_text("#!/bin/sh\ncat >/dev/null\nexit 0\n")
         (bin_dir / "sha256sum").chmod(0o755)
 
-    # The credential store the probe audits, and the record boot1 leaves for
-    # boot2. Supplied here rather than left to the block, because both are
-    # written by the IMAGE -- persist-identity.sh puts the store there from the
-    # wizard's ExecStartPost -- and this rig has no image.
+    # The credential store the probe audits and the record boot1 leaves for
+    # boot2; on a real unit the image writes both.
     store = bootdir / "otp-identity"
     store.mkdir(parents=True, exist_ok=True)
     if credential is not None:
         (store / "credential").write_text(credential + "\n")
-    # The machine-id the shipped script would find already kept, so its own
-    # machine-id branch is quiet and the exit status boot2's experiment reads
-    # is a statement about the credential.
+    # The machine-id is already kept, so the script's exit status speaks only
+    # for the credential.
     (store / "machine-id").write_text(LIVE_ID + "\n")
 
-    # The three commands the relabel experiment and the script it runs would
-    # otherwise reach for on the machine running this test: `chpasswd` really
-    # edits /etc/shadow, `findmnt` answers about the real root, and
-    # /opt/otp-unit/persist-identity.sh is not installed here.
+    # Stubs for what the relabel experiment would otherwise run on the host:
+    # chpasswd, findmnt, and the installed persist-identity.sh path.
     (bin_dir / "chpasswd").write_text(CHPASSWD_STUB)
     (bin_dir / "chpasswd").chmod(0o755)
     (bin_dir / "findmnt").write_text(IDENTITY_FINDMNT_STUB)
     (bin_dir / "findmnt").chmod(0o755)
-    # THE REAL SCRIPT, not a stub, pointed at this fixture's boot partition
-    # and /etc. The whole value of the experiment is that the guest block
-    # hands its synthesised state to the code that ships.
+    # The real script, pointed at this fixture's boot partition and /etc.
     shipped = tmp_path / "persist-identity.sh"
     shipped.write_text(
         "#!/bin/sh\n"
         f'exec bash {IDENTITY_SH} --boot-dir "{bootdir}" '
         f'--root "{tmp_path / "root"}" "$@"\n')
     shipped.chmod(0o755)
-    # "auto" is the healthy path: the digest boot1 would have written of the
-    # hash this fixture's own /etc/shadow holds. Computed from the fixture
-    # rather than pasted, so a test that changes the hash cannot leave a
-    # record describing the old one and call the mismatch a finding.
+    # "auto" is the healthy path: the digest of the hash this fixture's own
+    # /etc/shadow holds, computed so it cannot drift.
     if boot1_digest == "auto":
         boot1_digest = sha256_of(shadow_field(shadow_file.read_text(), "otp"))
     if boot1_digest is not None:
@@ -3803,20 +2790,12 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
 
     block = userconf_block()
     for original, replacement, why, count in (
-        # THE READ, not the path: the comments in the block name /etc/shadow
-        # eight times over and rewriting those would prove nothing. TWICE,
-        # not once, because boot1 reads the account's hash to say the seed
-        # was applied and boot2 reads it again to say the hash outlived the
-        # power cycle -- a rewrite that patched one would leave the other
-        # reading the machine this test runs on.
-        # FOUR, not the two it was: boot1 reads the account's hash to say the
-        # seed was applied, boot2 reads it again to say the hash outlived the
-        # power cycle, and boot2's relabel experiment reads it either side of
-        # the shipped script it runs.
+        # The read expression, not the bare path, since the block's comments
+        # also name /etc/shadow. Four reads: boot1's apply check, boot2's
+        # survival check, and either side of boot2's relabel experiment.
         ("{print $2}' /etc/shadow", "{print $2}' " + str(shadow_file),
          "the shadow read", 4),
-        # The awk, not the bare path: the comment above these two reads names
-        # /etc/passwd as well, and rewriting a comment proves nothing.
+        # The awk, not the bare path, for the same reason.
         ("exit }' /etc/passwd", "exit }' " + str(etc / "passwd"),
          "the passwd read", 2),
         ("/opt/otp-unit/persist-identity.sh", str(shipped),
@@ -3833,11 +2812,8 @@ def run_userconf(tmp_path, *, phase, service=USERCONF_SERVICE_STUB,
     runner.write_text(
         "set -uo pipefail\n"
         f'PHASE="{phase}"\nBOOTDIR="{bootdir}"\nPASS=0\nTOTAL=0\n'
-        # What the identity section above the block would have set. Named
-        # here for the same reason $BOOTDIR is: the credential checks compare
-        # the store's filesystem against the root's, and that comparison has
-        # to be steerable or the clause that catches an unmounted
-        # /boot/firmware can never be shown to work.
+        # What the identity section above the block would have set; steerable
+        # so the unmounted-/boot/firmware clause can be exercised.
         f'IDENTITY_STORE="{store}"\nSTORE_SRC="{store_src}"\n'
         f'ROOT_SOURCE="{root_source}"\n'
         + slice_between(GUEST_CHECK.read_text(), *HELPERS) + "\n"
@@ -3867,9 +2843,7 @@ def results(proc) -> dict:
 
 
 def test_a_seeded_first_boot_reports_applied_credentials_and_no_wizard(tmp_path):
-    # The positive control for everything below: every other test here
-    # asserts a FAIL, and a block that failed unconditionally would satisfy
-    # all of them.
+    # Positive control: every other test here asserts a FAIL.
     proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1)
     assert proc.returncode == 0, proc.stderr
     assert results(proc) == {
@@ -3882,14 +2856,8 @@ def test_a_seeded_first_boot_reports_applied_credentials_and_no_wizard(tmp_path)
 
 
 def test_a_boot_still_waiting_on_the_network_fails(tmp_path):
-    """
-    Run 31968966879's shape, stated as a check.
-
-    The wizard's job was queued behind network-online.target, which was
-    queued behind a wait with no timeout, and from the unit's own fields
-    that is indistinguishable from a skip. The queue is asked directly, in
-    both boots, because the boot that suffers it is any boot.
-    """
+    """A wizard job queued behind an unbounded network wait looks like a skip
+    in the unit's own fields, so the job queue is asked directly."""
     proc, _ = run_userconf(tmp_path, phase="boot1", env={
         **HEALTHY_BOOT1,
         "JOBS": "1 systemd-networkd-wait-online.service start running\n"})
@@ -3898,14 +2866,8 @@ def test_a_boot_still_waiting_on_the_network_fails(tmp_path):
 
 
 def test_an_unmasked_network_wait_fails_even_with_an_empty_queue(tmp_path):
-    """
-    Both halves, because either alone is satisfied by the broken image.
-
-    An empty queue at the moment the probe looks says nothing about the next
-    boot: whatever pulls network-online.target in decides that, and on the
-    image run 31968966879 booted it was cloud-init. The mask is what makes
-    the answer the same every time, so it is read back off the machine.
-    """
+    """An unmasked network wait fails even with an empty queue: the queue says
+    nothing about the next boot, the mask does."""
     for state in ("enabled", "disabled", "static"):
         proc, _ = run_userconf(tmp_path / state, phase="boot2",
                                env={**HEALTHY_BOOT2, "NETWAIT_ENABLED": state})
@@ -3914,15 +2876,9 @@ def test_an_unmasked_network_wait_fails_even_with_an_empty_queue(tmp_path):
 
 
 def test_a_credential_apply_that_took_the_front_panel_down_fails(tmp_path):
-    """
-    The defect this check exists for, with the credentials applied perfectly.
-
-    cancel-rename starts a getty on tty1 at the end of every successful
-    apply. While otp-unit.service carried Conflicts=getty@tty1.service that
-    start stopped the panel, so a unit whose operator used the documented
-    credential file printed nothing until it was power-cycled -- with every
-    other check in this phase green, because the seed WAS applied.
-    """
+    """A credential apply that takes the panel down fails its own check while
+    the seed check stays green: cancel-rename starts a getty on tty1 after
+    every successful apply."""
     proc, _ = run_userconf(tmp_path, phase="boot1",
                            env={**HEALTHY_BOOT1, "PANEL_ACTIVE": "inactive"})
     assert results(proc)["userconf-seed-applied"] == "PASS", proc.stdout
@@ -3931,13 +2887,8 @@ def test_a_credential_apply_that_took_the_front_panel_down_fails(tmp_path):
 
 
 def test_a_login_prompt_sharing_the_panels_tty_fails(tmp_path):
-    """
-    The other outcome of the same start, and the reason the check does not
-    stop at "otp-unit is active". Without the Conflicts= that used to stop
-    it, a getty that DOES start shares /dev/tty1 with a unit holding it
-    through StandardInput=tty-force: output interleaves and keystrokes go to
-    whichever grabbed them. A getty merely queued is the same thing a moment
-    later, so the queue counts too.
+    """A getty running on tty1, or queued to start, fails the check: it would
+    share the tty with the panel, interleaving output and stealing keystrokes.
     """
     proc, _ = run_userconf(tmp_path / "running", phase="boot1",
                            env={**HEALTHY_BOOT1, "TTY1_ACTIVE": "active"})
@@ -3950,14 +2901,8 @@ def test_a_login_prompt_sharing_the_panels_tty_fails(tmp_path):
 
 
 def test_a_wizard_still_holding_a_job_fails_the_first_boot(tmp_path):
-    """
-    Run 12's shape, stated as a check, with everything else looking healthy.
-
-    A queued job for a unit that has not started yet reads as `inactive` in
-    every other field -- and a job is the thing that actually held run 12's
-    boot open, with multi-user.target waiting on a whiptail nobody could
-    see. So the queue is asked directly rather than inferred from is-active.
-    """
+    """A queued wizard job fails the first boot even though every other field
+    reads `inactive`: a queued job is what holds multi-user.target open."""
     proc, _ = run_userconf(tmp_path, phase="boot1", env={
         **HEALTHY_BOOT1,
         "JOBS": "42 userconfig.service start waiting\n"})
@@ -3965,8 +2910,7 @@ def test_a_wizard_still_holding_a_job_fails_the_first_boot(tmp_path):
 
 
 def test_a_wizard_parked_mid_start_fails_the_first_boot(tmp_path):
-    # The other half of the same shape: the prompt is up, the unit has been
-    # "activating" for as long as the boot has been waiting.
+    # The prompt is up: the unit is "activating" with a running job.
     proc, _ = run_userconf(tmp_path, phase="boot1", env={
         **HEALTHY_BOOT1, "UC_ACTIVE": "activating", "UC_RESULT": "",
         "JOBS": "42 userconfig.service start running\n"})
@@ -3974,10 +2918,8 @@ def test_a_wizard_parked_mid_start_fails_the_first_boot(tmp_path):
 
 
 def test_a_seeded_boot_whose_wizard_was_skipped_fails(tmp_path):
-    # The condition came out false with a seed sitting on the card: the
-    # drop-in's paths and the file the operator wrote disagree, or the unit
-    # was masked. The credentials are silently ignored either way, and the
-    # log says so in systemd's words rather than the unit's fields.
+    # The condition came out false with a seed on the card, so the credentials
+    # are silently ignored; the log says so in systemd's words.
     proc, _ = run_userconf(tmp_path, phase="boot1", env={
         **HEALTHY_BOOT1, "UC_COND": "no",
         "UC_JOURNAL": "Aug 16 22:05:01 otp-unit systemd[1]: userconfig.service"
@@ -3988,45 +2930,24 @@ def test_a_seeded_boot_whose_wizard_was_skipped_fails(tmp_path):
 
 
 def test_a_seeded_boot_whose_wizard_never_ran_at_all_fails(tmp_path):
-    """
-    Nothing in the log, nothing in the queue, nothing wrong with the unit --
-    which is what a masked or never-pulled-in wizard looks like from every
-    other field, and what run 31968966879's boots looked like once their
-    queued job is taken out of the picture. The operator's credentials are
-    ignored in silence.
-
-    An empty journal is the one thing a garbage-collected unit and a
-    never-started one do NOT share: the collected one leaves its "Finished"
-    line behind, which is the whole reason this check reads the log.
-    """
+    """An empty journal fails: a masked or never-pulled-in wizard looks healthy
+    in every other field, whereas a garbage-collected unit that ran leaves its
+    "Finished" line."""
     proc, _ = run_userconf(tmp_path, phase="boot1",
                            env={**HEALTHY_BOOT1, "UC_JOURNAL": ""})
     assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
 
 
 def test_a_previous_boots_success_line_does_not_answer_for_this_boot(tmp_path):
-    """
-    `journalctl -u` with no boot filter answers out of every boot the journal
-    still holds. This machine's journal is volatile -- device/install.sh
-    writes Storage=volatile into journald.conf.d -- so today there is only
-    ever one boot in it, and the read was correct by accident three hundred
-    lines away in another file. Delete that one setting, or ship on a machine
-    someone has made persistent, and the FIRST boot's `Finished
-    userconfig.service` satisfies a later boot on which the unit never ran at
-    all: exactly the reading this block exists to make impossible.
-
-    `-b` on the read is what stops it, and this is the fixture that can tell.
-    The stub keeps a previous boot's entries and hands them over only to a
-    caller that did not ask for this one.
-    """
+    """The journal read is scoped with `-b`: on a persistent journal, a
+    previous boot's `Finished userconfig.service` would otherwise satisfy a
+    boot on which the unit never ran."""
     persistent = {**HEALTHY_BOOT1, "UC_JOURNAL": "", "UC_JOURNAL_LAST_BOOT":
                   "Aug 15 09:00:00 otp-unit systemd[1]: Finished "
                   "userconfig.service - User configuration dialog."}
     proc, _ = run_userconf(tmp_path, phase="boot1", env=persistent)
     assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "FAIL", proc.stdout
-    # The positive control on the fixture itself: the same journal, offered
-    # as THIS boot's, is the healthy case. Without this the test above would
-    # also pass against a stub that simply printed nothing.
+    # Positive control: the same journal offered as this boot's passes.
     proc, _ = run_userconf(
         tmp_path / "this-boot", phase="boot1",
         env={**HEALTHY_BOOT1, "UC_JOURNAL": persistent["UC_JOURNAL_LAST_BOOT"]})
@@ -4034,16 +2955,8 @@ def test_a_previous_boots_success_line_does_not_answer_for_this_boot(tmp_path):
 
 
 def test_the_wizards_own_stdout_cannot_report_its_success(tmp_path):
-    """
-    `journalctl -u` returns the unit's STDOUT as well as PID 1's status lines
-    about it -- that is what StandardOutput=journal means -- so a
-    userconf-service that merely PRINTED the phrase satisfied the check.
-    Nothing upstream prints it today, which is the only reason this was not
-    already a false green; a phrase whose truth depends on nobody happening
-    to say it is not a measurement.
-
-    `Finished` is systemd's own success line. Matching the speaker with it
-    costs nothing and means only PID 1 can make the claim.
+    """Only PID 1's `Finished` line counts: `journalctl -u` also returns the
+    unit's own stdout, so the phrase printed by userconf-service must not pass.
     """
     impostor = ("Aug 16 22:05:01 otp-unit systemd[1]: Starting "
                 "userconfig.service - User configuration dialog...\n"
@@ -4056,13 +2969,8 @@ def test_the_wizards_own_stdout_cannot_report_its_success(tmp_path):
 
 
 def test_the_success_line_is_matched_literally_not_as_a_glob(tmp_path):
-    """
-    `systemd[1]:` is a glob pattern as well as a string, and `[1]` is a
-    character class matching the single character 1. Unquoted inside the
-    ${var#pattern} that does the matching, `systemd1: Finished` would
-    therefore pass -- which is not a line systemd writes, but it is a line
-    the unit's own stdout could.
-    """
+    """`systemd[1]:` is matched literally: as an unquoted glob, `[1]` is a
+    character class and `systemd1: Finished` would pass."""
     globbed = ("Aug 16 22:06:10 otp-unit userconf-service[512]: systemd1: "
                "Finished userconfig.service - User configuration dialog.")
     proc, _ = run_userconf(tmp_path, phase="boot1",
@@ -4071,10 +2979,8 @@ def test_the_success_line_is_matched_literally_not_as_a_glob(tmp_path):
 
 
 def test_a_wizard_that_failed_on_the_seed_fails_the_first_boot(tmp_path):
-    # A malformed seed met at BOOT: userconf-service dies on the whiptail it
-    # cannot draw, and Restart=on-failure prints the two strings img-boot.sh
-    # fails a release on. The log carries both, so the check does not have to
-    # ask a unit that may already have been collected.
+    # A malformed seed met at boot: the unit fails and Restart=on-failure logs
+    # the two strings img-boot.sh fails a release on.
     proc, _ = run_userconf(tmp_path, phase="boot1", env={
         **HEALTHY_BOOT1, "UC_RESULT": "exit-code", "UC_ACTIVE": "failed",
         "UC_JOURNAL": "Aug 16 22:05:01 otp-unit systemd[1]: userconfig.service:"
@@ -4085,13 +2991,8 @@ def test_a_wizard_that_failed_on_the_seed_fails_the_first_boot(tmp_path):
 
 
 def test_a_wizard_that_only_finished_after_a_restart_fails(tmp_path):
-    """
-    "Finished" on its own is not the whole answer, because stock
-    userconfig.service carries Restart=on-failure: a boot that met a bad seed
-    can fail, be restarted, and finish. That boot printed "Failed with result"
-    and "Scheduled restart job" -- two of the strings img-boot.sh hard-fails a
-    release on -- so the guest must not call it clean either.
-    """
+    """A "Finished" after a failure and restart is still a FAIL: that boot
+    printed the strings img-boot.sh hard-fails a release on."""
     proc, _ = run_userconf(tmp_path, phase="boot1", env={
         **HEALTHY_BOOT1,
         "UC_JOURNAL": "Aug 16 22:05:01 otp-unit systemd[1]: userconfig.service:"
@@ -4104,33 +3005,18 @@ def test_a_wizard_that_only_finished_after_a_restart_fails(tmp_path):
 
 
 def test_a_finished_line_from_a_collected_unit_is_still_a_pass(tmp_path):
-    """
-    The measurement this check was rewritten around, stated as a test.
-
-    A seeded apply ends in cancel-rename, which runs `systemctl disable
-    userconfig` and a daemon-reload; the oneshot is inactive and unreferenced
-    by then, so systemd garbage-collects it and every property a later
-    `systemctl show` returns is a pristine default. Run 31972140190 measured
-    exactly that -- `condition=no result=success is-active=inactive jobs=0`
-    on a boot whose console says `Finished userconfig.service`, whose shadow
-    entry carries the seeded salt and whose card came back with the seed
-    consumed. Failing that boot would be the harness calling a correct
-    machine broken.
-    """
+    """A healthy apply still passes after systemd has garbage-collected the
+    unit: cancel-rename disables it, so `systemctl show` returns defaults and
+    the journal's Finished line is the evidence."""
     proc, _ = run_userconf(tmp_path, phase="boot1", env={
         **HEALTHY_BOOT1, "UC_TS": "", "UC_COND": "no", "UC_RESULT": "success"})
     assert results(proc)["userconf-seeded-boot-ran-no-wizard"] == "PASS", proc.stdout
 
 
 def test_a_seed_deleted_without_being_applied_fails(tmp_path):
-    """
-    The gap the shadow check exists to close.
-
-    From the host the file is gone, which is exactly what success looks like.
-    A userconf-service that unlinked the seed without running chpasswd would
-    leave the operator with an account whose password is pi-gen's random
-    FIRST_USER_PASS -- a value nobody has -- and a green tier 3.
-    """
+    """A seed removed without chpasswd running fails: from the host the file is
+    gone either way, and the account would keep the build-time password nobody
+    has."""
     proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
                            shadow="otp:$6$rEaLsAlT$otherbytes:20000:0:99999:7:::\n")
     assert results(proc)["userconf-seed-applied"] == "FAIL", proc.stdout
@@ -4144,8 +3030,8 @@ def test_no_shadow_entry_at_all_fails(tmp_path):
 
 
 def test_an_unseeded_second_boot_is_quiet_and_leaves_evidence(tmp_path):
-    # The positive control for the boot2 half, and the healthy path: skipped
-    # but enabled, no prompt possible, and the malformed seed quarantined.
+    # Positive control for boot2: skipped but enabled, no prompt possible, and
+    # the malformed seed quarantined.
     proc, bootdir = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2)
     assert proc.returncode == 0, proc.stderr
     assert results(proc) == {
@@ -4157,11 +3043,8 @@ def test_an_unseeded_second_boot_is_quiet_and_leaves_evidence(tmp_path):
         "userconf-malformed-seed-fails-fast": "PASS"}, proc.stdout
     assert (bootdir / "failed_userconf.txt").exists()
     assert not (bootdir / "userconf.txt").exists()
-    # AND THE EXPERIMENT PUT THE CARD BACK, by the shipped script's own
-    # action rather than by a cleanup step: only the NAME in the store was
-    # changed, so a working restore rewrites it and re-applies the same hash.
-    # The host's own credential-kept-on-the-card is looking at this file after
-    # the guest has finished with it.
+    # The experiment restored the card through the shipped script: only the
+    # name in the store was changed, so a working restore rewrites it.
     assert (bootdir / "otp-identity" / "credential").read_text() \
         == "otp:$6$otpimgcheck$hashbytes\n"
     assert shadow_field((tmp_path / "root" / "etc" / "shadow").read_text(),
@@ -4169,16 +3052,9 @@ def test_an_unseeded_second_boot_is_quiet_and_leaves_evidence(tmp_path):
 
 
 def test_the_relabel_experiment_is_refused_a_name_this_machine_really_has(tmp_path):
-    """
-    The fixture clause, and it is not decoration.
-
-    The experiment's whole subject is a store naming an account that does NOT
-    exist -- that is what a power cycle leaves behind after userconf-pi's
-    rename. Point it at a name the machine really has and it is a different
-    experiment: the restore would then be applying a credential to an account
-    somebody could already be using, which is the thing the UID rule exists to
-    stop. So the probe reads /etc/passwd and refuses to draw a conclusion.
-    """
+    """The relabel experiment refuses to conclude anything if the planted name
+    is a real account: its subject is a store naming an account that does not
+    exist."""
     proc, _ = run_userconf(
         tmp_path, phase="boot2", env=HEALTHY_BOOT2,
         passwd="root:x:0:0:root:/root:/bin/bash\n"
@@ -4186,68 +3062,44 @@ def test_the_relabel_experiment_is_refused_a_name_this_machine_really_has(tmp_pa
                "otp:x:1000:1000:,,,:/home/otp:/bin/bash\n")
     assert results(proc)["credential-recovers-a-store-naming-another-account"] \
         == "FAIL", proc.stdout
-    # And it says which clause: an account named `pi` is on this machine.
+    # It names the clause that failed.
     assert "an account here: yes" in proc.stdout, proc.stdout
 
 
 def test_a_relabel_experiment_that_never_changed_the_password_proves_nothing(tmp_path):
-    """
-    THE TWO-ABSENCE HOLE, in the shape this experiment can take it.
-
-    "the live hash is the kept one afterwards" is satisfied perfectly by an
-    experiment that never disturbed it: the mangle silently fails, the shipped
-    script finds the password already right, takes its early exit, relabels
-    the store and exits 0 -- and every other clause here is true of a boot
-    that proved nothing about the apply at all.
-
-    Driven with the chpasswd stub told to exit 0 having written nothing, which
-    is what a chpasswd missing from the image does.
-    """
+    """If the experiment's mangle never changed the live hash, "the hash is the
+    kept one afterwards" proves nothing, so the check fails. Driven with a
+    chpasswd that exits 0 having written nothing."""
     proc, _ = run_userconf(tmp_path, phase="boot2",
                            env={**HEALTHY_BOOT2, "CHPASSWD_APPLY": "no"})
     assert results(proc)["credential-recovers-a-store-naming-another-account"] \
         == "FAIL", proc.stdout
-    # The state the clause caught: nothing moved, so before and after agree.
+    # Nothing moved: before and after agree.
     assert re.search(r"before: (\S+)\.\.\. \| after: \1\.\.\.", proc.stdout), \
         proc.stdout
 
 
-# --- and the credential the seed used to lose ------------------------------
+# --- and the credential kept across the power cycle ------------------------
 #
-# These drive the SAME block through the same rig. The image the checks
-# describe is the one the owner's decision produced: the applied hash is kept
-# in /boot/firmware/otp-identity/credential, restored at sysinit, and still in
-# force after the power cycle. Every test below is a way for that to look
-# right while being false.
+# The same block through the same rig. Each test below is a way for the kept
+# credential to look right while being false.
 
 
 def test_a_boot_that_applied_the_seed_but_kept_nothing_fails(tmp_path):
-    """
-    THE OLD BEHAVIOUR, stated as a failure.
-
-    Everything else in boot1 was equally true of the image that lost the
-    password: the hash reaches /etc/shadow, the wizard finishes, the panel
-    survives. /etc is inside the overlay, so all of it died with the power.
-    An empty store is that image, and it has to be red.
-    """
+    """A boot that applied the seed but left the store empty fails: /etc is in
+    the overlay, so the password would die with the power."""
     proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
                            credential=None)
     assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
         proc.stdout
-    # The other one still passes: boot1 watched the apply happen and wrote its
-    # own record. That is the point of splitting them -- the positive control
-    # must not go red for the thing it is controlling for.
+    # Boot1's own record still passes: the positive control must not go red for
+    # what it controls for.
     assert results(proc)["credential-recorded-for-the-next-boot"] == "PASS"
 
 
 def test_a_store_holding_something_other_than_the_applied_hash_fails(tmp_path):
-    """
-    A store that exists is not a store that is right. This is the shape a
-    stale credential has: the operator seeded a NEW password, the wizard
-    applied it, and the recording phase never ran -- so the next power cycle
-    puts the OLD one back and the operator is locked out of a password they
-    believe they changed.
-    """
+    """A store holding a different hash from the applied one fails: the next
+    power cycle would restore a stale password."""
     proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
                            credential="otp:$6$otpimgcheck$somethingelse")
     assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
@@ -4255,8 +3107,8 @@ def test_a_store_holding_something_other_than_the_applied_hash_fails(tmp_path):
 
 
 def test_a_store_naming_another_account_fails(tmp_path):
-    """`chpasswd` takes `user:hash`, so a store naming somebody else restores
-    nothing -- and the digest of its hash field can still match perfectly."""
+    """A store naming another account fails even though the digest of its hash
+    field matches."""
     proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
                            credential="pi:$6$otpimgcheck$hashbytes")
     assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
@@ -4264,11 +3116,8 @@ def test_a_store_naming_another_account_fails(tmp_path):
 
 
 def test_a_credential_store_inside_the_overlay_is_not_persistence(tmp_path):
-    """
-    #35's hole, on the credential side. An unmounted /boot/firmware leaves the
-    store as a directory on the overlay's tmpfs: it agrees with /etc/shadow
-    perfectly, on every boot, while nothing survives any of them.
-    """
+    """A credential store on the overlay's tmpfs agrees with /etc/shadow on
+    every boot while nothing survives, so it fails."""
     proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
                            store_src="overlay", root_source="overlay")
     assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
@@ -4276,12 +3125,8 @@ def test_a_credential_store_inside_the_overlay_is_not_persistence(tmp_path):
 
 
 def test_a_root_nothing_could_describe_does_not_make_the_credential_kept(tmp_path):
-    """
-    The same clause from the other end. If findmnt could not describe `/`,
-    $ROOT_SOURCE is empty and "the store is not on the root's filesystem"
-    becomes true of every store there is -- a check that is only correct
-    because a different one failed.
-    """
+    """An empty $ROOT_SOURCE must not make every store look separate from the
+    root."""
     proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
                            root_source="")
     assert results(proc)["credential-recorded-outside-the-overlay"] == "FAIL", \
@@ -4289,12 +3134,8 @@ def test_a_root_nothing_could_describe_does_not_make_the_credential_kept(tmp_pat
 
 
 def test_a_first_boot_with_no_credential_at_all_records_nothing_and_says_so(tmp_path):
-    """
-    The positive control's own negative. A machine whose /etc/shadow has no
-    entry for the account has no credential to record, and a record file
-    written from an empty string would be a digest of nothing that boot2's
-    equally-empty read would match.
-    """
+    """With no shadow entry for the account, boot1 records nothing and fails,
+    rather than writing a digest of nothing that boot2 would match."""
     proc, bootdir = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
                                  shadow="pi:$6$x$y:20000:0:99999:7:::\n")
     assert results(proc)["credential-recorded-for-the-next-boot"] == "FAIL", \
@@ -4304,42 +3145,31 @@ def test_a_first_boot_with_no_credential_at_all_records_nothing_and_says_so(tmp_
 
 
 def test_a_record_that_never_reached_the_card_fails_boot1(tmp_path):
-    """
-    The read-back in the positive control, which is what makes it a control.
-
-    The record is the ONE thing boot2's claim rests on that the image did not
-    write, so boot1 has to say it landed rather than that it tried. A boot
-    partition that is full, read-only, or has something else at that path
-    leaves boot2 comparing against nothing -- and two nothings are equal.
-    """
+    """Boot1 reads its record back: on a full or read-only partition boot2
+    would otherwise compare against nothing."""
     bootdir = tmp_path / "firmware"
     bootdir.mkdir(parents=True, exist_ok=True)
-    # Something at the path the record wants, which no `printf >` can write
-    # over. Cheaper than a full partition and the same failure from the
-    # probe's side.
+    # A directory at the record's path, which no `printf >` can overwrite.
     (bootdir / "otp-imgcheck-credential").mkdir()
     proc, _ = run_userconf(tmp_path, phase="boot1", env=HEALTHY_BOOT1,
                            boot1_digest=None)
     assert results(proc)["credential-recorded-for-the-next-boot"] == "FAIL", \
         proc.stdout
-    # The apply itself is untouched: this is about the probe's own bookkeeping.
+    # The apply itself is unaffected.
     assert results(proc)["userconf-seed-applied"] == "PASS", proc.stdout
 
 
 def test_the_second_boot_accepts_the_password_that_outlived_the_power(tmp_path):
-    """The healthy boot2 path, spelled out: the hash carries the seed's salt
-    and digests to what boot1 recorded, with no seed on the card."""
+    """The healthy boot2 path: the hash carries the seed's salt and digests to
+    what boot1 recorded, with no seed on the card."""
     proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2)
     assert results(proc)["credential-survives-the-power-cycle"] == "PASS", \
         proc.stdout
 
 
 def test_a_second_boot_back_on_the_build_time_password_fails(tmp_path):
-    """
-    THE DEFECT, measured before this change and now a red line: boot2 came up
-    with pi-gen's random FIRST_USER_PASS, which nobody has, on a device whose
-    only other way in is the card.
-    """
+    """A boot2 back on pi-gen's random build-time password, which nobody has,
+    fails."""
     proc, _ = run_userconf(
         tmp_path, phase="boot2", env=HEALTHY_BOOT2,
         shadow="otp:$6$RaNdOmSaLt$buildtimebytes:20000:0:99999:7:::\n",
@@ -4349,11 +3179,8 @@ def test_a_second_boot_back_on_the_build_time_password_fails(tmp_path):
 
 
 def test_two_absences_are_not_a_credential_that_survived(tmp_path):
-    """
-    The two-absence hole the review caught on the machine-id side, closed on
-    this one with the same shape of clause. No hash in /etc/shadow and no
-    record from boot1 compare equal, and both are empty.
-    """
+    """No hash in /etc/shadow and no record from boot1 compare equal; that must
+    fail."""
     proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
                            shadow="root:!:20000:0:99999:7:::\n",
                            boot1_digest=None)
@@ -4362,20 +3189,9 @@ def test_two_absences_are_not_a_credential_that_survived(tmp_path):
 
 
 def test_a_digest_nothing_could_compute_is_not_a_match(tmp_path):
-    """
-    THE MISSING COMMAND, which is what the length clauses are actually for and
-    what the mutation gate caught this test's absence with.
-
-    Every other clause survives a broken `sha256sum`: the salt is still in
-    /etc/shadow, so attribution passes, and both digests come back as the
-    empty string, so the equality passes too -- a boot2 certifying that the
-    password survived on the strength of two things nothing computed. It is
-    not a hypothetical shape either: boot1 writes whatever `cred_digest`
-    returned into the record, so ONE broken sha256sum makes both sides empty
-    on the same machine.
-
-    The positive control is the same fixture with sha256sum working.
-    """
+    """Two empty digests are not a match: a missing or broken sha256sum leaves
+    both sides empty on the same machine. The same fixture with sha256sum
+    working is the positive control."""
     proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
                            boot1_digest="", sha256sum=False)
     assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
@@ -4387,15 +3203,8 @@ def test_a_digest_nothing_could_compute_is_not_a_match(tmp_path):
 
 
 def test_the_same_password_in_both_boots_is_not_the_seeded_one(tmp_path):
-    """
-    ATTRIBUTION, which the digest comparison cannot supply.
-
-    A boot2 whose hash digests to exactly what boot1 recorded has proved that
-    the password did not CHANGE -- and pi-gen's build-time password does not
-    change either. It is the same on every boot of a unit whose credential was
-    never persisted at all, which is the image this check exists to fail. Only
-    the salt says the hash in force is the one the operator seeded.
-    """
+    """The salt attributes the hash to the seed: an unchanged digest alone is
+    also true of the build-time password on a unit that persisted nothing."""
     build_time = "$6$RaNdOmSaLt$buildtimebytes"
     proc, _ = run_userconf(
         tmp_path, phase="boot2", env=HEALTHY_BOOT2,
@@ -4403,9 +3212,7 @@ def test_the_same_password_in_both_boots_is_not_the_seeded_one(tmp_path):
         boot1_digest=sha256_of(build_time))
     assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
         proc.stdout
-    # The positive control on the same fixture: swap in the seeded hash and
-    # its own digest, and the check passes. Without it this is satisfied by a
-    # clause that refuses everything.
+    # Positive control: the seeded hash and its own digest pass.
     seeded = "$6$otpimgcheck$hashbytes"
     proc, _ = run_userconf(
         tmp_path / "control", phase="boot2", env=HEALTHY_BOOT2,
@@ -4416,8 +3223,8 @@ def test_the_same_password_in_both_boots_is_not_the_seeded_one(tmp_path):
 
 
 def test_a_second_boot_with_a_password_but_no_record_fails(tmp_path):
-    """Half of the pair above, on its own: boot1 never wrote a record, so
-    there is nothing this boot's hash can be held against."""
+    """With no boot1 record there is nothing to hold this boot's hash against.
+    """
     proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
                            boot1_digest=None)
     assert results(proc)["credential-survives-the-power-cycle"] == "FAIL", \
@@ -4425,15 +3232,9 @@ def test_a_second_boot_with_a_password_but_no_record_fails(tmp_path):
 
 
 def test_a_password_that_could_have_come_from_a_seed_this_boot_fails(tmp_path):
-    """
-    The clause that makes this a statement about a POWER CYCLE.
-
-    A userconf.txt still on the card is a boot where the wizard is armed --
-    the delete failed, or the operator left the file there -- so the hash in
-    /etc/shadow may have been applied a moment ago rather than restored. That
-    is also the rejected "keep the seed file" option arriving by accident,
-    with the operator's credential line readable in any card reader forever.
-    """
+    """A userconf.txt still on the card fails the check: the hash may have been
+    applied this boot rather than restored, and the seed stays readable in any
+    card reader."""
     bootdir = tmp_path / "firmware"
     bootdir.mkdir(parents=True, exist_ok=True)
     (bootdir / "userconf.txt").write_text("otp:$6$otpimgcheck$hashbytes\n")
@@ -4443,10 +3244,8 @@ def test_a_password_that_could_have_come_from_a_seed_this_boot_fails(tmp_path):
 
 
 def test_a_restored_hash_that_was_mangled_on_the_way_back_fails(tmp_path):
-    """
-    Attribution is not integrity. A truncated restore still begins with the
-    seed's salt, so the salt clause alone would pass it -- and a truncated
-    crypt string is a password nobody can type.
+    """A truncated restore still begins with the seed's salt, so the digest
+    must match as well; a truncated crypt string is a password nobody can type.
     """
     proc, _ = run_userconf(
         tmp_path, phase="boot2", env=HEALTHY_BOOT2,
@@ -4457,36 +3256,25 @@ def test_a_restored_hash_that_was_mangled_on_the_way_back_fails(tmp_path):
 
 
 def test_the_probe_never_writes_the_hash_where_the_console_can_see_it(tmp_path):
-    """
-    This console is uploaded as a CI artifact, and a crypt string on it is a
-    crypt string anyone who downloads the run can attack at leisure -- for as
-    long as they like, against a hash the operator may have reused elsewhere.
-    What travels between the boots is a sha256 of it, and what is printed is
-    twelve characters of that.
-    """
+    """The hash never reaches the console, which is uploaded as a CI artifact:
+    boot1's record is a sha256 of it and only twelve characters of that are
+    printed."""
     secret = "$6$otpimgcheck$hashbytes"
     for phase, env in (("boot1", HEALTHY_BOOT1), ("boot2", HEALTHY_BOOT2)):
         proc, bootdir = run_userconf(tmp_path / phase, phase=phase, env=env)
         assert secret not in proc.stdout, proc.stdout
         assert "hashbytes" not in proc.stdout, proc.stdout
-        # And the record the probe itself leaves on the card is the digest,
-        # not the hash. The store beside it holds the hash in full -- that is
-        # the thing under test -- so this file must add nothing to it.
+        # The probe's own record on the card is the digest, not the hash.
         record = (bootdir / "otp-imgcheck-credential").read_text().strip()
         assert record == sha256_of(secret), record
-    # The positive control: the digest IS in the output, so "the hash is
-    # absent" is not satisfied by a probe that printed nothing at all.
+    # Positive control: the digest prefix is in the output.
     assert sha256_of(secret)[:12] in proc.stdout, proc.stdout
 
 
 def test_a_masked_wizard_is_quiet_for_the_wrong_reason(tmp_path):
-    """
-    Quiet is not the property. Masking userconfig.service also stops the
-    prompt -- an earlier fix did exactly that -- and it silently discards
-    every credential an operator ever writes to userconf.txt, because that
-    unit is the file's only consumer. With no SSH and no network, the tty2
-    recovery getty is then a login nobody can pass.
-    """
+    """A masked or disabled wizard is quiet for the wrong reason: the unit is
+    userconf.txt's only consumer, so every seeded credential would be
+    discarded."""
     for state in ("masked", "disabled"):
         proc, _ = run_userconf(tmp_path / state, phase="boot2",
                                env={**HEALTHY_BOOT2, "UC_ENABLED": state})
@@ -4495,37 +3283,22 @@ def test_a_masked_wizard_is_quiet_for_the_wrong_reason(tmp_path):
 
 
 def test_a_condition_systemd_never_evaluated_is_not_a_skip(tmp_path):
-    # An empty ConditionTimestamp is "systemd has not looked at this unit",
-    # which is what a probe that ran too early sees -- and it is
-    # indistinguishable from a skip in every other field.
+    # An empty ConditionTimestamp means systemd has not evaluated the unit,
+    # which looks like a skip in every other field.
     proc, _ = run_userconf(tmp_path, phase="boot2",
                            env={**HEALTHY_BOOT2, "UC_TS": ""})
     assert results(proc)["userconf-unseeded-boot-skips-the-wizard"] == "FAIL", proc.stdout
 
 
 def test_a_second_boot_whose_condition_is_still_true_fails(tmp_path):
-    """
-    The property this check is NAMED for, which nothing was testing.
-
-    Every other boot2 fixture leaves the condition false, so the
-    `condition = no` clause could be DELETED and the whole suite stayed
-    green -- the check went on being read as "the wizard was skipped" while
-    only ever measuring "the unit is enabled, evaluated, and not running".
-    Those do not imply it: a unit whose condition came out TRUE is one
-    systemd let start, and on a oneshot that has already finished it is
-    `inactive` with an evaluation timestamp and `enabled`, exactly like a
-    skip.
-
-    On the device a true condition here means the seed OUTLIVED the boot
-    that was supposed to consume it -- the delete failed, or the operator
-    wrote the file again -- so the wizard is armed on this boot and on every
-    boot after it, and a credential line is still sitting on a FAT partition
-    anybody can read in any card reader.
-    """
+    """A boot2 whose condition is true fails: the seed outlived the boot that
+    should have consumed it, so the wizard stays armed and a credential line
+    stays on the FAT partition. A finished oneshot otherwise looks exactly like
+    a skip."""
     proc, _ = run_userconf(tmp_path, phase="boot2",
                            env={**HEALTHY_BOOT2, "UC_COND": "yes"})
     assert results(proc)["userconf-unseeded-boot-skips-the-wizard"] == "FAIL", proc.stdout
-    # And the reader is told which half went wrong.
+    # The detail names which clause failed.
     assert "condition=yes" in proc.stdout, proc.stdout
 
 
@@ -4540,15 +3313,9 @@ def test_a_wizard_that_can_still_reach_a_tty_fails(tmp_path):
 def hang_stub(*, ignore_term: bool) -> str:
     """A userconf-service that quarantines the seed and then never returns.
 
-    The quarantine comes FIRST, which is the real order: upstream renames the
-    bad seed and only then reaches the whiptail. Every other clause of the
-    check therefore passes, so what these fixtures measure is the stopwatch
-    and nothing else.
-
-    `exec >/dev/null` before the block, so that the `sleep` this process
-    leaves behind when it is killed is not still holding the pipe the probe's
-    command substitution is reading -- without it the ORPHAN sets the test's
-    runtime, not the timeout, and the experiment measures the harness.
+    The quarantine comes first, as upstream does, so only the time bound is
+    under test. `exec >/dev/null` stops the orphaned `sleep` holding the pipe
+    the probe's command substitution reads.
     """
     return ('#!/bin/sh\n'
             + ('trap "" TERM\n' if ignore_term else '')
@@ -4559,40 +3326,20 @@ def hang_stub(*, ignore_term: bool) -> str:
 
 
 def test_a_malformed_seed_that_hangs_fails_instead_of_timing_the_boot_out(tmp_path):
-    """
-    The failure this experiment exists for. A userconf-service that blocks --
-    a whiptail that found a terminal after all, a read on a stdin that is not
-    really closed -- holds multi-user.target open on a device forever. Here it
-    is bounded and reported: the probe kills it and says rc=124.
-    """
+    """A userconf-service that blocks is killed at the bound and reported as
+    rc=124, instead of holding the boot open."""
     proc, bootdir = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
                                  service=hang_stub(ignore_term=False))
     assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
     assert "rc=124" in proc.stdout, proc.stdout
-    # And the probe carried on to report, rather than being the hang itself.
+    # The probe carried on to report.
     assert "TOTALS" in proc.stdout, proc.stdout
 
 
 def test_a_hang_that_ignores_the_term_signal_also_fails(tmp_path):
-    """
-    The hang the check was written for, and the one it used to PASS.
-
-    124 is what `timeout` answers when the child took its SIGTERM and died.
-    A child that IGNORES SIGTERM -- a whiptail with a handler, a shell with
-    `trap "" TERM`, anything wedged in uninterruptible state -- survives it
-    and has to be SIGKILLed by the `-k` escalation, and then timeout answers
-    128+9 = 137 instead. Against the `!= 124` form of the gate that scored
-
-        userconf-malformed-seed-fails-fast PASS rc=137
-
-    on a service that never returned, with the detail line printing the
-    "124 = still running" gloss beside a 137. The test above passed only
-    because a bare `sleep` is reaped by the first signal.
-
-    So the gate reads `-lt 124` now, and this is the fixture that tells the
-    two apart. Both fixtures are kept: this one alone would be satisfied by a
-    gate that only knew about 137.
-    """
+    """A child that ignores SIGTERM is SIGKILLed by `-k` and reports rc=137, so
+    the gate must fail every rc of 124 or above, not only 124. Both hang
+    fixtures are kept so neither number is special-cased."""
     proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
                            service=hang_stub(ignore_term=True))
     assert "rc=137" in proc.stdout, (
@@ -4603,13 +3350,8 @@ def test_a_hang_that_ignores_the_term_signal_also_fails(tmp_path):
 
 
 def test_the_detail_line_does_not_gloss_a_kill_as_a_timeout(tmp_path):
-    """
-    What the operator reads has to survive the same correction the gate did.
-    The old line said "(124 = still running at the 60s bound)" unconditionally
-    -- printed next to rc=137 it names the wrong number and the wrong signal,
-    and the next person debugging a red run is told the child was politely
-    asked when it was actually killed.
-    """
+    """The detail line must not gloss rc=137 as "124 = still running": that
+    names the wrong signal to whoever debugs the run."""
     proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
                            service=hang_stub(ignore_term=True))
     detail = next(ln for ln in proc.stdout.splitlines()
@@ -4619,12 +3361,8 @@ def test_the_detail_line_does_not_gloss_a_kill_as_a_timeout(tmp_path):
 
 
 def test_the_experiment_supplies_the_conditions_the_unit_would(tmp_path):
-    """
-    Stdin closed and TERM removed, which is what the drop-in plus a unit
-    with no tty add up to. Run it with the probe's own stdin and whiptail
-    may find a terminal after all -- and then the experiment measures a
-    machine nobody ships instead of the appliance.
-    """
+    """The experiment runs with stdin closed and TERM unset, as the unit would;
+    otherwise whiptail may find a terminal."""
     block = userconf_block()
     line = next(ln for ln in block.splitlines() if "USERCONF_SERVICE" in ln
                 and "timeout" in ln)
@@ -4633,16 +3371,16 @@ def test_the_experiment_supplies_the_conditions_the_unit_would(tmp_path):
 
 
 def test_a_malformed_seed_that_leaves_no_evidence_fails(tmp_path):
-    # It ended, and it took the operator's file with it. failed_userconf.txt
-    # is the only thing that tells them why they have no login.
+    # The seed is gone with no failed_userconf.txt, the only thing that tells
+    # the operator why they have no login.
     proc, _ = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
                            service='#!/bin/sh\nrm -f "$BOOTDIR/userconf.txt"\nexit 1\n')
     assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
 
 
 def test_a_seed_left_in_place_by_the_service_fails(tmp_path):
-    # Quarantine means moved: a card that still holds the bad line prompts on
-    # every boot from here on.
+    # Quarantine means moved: a card still holding the bad line prompts on
+    # every boot.
     proc, _ = run_userconf(
         tmp_path, phase="boot2", env=HEALTHY_BOOT2,
         service='#!/bin/sh\ncp "$BOOTDIR/userconf.txt" "$BOOTDIR/failed_userconf.txt"\nexit 1\n')
@@ -4650,68 +3388,40 @@ def test_a_seed_left_in_place_by_the_service_fails(tmp_path):
 
 
 def test_an_image_without_userconf_pi_fails_rather_than_passing_silently(tmp_path):
-    """
-    An absent userconf-service is not a pass.
-
-    Nothing would have been written, nothing would have failed, and both
-    "userconf.txt is gone" and "the boot did not hang" would be true -- of an
-    image on which the documented credential mechanism does not exist at all.
-    """
+    """An absent or non-executable userconf-service is a FAIL: "the seed is
+    gone" and "nothing hung" would otherwise both hold on an image without the
+    credential mechanism."""
     proc, bootdir = run_userconf(tmp_path, phase="boot2", env=HEALTHY_BOOT2,
                                  service=None)
     assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
     assert "rc=none" in proc.stdout, proc.stdout
-    # And nothing was planted on a card whose machine cannot consume it.
+    # Nothing was planted on a card whose machine cannot consume it.
     assert not (bootdir / "userconf.txt").exists()
 
-    # The other way it goes missing: present, and not runnable.
+    # Present but not executable.
     proc, _ = run_userconf(tmp_path / "not-executable", phase="boot2",
                            env=HEALTHY_BOOT2, executable=False)
     assert results(proc)["userconf-malformed-seed-fails-fast"] == "FAIL", proc.stdout
 
 
 def test_the_probe_is_given_longer_than_its_own_bounded_wait(tmp_path):
-    """
-    systemd's default TimeoutStartSec is 90s and the probe's own poll for
-    otp-unit.service is 45 iterations of `sleep 2` -- 90s exactly, before
-    cupsd -t and two Python starts under TCG. On the default, a slow but
-    healthy boot loses its probe mid-poll and the phase reports nothing,
-    which the harness fails for having no OTP-GUEST-DONE line. It fails red
-    rather than green, so this is a flake risk and not a false pass, but the
-    number is worth stating rather than inheriting.
+    """The unit's TimeoutStartSec exceeds the sum of every bounded wait in the
+    probe and is below the per-boot backstop, so a slow boot keeps its report
+    and a wedged probe is killed.
 
-    EVERY bounded wait, summed, not the first one. The probe grew a second
-    poll and a `timeout` when the credential checks landed, and a test that
-    kept reading only the unit poll would have gone on approving a budget
-    against 90s of a worst case several times that. Measured as this stands:
-    90s polling for otp-unit, 15s waiting for journald to index the
-    forwarding marker, 60s waiting for the unit to decide it has no panel,
-    120s polling for systemd's verdict on the wizard, 90s bounding the
-    diagnostic sheet and 60s bounding the malformed seed -- 435s against a
-    TimeoutStartSec of 480 inside a 600s per-boot backstop.
-
-    That sum is deliberately pessimistic: the two experiments are in
-    different phases, so no single boot can pay both (boot1's worst case is
-    375s, boot2's 345s). Summing them anyway keeps the assertion below
-    arithmetic rather than bookkeeping about which phase runs what.
-
-    Those three numbers are prose and the assertions below are not: the sums
-    are re-derived from the shipped files on every run, so a wait that
-    changes size fails the arithmetic rather than the sentence. The wizard
-    poll was 30s when this paragraph was first written and is 120s now.
-
-    Both halves are read out of the shipped files: the bounds out of the
-    probe, the backstop out of the workflow.
+    All waits are summed although the two experiments run in different phases;
+    that is pessimistic but keeps the check simple arithmetic. Bounds are read
+    from the probe, the backstop from the workflow.
     """
     probe = GUEST_CHECK.read_text()
-    # Each `for _ in $(seq 1 N) ... done` with the `sleep S` inside it.
+    # Each `for _ in $(seq 1 N)` loop with the `sleep S` inside it.
     poll_bound = 0
     for loop in re.finditer(r"for _ in \$\(seq 1 (\d+)\); do(.*?)\n *done",
                             probe, re.S):
         interval = re.search(r"^\s*sleep (\d+)\s*$", loop.group(2), re.M)
         assert interval, f"a poll with no sleep in it: {loop.group(0)[:80]}"
         poll_bound += int(loop.group(1)) * int(interval.group(1))
-    # Plus anything the probe runs under a stopwatch of its own.
+    # Plus anything run under `timeout`.
     for bound in re.finditer(r"timeout -k \d+ (\d+)", probe):
         poll_bound += int(bound.group(1))
     assert poll_bound >= 90, "the probe's bounded waits went missing"
@@ -4732,11 +3442,8 @@ def test_the_probe_is_given_longer_than_its_own_bounded_wait(tmp_path):
 
 
 def test_the_probe_checks_the_sentinel_before_it_writes_one():
-    """
-    Ordering is the whole test in boot2: reading the sentinel after writing
-    it would report a survival every time, on a card that discards
-    perfectly. The read is at the top of the script for that reason.
-    """
+    """The sentinel is read before it is written: the other order would report
+    a survival every time."""
     text = GUEST_CHECK.read_text()
     read_at = text.index('if [ -e "$SENTINEL" ]; then')
     write_at = text.index("> \"$SENTINEL\" 2>/dev/null")
@@ -4746,13 +3453,8 @@ def test_the_probe_checks_the_sentinel_before_it_writes_one():
 
 
 def test_the_probe_states_two_presences_before_it_asserts_an_absence():
-    """
-    "The file is gone" is satisfied by a boot1 that never ran, by a path
-    that does not exist and by a rig that cannot write to / at all. Both
-    controls are reported before it, with the same fixture: a sentinel
-    written this boot and read back, and the setting boot1 persisted read
-    back through config.load().
-    """
+    """Two presences are reported before the absence: "the file is gone" is
+    also true of a boot1 that never ran or a rig that cannot write to /."""
     text = GUEST_CHECK.read_text()
     absence = text.index("check root-writes-discarded-by-the-power-cycle")
     for control in ("check root-write-lands-and-is-readable",
@@ -4760,28 +3462,19 @@ def test_the_probe_states_two_presences_before_it_asserts_an_absence():
         assert text.index(control) < absence, control
 
 
-# --- the provisioning agent that is no longer on the image ---------------
+# --- the provisioning agent that is not on the image ----------------------
 #
-# Issue #34: pi-gen's ENABLE_CLOUD_INIT=0 guards only the sub-stage that
-# preseeds a NoCloud datasource, so cloud-init and rpi-cloud-init-mods went
-# onto every image this project built. The stage purges them now and
-# install.sh still writes the kill switch, and tier 3 asks the booted machine
-# about both -- separately, because after a purge nearly every piece of
-# cloud-init evidence is absent for a reason that has nothing to do with the
-# kill switch. These run the shipped block against a dpkg and a systemd that
-# say whatever the case needs.
+# The stage purges cloud-init and rpi-cloud-init-mods and install.sh writes the
+# kill switch (issue #34). Tier 3 checks the two separately, because after a
+# purge most cloud-init absences say nothing about the kill switch. These run
+# the shipped block against a stubbed dpkg and systemd.
 
 CLOUD_INIT_BLOCK = ("# --- the provisioning agent this image no longer carries",
                     'dir=$(yesno test -d "${CI_DISABLED%/*}")"')
 
-# Answers the two questions the probe asks and refuses everything else, for
-# the reason SYSTEMCTL_STUB does: a stub that returned "" for a question
-# nobody expected would make an absence check pass by accident, which is the
-# whole failure mode this block was written around.
-#
-# `-W -f <fmt> <pkg>` puts the package name in $4. An unknown package is an
-# EMPTY answer and rc 1 -- that is what dpkg-query does, and the block's
-# `2>/dev/null || true` is written for it.
+# Answers the probe's two questions and refuses everything else, so an absence
+# check cannot pass by accident. `-W -f <fmt> <pkg>` puts the package name in
+# $4; an unknown package is an empty answer and rc 1, as with dpkg-query.
 DPKG_QUERY_STUB = """#!/bin/sh
 case "$1 $2" in
     "-W -f") ;;
@@ -4801,8 +3494,8 @@ printf '%s' "$ANSWER"
 [ -n "$ANSWER" ] || exit 1
 """
 
-# The same shape for systemd. LoadState is the property the probe reads, and
-# `not-found` is what a unit systemd has never heard of answers.
+# The same for systemd: `not-found` is the LoadState of a unit it has never
+# heard of.
 CLOUD_SYSTEMCTL_STUB = """#!/bin/sh
 case "$1 $2 $3 $4" in
     "show -p LoadState --value")
@@ -4821,8 +3514,7 @@ case "$1 $2 $3 $4" in
 esac
 """
 
-# A purged machine with the kill switch still on it: no package, no unit, no
-# generator, and /etc/cloud/cloud-init.disabled a regular file.
+# A purged machine with the kill switch in place: all stub defaults.
 HEALTHY_PURGE = {}
 
 
@@ -4831,12 +3523,8 @@ def run_cloud_init(tmp_path, *, env=None, marker="file", generator=False,
                    siblings=("systemd-fstab-generator", "systemd-gpt-auto-generator")):
     """Run the shipped cloud-init block against a substituted /usr and /etc.
 
-    Three absolute paths are rewritten and nothing else is: the block's two
-    `check` calls, their conditions and every word they print are the code
-    that ships. The paths are rewritten at their ASSIGNMENTS, which appear
-    once each -- the comments around them name /etc/cloud and the generator
-    directory several times over and rewriting a comment would prove
-    nothing.
+    Three paths are rewritten at their assignments, which appear once each;
+    everything else is the shipped code.
     """
     root = tmp_path / "root"
     gen_dir = root / "usr" / "lib" / "systemd" / "system-generators"
@@ -4896,9 +3584,7 @@ def run_cloud_init(tmp_path, *, env=None, marker="file", generator=False,
 
 
 def test_a_purged_machine_with_its_kill_switch_reports_both(tmp_path):
-    # The positive control for everything below: every other test here
-    # asserts a FAIL, and a block that failed unconditionally would satisfy
-    # all of them.
+    # Positive control: every other test here asserts a FAIL.
     proc = run_cloud_init(tmp_path, env=HEALTHY_PURGE)
     assert proc.returncode == 0, proc.stderr
     assert results(proc) == {
@@ -4907,41 +3593,24 @@ def test_a_purged_machine_with_its_kill_switch_reports_both(tmp_path):
 
 
 def test_a_cloud_init_still_installed_fails(tmp_path):
-    """
-    The state every image this project built shipped in, stated as a check.
-
-    ENABLE_CLOUD_INIT=0 said cloud-init was off and the packages were on the
-    card the whole time -- which is why nobody went looking for a cloud-init
-    problem when a boot stopped finishing. dpkg is the purge's own gate.
-    """
+    """An installed cloud-init or rpi-cloud-init-mods fails the check;
+    ENABLE_CLOUD_INIT=0 does not remove the packages."""
     for var in ("PKG_CLOUD_INIT", "PKG_RPI_MODS"):
         proc = run_cloud_init(tmp_path / var, env={var: "installed"})
         assert results(proc)["cloud-init-is-not-installed"] == "FAIL", proc.stdout
 
 
 def test_a_removed_but_not_purged_cloud_init_fails(tmp_path):
-    """
-    `remove` leaves `config-files`, and on this device that is not enough.
-
-    The units and the generator go, but rpi-cloud-init-mods'
-    /etc/cloud/cloud.cfg.d/99_raspberry-pi.cfg stays -- and that file is what
-    points the NoCloud datasource at file:///boot/firmware. Anything that
-    brought the package back would come back already aimed at the partition
-    an operator is told to write files on.
-    """
+    """`config-files` is not purged: rpi-cloud-init-mods' cloud.cfg.d file
+    stays and points the NoCloud datasource at /boot/firmware for any
+    reinstall."""
     proc = run_cloud_init(tmp_path, env={"PKG_CLOUD_INIT": "config-files"})
     assert results(proc)["cloud-init-is-not-installed"] == "FAIL", proc.stdout
 
 
 def test_a_cloud_init_unit_systemd_still_knows_fails(tmp_path):
-    """
-    The other half, and it is not implied by dpkg.
-
-    A unit file dropped into /etc/systemd/system by hand, or a package
-    reinstalled from a local .deb, gives systemd a cloud-init.target that
-    dpkg has no opinion about. `masked` counts as knowing it: a masked unit
-    is a unit whose file is on the machine.
-    """
+    """A cloud-init unit systemd still knows fails, whatever dpkg says;
+    `masked` counts, since the unit file is on the machine."""
     for var, state in (("LOAD_TARGET", "loaded"), ("LOAD_LOCAL", "masked"),
                        ("LOAD_CONFIG", "loaded")):
         proc = run_cloud_init(tmp_path / var, env={var: state})
@@ -4949,26 +3618,16 @@ def test_a_cloud_init_unit_systemd_still_knows_fails(tmp_path):
 
 
 def test_a_generator_left_behind_fails(tmp_path):
-    """
-    The generator is the thing that puts cloud-init.target into the boot
-    transaction, and it runs from /usr/lib whether or not any unit is
-    enabled. A purge that left it is a purge that did not happen.
-    """
+    """A leftover generator fails: it puts cloud-init.target into the boot
+    transaction whether or not any unit is enabled."""
     proc = run_cloud_init(tmp_path, generator=True)
     assert results(proc)["cloud-init-is-not-installed"] == "FAIL", proc.stdout
 
 
 def test_the_absences_need_their_positive_controls(tmp_path):
-    """
-    THE FAILURE THIS CHECK EXISTS TO NOT HAVE.
-
-    Every clause but one is an absence, and a probe whose dpkg-query answers
-    nothing, whose systemctl answers nothing, or which is looking at a
-    directory that is not there produces all of them at once -- on a machine
-    with cloud-init running. So each mechanism is asked one question it must
-    answer in the affirmative, and each of those three is broken here on a
-    machine that is otherwise perfectly purged.
-    """
+    """Each mechanism behind the absence clauses must answer one positive
+    question: a silent dpkg-query, a silent systemctl or an empty generator
+    directory would otherwise report a clean purge."""
     for case, kwargs in (
             ("dpkg-query says nothing", {"env": {"PKG_SYSTEMD": ""}}),
             ("systemctl says nothing", {"env": {"LOAD_UNIT": ""}}),
@@ -4979,15 +3638,9 @@ def test_the_absences_need_their_positive_controls(tmp_path):
 
 
 def test_a_missing_kill_switch_fails_with_the_purge_still_green(tmp_path):
-    """
-    THE DISTINCTION THE SECOND CHECK EXISTS FOR, and the trap issue #34
-    named: after a purge almost every cloud-init absence is explained by the
-    purge, so a check over the absences alone would go on passing if
-    install.sh stopped writing /etc/cloud/cloud-init.disabled tomorrow. It
-    is the belt to the purge's braces -- what disables a cloud-init a later
-    dependency drags back in -- so it gets a check of its own, and this is
-    the machine where the two disagree.
-    """
+    """A missing kill switch fails its own check while the purge check stays
+    green: the kill switch is what disables a cloud-init a later dependency
+    brings back."""
     proc = run_cloud_init(tmp_path, marker="missing")
     assert results(proc)["cloud-init-is-not-installed"] == "PASS", proc.stdout
     assert results(proc)["cloud-init-kill-switch-survives-the-purge"] == "FAIL", \
@@ -4995,15 +3648,8 @@ def test_a_missing_kill_switch_fails_with_the_purge_still_green(tmp_path):
 
 
 def test_a_kill_switch_that_is_not_a_regular_file_fails(tmp_path):
-    """
-    The shape ds-identify requires, not merely the name.
-
-    cloud-init 25.2's `is_disabled()` is `[ -f /etc/cloud/cloud-init.disabled ]`,
-    so a directory of that name and a symlink pointing at nothing are both
-    not a kill switch at all while satisfying every looser test. `-e` would
-    accept the first; `-e` and `-f` both reject the second, which is why the
-    check reports them separately.
-    """
+    """The kill switch must be a regular file: ds-identify tests `[ -f ... ]`,
+    so a directory or a dangling symlink of that name does nothing."""
     for case in ("directory", "dangling-symlink"):
         proc = run_cloud_init(tmp_path / case, marker=case)
         assert results(proc)["cloud-init-kill-switch-survives-the-purge"] == "FAIL", \
@@ -5011,15 +3657,8 @@ def test_a_kill_switch_that_is_not_a_regular_file_fails(tmp_path):
 
 
 def test_a_purge_that_took_etc_cloud_with_it_fails(tmp_path):
-    """
-    Why the stage purges BEFORE install.sh runs.
-
-    dpkg removes a package's conffiles on purge and then removes the
-    directories it owned once they are empty, and /etc/cloud is cloud-init's.
-    The marker survives a purge ordered after it only because dpkg will not
-    delete a directory holding a file it does not own -- so this is the shape
-    of the mistake, read off the machine rather than argued about.
-    """
+    """A purge that removed /etc/cloud took the marker with it; this is why the
+    stage purges before install.sh runs."""
     proc = run_cloud_init(tmp_path, marker="no-etc-cloud")
     assert results(proc)["cloud-init-kill-switch-survives-the-purge"] == "FAIL", \
         proc.stdout
@@ -5036,29 +3675,14 @@ def netplan_report(proc):
 
 
 def test_the_probe_reports_what_the_purge_did_to_netplan(tmp_path):
-    """
-    A REPORT, ASSERTED AS A REPORT, and this test used to be worth less than
-    it looked.
-
-    /usr/lib/netplan/00-network-manager-all.yaml is the one file
-    rpi-cloud-init-mods ships that is not cloud-init's own, and the purge
-    takes it. Whether that matters is settled in the comment beside the
-    check, off the archives and netplan's source -- not here, and not by the
-    console. What this asserts is only that the two facts a reader would
-    look for first are still printed, and that they are read off the machine
-    rather than baked in: the earlier version created the netplan DIRECTORY
-    and never the file, so `netplan-renderer=yes` was unreachable and the
-    assertion could not have told a live `test -e` from the literal string
-    `no`. Both branches are exercised now.
-    """
+    """The check line reports whether netplan's NetworkManager renderer file
+    exists and whether NetworkManager is active, read off the machine: the
+    purge removes that file. Both branches are exercised."""
     purged = run_cloud_init(tmp_path / "purged", env={"NM_ACTIVE": "active"})
     assert netplan_report(purged) == \
         "netplan-renderer=no NetworkManager=active", purged.stdout
 
-    # The same probe on a machine where the file survived -- a purge that
-    # did not happen, or a package that came back. The check itself is not
-    # gated on it, so this stays a PASS with a different report, and that
-    # difference is the whole of what the line is good for.
+    # With the file kept the check still passes; only the report differs.
     kept = run_cloud_init(tmp_path / "kept", renderer=True,
                           env={"NM_ACTIVE": "inactive"})
     assert netplan_report(kept) == \

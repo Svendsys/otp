@@ -30,8 +30,11 @@ import os
 import sys
 from dataclasses import dataclass
 
-from otpunit.hw.buttons import GpioButtons, KeyboardButtons
+from otpunit.hw.buttons import AnyButtons, GpioButtons, KeyboardButtons
 from otpunit.hw.display import ConsoleDisplay, Ssd1306Display
+
+
+OLED_ADDRESSES = (0x3C, 0x3D)
 
 
 @dataclass
@@ -43,40 +46,22 @@ class Interface:
 
     @property
     def interactive(self) -> bool:
-        """A menu needs something to draw on AND something to press."""
+        """A menu needs something to draw on and something to press."""
         return self.display is not None and self.buttons is not None
 
     def prove(self, seconds: float = 20.0, sleep=None, clock=None) -> bool:
         """
         Wait for one press, to confirm somebody can actually drive this.
 
-        Opening GpioButtons proves NOTHING about whether buttons exist.
-        gpiozero only reserves and configures a pin; there is no presence
-        detection on any of its four pin factories, so wherever gpiozero
-        finds a factory at all the constructor succeeds. This used to say
-        "on any Pi with lgpio installed -- every unit this targets", which
-        named a factory nothing here establishes: gpiozero catches
-        `Exception` and not `ImportError` when a factory fails to import
-        (gpiozero 2.0.1, devices.py:299), so an lgpio whose import RAISES
-        -- which it does when the working directory is read-only, and this
-        unit runs with `WorkingDirectory=/opt/otp-unit` under
-        `ProtectSystem=strict` -- is indistinguishable from an lgpio that
-        was never installed, and the fallback walks on to native. Which
-        factory a booted unit ends up on is issue #43. Nothing below
-        depends on the answer, which is the point: none of them can tell
-        you whether a button is wired to the pin. That made the keyboard
-        branch unreachable, and worse: attaching a monitor to a working
-        headless unit promoted `display` to non-None, `interactive` to
-        True, and sent it into a menu whose first `buttons.wait()` blocks
-        on an empty queue forever. No pad, no log line, no timeout.
+        Opening GpioButtons proves nothing about whether buttons exist:
+        gpiozero only reserves a pin and has no presence detection. A
+        keyboard being plugged in does not mean anyone is at it either.
+        Trusting either would send a headless unit with a monitor attached
+        into a menu that blocks forever instead of printing.
 
-        A keyboard being present says nothing either -- it says a keyboard
-        is plugged in, not that anyone is at it.
-
-        So neither is trusted. One press within the window and the panel
-        is proven; silence means print instead. The cost is that an
-        operator must press something at boot, which also tells them the
-        panel works.
+        So one press within the window proves the panel, and silence means
+        print instead. The cost is that the operator must press something
+        at boot.
         """
         import time
 
@@ -168,11 +153,17 @@ def console_usable() -> bool:
 
 def open_display(rotate: int = 0, log=None):
     """The best display available, and what it is."""
-    try:
-        return Ssd1306Display(rotate=rotate), "SSD1306 OLED"
-    except Exception as exc:                     # noqa: BLE001
-        if log:
-            log(f"no OLED ({exc})")
+    # 0x3C is what almost every SSD1306 module ships as; 0x3D is the other
+    # position of the address jumper.
+    failures = []
+    for address in OLED_ADDRESSES:
+        try:
+            return (Ssd1306Display(address=address, rotate=rotate),
+                    "SSD1306 OLED")
+        except Exception as exc:                 # noqa: BLE001
+            failures.append(f"0x{address:02X}: {exc}")
+    if log:
+        log(f"no OLED ({'; '.join(failures)})")
 
     if screen_connected() and console_usable():
         return ConsoleDisplay(stream=sys.stdout, hint=False), "HDMI console"
@@ -181,15 +172,25 @@ def open_display(rotate: int = 0, log=None):
 
 def open_buttons(log=None):
     """The best input available, and what it is."""
+    # Both, when both are there. Opening the GPIO pins succeeds on any Pi
+    # whether or not a switch is wired to them, so preferring them outright
+    # would mean a keyboard is never listened to.
+    sources, kinds = [], []
     try:
-        return GpioButtons(), "GPIO buttons"
+        sources.append(GpioButtons())
+        kinds.append("GPIO buttons")
     except Exception as exc:                     # noqa: BLE001
         if log:
             log(f"no GPIO buttons ({exc})")
 
     if keyboard_connected() and console_usable():
-        return KeyboardButtons(allow_quit=False), "USB keyboard"
-    return None, "none"
+        sources.append(KeyboardButtons(allow_quit=False))
+        kinds.append("USB keyboard")
+    if not sources:
+        return None, "none"
+    if len(sources) == 1:
+        return sources[0], kinds[0]
+    return AnyButtons(sources), " and ".join(kinds)
 
 
 def detect(rotate: int = 0, log=None) -> Interface:

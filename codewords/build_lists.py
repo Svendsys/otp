@@ -1,66 +1,30 @@
 """Curate the codeword vocabulary into codewords/.
 
-A codeword is read aloud over a noisy channel and then carried in someone's
-head from a handover to a radio. Everything here serves that: words are
-concrete and *picturable*, phonetically distinct (no shared Soundex, edit
-distance >= 2), and free of NATO alphabet collisions.
+A codeword is read aloud over a noisy channel and carried in someone's head, so
+words are concrete and picturable, phonetically distinct (no shared Soundex,
+edit distance >= 2) and free of NATO alphabet collisions.
 
-Three rules decide what goes in the raw lists below.
+Rules for the raw lists:
 
-**Picture first.** A word earns its place if a person can see the thing.
-BUTTERFLY and ELEPHANT are worth more than a dozen field-guide names, because
-the picture is what survives the walk to the radio. Taxonomic completeness is
-not a goal; recognisability is.
+Picture first. A word earns its place if a person can see the thing, whatever
+its source: figures, folklore, food and gear count alongside natural history.
+Seat the generic word (FIRE, WATER, STONE) before the species-deep one.
 
-That test is not only about nature, which is the trap this list fell into
-once already. The fastest pictures a Western adult holds are not all animals:
-SANTA, CLOWN, GHOST, DRAGON, PIZZA, ROBOT and HEART are drawn from memory by
-people who could not name a single warbler. So the vocabulary carries figures,
-folklore, food, clothing, gear, toys and the festive calendar alongside the
-natural history -- the shared furniture, wherever it comes from.
+No field guides. The test is whether a Nordic adult already holds the picture.
+A short list of words everyone owns beats a long one padded with rare
+specimens. CAR, HOUSE and BOAT stay out: each is one edit from CAT, HORSE and
+GOAT, the better pictures.
 
-The same trap has a second floor: going species-deep and never seating the
-generic parent. The lists once carried PANGOLIN, ECHIDNA and QUOKKA while
-FIRE, WATER, ICE and STONE were absent entirely -- the elemental words were
-never candidates, so the slots they should have won went by walkover to
-whatever happened to be in RAW. `elements` exists to hold that floor, and it
-is worth re-asking of any new category: what is the word a child would draw
-first, and is it actually in here?
+English the whole channel shares: cognates, school English, shared Western
+culture.
 
-**No field guides.** The test is not "is this a real animal" but "does a
-Nordic adult already hold this picture". Rare fauna, ornamental garden
-flowers, heraldic colours, weaving vocabulary and architectural masonry all
-failed it and are gone. A category that has run out of words people know is
-finished -- pad it with a rarer specimen and every draw that lands there
-produces a codeword nobody can carry to a radio. Prefer a short list of
-words everyone owns over a long one that only reads well on paper.
+Tier is priority. Soundex is scarce (BEAR and BOAR cannot both exist), so tier
+1 of every category is admitted before tier 2 of any. Within a tier, categories
+are tried in the order they appear. `--show-drops` prints the losers.
 
-Some everyday words simply cannot be had, and the reason is edit distance
-rather than Soundex. CAR, HOUSE and BOAT are each one character from CAT,
-HORSE and GOAT, and the animal is the better picture in all three cases, so
-the everyday word stays out. Do not spend another round retrying them.
-
-**English the whole channel shares.** The lists lean on words a Nordic
-speaker already owns -- through cognates (HVAL/WHALE, ELG/ELK, NARHVAL/
-NARWHAL, MAMMUT/MAMMOTH, KROKODILLE/CROCODILE), through school English, or
-through shared Western culture. What a Scandinavian does *not* carry is the
-English name of every warbler and wrasse, so DUNLIN, GODWIT, GUDGEON and
-their kind are gone, and PENGUIN, FLAMINGO, SALMON and SHARK took the room.
-
-**Tier is priority.** Soundex is a scarce resource -- BEAR and BOAR cannot
-both exist, and neither can SNOW and SWAN -- so it is spent on the word more
-people can see. Each category is split into tiers, and *tier 1 of every
-category is admitted before tier 2 of any of them*: the first sweep seats
-SNOW, MOON and PIANO alongside BEAR and BUTTERFLY, and only then do CARIBOU
-and PEONY get their turn at what is left. Within a tier, categories are
-tried in the order they appear here. Losers are printed by `--show-drops`,
-which is the way to check that a category is giving up the right words.
-
-Lengths are set by the printed header, which fits 17 characters at the
-tightest format (A7 with a 6-character AUTH group): MODIFIER + "-" + NOUN.
-The split is 7 + 1 + 9 rather than 8 + 1 + 8, because the noun carries the
-picture and the adjective only decorates it. That one character is what buys
-BUTTERFLY, CROCODILE, LIGHTNING, ACCORDION and WATERFALL.
+Lengths are set by the printed header: 17 characters at the tightest format (A7
+with a 6-character AUTH group), split 7 + 1 + 9 because the noun carries the
+picture.
 """
 import argparse
 import re
@@ -80,17 +44,10 @@ NATO = {
     "WHISKEY", "XRAY", "YANKEE", "ZULU",
 }
 
-# Words that would read as instructions or procedure over a voice channel,
-# and words this system already uses to talk about itself.
-#
-# The second family is the easier one to miss, because the words are ordinary
-# and picturable and a curator has no reason to suspect them. But a codeword
-# is spoken on the same channel as the traffic it names, and "use RED-DOCUMENT"
-# can be heard as "use the red document" in a way "use RED-MOON" cannot. The
-# test is not whether the word is abstract -- DOCUMENT is concrete enough, and
-# every Scandinavian owns it -- but whether this machine and its operators
-# already say it while running the machine. Pads, keys, groups, messages and
-# documents are the payload; power is the state the unit lives and dies in.
+# Words that would read as instructions over a voice channel, and words this
+# system already uses about itself: a codeword is spoken on the same channel as
+# the traffic it names, and "use RED-DOCUMENT" can be heard as "use the red
+# document".
 PROCEDURAL = {
     "ABORT", "AFFIRM", "BREAK", "CANCEL", "CLEAR", "CORRECT", "OUT", "OVER",
     "READY", "RELAY", "REPEAT", "ROGER", "SAY", "SEND", "STOP", "WAIT", "WILCO",
@@ -246,8 +203,7 @@ RAW = {
     """,
 ],
 "elements": [
-    # The words a child draws first, and the floor the rest of the lists are
-    # measured against.
+    # The words a child draws first.
     "FIRE WATER ICE STONE GRASS",
     "FLAME EMBER PUDDLE RIPPLE",
     "SMOKE SAND DUST STEAM",
@@ -378,23 +334,10 @@ RAW = {
 ],
 }
 
-# Modifiers are chosen the same way, for the same reason: a Nordic speaker
-# should read one without reaching for a dictionary. Sensory and physical
-# words -- colour, size, texture, temperature, motion, light, sound, wear --
-# come first; the abstract character words a schoolbook never teaches, LIMPID
-# and TACIT and FRUGAL and VAGRANT, are gone.
-#
-# One more rule applies here and nowhere else, because the vocabulary now
-# holds three dozen people: every modifier is printed against every noun
-# eventually, so a modifier is disqualified if the pair it makes with a
-# person is one an operator would not want to read aloud to a stranger.
-# NAKED and BARE went first and obviously. CHUBBY, PERKY, JUICY, TASTY and
-# CREAMY followed, because each one's primary reading lands on a body, and
-# FRUITY because its secondary reading is a slur. DIRTY went too -- MUDDY,
-# GRIMY, GRUBBY, DUSTY and SOOTY all carry the picture without the trope.
-# This is not a general prudishness: SLIMY, HAIRY, SMOKED and STUFFED all
-# stay, because their pictures are real and the pairs they make are merely
-# funny.
+# Modifiers follow the same rule: sensory and physical words a Nordic speaker
+# reads without a dictionary. Every modifier is eventually printed against
+# every noun, people included, so one is disqualified if a pair it makes with a
+# person is one an operator would not read aloud to a stranger.
 MODIFIERS = """
 RED GREEN YELLOW PURPLE WHITE BLACK BROWN GOLDEN SILVERY BRONZED COPPERY
 CRIMSON SCARLET ROSY RUDDY PALE DARK BRIGHT INKY MILKY PEARLY SOOTY DUSTY
@@ -497,9 +440,8 @@ def clean(raw: str) -> list[str]:
 
 def filter_list(words, taken_soundex, taken_words, maxlen, all_kept=None,
                 forbidden=frozenset()):
-    # all_kept spans every category, because a codeword's noun can come from
-    # any of them -- CIVET and RIVET must not both survive just because one is
-    # an animal and the other a tool.
+    # all_kept spans every category, since a noun can come from any: CIVET and
+    # RIVET must not both survive.
     kept, dropped = [], []
     if all_kept is None:
         all_kept = kept
@@ -508,8 +450,7 @@ def filter_list(words, taken_soundex, taken_words, maxlen, all_kept=None,
             dropped.append((w, "shape"))
             continue
         if not 3 <= len(w) <= maxlen:
-            # Never silently truncated: a mangled word is neither sayable nor
-            # picturable, so an over-long one is reported and left out.
+            # An over-long word is reported and left out, never truncated.
             dropped.append((w, f"too long (>{maxlen})" if len(w) > maxlen
                             else "too short (<3)"))
             continue
@@ -565,10 +506,9 @@ def main():
     for name, words in kept.items():
         (OUT / "nouns" / f"{name}.txt").write_text("\n".join(sorted(words)) + "\n")
 
-    # Modifiers and nouns keep separate phonetic namespaces -- position tells
-    # the two halves apart, so one is never mistaken for the other -- but a
-    # word that is both would make a codeword like SCARLET-SCARLET, so the
-    # noun keeps it and the modifier gives way.
+    # Modifiers and nouns keep separate phonetic namespaces, since position
+    # tells them apart, but a word in both would allow SCARLET-SCARLET, so the
+    # noun keeps it.
     mods, mod_drops = filter_list(clean(MODIFIERS), {}, set(), MODIFIER_MAX,
                                   forbidden=noun_words)
     (OUT / "modifiers.txt").write_text("\n".join(sorted(mods)) + "\n")

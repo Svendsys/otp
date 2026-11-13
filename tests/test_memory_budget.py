@@ -1,107 +1,35 @@
 """What the largest pad this unit offers costs a 512MB board with no swap.
 
-`otpunit/jobs.py` renders the whole PDF into one in-memory buffer and holds
-it for the duration of BOTH copies -- deliberately, because copies A and B
-must be byte-identical, and because writing it to a file is the thing this
-project exists to avoid. Nothing measured what that costs, and the panel
-offers `pages = 1000`.
+`otpunit/jobs.py` renders the whole PDF into one in-memory buffer and holds it
+across both copies, so that A and B are byte-identical and nothing is written
+to a file. The failure guarded against is the unit being OOM-killed mid-job,
+with a volatile journal and nothing to read afterwards.
 
-The failure this guards against is not a slow print. It is the unit being
-OOM-killed part-way through a job on a board with no swap, leaving no
-evidence: the journal is volatile by design, so the operator gets a printer
-that stopped and nothing to read.
+The budget is an allocation from the board, not "current usage plus ten
+percent":
 
-THE BUDGET, and it is a budget rather than a measurement
---------------------------------------------------------
+      512 MiB   Pi Zero 2 W
+    -  64 MiB   VideoCore split (firmware default; config.txt names no gpu_mem)
+      448 MiB   what Linux has; install.sh removes swap
+    - 160 MiB   kernel, systemd, cupsd and its filters, the tmpfs spool
+      288 MiB   available to the unit process
 
-Written as an allocation from the board so that it cannot ratchet upward
-every time someone makes the code worse. A ceiling set to "current usage
-plus ten percent" is not a ceiling.
+`PROCESS_CEILING_MIB` gives 128 of those to a job the panel can ask for
+(`PAGE_CHOICES` tops out at 1000). The full 288 is the looser bound for
+`MAX_PAGES`, reachable only by hand-editing otp-unit.conf. `PER_PAGE_KIB`
+bounds the per-page slope.
 
-    512 MiB   Pi Zero 2 W, and there is no other variant
-  -  64 MiB   the VideoCore split, taken by the firmware before Linux sees
-              a byte. 64 is the firmware default when config.txt names no
-              gpu_mem, and nothing in this repository names one. If the
-              real split is smaller the error is in the safe direction.
-  ---------
-    448 MiB   what Linux has, all of it (device/install.sh:110-118 removes
-              dphys-swapfile, so there is no second chance)
-  - 160 MiB   everything that is not the unit: kernel, systemd, journald,
-              udev, dbus, cupsd AND its filter chain -- plus the tmpfs
-              spool, which holds each submitted copy in RAM, and the
-              filters' scratch under /run/cups/tmp
-  ---------
-    288 MiB   available to the unit process
+A6 is the worst format: A4 and A7 impose four and two pad pages per sheet, so
+the same pad is fewer PDF page objects. `test_a6_is_still_the_worst_format`
+fails if that inverts.
 
-`PROCESS_CEILING_MIB` allocates 128 of those 288 to a job the PANEL can
-ask for -- `PAGE_CHOICES` tops out at 1000. That leaves 160 MiB of margin
-against a figure that is itself conservative, and it is 2.9x what the job
-measures today, so it is a tripwire for a real regression rather than for
-a font change.
+Peaks are read from `VmHWM` in /proc/self/status, not `ru_maxrss`: on exec the
+kernel folds the parent's peak into the child's ru_maxrss, so a child of a
+large pytest reports pytest.
 
-`BOARD_MIB` minus the two deductions is the looser bound, and it applies
-to `MAX_PAGES` -- 9999, reachable only by hand-editing otp-unit.conf on
-the SD card. Two tiers on purpose: the supported configuration gets the
-tight budget, the hand-edited one only has to not kill the board.
-
-MEASURED here, no TRNG, x86-64, CPython + reportlab, peak VmHWM in MiB.
-Every figure is at the EXPENSIVE end of each panel-reachable setting --
-`training` stamps a rotated watermark on every page and `auth_size` takes
-its largest choice, together worth about 1.3 MiB at 1000 pages:
-
-    format   100 pages   250 pages   1000 pages   PDF at 1000
-    A6           28.0        31.0         45.0       2.15 MiB
-    A4           27.6        29.6         39.9       1.67 MiB
-    A7           27.2        28.9         36.7       1.24 MiB
-    (interpreter + imports alone: 26.0 MiB)
-
-And generate() is not the end of it: `Cups.submit` hands `bytes(data)` to
-subprocess, a second full copy held across the call, once per copy. That
-extra copy does NOT raise the process high-water mark at these sizes --
-measured, the whole PadPairJob peaks at exactly the generate figure,
-because the submit copy fits under reportlab's own transient peak. It is
-still real, and it is still measured -- with tracemalloc rather than RSS,
-because the allocator can serve that copy from arena space generate just
-freed and fault no new page. It comes to 1.00 pads exactly. An earlier
-version of this file claimed "about 4% above" from a reading that could
-not distinguish one copy from three.
-
-A6 is the worst case and not by accident: A4 and A7 impose four and two
-pad pages onto one sheet, so a 1000-page pad is 250 or 500 PDF page
-objects against A6's 1000. `test_a6_is_still_the_worst_format` exists so
-that if that ever inverts, the headline test gets retargeted by a red run
-rather than quietly measuring the second-worst case.
-
-The slope is ~18.5 KiB per pad page and flat, which is the number that
-generalises: at MAX_PAGES it projects to about 210 MiB, inside the 288.
-`PER_PAGE_KIB` is the budget for it and is deliberately near the
-measurement rather than double it -- see the constant.
-
-WHAT NOT TO MEASURE IT WITH
----------------------------
-
-`resource.getrusage(RUSAGE_SELF).ru_maxrss` in a subprocess -- the obvious
-choice, and the one this was first written with -- does not measure the
-subprocess. On exec the kernel folds the outgoing mm's peak into
-`signal->maxrss`, so a child forked from a large parent reports the
-PARENT. It passed when this file was run alone and reported base == peak
-== 63.8 MiB for BOTH a 250-page and a 1000-page pad under the full suite,
-which is pytest's own footprint wearing the pad's name. `VmHWM` from
-/proc/self/status is the current mm's peak only and is reset by exec.
-Two tests pin this; see `test_a_large_parent_does_not_inflate_the_reading`.
-
-A NOTE ON TIMING, because it cost an afternoon
-----------------------------------------------
-
-Every child below is pinned to a NONEXISTENT `OTP_HWRNG_PATH` unless it is
-deliberately testing the TRNG path. Left alone, `_hwrng_bytes` opens the
-host's real /dev/hwrng, and on a throttled virtio-rng -- which is what a
-CI runner or a Firecracker VM has -- it spends its whole time in the
-EAGAIN sleep loop. Measured here: the identical 1000-page pad took 2.7
-seconds pinned and 205 seconds unpinned. The peak RSS was the same to
-within 1%, so the measurement was never wrong; the suite just took three
-and a half minutes to say so. tests/conftest.py pins the parent for the
-same reason, but a subprocess inherits the environment, not the fixture.
+Every child is pinned to a nonexistent `OTP_HWRNG_PATH` unless it tests the
+TRNG path; a throttled host /dev/hwrng makes generation orders of magnitude
+slower. A subprocess inherits the environment, not the conftest fixture.
 """
 from __future__ import annotations
 
@@ -118,12 +46,7 @@ sys.path.insert(0, str(REPO))
 
 from otpunit import config                        # noqa: E402
 
-# Every measurement here reads /proc/self/status, and the ru_maxrss test
-# asserts a Linux exec detail outright. Without this the whole module turned
-# into nine hard failures on macOS or Windows, each reported as "the
-# measurement child died; nothing was measured" -- a misleading diagnosis
-# for what is really an unsupported platform. tests/test_simulated_hardware
-# guards its kernel dependencies the same way.
+# Every measurement reads /proc/self/status, so skip on other platforms.
 pytestmark = pytest.mark.skipif(
     not Path("/proc/self/status").exists(),
     reason="the memory budget is measured through /proc, which is Linux-only")
@@ -138,30 +61,16 @@ AVAILABLE_MIB = LINUX_MIB - SYSTEM_ALLOWANCE_MIB
 
 #: What a job the panel can ask for may peak at.
 PROCESS_CEILING_MIB = 128
-#: Marginal cost per pad page. Measured repeatedly at 18.4-18.5 KiB on this
-#: machine (250 -> 1000 pages), and this is the growth guard -- the one that
-#: generalises past the sizes actually measured.
-#:
-#: 25, not 40. At 40 the budget sat at 2.17x the measured slope, so a
-#: regression that DOUBLED per-page retention -- unambiguously "it now keeps
-#: something per page" -- landed at 36 KiB and passed, and its 1000-page
-#: peak of ~61 MiB also cleared the 128 MiB ceiling. Nothing in the file
-#: went red. 25 leaves 35% headroom over the measurement, which covers
-#: reportlab version drift without covering a doubling.
+# Marginal cost per pad page, measured at about 18.5 KiB. 25 leaves headroom
+# for reportlab version drift while still failing a doubling of per-page
+# retention.
 PER_PAGE_KIB = 25
 
 NO_TRNG = "/nonexistent/hwrng-under-test"
 
-# Killing the child rather than hanging the suite.
-#
-# 60, not 300. The failure this bounds is the unpinned-TRNG one in the
-# module docstring: 205 seconds for a 1000-page pad against 2.7 pinned. At
-# 300 no single child could exceed the timeout, so instead the eight
-# pad-generating children summed to roughly 640 seconds and CI's own
-# `timeout 600 pytest -q` killed the whole run with no test name and no
-# output -- a hang that loses its diagnosis, which is the outcome the
-# timeout exists to prevent. 60 is still 20x the pinned figure and lands
-# well below the documented bad case.
+# Kills a child instead of hanging the suite. Short enough that the sum over
+# all children stays under CI's own timeout, which would kill the run with no
+# test name.
 CHILD_TIMEOUT = 60
 
 
@@ -247,15 +156,11 @@ print(json.dumps({{"base": base, "peak": peak, "pdf": {mib} * 1024 * 1024,
 def child(body: str, hwrng: str = NO_TRNG) -> dict:
     """Run `body` in a fresh interpreter; return its peak RSS report.
 
-    A subprocess and not this one, because ru_maxrss is a high-water mark
-    that never comes down: pytest has already imported reportlab, pypdf and
-    every test module, so measuring in-process would report the suite's
-    peak and call it the pad's.
+    A subprocess, because the peak is a high-water mark and pytest has already
+    imported reportlab, pypdf and every test module.
     """
-    # PREPENDED, not assigned. Overwriting PYTHONPATH discarded whatever
-    # the runner had set -- a vendored dependency directory, a tox path --
-    # and the child then failed its reportlab import and reported "the
-    # measurement child died" for a reason with nothing to do with memory.
+    # Prepended, not assigned: the runner's PYTHONPATH may carry the
+    # dependencies.
     environment = dict(os.environ, OTP_HWRNG_PATH=hwrng,
                        PYTHONPATH=os.pathsep.join(
                            p for p in (str(REPO), os.environ.get("PYTHONPATH"))
@@ -268,11 +173,7 @@ def child(body: str, hwrng: str = NO_TRNG) -> dict:
         raise AssertionError(
             "the measurement child died; nothing was measured:\n"
             + result.stderr.decode("utf-8", "replace")[-2000:])
-    # The LAST line, and a diagnosis if it will not parse. A child that
-    # exits 0 having also written something else to stdout -- a deprecation
-    # notice routed there, a progress reporter reintroduced -- otherwise
-    # raised a bare JSONDecodeError naming neither the child nor what it
-    # printed.
+    # Parse the last line, and say what the child printed if it will not parse.
     out = result.stdout.decode("utf-8", "replace")
     try:
         return json.loads(out.strip().splitlines()[-1])
@@ -288,12 +189,9 @@ def pad(pages: int, paper: str = "A6", a7: bool = False,
         auth_size: int = max(config.AUTH_SIZE_CHOICES)) -> dict:
     """One pad, measured in a fresh interpreter.
 
-    The defaults are the EXPENSIVE end of every panel-reachable setting,
-    not config.Settings()'s defaults: `training` stamps a rotated
-    watermark on every page and `auth_size` lengthens the draw, and the
-    first version of this file varied only pages/paper/a7 while its
-    docstring claimed to measure the worst supported case. Measured at
-    1000 A6 pages: 43.6 plain, 44.7 with training, 45.0 with both.
+    The defaults are the expensive end of every panel-reachable setting, not
+    config.Settings()'s defaults: `training` stamps a watermark on every page
+    and `auth_size` lengthens the draw.
     """
     return child(_PAD_BODY.format(pages=pages, paper=paper, a7=a7,
                                   training=training, auth_size=auth_size),
@@ -359,16 +257,11 @@ print(json.dumps({{"base": base, "peak": peak, "pdf": cups.sizes[0],
 
 @pytest.fixture(scope="module")
 def measured():
-    """The expensive measurements, taken once and shared.
+    """The expensive measurements, taken once per module and shared; nothing
+    mutates the result.
 
-    Module-scoped deliberately: a 1000-page pad is ~2.7 seconds, and three
-    tests want the same number. Nothing here mutates the result.
-
-    The other two formats are measured at the SAME page count as a6-1000,
-    out of the same dict, because the only thing that makes them comparable
-    is that every argument except the format is identical -- and a page
-    count written twice is a page count that can drift apart. See
-    test_a6_is_still_the_worst_format for why it is 1000 and not 200.
+    All three formats are measured at the same page count out of one dict, so
+    only the format differs.
     """
     return {
         "a6-250": pad(250),
@@ -383,7 +276,8 @@ def measured():
 
 
 def test_the_largest_pad_the_panel_offers_fits_the_process_budget(measured):
-    """The headline. 1000 A6 pages, the worst supported case."""
+    """1000 A6 pages, the worst supported case, peaks under the process ceiling.
+    """
     seen = measured["a6-1000"]
     assert seen["peak"] < PROCESS_CEILING_MIB, (
         f"a {max(config.PAGE_CHOICES)}-page A6 pad peaked at "
@@ -393,35 +287,17 @@ def test_the_largest_pad_the_panel_offers_fits_the_process_budget(measured):
 
 
 def test_the_whole_job_fits_it_too_and_not_just_the_generate(measured):
-    """
-    generate() is not the process peak, and the headline above measures
-    only generate(). `Cups.submit` hands `bytes(data)` to subprocess -- a
-    SECOND full copy of the pad, held live across the call -- and it does
-    that once per copy.
+    """Submitting holds about one extra copy of the pad live (`Cups.submit` passes
+    `bytes(data)` to subprocess), never several.
 
-    Counted with tracemalloc over the submit phase, in pads. One extra
-    copy is correct and is what it measures: 1.00, exactly.
-
-    The earlier form of this test could not fail. It asserted
-    `peak >= after_generate` on a high-water mark, which only ever rises --
-    true by construction. At 1000 pages the two were EQUAL to the
-    hundredth of a MiB, because the submit copy fits under reportlab's own
-    transient peak, and the docstring's "44.6 against 46.4" did not
-    reproduce. A regression to three live copies passed every assertion.
-
-    RSS cannot answer this even with the high-water mark rebased: generate
-    frees enough on its way out that the allocator can serve bytes(data)
-    from already-resident arena space, faulting no new page. That form
-    measured 1.00 pads on one machine and 0.00 on CI for identical code.
-    Whether a copy shows up in RSS is a property of the free lists;
-    tracemalloc counts the allocation itself.
+    Counted with tracemalloc over the submit phase: RSS cannot see a copy the
+    allocator serves from arena space generate() just freed.
     """
     seen = measured["submit-1000"]
     assert seen["copies"] == 2, "a pad is a PAIR; both copies must be submitted"
     copies_live = seen["submit_bytes"] / seen["pdf"]
-    # Between half a pad and one and a half. The floor matters as much as
-    # the ceiling: at zero the measurement has stopped seeing the copy and
-    # the ceiling below becomes vacuous.
+    # The floor matters as much as the ceiling: at zero the measurement has
+    # stopped seeing the copy.
     assert 0.5 < copies_live < 1.5, (
         f"the submit phase allocated {copies_live:.2f} copies of the "
         f"{seen['pdf'] / 1048576:.2f} MiB pad; one is expected -- the "
@@ -434,12 +310,8 @@ def test_the_whole_job_fits_it_too_and_not_just_the_generate(measured):
 
 
 def test_the_measurement_saw_a_pad_and_not_an_empty_buffer(measured):
-    """
-    Without this every assertion above is satisfied by generating nothing.
-
-    A floor of 500 bytes per pad page, against a measured ~2250 for A6 --
-    loose enough to survive a layout change, tight enough that a job which
-    silently produced ten pages instead of a thousand cannot pass.
+    """The measured PDF is at least 500 bytes per pad page (A6 is ~2250), so a job
+    that generated little or nothing cannot satisfy the budget tests.
     """
     seen = measured["a6-1000"]
     assert seen["pdf"] > 1000 * 500, seen
@@ -448,11 +320,9 @@ def test_the_measurement_saw_a_pad_and_not_an_empty_buffer(measured):
 
 
 def test_the_per_page_cost_stays_flat(measured):
-    """
-    The scale-invariant statement, and the one that catches the real
-    regression: not "it got a bit bigger" but "it now retains something per
-    page". A slope measured between two sizes in the same interpreter is
-    also far more stable across reportlab versions than an absolute.
+    """The marginal cost per pad page stays under PER_PAGE_KIB. A slope between
+    two sizes catches per-page retention and is stable across reportlab
+    versions.
     """
     small, large = measured["a6-250"], measured["a6-1000"]
     per_page_kib = (large["peak"] - small["peak"]) * 1024 / (1000 - 250)
@@ -462,11 +332,9 @@ def test_the_per_page_cost_stays_flat(measured):
 
 
 def test_the_hand_edited_page_ceiling_still_fits_the_board(measured):
-    """
-    `PAGE_CHOICES` stops at 1000; `MAX_PAGES` is 9999, and a hand-edited
-    otp-unit.conf on the SD card is invited by the file's own header. That
-    path gets the looser bound -- it need not fit the process budget, but
-    it must not take the board down.
+    """A pad at `MAX_PAGES`, reachable by hand-editing otp-unit.conf, projects to
+    less than the board has available: it need not fit the process budget, only
+    not kill the board.
     """
     small, large = measured["a6-250"], measured["a6-1000"]
     per_page_mib = (large["peak"] - small["peak"]) / (1000 - 250)
@@ -480,42 +348,9 @@ def test_the_hand_edited_page_ceiling_still_fits_the_board(measured):
 
 
 def test_a6_is_still_the_worst_format(measured):
-    """
-    The headline measures A6 because A6 measured worst: A4 and A7 impose
-    four and two pad pages per sheet, so the same pad is a quarter or a
-    half as many PDF page objects. If that ever inverts, this goes red and
-    the headline gets retargeted -- rather than quietly measuring the
-    second-worst case for ever after.
-
-    1000 pages, not 200, AND THE REASON IS A RED RUN ON HEALTHY CODE.
-    This used to measure 200 pages, on the argument that the order is
-    established well before the sizes stop being cheap. The order is --
-    but not by enough to survive a noisy machine. Run 32160857598 failed
-    it on a GitHub runner with A6=31.56, A4=31.25: A6 still the worst
-    format, separation 0.31 MiB, against a margin of 0.5. Nothing in that
-    pull request touched the PDF path.
-
-    Peak RSS is the noisy part. What separates the formats is PDF page
-    objects -- A4 imposes four pad pages per sheet and A7 two, so the same
-    pad is a quarter or a half as many objects -- and that difference
-    scales with the page count while the noise does not. Measured on this
-    container, six repetitions at 200 and two at each of the others:
-
-        pages   A6 - runner-up          three pads cost
-          200   0.85 .. 1.20 MiB        2.4s
-          500   2.16 .. 2.77 MiB        4.3s
-         1000   5.60 .. 6.44 MiB        7.1s
-
-    So the fix is not a smaller margin, which would only make a real
-    narrowing invisible; it is a bigger signal. At 1000 pages -- which is
-    also max(config.PAGE_CHOICES), the case the headline is taken at --
-    the separation is ~6 MiB against a few tenths of noise, and A6 and
-    a6-1000 are the same measurement, so this costs two extra pads rather
-    than three.
-
-    If the ordering ever inverts, this goes red and the headline gets
-    retargeted -- rather than quietly measuring the second-worst case for
-    ever after.
+    """A6 peaks highest of the three formats, so the headline test measures the
+    worst case. Taken at 1000 pages, where the separation (several MiB) is far
+    above RSS noise.
     """
     peaks = {
         "A6": measured["a6-1000"]["peak"],
@@ -523,34 +358,18 @@ def test_a6_is_still_the_worst_format(measured):
         "A7": measured["a7-1000"]["peak"],
     }
     runner_up = max(v for k, v in peaks.items() if k != "A6")
-    # STRICT, and by a stated margin. `== max(...)` was satisfied by a tie,
-    # so the ordering could collapse to equality -- the point at which A6
-    # stops being the worst case -- without going red. 2.0 MiB is a third
-    # of the measured separation: it still catches a collapse most of the
-    # way to equality, and it is an order of magnitude above the noise that
-    # produced the red run above.
+    # Strict, by a stated margin: a tie means A6 is no longer the worst case.
+    # 2.0 MiB is well above RSS noise and well below the measured separation.
     assert peaks["A6"] > runner_up + 2.0, peaks
 
 
 def test_a_present_trng_does_not_change_the_shape_of_the_cost():
-    """
-    The device HAS a TRNG -- every Pi does -- so the measured configuration
-    has to be the one that ships. `get_random_bytes` XORs two big integers
-    per draw, and a change there would show up as a per-draw allocation
-    that the no-TRNG path never pays.
+    """With a hardware RNG present, which is what ships, the peak matches the
+    no-TRNG path.
 
-    A regular file stands in for /dev/hwrng: O_NONBLOCK is a no-op on one,
-    so reads always succeed and the throttling that dominates a real VM's
-    /dev/hwrng cannot skew this.
-
-    The tally is checked, not assumed. `_hwrng_bytes` returns None on an
-    OSError, a short read, or a `_looks_alive` rejection, and
-    `get_random_bytes` then falls back to os.urandom silently -- so every
-    way this setup can fail to reach the fake device (a renamed env var, a
-    file the child cannot read, content that looks stuck) degrades the test
-    into comparing the CSPRNG path against itself and passing. Filling the
-    file with zeros instead of urandom makes `_looks_alive` reject it and
-    was measured to leave the old assertions green.
+    A regular file stands in for /dev/hwrng. The tally of hardware bytes is
+    asserted, because every way of failing to reach the fake falls back to
+    os.urandom silently and would compare the CSPRNG path with itself.
     """
     import tempfile
 
@@ -581,16 +400,8 @@ def test_a_present_trng_does_not_change_the_shape_of_the_cost():
 
 
 def test_the_measurement_can_actually_fail():
-    """
-    Everything above is vacuous if `child()` does not really observe the
-    child's memory -- a wrong ru_maxrss unit, a subprocess that never ran
-    the body, a report read from the wrong process. So run the identical
-    machinery against a child that allocates a known amount and insist it
-    is seen.
-
-    192 MiB is chosen to sit ABOVE PROCESS_CEILING_MIB: this also proves
-    the ceiling is a number the measurement could exceed, rather than one
-    nothing could ever reach.
+    """`child()` sees a child that allocates a known 192 MiB. That is above
+    PROCESS_CEILING_MIB, so the ceiling is a number the measurement can exceed.
     """
     seen = child(_ALLOCATION_BODY.format(mib=192))
     assert seen["peak"] > 160, \
@@ -600,18 +411,9 @@ def test_the_measurement_can_actually_fail():
 
 
 def test_a_large_parent_does_not_inflate_the_reading():
-    """
-    The bug this file was first written with, pinned.
-
-    `ru_maxrss` in the child is `max(signal->maxrss, current mm)`, and exec
-    folds the outgoing mm's peak into the first term -- so a child forked
-    from a fat pytest reports pytest. Measured: parent at 310 MiB, child
-    that allocated nothing, `ru_maxrss` 310.3 MiB against `VmHWM` 7.7 MiB.
-
-    Under the full suite that turned the headline test into a measurement
-    of the test runner: base == peak == 63.8 MiB for a 250-page pad AND a
-    1000-page one. It passed on this file alone, which is the worst way for
-    it to fail.
+    """A child of a large parent reports its own peak. `ru_maxrss` would report
+    the parent's, because exec folds the outgoing mm's peak into it; `VmHWM`
+    does not.
     """
     small = child("peak = base = rss_mib()\n"
                   'print(json.dumps({"base": base, "peak": peak, "pdf": 0,'
@@ -630,8 +432,7 @@ def test_a_large_parent_does_not_inflate_the_reading():
         f"a 256 MiB parent moved an empty child's reading from "
         f"{small['peak']:.1f} to {after['peak']:.1f} MiB; the measurement "
         f"is of the wrong process")
-    # And prove the trap is real rather than hypothetical, so nobody
-    # "simplifies" this back to ru_maxrss.
+    # And prove the trap is real, so nobody simplifies this back to ru_maxrss.
     assert after["rusage"] > 200, (
         "ru_maxrss no longer inherits the parent's peak on this kernel; "
         f"got {after['rusage']:.1f} MiB from a 256 MiB parent. If that is "
@@ -639,9 +440,8 @@ def test_a_large_parent_does_not_inflate_the_reading():
 
 
 def test_a_child_that_dies_is_not_read_as_a_small_footprint():
-    """
-    A crashed child prints nothing, and "nothing" must not parse as a low
-    peak. This is how a measurement harness goes quietly green.
+    """A crashed child prints nothing, and that must raise, not parse as a low
+    peak.
     """
     with pytest.raises(AssertionError, match="nothing was measured"):
         child("raise SystemExit(3)")

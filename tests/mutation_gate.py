@@ -1,59 +1,19 @@
 #!/usr/bin/env python3
 """Break each load-bearing guard on purpose and require the suite to notice.
 
-WHY THIS EXISTS. Five checks in this repository have been found unable to
-fail, one per audit round: a tier-3 boot offset aimed at a zero-filled gap,
-a tier-3 verdict grepping for the image's own hostname, a tier-2 spool check
-that was really a systemd invariant, a truncated-run gate satisfied by a
-guest killed after two checks, and a group guard that matched the TEXT of a
-`for` header and never ran the body. Each was found by hand, mutated by
-hand, and confirmed by hand -- and the next one was found the same way, a
-round later. The recurring defect is not any of them individually: it is
-that a check's ability to fail is UNVERIFIED BY DEFAULT, and five rounds of
-reading did not establish it. See issue #14.
+`mutations.toml` says, for each guard, what it exists to catch, the edit
+that breaks it, and the tests that must go red. This applies each edit,
+runs those tests and restores the file (issue #14).
 
-So the hand-run round becomes a table and a runner. `mutations.toml` says,
-for each guard, "this exists to catch X; here is X, and here are the tests
-that must go red for it". This runs them.
+Anything that would turn the gate into a no-op is a failure, not a skip: a
+`find` that does not match the declared number of times, named tests that
+are not green before the mutation, named tests that do not run, and a tier
+that was not selected is named in the summary with its mutation count.
 
-WHAT IT REFUSES TO DO QUIETLY. Every way this gate could rot into a no-op is
-a loud failure rather than a skip:
-
-  - a `find` string that no longer matches the file (the guard moved, or was
-    rewritten) fails the run. A mutation that cannot be applied proves
-    nothing, and a gate that shrugs at that is the exact defect class it
-    exists to fix.
-  - a `find` that matches more than the declared number of times fails too:
-    which occurrence got mutated would then depend on the file's history.
-  - the named tests must be GREEN before the mutation. A test that is
-    already red catches everything, including mutations it cannot see.
-  - the named tests must actually RUN. All-skipped is not proof; on a
-    machine with no cupsd the hardware tier says so instead of passing.
-  - a tier that was not selected is named in the summary with its mutation
-    count, so a partial run cannot read as a complete one.
-
-RESTORING THE TREE. Not `git checkout`: a previous hand-run round used it
-between mutations and destroyed an uncommitted fix in the same tree. Not
-`git stash push` + `git stash drop` either, which the issue suggested and
-which was measured here before choosing:
-
-    $ printf 'committed line\nMY UNCOMMITTED FIX\n' > f.txt   # dirty tree
-    $ sed -i s/committed/MUTATED/ f.txt                       # the mutation
-    $ git stash push -- f.txt && git stash drop
-    $ cat f.txt
-    committed line
-
-The developer's uncommitted work went with the mutation -- recoverable from
-the dropped stash object, but gone from the worktree. That is `git checkout`
-one step removed, and this runner is meant to be safe to run on a tree with
-work in progress in it, because a gate people are afraid to run locally gets
-run in CI only.
-
-What it does instead: read the file's exact bytes before mutating, write
-those bytes back afterwards in a `finally`, and verify the readback matches.
-`git stash create` is taken once at the start as a crash net -- it writes a
-recoverable snapshot commit of the whole dirty tree and, unlike `stash
-push`, does not touch the worktree to do it.
+Files are restored from the exact bytes read before mutating, written back
+in a `finally` and verified, so uncommitted work survives; `git checkout`
+and `git stash push` would both revert it to HEAD. `git stash create` is
+taken once at the start as a crash net and does not touch the worktree.
 
 USAGE
 
@@ -62,9 +22,8 @@ USAGE
     python3 tests/mutation_gate.py --tier all
     python3 tests/mutation_gate.py --list
 
-There is deliberately no default tier. The hardware tier needs a real cupsd
-and the fast tier does not, so any default would be either a run that fails
-on most machines or a run that silently covers less than the table.
+There is no default tier: the hardware tier needs a real cupsd, so any
+default would either fail on most machines or cover less than the table.
 """
 from __future__ import annotations
 
@@ -82,30 +41,22 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 TABLE = Path(__file__).resolve().parent / "mutations.toml"
 
-#: How the mutated run is invoked. `--tb=no -rfE` because the tracebacks are
-#: not the evidence here -- WHICH tests went red is -- and `-q` keeps a run
-#: of twenty mutations readable. `-p no:cacheprovider` so a gate run does not
-#: leave .pytest_cache pointing at a tree of failures that never existed.
+#: How the mutated run is invoked. Which tests went red is the evidence, not
+#: the tracebacks; `-p no:cacheprovider` keeps a gate run from leaving a
+#: .pytest_cache full of failures that never existed.
 PYTEST_ARGS = ("-q", "--no-header", "--tb=no", "-rfE", "-p", "no:cacheprovider")
 
-#: pytest's exit codes, as far as this cares. Both of these mean "no test
-#: ran", and telling them apart from a red test is the whole job: a node id
-#: pointing at a file that is gone exits 5, and one naming a test that has
-#: been renamed inside a file that still exists exits 4 with `ERROR: not
-#: found:` -- measured, because 4 is documented as "usage error" and reads
-#: like a problem with this runner's arguments rather than with the table.
+#: pytest exit codes that mean "no test ran": 5 for a node id whose file is
+#: gone, 4 (`ERROR: not found:`) for a test renamed inside a file that exists.
 NO_TESTS_COLLECTED = 5
 USAGE_ERROR = 4
 
-#: Not one of pytest's, and deliberately outside its range: the run never
-#: finished, so there is no exit code to report.
+#: Not a pytest code: the run never finished.
 TIMED_OUT = -9
 
 _COUNT = re.compile(r"(\d+) (passed|failed|errors?|skipped|deselected|xfailed|xpassed)")
-#: pytest's counts line, which always ends "in 0.42s". Pinned to that shape
-#: so the counts come from pytest's own summary and not from a test's output
-#: -- this runner's tests capture nested pytest runs, and a line of theirs
-#: saying "3 passed" would otherwise be read as the verdict.
+#: pytest's counts line, which always ends "in 0.42s". Pinned to that shape so
+#: a captured nested run's "3 passed" is not read as the verdict.
 _SUMMARY = re.compile(r"\d+ (?:passed|failed|errors?|skipped|deselected"
                       r"|xfailed|xpassed).*\bin \d+\.\d+s")
 
@@ -126,13 +77,8 @@ class Edit:
 class Mutation:
     """One break, applied as one or more exact edits.
 
-    More than one edit per row is not a convenience. A property can be
-    defended twice, and then no single edit can turn the suite red -- the
-    first run of this gate found exactly that case (tier2-crlf-not-stripped:
-    the CR strip AND the `grep -oE` extraction both keep the trailing \\r out
-    of the counts comparison, so removing either alone left all 17 tier-2
-    tests green). Writing that as two edits states the redundancy instead of
-    hiding it behind a dropped row.
+    A property defended twice cannot be turned red by a single edit, so a
+    row may carry several edits that remove every defence at once.
     """
     name: str
     tier: str
@@ -150,13 +96,7 @@ class Tier:
     name: str
     description: str
     pytest_args: tuple[str, ...] = ()
-    #: Wall clock for ONE mutated run. A mutated run can hang rather than
-    #: fail: the first hardware-tier run here sat for ten minutes and had to
-    #: be killed from outside, which is also how the missing signal handling
-    #: below was found. The cause turned out to be contention for /tmp with
-    #: another checkout rather than the mutation, but a gate that can only be
-    #: ended from outside is a runner burning for six hours with nothing to
-    #: report -- the failure ci.yml's own timeouts were written for.
+    #: Wall clock for one mutated run, which can hang rather than fail.
     timeout: float = 300.0
 
 
@@ -195,13 +135,8 @@ class Outcome:
 
 
 def load(table_path: Path = TABLE) -> tuple[dict, list]:
-    """Parse and validate mutations.toml.
-
-    Every validation here is a loud failure rather than a dropped row. A
-    table that silently ignores a malformed entry is a gate with a hole in
-    it that nobody can see from the outside -- which is what this whole
-    mechanism exists to stop.
-    """
+    """Parse and validate mutations.toml. A malformed entry is a loud failure,
+    never a dropped row."""
     document = tomllib.loads(table_path.read_text())
 
     tiers = {}
@@ -258,19 +193,15 @@ def load(table_path: Path = TABLE) -> tuple[dict, list]:
 def applies(mutation: Mutation, repo: Path = REPO) -> str:
     """"" if the mutation still applies cleanly, else why not.
 
-    Split out from the runner because it costs nothing: the fast suite calls
-    it on every row (tests/test_mutation_gate.py), so a table that has rotted
-    against a renamed guard is caught by `pytest -q` and not only by the
-    gate job.
+    Cheap enough that the fast suite calls it on every row
+    (tests/test_mutation_gate.py).
     """
     for edit in mutation.edits:
         target = repo / edit.path
         if not target.is_file():
             return f"{edit.path} does not exist"
-        # Bytes, not text. Reading and rewriting through str translates line
-        # endings, so mutating a CRLF file would silently rewrite every line
-        # in it as well -- a much bigger edit than the row describes, on a
-        # file the tests then judge.
+        # Bytes, not text: rewriting through str translates line endings,
+        # which would change every line of a CRLF file.
         found = target.read_bytes().count(edit.find.encode())
         if found != edit.occurrences:
             return (f"`find` matches {found} time(s) in {edit.path}, "
@@ -287,8 +218,8 @@ def parse_pytest(output: str) -> tuple[dict, tuple, tuple]:
     lines = output.splitlines()
     summaries = [line for line in lines if _SUMMARY.search(line)]
     counts = {}
-    # The LAST summary line: with -rfE the short summary comes first, and
-    # stderr (a warning from an import, say) can land after it.
+    # The last summary line: with -rfE the short summary comes first, and
+    # stderr can land after it.
     for line in summaries[-1:]:
         for number, word in _COUNT.findall(line):
             counts[word.rstrip("s") if word.startswith("error") else word] = int(number)
@@ -333,13 +264,9 @@ class Gate:
     def baseline(self, tier: Tier, tests: tuple) -> str:
         """"" if the named tests pass on the unmutated tree, else why not.
 
-        Cached per (tier, tests): most rows in the table share a test file
-        with a neighbour, and the baseline is a third of the runtime.
-
-        This is the anti-tautology check. Without it a test file that is
-        broken, deselected by a marker, or renamed out from under the table
-        would "catch" every mutation aimed at it, and the gate would be
-        green for the same reason the guards it audits were green.
+        Cached per (tier, tests). Without this check a test file that is
+        broken, deselected or renamed would "catch" every mutation aimed at
+        it.
         """
         key = (tier.name, tests)
         if key not in self._baselines:
@@ -383,9 +310,8 @@ class Gate:
         if problem:
             return Outcome(mutation, "BROKEN", problem)
 
-        # Every file's pre-mutation bytes, read before anything is written,
-        # so the restore puts back what was there rather than what HEAD says
-        # was there. That difference is the developer's uncommitted work.
+        # Pre-mutation bytes, read before anything is written, so the restore
+        # keeps the developer's uncommitted work rather than what HEAD has.
         originals = {edit.path: (self.repo / edit.path).read_bytes()
                      for edit in mutation.edits}
         started = time.monotonic()
@@ -395,17 +321,10 @@ class Gate:
                 target = self.repo / edit.path
                 self._write(target, target.read_bytes().replace(
                     edit.find.encode(), edit.replace.encode()))
-            # Asked BEFORE the run, because afterwards there is no way to
-            # tell. See _write: a cache entry left over from the original
-            # is one CPython will believe, since the source's (mtime, size)
-            # are all it compares and a length-preserving mutation changes
-            # neither -- so the subprocess below would execute the
-            # ORIGINAL, the row would survive, and the report would say the
-            # guard is fine. That is the direction of this failure that
-            # costs something: the other way round leaves a dirty tree,
-            # which the run notices at the end. Not a verdict of SURVIVED
-            # either, which would send someone to write a test that already
-            # exists; the gate could not measure this row, and says so.
+            # Asked before the run: a stale cache entry makes the subprocess
+            # execute the original, and afterwards that is indistinguishable
+            # from a missing guard. Reported as BROKEN, not SURVIVED, because
+            # the row was not measured.
             shadowed = self._shadowed_by_cache(mutation)
             result = (None if shadowed
                       else self.runner(self.repo, tier, mutation.tests))
@@ -418,9 +337,8 @@ class Gate:
             return Outcome(mutation, "BROKEN", shadowed, seconds=elapsed)
 
         if result.returncode == TIMED_OUT:
-            # A hang is not a red test. It might mean the mutation wedged
-            # something, which is worth knowing, but it is not evidence that
-            # any check noticed -- and it must not be counted as one.
+            # A hang is not a red test and is not evidence that any check
+            # noticed.
             return Outcome(
                 mutation, "BROKEN",
                 f"the mutated run did not finish in {tier.timeout:.0f}s. A "
@@ -437,8 +355,8 @@ class Gate:
                 f"the guard was broken and the suite stayed green "
                 f"({result.summary})", seconds=elapsed)
         if not result.failed:
-            # Red for a reason that is not a test noticing: a collection
-            # error, or an internal pytest failure. Not proof of anything.
+            # Red without a failed test: a collection error or an internal
+            # pytest failure, not a check noticing.
             return Outcome(
                 mutation, "BROKEN",
                 f"the run went red with no FAILED test (rc={result.returncode}, "
@@ -447,20 +365,12 @@ class Gate:
         return Outcome(mutation, "caught", "", red=result.failed, seconds=elapsed)
 
     def _shadowed_by_cache(self, mutation: Mutation) -> str:
-        """
-        Name any mutated file the interpreter might read out of the cache.
+        """Name any mutated file the interpreter might read out of the cache.
 
-        The check `_write` cannot make about itself. `_write` drops the
-        `__pycache__` entry on both writes; this asks, once the mutation is
-        on disk and before anything runs against it, whether that actually
-        happened -- an unwritable `__pycache__`, a second process compiling
-        the file in the window, or the deletion being dropped from the
-        apply side alone, which is a one-line edit and which the restore
-        side's own test cannot see.
-
-        It is cheap (one `stat` per mutated file) and it is the only moment
-        the question can be answered: after the run, a row that executed
-        the original looks exactly like a row whose guard is missing.
+        `_write` drops the `__pycache__` entry, but the directory can be
+        unwritable or a second process can recompile the file. This checks,
+        once the mutation is on disk and before anything runs, that the
+        entry is really gone.
         """
         for edit in mutation.edits:
             cached = self._cache_entry(self.repo / edit.path)
@@ -484,48 +394,14 @@ class Gate:
 
     @classmethod
     def _write(cls, target: Path, data: bytes) -> None:
-        """
-        Write `data`, and make sure the interpreter will actually read it.
+        """Write `data` and drop the file's `__pycache__` entry.
 
-        CPython decides whether a `__pycache__` entry is still good by
-        comparing the source's mtime IN WHOLE SECONDS and its size --
-        nothing about its contents. A mutation whose `replace` is the same
-        length as its `find`, which a swapped pair of lines is, changes
-        neither; and a mutated run that finishes inside a second leaves a
-        cache entry the RESTORED file matches exactly. Python then goes on
-        executing the mutation, in a tree `git diff` calls clean, for every
-        run in that checkout until something else touches the file.
-
-        Measured here, restoring
-        panel-replacement-runs-before-anything-can-find-it -- which swaps
-        two lines and so preserves the length. The row was reported caught,
-        `git diff --exit-code` was clean, and the next ordinary pytest run
-        in the same checkout failed on the mutated behaviour:
-
-            pyc records mtime 1787071573 size 41074
-            src has      mtime 1787071573 size 41074
-
-        It runs the other way too, and that way is worse: a mutation
-        written within a second of the original's cache entry can be
-        executed AS THE ORIGINAL, and the row then survives for a reason
-        that has nothing to do with the guard it is meant to test -- a
-        green line in a report, which is the one thing this whole mechanism
-        exists to refuse.
-
-        So the cache entry goes with every write, in both directions.
-        Deleting it is enough: the next import compiles what is there.
-
-        The two directions need separate checks and did not have them: a
-        test that plants an entry, calls `apply_and_judge` and finds the
-        entry gone afterwards is satisfied by the RESTORE side alone, and
-        a row that mutates the line below disables both sides at once.
-        Measured: reverting only the apply side -- `self._write(target,
-        ...)` back to `target.write_bytes(...)` in `apply_and_judge` --
-        left the gate's own suite green and its row still reported caught,
-        while the direction that can execute a mutation as the original
-        was wide open. `_shadowed_by_cache` is the apply side's own check;
-        `test_the_mutated_run_never_starts_with_a_cache_entry_to_believe`
-        is the test that can only see that side.
+        CPython validates a cache entry by the source's mtime in whole
+        seconds and its size, not its contents. A same-length mutation
+        written and restored within a second changes neither, so without
+        this the interpreter could keep executing the mutation after the
+        restore, or execute the original during the mutated run. Deleting
+        the entry is enough: the next import recompiles.
         """
         target.write_bytes(data)
         cached = cls._cache_entry(target)
@@ -548,9 +424,8 @@ class Gate:
     def snapshot(self) -> str:
         """A recoverable copy of any uncommitted work, without touching it.
 
-        `git stash create` writes the stash commit and stops there -- no
-        worktree change, no stash list entry, nothing to pop. It is empty on
-        a clean tree, which is the common case in CI.
+        `git stash create` writes the stash commit only: no worktree change
+        and no stash list entry. It is empty on a clean tree.
         """
         try:
             proc = subprocess.run(["git", "stash", "create", "mutation gate"],
@@ -629,11 +504,9 @@ def main(argv=None) -> int:
         print("no mutations selected -- check --tier/--name", file=sys.stderr)
         return 1
 
-    # A mutated tree left behind is the worst thing this program can do, and
-    # it has done it once: killed by SIGTERM at a ten-minute cap, the default
-    # disposition terminated the process without unwinding, and
-    # device/install.sh stayed mutated in the worktree. `finally` only runs
-    # if something unwinds, so the signal has to become an exception.
+    # `finally` only runs if something unwinds, and the default disposition
+    # of these signals terminates without unwinding, leaving a mutated tree.
+    # So the signal becomes an exception.
     def unwind(signum, _frame):
         raise KeyboardInterrupt(f"signal {signum}")
 
@@ -662,8 +535,8 @@ def main(argv=None) -> int:
     print(f"\n=== {len(outcomes) - len(bad)}/{len(outcomes)} caught "
           f"in {elapsed:.0f}s")
 
-    # Name what was NOT run, with its size. A gate that covers half the table
-    # must not read like one that covers all of it.
+    # Name what was not run, with its size, so a partial run cannot read as a
+    # complete one.
     skipped_tiers = {t.name: sum(1 for m in mutations if m.tier == t.name)
                      for t in tiers.values()
                      if "all" not in args.tier and t.name not in args.tier}

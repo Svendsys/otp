@@ -13,11 +13,9 @@ ConditionPathIsDirectory=/opt/otp-unit/cups-etc
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# The root filesystem is a read-only overlay, so CUPS cannot write its queue
-# configuration to /etc/cups. Rather than fight that, lean on it: mount a
-# tmpfs there and repopulate it from a baked-in template on every boot. The
-# queue is then rebuilt from the printer that is actually plugged in, and no
-# record of previous printers survives a power-cycle.
+# The root is a read-only overlay, so /etc/cups gets a tmpfs repopulated from
+# a baked-in template each boot: the queue is rebuilt from the printer
+# actually plugged in, and no record of previous printers survives.
 ExecStart=/bin/mount -t tmpfs -o mode=0755,size=4M tmpfs /etc/cups
 ExecStart=/bin/sh -c 'cp -a /opt/otp-unit/cups-etc/. /etc/cups/'
 ExecStop=/bin/umount /etc/cups

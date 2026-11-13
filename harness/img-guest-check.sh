@@ -1,40 +1,24 @@
 #!/usr/bin/env bash
 #
-# Runs INSIDE the tier-3 image boot, as root, once per boot.
+# Runs inside the tier-3 image boot, as root, once per boot.
 #
 #   img-guest-check.sh
 #
 # Started by otp-unit-imgcheck.service, which exists only while the kernel
-# command line carries otp.imgcheck=<phase> -- something nothing but
-# harness/img-boot.sh puts there. The phase is read from /proc/cmdline rather
-# than passed as an argument so that the unit file needs no per-boot edit.
-# The script refuses to do anything at all without that token; see the phase
-# guard below for why the unit's condition is not enough on its own.
+# command line carries otp.imgcheck=<phase>; only harness/img-boot.sh puts
+# it there. The phase is read from /proc/cmdline so the unit file needs no
+# per-boot edit, and the script refuses to run without it.
 #
-# WHY THIS EXISTS. The read-only overlay was the largest completely
-# unobserved surface in the project (issue #9). Tier 2 cannot see it: two
-# mechanisms were tried in that Debian guest and both failed, one of them by
-# panicking the kernel. Tier 3 can, because tier 3 boots the artifact that is
-# actually flashed, with the overlay the image was built with -- and the
-# overlay is a property of a booted machine, so a booted machine has to be
-# the one asked.
+# Two boots of the artifact that is flashed, overlay engaged (issue #9):
 #
-# TWO BOOTS, and the second is the whole point:
+#   boot1  writes a sentinel to / and a setting to /boot/firmware through
+#          config.save().
+#   boot2  the same card, powered off and on. The sentinel must be gone
+#          (the overlay discards) and the setting still there (the boot
+#          partition is outside it).
 #
-#   boot1  the overlay is engaged. Writes a sentinel to / and a setting to
-#          /boot/firmware through config.save().
-#   boot2  the same card, powered off and on. The sentinel must be GONE --
-#          that is the overlay discarding -- and the setting must still be
-#          there -- that is the boot partition being outside it.
-#
-# An absence proves nothing on its own: a boot1 that never ran, a sentinel
-# written to the wrong path, or a check looking somewhere else all produce
-# the same missing file. So boot2 states two presences with the same fixture
-# first, and the discard check is reported last, after both. The sentinel is
-# rewritten and read back, which proves the path is writable and that this
-# check would have found the file had it survived; and the setting boot1
-# wrote is read back through config.load(), which proves boot1 ran and got
-# far enough to write things down.
+# An absence proves nothing alone, so boot2 first states two presences with
+# the same fixtures and reports the discard check last.
 #
 # Prints one line per check in the format the host greps for:
 #
@@ -42,32 +26,19 @@
 #   OTP-GUEST-DONE <phase>
 #   OTP-RESULT <phase> <passed>/<total>
 #
-# The phase is in every marker because the host requires each expected phase
-# to have reported exactly once. A boot that never happened produces no
-# output, which is indistinguishable from a boot with nothing to say -- the
-# lesson tier 2's three-phase gate was built out of.
-#
-# Never exits non-zero on a failed check. It reports them all and lets the
-# host decide; stopping at the first would hide the rest behind it. Refusing
-# to run at all is a different thing and does exit non-zero -- see below.
+# The phase is in every marker because the host requires each expected
+# phase to have reported exactly once. Never exits non-zero on a failed
+# check; refusing to run at all does.
 set -uo pipefail
 
 BOOTDIR=/boot/firmware
-# This machine's identity, named rather than spelled inline where it is read.
-# Same reason $BOOTDIR is a variable: the checks over it are sliced out and
-# run against a tree tests/test_overlay_root.py builds, and a hardcoded /etc
-# would leave them exercised only by a real emulated boot -- which is the one
-# place a check that has stopped checking cannot be noticed cheaply.
+# A variable, like $BOOTDIR, because tests/test_overlay_root.py slices
+# these checks out and runs them against a tree it builds.
 ETC_MACHINE_ID=/etc/machine-id
 
-# THE PHASE, and every write in this file hangs off it.
-#
-# `set -f` around the loop because the substitution is deliberately word
-# split and must NOT also be pathname expanded. This runs as root from a
-# systemd unit, whose working directory is /, so with globbing left on a
-# cmdline token of `*` is replaced by the listing of the root directory
-# before the case below ever sees it -- and a file in / whose name happens
-# to start otp.imgcheck= would then choose the phase.
+# The phase. `set -f` because the substitution is word split and must not
+# also be pathname expanded: this runs with cwd /, where a cmdline token of
+# `*` would expand to the root listing.
 PHASE=""
 set -f
 for token in $(tr -d '\n' < /proc/cmdline 2>/dev/null); do
@@ -77,24 +48,11 @@ for token in $(tr -d '\n' < /proc/cmdline 2>/dev/null); do
 done
 set +f
 
-# REFUSE anything that is not one of the two phases the harness supplies,
-# and refuse it here, before a single check has run.
-#
-# This script WRITES. It puts a sentinel in / and it puts a marker page
-# count through config.save() into $BOOTDIR/otp-unit.conf -- which is
-# OUTSIDE the overlay, on the boot partition, and therefore permanent on a
-# real unit. install.sh ships it 0755 in /opt/otp-unit and enables its unit
-# on every appliance, so until this guard existed the only thing between an
-# operator's settings and that write was the ConditionKernelCommandLine=
-# line in otp-unit-imgcheck.service: one line, in one file, that a drop-in,
-# a hand-run `systemctl start`, or anyone resolving the ExecStart path
-# steps straight past.
-#
-# Measured rather than argued. Given a realistic device command line with
-# no otp.imgcheck token, the previous version set PHASE=unknown and ran
-# every check regardless: the unit's page count went 500 -> 137 on the boot
-# partition and a sentinel was left in /. The unit condition stays where it
-# is -- this is a second lock on the same door, not a replacement.
+# Refuse anything but the two phases the harness supplies, before any
+# check runs. This script writes a sentinel to / and a marker page count
+# into $BOOTDIR/otp-unit.conf, outside the overlay and so permanent on a
+# real unit. The unit's ConditionKernelCommandLine= is bypassed by a
+# drop-in or a hand-run start; this is the second lock.
 case "$PHASE" in
     boot1|boot2) ;;
     *)
@@ -112,14 +70,11 @@ esac
 
 PASS=0
 TOTAL=0
-# Written to / in every phase and looked for at the start of the next one.
-# At the root of the filesystem on purpose: /tmp and /run are tmpfs whatever
-# the root is, so a sentinel there would vanish across a power-cycle on a
-# perfectly writable card and prove nothing.
+# Written to / in every phase and looked for at the start of the next.
+# Not /tmp or /run: those are tmpfs whatever the root is.
 SENTINEL=/otp-imgcheck-sentinel
 # A page count no default and no panel choice produces, so its presence in
-# boot2 can only be the write boot1 made. Same value and same reasoning as
-# tier 2's MARK_PAGES.
+# boot2 can only be boot1's write.
 MARK_PAGES=137
 
 check() {
@@ -136,16 +91,13 @@ check() {
 yesno() { if "$@" >/dev/null 2>&1; then echo yes; else echo no; fi; }
 
 echo "OTP-GUEST starting phase=$PHASE on $(uname -srm)"
-# The command line, every phase. The tier-2 arc turned on being able to tell
-# "the flag arrived and did nothing" from "the flag never arrived", and that
-# distinction only existed because the guest echoed its own cmdline.
+# Echoed so "the flag arrived and did nothing" can be told from "the flag
+# never arrived".
 echo "OTP-CMDLINE $PHASE $(tr -d '\n' < /proc/cmdline)"
 
 # --- was the sentinel from the previous boot discarded? -------------------
 
-# FIRST, before anything else writes to /. In boot2 this is the answer to
-# issue #9's last bullet; in boot1 it is the statement that the card came up
-# clean, which is what makes boot2's reading of it mean something.
+# First, before anything else writes to /.
 SENTINEL_SURVIVED=no
 SENTINEL_WAS=""
 if [ -e "$SENTINEL" ]; then
@@ -157,19 +109,18 @@ fi
 
 ROOT_FSTYPE=$(findmnt -no FSTYPE / 2>/dev/null | head -1)
 ROOT_SOURCE=$(findmnt -no SOURCE / 2>/dev/null | head -1)
-# The super options, which name the three layers. Read from mountinfo rather
-# than from findmnt's OPTIONS, which reports the per-mount flags and would
-# say rw,relatime for an overlay and for a plain ext4 alike.
+# The super options name the three layers. From mountinfo, because
+# findmnt's OPTIONS reports per-mount flags that read the same for an
+# overlay and a plain ext4.
 ROOT_SUPER=$(awk '$5 == "/" {for (i = 7; i <= NF; i++) if ($i == "-") {print $(i + 3); exit}}' \
              /proc/self/mountinfo 2>/dev/null | head -1)
 check root-is-overlay \
       "$(if [ "$ROOT_FSTYPE" = "overlay" ]; then echo yes; else echo no; fi)" \
       "fstype=${ROOT_FSTYPE:-?} source=${ROOT_SOURCE:-?} super=${ROOT_SUPER:-?}"
 
-# The positive control for the sentinel checks, and it runs in both phases.
-# "the file is gone" is satisfied by a rig that cannot write to / at all, by
-# a path that does not exist, and by a boot that never got this far. Writing
-# it and reading it back in the same phase removes all three.
+# The positive control for the sentinel checks, in both phases: writing
+# and reading back rules out a root that cannot be written, a wrong path
+# and a boot that never got this far.
 WROTE=no
 if printf 'phase=%s stamp=%s\n' "$PHASE" "$(date -u +%s 2>/dev/null)" \
         > "$SENTINEL" 2>/dev/null && [ -s "$SENTINEL" ]; then
@@ -179,11 +130,8 @@ check root-write-lands-and-is-readable "$WROTE" "$SENTINEL"
 
 # --- the unit, on a read-only root ----------------------------------------
 
-# Polled rather than slept through. otp-unit-imgcheck.service is only
-# After= the unit, and Type=simple means "started" the instant the process is
-# spawned, so without this the check would race a Python interpreter that has
-# not imported anything yet. Bounded, because a unit that is never going to
-# come up must still produce a report.
+# Polled: Type=simple means "started" the instant the process is spawned.
+# Bounded, because a unit that never comes up must still produce a report.
 STATE=inactive
 for _ in $(seq 1 45); do
     STATE=$(systemctl is-active otp-unit.service 2>&1 || true)
@@ -199,36 +147,35 @@ check unit-not-restart-looping \
       "$(if [ "${RESTARTS:-9}" -le 1 ] 2>/dev/null; then echo yes; else echo no; fi)" \
       "NRestarts=$RESTARTS"
 
+# Read through the unit's own mount namespace, since that is the view its
+# refusal is decided on. A unit that refuses live pads on the shipped image
+# is an appliance that prints nothing.
+UNIT_PID=$(systemctl show otp-unit.service -p MainPID --value 2>/dev/null || echo 0)
+POSTURE=$(python3 - "$UNIT_PID" <<'PY' 2>&1
+import sys
+sys.path.insert(0, "/opt/otp-unit")
+from otpunit import posture
+print(",".join(posture.problems(mounts=f"/proc/{sys.argv[1]}/mounts")) or "none")
+PY
+)
+check unit-will-make-live-pads \
+      "$(if [ "$POSTURE" = "none" ]; then echo yes; else echo no; fi)" \
+      "problems=$POSTURE pid=$UNIT_PID swaps=$(tail -n +2 /proc/swaps | wc -l)"
+
 # --- the journal, now that the console carries it -------------------------
 
-# ONE MARKER, PUT WHERE ONLY THE JOURNAL CAN CARRY IT. Issue #21 added
-# systemd.journald.forward_to_console=1 to the emulated kernel command line so
-# that what this machine logs reaches the serial port the harness captures --
-# until then the journal was volatile, died with the guest, and everything the
-# unit did after starting was invisible. A kernel parameter that is accepted
-# and ignored looks exactly like one that works, so the harness does not take
-# it on trust: this line goes into the journal through systemd-cat and by no
-# other route. NOT through this script's stdout, which systemd already copies
-# to the console (StandardOutput=journal+console in
-# otp-unit-imgcheck.service), and the marker text is never echoed back into a
-# check's detail either -- either of those would put it on the console with
-# the forwarding switched off, and the host's gate would pass for the wrong
-# reason.
-#
-# THIS check is the other half of that pair, and it is the positive control:
-# it says the journal ACCEPTED the marker. Without it, a console with no
-# marker is equally "forwarding is off" and "systemd-cat is missing or wrote
-# nothing", and nothing outside the guest can tell those apart.
-#
-# -p notice because journald's MaxLevelConsole decides what forwarding lets
-# through. It defaults to info, and device/install.sh's journald.conf.d sets
-# only Storage and RuntimeMaxUse, so notice clears the default with a margin
-# and would still clear a console level tightened as far as notice.
+# The kernel command line carries systemd.journald.forward_to_console=1
+# (issue #21). To prove it works, one marker goes into the journal through
+# systemd-cat and by no other route: never through this script's stdout or
+# a check's detail, which reach the console without forwarding. The host
+# looks for it on the console; this check is the positive control that the
+# journal accepted it.
+
+# -p notice clears journald's default MaxLevelConsole of info.
 JOURNAL_TAG=otp-imgcheck
 JOURNAL_MARK="OTP-JOURNAL-FORWARDED $PHASE"
 printf '%s\n' "$JOURNAL_MARK" | systemd-cat -t "$JOURNAL_TAG" -p notice 2>/dev/null || true
-# Polled: systemd-cat returns once it has written to journald's socket, and
-# the entry is indexed on journald's own schedule rather than ours.
+# Polled: journald indexes the entry on its own schedule.
 MARKED=0
 for _ in $(seq 1 15); do
     MARKED=$(journalctl -b -t "$JOURNAL_TAG" --no-pager 2>/dev/null \
@@ -242,78 +189,25 @@ check journal-marker-accepted \
 
 # --- the panel this machine does not have ---------------------------------
 
-# THE HEADLESS ROUTE, WATCHED BEING TAKEN. QEMU's raspi3b is a Pi with
-# nothing plugged into it: no OLED on the I2C bus, and -append drops the
-# dtparam=i2c_arm=on that would give the bus a device node at all. That is
-# exactly the case otpunit/diagnostics.py exists for -- "a print unit with no
-# OLED is mute" -- and until now nothing had ever watched the shipped code
-# make that decision on the artifact people flash. Issue #21.
-#
-# Read out of the unit's journal rather than off the console, for the reason
-# the userconf block below reads one: it is scoped to the unit and to this
-# boot, and it does not depend on which serial port a line landed on or on
-# the console forwarding that this same probe is busy proving.
-#
-# -b, THIS BOOT. Same argument as the userconf poll: device/install.sh's
-# Storage=volatile is the only thing that makes an unscoped read safe today,
-# and a probe must not depend for its correctness on a line in another file.
-#
-# THREE CLAUSES, because each one is a different claim and only the middle
-# one is about the thing this check is named for.
-#
-#   "no OLED ("                          otpunit/hmi.open_display reporting
-#                                        that the display probe RAISED, with
-#                                        the exception in the brackets. This
-#                                        says the unit LOOKED.
-#   "interface -- display: none,"        otpunit/hmi.Interface.describe by way
-#                                        of otpunit/__main__: the display it
-#                                        settled on, after the OLED and the
-#                                        HDMI console were both ruled out.
-#                                        This says it found NOTHING TO DRAW ON.
-#   "no usable interface; printing       otpunit/__main__ choosing the
-#    unattended"                         headless route off the back of that.
-#                                        This says what it DECIDED.
-#
-# WHY THE MIDDLE ONE HAD TO BE ADDED, and the reason is the HOLE, not the
-# emulator. Without `display: none,` this check is made of two strings that a
-# machine WITH a screen also logs: an HDMI console and no buttons produces
-# "no OLED (" -- because the SSD1306 probe still raised -- and "printing
-# unattended" -- because Interface.interactive wants a display AND buttons.
-# So a unit that found something to draw on would have passed a check whose
-# name says it detected no panel. Requiring `display: none` closes that, and
-# keys the check on the one thing the emulator genuinely cannot provide:
-# there is no /dev/i2c-* and /sys/class/drm is empty in every boot measured,
-# with the board revision and without it.
-#
-# WHAT THE EMULATED MACHINE ACTUALLY REPORTS, since an earlier version of
-# this comment got it wrong and a wrong comment is what a check gets read
-# through. harness/img-boot.sh writes /system/linux,revision into the DTB so
-# rpi-eeprom-update.service stops failing, and gpiozero reads the same
-# property -- so the pin factory loads instead of raising BadPinFactory. It
-# does NOT follow that a Button constructs. Run 32020772161, boot1
-# console-text.log:713-714:
-#
-#   no GPIO buttons ([Errno 22] Invalid argument)
-#   interface -- display: none, input: none
-#
-# Claiming GPIO5 on QEMU's gpiochip fails EINVAL, hmi.open_buttons() falls
-# through to (None, "none"), and this machine has neither half. That does not
-# weaken anything above: the hole the third clause closes belongs to a unit
-# with an HDMI console, which the emulator is not, and a check must not be
-# built out of what today's emulator happens to lack.
-#
-# The three strings are written in otpunit/ and matched here, which is how a
-# check stops checking with nothing going red -- so tests/test_img_verdict.py
-# holds each of them against the module that prints it, and holds
-# `display: none` against Interface.describe() by RUNNING it.
-#
-# POLLED, and it has to be. otp-unit.service is Type=simple, so systemd calls
-# it active the instant the process is SPAWNED -- `unit-active` above breaks
-# out of its poll before the interpreter has imported luma, gpiozero or
-# anything else, and under TCG that import is seconds of real work. Reading
-# the journal straight afterwards asks a unit that has not decided anything
-# yet, and reads "it never looked for a panel". Bounded, because a unit that
-# is never going to say it must still produce a report.
+# The headless route. QEMU's raspi3b has no OLED and no I2C device node,
+# which is the case otpunit/diagnostics.py exists for (issue #21). Read
+# from the unit's journal for this boot (-b), not the console.
+
+# Three clauses, each a different claim:
+#   "no OLED ("                     hmi.open_display's probe raised: the
+#                                   unit looked.
+#   "interface -- display: none,"   Interface.describe: nothing to draw on.
+#                                   Without it a unit with an HDMI console
+#                                   and no buttons logs the other two.
+#   "no usable interface; printing  __main__ chose the headless route.
+#    unattended"
+
+# tests/test_img_verdict.py holds each string against the module that
+# prints it. The input half is not read: on the emulator claiming GPIO5
+# fails EINVAL, on a real Pi it says "GPIO buttons" wired or not.
+
+# Polled: Type=simple reports active before the interpreter has imported
+# anything, and under TCG that import takes seconds.
 NO_OLED=no
 NO_DISPLAY=no
 HEADLESS=no
@@ -326,12 +220,7 @@ for _ in $(seq 1 30); do
     [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ] && break
     sleep 2
 done
-# What it decided it had, quoted back. Display and input are chosen
-# independently, so WHICH of them was missing is the half worth reading. On
-# the emulated machine both are `none`; on a real Pi with lgpio the input
-# half says "GPIO buttons" whether or not anything is wired to those pins,
-# which is why Interface.prove exists and why this check is not allowed to
-# read the input half.
+# What the unit decided it had, quoted back in the detail.
 UNIT_IFACE=$(printf '%s' "$UNIT_LOG" | grep -m1 -oE 'interface -- .{0,60}' || true)
 check unit-detects-no-panel \
       "$(if [ "$NO_OLED" = yes ] && [ "$NO_DISPLAY" = yes ] && [ "$HEADLESS" = yes ]; then echo yes; else echo no; fi)" \
@@ -339,10 +228,8 @@ check unit-detects-no-panel \
 
 # --- CUPS, which is the half of the design the overlay could break --------
 
-# /etc/cups has to be writable for cupsd to start at all, and on a read-only
-# root the answer is a tmpfs laid over it and repopulated from a template in
-# /opt/otp-unit/cups-etc. If that is wrong the unit cannot print, and nothing
-# short of a booted machine with the overlay engaged would say so.
+# /etc/cups must be writable for cupsd to start; on a read-only root that
+# is a tmpfs repopulated from /opt/otp-unit/cups-etc.
 ETC_CUPS_FS=$(findmnt -no FSTYPE /etc/cups 2>/dev/null | head -1)
 check etc-cups-is-its-own-tmpfs \
       "$(if [ "$ETC_CUPS_FS" = "tmpfs" ]; then echo yes; else echo no; fi)" \
@@ -351,9 +238,8 @@ check etc-cups-is-its-own-tmpfs \
 check cups-running "$(yesno systemctl is-active cups.service)" \
       "is-active=$(systemctl is-active cups.service 2>&1 || true)"
 
-# install.sh gates on this at provisioning time, against the configuration as
-# it stood in a chroot. This asks the daemon's own parser on the machine that
-# has to run it, after the tmpfs was laid down and repopulated.
+# install.sh gates on this in a chroot; this asks the daemon's parser on
+# the booted machine, after the tmpfs was repopulated.
 check cupsd-config-valid \
       "$(yesno cupsd -t -c /etc/cups/cupsd.conf -s /etc/cups/cups-files.conf)" \
       ""
@@ -361,8 +247,7 @@ check cupsd-config-valid \
 # --- settings, which must outlive the power-cycle -------------------------
 
 # The boot partition has to be a separate mount, or "the setting survived"
-# would be a statement about the overlay's tmpfs and would be false on the
-# next power-cycle.
+# is a statement about the overlay's tmpfs.
 BOOT_SRC=$(findmnt -no SOURCE --target "$BOOTDIR" 2>/dev/null || echo "?")
 BOOT_FS=$(findmnt -no FSTYPE --target "$BOOTDIR" 2>/dev/null || echo "?")
 check boot-partition-separate \
@@ -371,90 +256,47 @@ check boot-partition-separate \
 
 # --- the identity, which is the one thing allowed to survive --------------
 
-# WHAT THIS IS ABOUT. /etc is inside the overlay, so /etc/machine-id reverted
-# to pi-gen's `uninitialized` on every power cycle -- and systemd reads that
-# word as "first boot": preset-all again, ssh.socket enabled again,
-# regenerate_ssh_host_keys.service deleting and remaking the host keys again.
-# Run 72's console carries all of it, in both boots. device/install.sh answers
-# it with a machine-id restored by the initramfs and an
-# otp-unit-identity.service that records it on the boot partition; these are
-# the checks that say whether any of that happened on the machine rather than
-# in a comment.
+# /etc is inside the overlay, so without persistence /etc/machine-id
+# reverts to `uninitialized` on every power cycle and systemd treats each
+# boot as a first boot. device/install.sh restores it from the initramfs
+# and otp-unit-identity.service records it on the boot partition.
 IDENTITY_STORE="$BOOTDIR/otp-identity"
 LIVE_MACHINE_ID=$(tr -d '\n\r' < "$ETC_MACHINE_ID" 2>/dev/null)
 KEPT_MACHINE_ID=$(tr -d '\n\r' < "$IDENTITY_STORE/machine-id" 2>/dev/null)
-# OUTSIDE THE OVERLAY, ASKED OF THE DIRECTORY THAT IS ACTUALLY WRITTEN.
-# Without this clause the check is satisfied by a store that is a plain
-# directory on the overlay's tmpfs -- /boot/firmware failing to mount is all
-# it takes. The copy and the original then agree with each other perfectly,
-# on every boot, while nothing survives any of them, and every field below
-# reads green. `boot-partition-separate` above says $BOOTDIR is its own
-# mount; this says the store is not on the same filesystem as /.
-#
-# findmnt --target, which answers for the CONTAINING mount, so a store that
-# is a directory inside the root reports the root's source rather than
-# nothing. That is the same call and the same reasoning as $BOOT_SRC above.
+# findmnt --target answers for the containing mount, so a store that is a
+# plain directory on the overlay (an unmounted /boot/firmware) reports the
+# root's source and fails the check below.
 STORE_SRC=$(findmnt -no SOURCE --target "$IDENTITY_STORE" 2>/dev/null || echo "?")
 MACHINE_ID_KEPT=no
 if [ -n "$LIVE_MACHINE_ID" ] && [ "$LIVE_MACHINE_ID" = "$KEPT_MACHINE_ID" ]; then
     MACHINE_ID_KEPT=yes
 fi
-# $ROOT_SOURCE IS REQUIRED TO BE SOMETHING, and that is not paranoia about a
-# value set two hundred lines up: if findmnt could not describe `/`, it is
-# empty, and "the store is not on the root's filesystem" becomes true of
-# every store there is. `root-is-overlay` would be red in that case too, but
-# a check that is only correct because a different check failed is not a
-# check -- it is a coincidence with a name.
-#
-# The detail carries the first eight characters of each id and no more. A
-# machine-id is this machine's identifier and this console is uploaded as a
-# CI artifact; eight is enough to compare two boots by eye and not enough to
-# be the value.
-#
-# WHAT THIS CHECK CANNOT SEE, said here rather than left to be discovered:
-# it compares the live id with the STORE, and otp-unit-identity.service has
-# already run by the time it does. On a boot where the store was empty, that
-# unit wrote this boot's id into it and exited 0 -- so the two agree because
-# one was copied from the other a second ago, not because anything survived
-# a power cycle. Measured by running the shipped script against an empty
-# store: rc=0, store silently populated, no complaint. The pair below is
-# what tells "restored" from "recorded fresh this boot", and it is the same
-# two-absence hole the host-key checks used to close on their own side.
+# $ROOT_SOURCE must be non-empty, or "not on the root's filesystem" is true
+# of every store. The detail carries eight characters of each id: this
+# console is uploaded as a CI artifact.
+
+# This compares the live id with the store, which
+# otp-unit-identity.service may have filled this very boot; the
+# probe-owned record below is what tells "restored" from "recorded fresh".
 check machine-id-persisted-outside-the-overlay \
       "$(if [ "$MACHINE_ID_KEPT" = yes ] && [ "$STORE_SRC" != "?" ] \
             && [ -n "$ROOT_SOURCE" ] \
             && [ "$STORE_SRC" != "$ROOT_SOURCE" ]; then echo yes; else echo no; fi)" \
       "$ETC_MACHINE_ID=${LIVE_MACHINE_ID:0:8}... stored=${KEPT_MACHINE_ID:0:8}... match=$MACHINE_ID_KEPT store=$IDENTITY_STORE src=$STORE_SRC root-src=${ROOT_SOURCE:-?}"
 
-# THE SAME CARD, POWERED OFF AND ON, STILL THE SAME MACHINE.
-#
-# A SECOND FILE, written by this probe and not by the thing under test. The
-# store above is otp-unit-identity.service's own output, so a boot that
-# truncated or deleted it is a boot that fills it in again from the id
-# systemd just generated -- and every boot is a first boot again while
-# `machine-id-persisted-outside-the-overlay` goes on reading PASS. This
-# record is written once, in boot1, and compared in boot2, so the value
-# boot2 is held against is one that predates boot2's own identity entirely.
-#
-# The detail is truncated to eight characters for the reason the check above
-# gives; the record on the card carries the full id, on the same partition
-# the store already keeps it on, so it is no new exposure.
+# A second file, written by this probe once in boot1 and compared in boot2,
+# so the value boot2 is held against predates boot2's own identity.
 MACHINE_ID_RECORD="$BOOTDIR/otp-imgcheck-machine-id"
 
 # Eight characters or the word `nothing`, so an absent value cannot read as
-# the "..." of a present one.
+# a present one.
 short_id() {
     if [ -n "$1" ]; then printf '%s...' "${1:0:8}"; else printf 'nothing'; fi
 }
 
 if [ "$PHASE" = "boot1" ]; then
     # THE POSITIVE CONTROL, and it is the reason boot2's check can mean
-    # anything. "the two ids are identical" is satisfied perfectly by a
-    # machine with no readable /etc/machine-id in either boot and by a record
-    # file that was never written -- two ways for the property to read green
-    # while nothing is being kept. So boot1 states, out of the same variable
-    # and the same file boot2 will read: there WAS an id, and it came back
-    # off the boot partition byte for byte.
+    # anything: there was an id, and it reads back off the boot partition.
     printf '%s\n' "$LIVE_MACHINE_ID" > "$MACHINE_ID_RECORD" 2>/dev/null || true
     MACHINE_ID_READBACK=$(tr -d '\n\r' < "$MACHINE_ID_RECORD" 2>/dev/null)
     check machine-id-recorded-for-the-next-boot \
@@ -465,15 +307,8 @@ if [ "$PHASE" = "boot1" ]; then
 fi
 
 if [ "$PHASE" = "boot2" ]; then
-    # THE PROPERTY: the second boot is the same machine as the first. Before
-    # the machine-id was persisted this was false by construction -- /etc is
-    # inside the overlay, pi-gen ships /etc/machine-id holding
-    # `uninitialized`, and systemd generated a new one on every power cycle.
-    #
-    # BOTH SIDES ARE REQUIRED TO BE NON-EMPTY, which is the clause that makes
-    # this a statement rather than a tautology: two absences are equal, and
-    # `machine-id-recorded-for-the-next-boot` in boot1 is what rules the
-    # recorded side of that out with the same fixture and the same variable.
+    # The second boot is the same machine as the first. Both sides must be
+    # non-empty: two absences are equal.
     MACHINE_ID_BOOT1=$(tr -d '\n\r' < "$MACHINE_ID_RECORD" 2>/dev/null)
     check machine-id-identical-across-the-power-cycle \
           "$(if [ -n "$LIVE_MACHINE_ID" ] && [ -n "$MACHINE_ID_BOOT1" ] \
@@ -483,10 +318,8 @@ if [ "$PHASE" = "boot2" ]; then
 fi
 
 if [ "$PHASE" = "boot2" ]; then
-    # BEFORE the write below, and read back through config.load() rather
-    # than grepped for: a setting that persisted as bytes but no longer
-    # parses is not a setting that persisted, because load() falls back to
-    # the default for any field it cannot use, silently and by design.
+    # Before the write below, and through config.load(), not grep: load()
+    # silently defaults any field it cannot parse.
     KEPT=$(python3 - <<'PY' 2>&1 || true
 import sys
 sys.path.insert(0, "/opt/otp-unit")
@@ -499,25 +332,17 @@ PY
           "$(if [ "$KEPT" = "$MARK_PAGES" ]; then echo yes; else echo no; fi)" \
           "pages=$KEPT want=$MARK_PAGES from ${BOOTDIR}/otp-unit.conf"
 
-    # LAST, and that ordering is the point. This is the only check in the
-    # run whose evidence is a file NOT being there, and an absence is
-    # equally satisfied by a boot1 that never ran, by a sentinel written
-    # somewhere else, and by a rig that cannot write to / at all. The two
-    # checks above it rule all three out with the same fixture: the setting
-    # boot1 persisted is readable, and a sentinel written this boot is
-    # readable back from the path this check looks at. The value read here
-    # was taken before anything in this script wrote anything.
+    # Last: the only check whose evidence is an absence. The two above rule
+    # out a boot1 that never ran and an unwritable or wrong path; the value
+    # was read before this script wrote anything.
     check root-writes-discarded-by-the-power-cycle \
           "$(if [ "$SENTINEL_SURVIVED" = "no" ]; then echo yes; else echo no; fi)" \
           "$SENTINEL before this boot: ${SENTINEL_WAS:-absent}"
 fi
 
-# Through config.save() at its real CONFIG_PATH, in both phases. That code is
-# the only writer on the device that has to work with the root read-only, and
-# it is the thing under test rather than a shell redirect to somewhere
-# convenient. Writing in boot2 as well keeps the check honest about which
-# boot's write boot2 read: a save that only ever worked once would still pass
-# a two-boot run that wrote only in boot1.
+# Through config.save() at its real CONFIG_PATH, in both phases: it is the
+# only writer on the device that must work with the root read-only.
+# Writing in boot2 too catches a save that only works once.
 SAVED=$(MARK="$MARK_PAGES" python3 - <<'PY' 2>&1 || true
 import os, sys
 sys.path.insert(0, "/opt/otp-unit")
@@ -534,60 +359,27 @@ check setting-saved-to-the-boot-partition \
 
 # --- the provisioning agent this image no longer carries ------------------
 
-# TWO CHECKS, because neither claim can stand in for the other.
-#
-# Until issue #34 this image shipped cloud-init. pi-gen's ENABLE_CLOUD_INIT=0
-# -- which image/build.sh sets -- guards only stage2/04-cloud-init/01-run.sh,
-# the half that preseeds a NoCloud datasource; the sibling 00-packages file
-# that installs the packages is unguarded, and pi-gen installs every
-# *-packages file it finds. So `cloud-init` and `rpi-cloud-init-mods` went
-# onto every image this project has ever built, with their units enabled and
-# their generator in place, while the build config said cloud-init was off.
-# rpi-cloud-init-mods then ships a datasource pointed at
-# `seedfrom: file:///boot/firmware` -- the one partition an operator is told
-# to write files on, on a device whose threat model is somebody holding the
-# card. image/stage-otpunit/01-otpunit/00-run.sh purges both packages now;
-# device/install.sh goes on writing cloud-init's own kill switch, because a
-# reintroduced dependency must not be able to re-arm it silently and because
-# a hand-provisioned Pi never met the purge at all.
-#
-# THE TRAP THESE ARE WRITTEN AROUND. After a purge, nearly every piece of
-# cloud-init evidence is absent for a reason that has nothing to do with the
-# kill switch: no units, no generator, no datasource, no minute spent looking
-# for one. One check over all of it would pass for the wrong reason, and
-# would go on passing if install.sh stopped writing
-# /etc/cloud/cloud-init.disabled tomorrow. So the absences are one check and
-# the marker file is another, and either can go red with the other green.
-#
-# WHAT IS STILL NOT MEASURED, said plainly, because a comment that glossed
-# over exactly this is what issue #34 had to correct. Neither check runs
-# cloud-init's own code -- there is none left on the machine to run. The kill
-# switch is read by /usr/lib/cloud-init/ds-identify, not by the generator
-# directly: `is_disabled()` returns 0 on `[ -f /etc/cloud/cloud-init.disabled ]`
-# before any datasource search, `_main` returns 2 at that, and the generator's
-# rc=2 branch is what removes the multi-user.target.wants link for
-# cloud-init.target. Quoted from cloud-init 25.2-1~bpo13+1+rpt20, the build
-# the Raspberry Pi archive would have put on this image. That the RUNTIME
-# honours the file is upstream's property and nothing in this repository
-# tests it. What these check is that the packages are gone and that the file
-# is on the booted image in the shape ds-identify requires: a regular file,
-# at that path.
+# Two checks. image/stage-otpunit/01-otpunit/00-run.sh purges cloud-init
+# and rpi-cloud-init-mods, whose datasource seeds from /boot/firmware
+# (issue #34); device/install.sh also writes cloud-init's kill switch.
+# After a purge nearly all cloud-init evidence is absent whether or not
+# the kill switch exists, so the absences are one check and the marker
+# file another.
 
-# EVERY ABSENCE WITH A POSITIVE CONTROL BESIDE IT. A dpkg-query that answers
-# nothing, a systemctl that answers nothing and an empty generator directory
-# are each indistinguishable from a probe whose tools are broken -- and this
-# probe runs on a machine whose /usr the same purge has just edited. So all
-# three mechanisms are asked one question they must answer in the affirmative
-# in the same breath.
+# Neither runs cloud-init's code. That ds-identify honours the file is
+# upstream's property; these check the packages are gone and the file has
+# the shape ds-identify requires.
+
+# Every absence has a positive control: each mechanism (dpkg-query,
+# systemctl, the generator directory) must also answer one question in
+# the affirmative.
 CI_PACKAGES="cloud-init rpi-cloud-init-mods"
-# The three the issue names. cloud-init.target is the one the generator
-# links; the other two are what run out of it, and userconfig.service's
-# `After=cloud-config.service` is the ordering that held run 31968966879's
-# credential wizard for the life of both boots.
+# cloud-init.target is the one the generator links; the other two run out
+# of it.
 CI_UNITS="cloud-init.target cloud-init-local.service cloud-config.service"
 CI_GENERATOR_DIR=/usr/lib/systemd/system-generators
-# The one file rpi-cloud-init-mods ships that is not cloud-init's own:
-# netplan's renderer default. Reported, not gated -- see below.
+# The one file rpi-cloud-init-mods ships that is not cloud-init's own.
+# Reported, not gated.
 CI_NETPLAN_RENDERER=/usr/lib/netplan/00-network-manager-all.yaml
 CI_DISABLED=/etc/cloud/cloud-init.disabled
 
@@ -595,18 +387,14 @@ CI_INSTALLED=""
 for pkg in $CI_PACKAGES; do
     # shellcheck disable=SC2016  # a dpkg-query field name, not a shell expansion
     CI_ST=$(dpkg-query -W -f '${db:Status-Status}' "$pkg" 2>/dev/null || true)
-    # `config-files` is a REMOVE and not a purge, and the difference matters
-    # on this device: the units and the generator are gone, but
-    # /etc/cloud/cloud.cfg.d/99_raspberry-pi.cfg is not, so anything that
-    # brought the package back would come back already pointed at the boot
-    # partition. Only gone passes.
+    # `config-files` is a remove, not a purge: the datasource config
+    # pointing at the boot partition would still be there. Only gone passes.
     case "$CI_ST" in
         ""|not-installed) ;;
         *) CI_INSTALLED="$CI_INSTALLED $pkg=$CI_ST" ;;
     esac
 done
-# The control, through the same query: a package this appliance cannot boot
-# without, which must come back `installed`.
+# The control: a package that must come back `installed`.
 CI_CONTROL_PKG=systemd
 # shellcheck disable=SC2016  # a dpkg-query field name, not a shell expansion
 CI_CONTROL_STATUS=$(dpkg-query -W -f '${db:Status-Status}' "$CI_CONTROL_PKG" 2>/dev/null || true)
@@ -616,59 +404,22 @@ for unit in $CI_UNITS; do
     CI_LS=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
     [ "$CI_LS" = not-found ] || CI_LOADED="$CI_LOADED $unit=${CI_LS:-?}"
 done
-# The control for the same reading, and it is the unit this whole tier is
-# about: a systemctl that had stopped answering would report every cloud-init
-# unit not-found and this one too.
+# The control: a systemctl that stopped answering would report this unit
+# not-found too.
 CI_CONTROL_UNIT=otp-unit.service
 CI_CONTROL_LOAD=$(systemctl show -p LoadState --value "$CI_CONTROL_UNIT" 2>/dev/null || true)
 
 CI_GENERATOR="$CI_GENERATOR_DIR/cloud-init-generator"
-# systemd's own generators live in that directory, so a listing that comes
-# back empty is a wrong path or an unreadable /usr rather than a purge.
+# systemd's own generators live here, so an empty listing is a wrong path
+# or an unreadable /usr, not a purge.
 CI_GENERATOR_SIBLINGS=$(find "$CI_GENERATOR_DIR" -mindepth 1 -maxdepth 1 \
                         2>/dev/null | wc -l)
 
-# NETPLAN AND NetworkManager: THE ARGUMENT IS IN THIS COMMENT, AND THE
-# CONSOLE LINE IS ONLY A REPORT. rpi-cloud-init-mods ships one file that is
-# not cloud-init's own -- /usr/lib/netplan/00-network-manager-all.yaml,
-# `renderer: NetworkManager` -- and the purge takes it. This check was first
-# written as though the detail line below answered whether that mattered. It
-# does not and cannot: on a correctly purged unit that line reads
-# `netplan-renderer=no NetworkManager=active` on every boot, two constants,
-# which cannot tell "removing the renderer default broke nothing" apart from
-# "removing it broke the link". The question is settled off the archives and
-# off netplan's own source instead, read on 2026-08-18:
-#
-#   - NETPLAN STAYS INSTALLED, so the purge cannot take it. The Raspberry Pi
-#     archive's own network-manager -- 1.52.1-1+rpt4, not Debian's plain
-#     1.52.1-1, which does not -- carries `Depends: netplan.io (>= 0.106~)`.
-#     rpi-cloud-init-mods depends on netplan.io too, and this is why that
-#     does not matter.
-#   - AFTER THE PURGE NETPLAN HAS NO CONFIGURATION AT ALL. Searching
-#     Contents-arm64 for both trixie archives, that yaml is the only netplan
-#     config file any package ships; netplan-generator's own entry under
-#     /usr/lib/netplan is a file called PLACEHOLDER. With no netdefs parsed,
-#     netplan 1.1.2 writes no backend configuration and never reaches
-#     enable_networkd() (src/generate.c:314-317) -- so nothing here can
-#     re-arm the networkd wait that ended both boots of run 31968966879.
-#   - AND THE FILE'S ONE REAL EFFECT DOES NOT EXIST ON THIS DISTRIBUTION.
-#     What `renderer: NetworkManager` buys is src/generate.c:305-308, which
-#     shadows /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf
-#     with an empty file in /run; netplan's own comment beside it says that
-#     is the point. No package in either archive ships that conf file -- the
-#     three that exist are wpasupplicant's no-mac-addr-change.conf,
-#     network-manager-config-connectivity-debian's 20-connectivity-debian.conf
-#     and raspberrypi-net-mods' rpi-no-scan-rand-mac-address.conf. It is an
-#     Ubuntu convention. The override was a no-op on Raspberry Pi OS before
-#     the purge and is a no-op after it.
-#   - install.sh masks systemd-networkd-wait-online.service regardless of
-#     any of this, and network-wait-cannot-hold-the-boot-open below reads
-#     that back off the same boot.
-#
-# The detail line stays because the state of both is the first thing a
-# reader wants off the machine that booted without them, and because a
-# report costs nothing. It is a report. The evidence is the four bullets
-# above, and nothing should cite the line in their place.
+# The netplan-renderer and NetworkManager fields in the detail are a
+# report, not evidence: on a purged unit they are constants. Removing the
+# renderer default is harmless because netplan then has no configuration
+# and writes no backend config, and install.sh masks
+# systemd-networkd-wait-online.service regardless (checked below).
 check cloud-init-is-not-installed \
       "$(if [ -z "$CI_INSTALLED" ] && [ "$CI_CONTROL_STATUS" = installed ] \
             && [ -z "$CI_LOADED" ] && [ "$CI_CONTROL_LOAD" = loaded ] \
@@ -677,27 +428,10 @@ check cloud-init-is-not-installed \
          then echo yes; else echo no; fi)" \
       "dpkg:${CI_INSTALLED:- none} (control $CI_CONTROL_PKG=${CI_CONTROL_STATUS:-?}) | units:${CI_LOADED:- none} (control $CI_CONTROL_UNIT=${CI_CONTROL_LOAD:-?}) | generator=$(yesno test -e "$CI_GENERATOR") siblings=${CI_GENERATOR_SIBLINGS:-?} | netplan-renderer=$(yesno test -e "$CI_NETPLAN_RENDERER") NetworkManager=$(systemctl is-active NetworkManager.service 2>&1 || true)"
 
-# THE BELT, READ BACK OFF THE MACHINE RATHER THAN OFF THE LINE THAT WRITES
-# IT. Until now the kill switch's only coverage was
-# tests/test_overlay_root.py running install.sh's block into a fake /etc: it
-# said the script writes the file, never that the file reached an image. Two
-# ways it might not have. dpkg removes a package's own conffiles on purge and
-# then removes the directories it owned once they are empty, so a purge
-# ordered after install.sh puts the marker's own directory in the way of that
-# sweep -- it survives today only because dpkg will not delete a directory
-# holding a file it does not own. And install.sh is one `install -d` away
-# from writing it somewhere the image build discards.
-#
-# `-f`, NOT `-e`, and that is the shape ds-identify requires: `is_disabled()`
-# is `[ -f /etc/cloud/cloud-init.disabled ]`, so a directory of that name or
-# a symlink pointing at nothing is not a kill switch at all while satisfying
-# every looser test. Both are reported so the console can tell those apart
-# from an absence.
-#
-# IN BOTH PHASES, and boot2 is the one that says the file SHIPPED. /etc is
-# inside the read-only overlay, whose discard boot2 establishes with the
-# sentinel before anything else runs, so a marker still there after the power
-# cycle is one the image was built with rather than one this boot made.
+# The kill switch, read back off the machine. `-f`, not `-e`: ds-identify
+# tests `[ -f /etc/cloud/cloud-init.disabled ]`, so a directory or dangling
+# symlink of that name is no kill switch. In boot2 the overlay has
+# discarded boot1's writes, so a marker still there shipped in the image.
 CI_DISABLED_IS_FILE=$(yesno test -f "$CI_DISABLED")
 check cloud-init-kill-switch-survives-the-purge \
       "$CI_DISABLED_IS_FILE" \
@@ -706,59 +440,22 @@ check cloud-init-kill-switch-survives-the-purge \
 if [ "$PHASE" = "boot1" ]; then
     # --- the diagnostic sheet, and how far the print path really gets -----
 
-    # WHAT THIS IS NOT, because issue #21 expected something else and the
-    # difference is the finding. It said "the headless diagnostic path should
-    # fire under QEMU by design". It does not fire, and cannot:
-    # otpunit/__main__ falls through to diagnostics.run_headless(), which
-    # loops on cups.devices(); Cups.devices() is built from `lpinfo -v` and
-    # keeps only usb://, a loopback IPP endpoint, or a dnssd:// entry that
-    # identifies itself as one of the attached USB devices. An emulated Pi has
-    # no printer of any kind, so that list is empty on every poll and the unit
-    # waits in silence -- no sheet is submitted, and none can be. A unit with
-    # neither a panel nor a printer says nothing at all, which is worth
-    # knowing about a design whose answer to a missing panel is "the printer
-    # becomes the console". The unit's own half of that decision is
-    # unit-detects-no-panel above, and it is the half that IS observable.
-    #
-    # WHAT THIS IS. The rest of that path, driven by hand, on the real image,
-    # through the shipped code and the shipped cupsd, with the one thing the
-    # emulator cannot provide -- a queue -- supplied here. It answers two
-    # questions a booted image is the only place to ask: can this image RENDER
-    # the sheet (reportlab installed and working, every probe in
-    # diagnostics.collect() returning on a machine rather than in a unit
-    # test), and does the shipped cupsd ACCEPT it.
-    #
-    # THE QUEUE IS THE PROBE'S, NOT THE UNIT'S. A separate name, so nothing
-    # here can be mistaken for something otp-unit did, and so a leftover from
-    # this experiment cannot be what the unit later prints into. It points at
-    # a usb:// URI with nothing behind it, which is the "queue with no
-    # physical printer" the issue asks for: the job is ACCEPTED, which is the
-    # claim, and what the backend does with it afterwards is not. /etc/cups is
-    # a tmpfs (otp-unit-etc-cups.service) so none of this can reach the card,
-    # and the queue is removed below regardless.
-    #
-    # MEASURED, not assumed: `lpadmin -p NAME -E -v usb://...` with no -m at
-    # all creates a queue that `lp` will accept a job into. Checked against a
-    # real cupsd 2.4.7 configured from device/install.sh's own directives (the
-    # rig tests/cupsrig.py builds), which answered `request id is
-    # otpimgcheck-1`. Trixie ships the same CUPS major; this boot is the first
-    # time it is asked of the image.
+    # The unit's own headless path cannot fire here: run_headless() waits for
+    # a printer and the emulator has none. This drives the rest by hand
+    # through the shipped code and cupsd: can the image render the sheet, and
+    # does cupsd accept it.
+
+    # The queue is the probe's own name, pointing at a usb:// URI with nothing
+    # behind it: the job being accepted is the claim. /etc/cups is a tmpfs, so
+    # none of this reaches the card. `lpadmin -p NAME -E -v usb://...` with no
+    # -m creates a queue `lp` accepts a job into.
     SHEET_QUEUE=otpimgcheck
     SHEET_URI="usb://OTP/imgcheck"
     SHEET_LPADMIN=$(/usr/sbin/lpadmin -p "$SHEET_QUEUE" -E -v "$SHEET_URI" 2>&1)
     SHEET_LPADMIN_RC=$?
-    # BOUNDED, and bounded here rather than trusted to be quick. This is the
-    # only step in the probe that starts a Python interpreter with reportlab
-    # in it, under TCG, and otp-unit-imgcheck.service's TimeoutStartSec is
-    # what a slow one would eat -- a probe killed mid-run reports nothing at
-    # all, and the phase fails for having no OTP-GUEST-DONE line rather than
-    # for anything about the image. 90s, and the exit code is REPORTED rather
-    # than gated -- the two checks below read what the program SAID, and a
-    # bound that fired leaves that output incomplete and turns them red on
-    # its own. The number is in the detail so that a red reads as "it never
-    # finished" instead of "it failed", which are different diagnoses:
-    # anything at or above 124 is timeout(1) saying it could not get a clean
-    # status out of the child, not the program returning.
+    # Bounded: a probe killed by otp-unit-imgcheck.service's TimeoutStartSec
+    # reports nothing at all. The exit code is reported, not gated; at or
+    # above 124 it is timeout(1) saying the program never finished.
     SHEET_SAID=$(SHEET_QUEUE="$SHEET_QUEUE" timeout -k 5 90 python3 - <<'PY' 2>&1
 import os, sys
 sys.path.insert(0, "/opt/otp-unit")
@@ -777,8 +474,8 @@ except Exception as exc:                         # noqa: BLE001
     print("RENDER failed %s: %s" % (type(exc).__name__, exc))
     raise SystemExit(0)
 
-# A SEPARATE try, so "the image cannot draw the sheet" and "cupsd would not
-# take it" are never reported as the same failure.
+# A separate try, so "cannot draw the sheet" and "cupsd would not take it"
+# are reported apart.
 try:
     from otpunit.printer import Cups
     print("SUBMIT ok job=%s" % (Cups().submit(bytes(sheet), name=queue,
@@ -789,43 +486,33 @@ PY
 )
     SHEET_RC=$?
     SHEET_SAID=${SHEET_SAID//[$'\n\r']/ }
-    # RENDERED means a PDF, not merely bytes. reportlab writing a truncated
-    # or empty file would satisfy "no exception was raised", and %PDF is the
-    # cheapest thing that separates a page from an artefact.
+    # Rendered means a PDF, not merely no exception.
     SHEET_RENDERED=no
     case "$SHEET_SAID" in *"RENDER ok bytes="*"magic=%PDF"*) SHEET_RENDERED=yes ;; esac
     check diagnostic-sheet-renders "$SHEET_RENDERED" \
           "rc=$SHEET_RC (>=124 = no clean status at the 90s bound) $SHEET_SAID"
-    # ENQUEUED means cupsd gave it an id. lp exiting 0 is not the same claim:
-    # Cups.submit() pulls "request id is <id>" out of lp's stdout and returns
-    # "" when that is absent, so an lp that succeeded and said nothing useful
-    # reads as no job here, which is the honest answer.
+    # Enqueued means cupsd gave it an id: Cups.submit() returns "" when lp's
+    # "request id is <id>" is absent.
     SHEET_ENQUEUED=no
     case "$SHEET_SAID" in
         *"SUBMIT ok job=$SHEET_QUEUE-"*) SHEET_ENQUEUED=yes ;;
     esac
     check diagnostic-sheet-reaches-cups "$SHEET_ENQUEUED" \
           "lpadmin rc=$SHEET_LPADMIN_RC ${SHEET_LPADMIN:-(silent)} | queue=$(/usr/bin/lpstat -v "$SHEET_QUEUE" 2>&1 | head -1) | $SHEET_SAID"
-    # Removed whatever happened. The overlay would discard it at the next
-    # power-cycle anyway, but boot2's checks read a machine that is supposed
-    # to look like a unit rather than like a test rig.
+    # Removed whatever happened, so boot2 reads a machine that looks like a
+    # unit.
     /usr/sbin/lpadmin -x "$SHEET_QUEUE" 2>/dev/null || true
 fi
 
 # --- the seeded userconf.txt path -----------------------------------------
 
-# WHY THIS IS HERE. Issue #18 replaced a mask on userconfig.service with a
-# ConditionPathExists drop-in so that the documented headless credential file
-# keeps working, and until issue #20 only the branch where nobody ever wrote
-# one had been exercised: no seed, no wizard, boot green. The harness plants a
-# real seed in the boot partition before boot1; what follows is the machine's
-# side of it.
-#
-# The account the seed names and the salt its hash carries. The hash itself
-# stays in harness/img-boot.sh, which is not installed on a unit; only this
-# marker travels here, and a salt is a comparison string rather than a
-# credential. tests/test_img_verdict.py holds the two files against each other
-# and against image/build.sh's FIRST_USER_NAME.
+# The harness plants a real userconf.txt seed in the boot partition before
+# boot1 (issues #18, #20); this is the machine's side of it.
+
+# The account the seed names and the salt its hash carries. The hash stays
+# in harness/img-boot.sh; a salt is a comparison string, not a credential.
+# tests/test_img_verdict.py holds the two files against each other and
+# against image/build.sh's FIRST_USER_NAME.
 USERCONF_USER=otp
 # shellcheck disable=SC2016  # the $ signs are crypt(3) field separators
 USERCONF_SALT='$6$otpimgcheck$'
@@ -833,32 +520,18 @@ USERCONF_SERVICE=/usr/lib/userconf-pi/userconf-service
 
 # --- and where that credential is kept, now that it is kept ---------------
 
-# WHAT CHANGED. The seed used to last exactly one boot: `chpasswd -e` writes
-# to /etc/shadow, /etc is inside the overlay, and userconf-service deletes the
-# seed from the FAT partition as the last step of applying it. The owner's
-# decision is to persist it, so device/persist-identity.sh records the applied
-# hash here from the wizard's own ExecStartPost and restores it at sysinit.
-# These are the checks that say whether any of that happened on the machine.
+# `chpasswd -e` writes /etc/shadow, inside the overlay, and
+# userconf-service deletes the seed. device/persist-identity.sh records
+# the applied hash here and restores it at sysinit.
 CRED_STORE="$IDENTITY_STORE/credential"
 
-# A PROBE-OWNED RECORD, for the reason $MACHINE_ID_RECORD is one: the store is
-# the thing under test, and boot2 comparing the live hash against a store that
-# boot2 itself could have refilled is a comparison with no power cycle in it.
-# This file is written once, in boot1, before the power goes off.
+# A probe-owned record, as $MACHINE_ID_RECORD is: written once in boot1, so
+# boot2 is not comparing against a store it could have refilled itself.
 CRED_RECORD="$BOOTDIR/otp-imgcheck-credential"
 
-# THE HASH IS NEVER PRINTED AND NEVER COPIED. This console is uploaded as a CI
-# artifact and a password hash is offline-crackable at leisure, so what
-# travels between the boots is a sha256 of it: equal exactly when the hashes
-# are equal, and no use to anyone who reads it. The digest is not a new
-# exposure either -- the hash it covers is already on this same partition, in
-# full, in the store being audited.
-#
-# 64 CHARACTERS OR IT DID NOT HAPPEN. A missing sha256sum, an unreadable
-# /etc/shadow or an empty argument all produce the empty string, and two empty
-# strings compare equal -- which is exactly how "the credential survived"
-# would come to mean "there was never a credential". Every check below
-# requires the length as well as the match.
+# The hash is never printed or copied: this console is a CI artifact, so
+# only a sha256 of it travels. Every check requires 64 characters as well
+# as a match, because two empty digests compare equal.
 cred_digest() {
     [ -n "${1:-}" ] || return 0
     printf '%s' "$1" | sha256sum 2>/dev/null | cut -d' ' -f1
@@ -868,59 +541,17 @@ cred_short() {
     if [ "${#1}" = 64 ]; then printf '%s...' "${1:0:12}"; else printf 'nothing'; fi
 }
 
-# POLLED UNTIL SYSTEMD HAS DEALT WITH THE UNIT, not for a fixed few seconds.
-# Nothing orders this probe after userconfig.service -- the two run in the
-# same stretch of a boot -- and "systemd has not looked at it yet" and
-# "systemd looked and skipped it" are the same two empty fields from here.
-# Reading the first as the second passes on exactly the boot run 12 died on.
-#
-# SETTLED means both halves: a condition timestamp says systemd evaluated the
-# unit, and an empty job queue says it is not still waiting to. A JOB is what
-# held run 12's boot open (a whiptail nobody could see, with
-# multi-user.target waiting on the job) and it is what run 31968966879 found
-# again for a different reason -- a unit whose ExecStart has not been reached
-# reads `inactive` in every other field systemd offers.
-#
-# 120 seconds, against a 30-second wait that was not enough: in run
-# 31968966879 the wait expired, the probe reported `condition=no jobs=1`, and
-# the job was queued behind a network wait that was never going to return.
-# That diagnosis came out of the fields printed below, so the timeout still
-# reports rather than aborting -- it is longer now, not softer.
-#
-# THE JOURNAL IS ONE OF THE TWO SIGNALS, and it has to be, because on a
-# SEEDED boot the machine destroys the other one at exactly the moment of
-# interest. The apply ends in cancel-rename, which runs `systemctl disable
-# userconfig` and a daemon-reload; the oneshot is by then inactive and
-# nothing references it, so systemd garbage-collects the unit and every
-# property below comes back a pristine default. Run 31972140190 measured
-# that: `condition=no result=success is-active=inactive jobs=0` for a unit
-# whose own console says `Finished userconfig.service - User configuration
-# dialog.`, with the seeded hash in the shadow file and the seed gone from
-# the card --
-# and the poll spent its whole 120 seconds waiting for a timestamp that had
-# been collected along with the unit. Log entries outlive unit objects.
-#
-# TWO NARROWINGS ON THE READ, both of them one config line away from
-# mattering:
-#
-#   -b, THIS BOOT. `journalctl -u` with no boot filter answers out of every
-#   boot the journal still holds. That is harmless only because
-#   device/install.sh sets Storage=volatile in journald.conf.d -- delete that
-#   one line and a PREVIOUS boot's `Finished userconfig.service` satisfies a
-#   boot on which the unit never ran at all, which is precisely the reading
-#   this whole block exists to make impossible. A probe must not depend for
-#   its correctness on a setting three hundred lines away in another file.
-#
-#   systemd[1], NOT just the phrase. `journalctl -u` returns the unit's own
-#   STDOUT as well as PID 1's status lines about it -- that is what
-#   StandardOutput=journal means -- so a userconf-service that merely PRINTED
-#   "Finished userconfig.service" passed this check. Demonstrated with a
-#   synthetic journal. `Finished` is systemd's own success line and only
-#   systemd may say it, so the match carries the speaker: no other process on
-#   the machine writes with the identifier systemd and PID 1.
-#
-# The needle is quoted inside the ${#} patterns below. Unquoted, `[1]` is a
-# glob character class and the match would also accept `systemd1: Finished`.
+# Polled until systemd has dealt with the unit: nothing orders this probe
+# after userconfig.service. Settled means no queued job, plus either a
+# condition timestamp or systemd's own "Finished" line in the journal. The
+# journal is needed because a seeded apply ends in cancel-rename, which
+# disables the unit and reloads, after which systemd garbage-collects it
+# and every property reads as a default.
+
+# -b restricts the read to this boot, so correctness does not depend on
+# install.sh's Storage=volatile. The needle carries the speaker,
+# systemd[1], because `journalctl -u` also returns the unit's own stdout.
+# It is quoted in the ${#} patterns below: unquoted, `[1]` is a glob class.
 UC_DONE='systemd[1]: Finished userconfig.service'
 UC_COND_TS=""
 UC_JOBS=1
@@ -942,17 +573,11 @@ UC_ENABLED=$(systemctl is-enabled userconfig.service 2>&1 || true)
 
 # --- what the wizard's job was waiting for --------------------------------
 
-# THE JOB THAT WAS NEVER GOING TO FINISH, asked about directly. Stock
-# systemd-networkd-wait-online.service carries TimeoutStartSec=infinity, and
-# on this appliance -- NetworkManager owns the link, networkd configures
-# nothing -- it never returns. In run 31968966879 both boots ended with that
-# job still running ("no limit"), network-online.target never reached,
-# cloud-init's config stage never run, and userconfig.service queued behind
-# it: the seeded credential file came off the card untouched. device/install.sh
-# masks it and switches cloud-init off; this reads the first back off the
-# running machine and looks for its job in the queue, because a mask that
-# reached the image and a boot that is not waiting on it are different
-# claims.
+# Stock systemd-networkd-wait-online.service has TimeoutStartSec=infinity
+# and never returns here, where NetworkManager owns the link; it would
+# hold userconfig.service queued behind it. install.sh masks it. A mask
+# that reached the image and a boot not waiting on it are separate claims,
+# so both are read.
 NETWAIT=systemd-networkd-wait-online.service
 NETWAIT_ENABLED=$(systemctl is-enabled "$NETWAIT" 2>&1 || true)
 NETWAIT_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -cF "$NETWAIT" || true)
@@ -962,13 +587,10 @@ check network-wait-cannot-hold-the-boot-open \
       "$NETWAIT is-enabled=$NETWAIT_ENABLED jobs=${NETWAIT_JOBS:-?}"
 
 if [ "$PHASE" = "boot1" ]; then
-    # APPLIED, not merely deleted. From outside, the harness can watch the
-    # file vanish from the FAT partition; only the machine can say the
-    # credentials in it were put anywhere, and a userconf-service that
-    # deleted the seed without applying it would look identical from there.
-    # pi-gen hashes FIRST_USER_PASS with a random salt, so this marker in the
-    # shadow entry can only have come from the seed. The entry itself is
-    # never printed: this console is uploaded as a CI artifact.
+    # Applied, not merely deleted: only the machine can say the seed's
+    # credentials went anywhere. pi-gen hashes FIRST_USER_PASS with a random
+    # salt, so this salt in the shadow entry can only come from the seed.
+    # The entry itself is never printed.
     UC_SHADOW=$(awk -F: -v u="$USERCONF_USER" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
     UC_APPLIED=no
     if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; then
@@ -977,32 +599,18 @@ if [ "$PHASE" = "boot1" ]; then
     check userconf-seed-applied "$UC_APPLIED" \
           "${USERCONF_USER}'s shadow entry (${#UC_SHADOW} chars) begins $USERCONF_SALT: $UC_APPLIED"
 
-    # NO WIZARD, which is the clause issue #20 is written around. A seeded
-    # boot must take the non-interactive path: the oneshot RAN and FINISHED
-    # successfully, nothing skipped or failed it, and it has left no job of
-    # its own in the queue holding multi-user.target open.
-    #
-    # READ OFF THE LOG, not off the unit, and that is a strengthening rather
-    # than a softening. `ConditionResult=yes` said only that systemd let the
-    # unit start; `systemd[1]: Finished userconfig.service` is systemd's own
-    # success line and a unit that was skipped, that is still running, or
-    # that failed never prints it. It is also the only one of the two that
-    # still exists after the apply: see the poll above for what
-    # cancel-rename's `systemctl disable` plus a daemon-reload do to the unit
-    # object, measured in run 31972140190. ConditionResult is still REPORTED,
-    # so a future reader can see the collected-unit default for what it is.
-    #
-    # WITH THE SPEAKER, and out of THIS boot: $UC_DONE and the `-b` on the
-    # read carry both narrowings, and the poll above says why each is there.
+    # A seeded boot must take the non-interactive path (issue #20): the
+    # oneshot finished, nothing skipped or failed it, and no job of its own
+    # is left holding multi-user.target open. Read off the log, because the
+    # unit object does not survive the apply (see the poll above);
+    # ConditionResult is reported only.
     UC_TROUBLE=no
     case "$UC_LOG" in
         *"Failed with result"*|*"Failed to start"*|*"Scheduled restart job"*|\
         *"was skipped"*|*"skipped, unmet condition"*) UC_TROUBLE=yes ;;
     esac
-    # The trouble strings above are deliberately NOT speaker-scoped: a
-    # userconf-service that printed one of them on its own stdout is a boot
-    # worth failing either way, and that is the safe direction. "Finished" is
-    # the clause that has to be earned.
+    # The trouble strings are not speaker-scoped: failing on the unit's own
+    # stdout is the safe direction.
     UC_FINISHED=no
     if [ "${UC_LOG#*"$UC_DONE"}" != "$UC_LOG" ]; then
         UC_FINISHED=yes
@@ -1013,17 +621,10 @@ if [ "$PHASE" = "boot1" ]; then
              then echo yes; else echo no; fi)" \
           "journal-finished=$UC_FINISHED trouble=$UC_TROUBLE is-active=$UC_ACTIVE jobs=${UC_JOBS:-?} condition=${UC_COND:-?} result=${UC_RESULT:-?}"
 
-    # AND THE PANEL IS STILL THERE AFTERWARDS, which is the half nobody was
-    # looking at. Applying a seed ends in userconf-pi's cancel-rename, and
-    # cancel-rename starts a getty on tty1 -- the tty otp-unit.service holds
-    # as its front panel. While that unit carried Conflicts=getty@tty1.service
-    # the start stopped it, so setting a password the documented way took the
-    # print unit down until the next power-cycle. device/install.sh answers
-    # that with a condition on the getty; both halves are read here, after
-    # the apply and in the only boot that performs one.
-    #
-    # `unit-active` above cannot stand in for this: it runs before the seed
-    # is applied and passes on a machine the apply is about to take down.
+    # The apply ends in cancel-rename, which starts a getty on tty1, the
+    # tty otp-unit.service holds as its front panel. device/install.sh
+    # conditions that getty off. `unit-active` above runs before the apply
+    # and cannot stand in for this.
     PANEL=$(systemctl is-active otp-unit.service 2>&1 || true)
     TTY1=$(systemctl is-active getty@tty1.service 2>&1 || true)
     TTY1_JOBS=$(systemctl list-jobs --no-legend 2>/dev/null | grep -cF "getty@tty1.service" || true)
@@ -1032,30 +633,14 @@ if [ "$PHASE" = "boot1" ]; then
                 && [ "${TTY1_JOBS:-1}" = 0 ]; then echo yes; else echo no; fi)" \
           "otp-unit=$PANEL getty@tty1=$TTY1 getty-jobs=${TTY1_JOBS:-?}"
 
-    # AND THE APPLY WAS WRITTEN DOWN SOMEWHERE THE POWER CANNOT REACH.
-    #
-    # Everything in this phase so far is about the hash arriving in
-    # /etc/shadow, and /etc/shadow is inside the overlay -- so all of it was
-    # equally true of the image that lost the password at the power cycle.
-    # This is the check that tells the two apart from inside boot1, before
-    # boot2 exists to say anything.
-    #
-    # FOUR CLAUSES, and each one closes a way the store can look right while
-    # being useless:
-    #
-    #   - $UC_APPLIED, so the hash under discussion is the SEEDED one. Only
-    #     the harness's seed carries $USERCONF_SALT; pi-gen's FIRST_USER_PASS
-    #     is hashed with a random salt, so a store full of the build-time
-    #     password would satisfy every other clause here.
-    #   - the store names the account the seed named, because `chpasswd` takes
-    #     `user:hash` and a store naming somebody else restores nothing.
-    #   - the digests match AND are 64 characters, which is what makes this a
-    #     comparison rather than two absences agreeing.
-    #   - the store is not on the root's filesystem. Without that clause an
-    #     unmounted /boot/firmware gives a store in the overlay's tmpfs that
-    #     agrees with /etc/shadow perfectly, on every boot, while nothing
-    #     survives any of them. Same reasoning, same $STORE_SRC, as
-    #     machine-id-persisted-outside-the-overlay above.
+    # /etc/shadow is inside the overlay, so the hash must also be recorded
+    # outside it. Four clauses:
+    #   - $UC_APPLIED: the hash is the seeded one, not the build-time
+    #     password.
+    #   - the store names the seeded account; `chpasswd` takes `user:hash`.
+    #   - the digests match and are 64 characters.
+    #   - the store is not on the root's filesystem ($STORE_SRC, as for
+    #     machine-id-persisted-outside-the-overlay).
     CRED_KEPT=$(tr -d '\n\r' < "$CRED_STORE" 2>/dev/null)
     CRED_KEPT_USER=${CRED_KEPT%%:*}
     CRED_KEPT_HASH=${CRED_KEPT#*:}
@@ -1073,14 +658,8 @@ if [ "$PHASE" = "boot1" ]; then
              then echo yes; else echo no; fi)" \
           "$CRED_STORE user=${CRED_KEPT_USER:-none} kept=$(cred_short "$CRED_KEPT_DIGEST") live=$(cred_short "$CRED_LIVE_DIGEST") applied=$UC_APPLIED src=$STORE_SRC root-src=${ROOT_SOURCE:-?}"
 
-    # THE POSITIVE CONTROL boot2's claim rests on, written with the same
-    # variable boot2 will read. "the password is the same across the power
-    # cycle" is satisfied perfectly by a machine with no readable /etc/shadow
-    # in either boot and a record file that was never written -- the two-
-    # absence hole the review caught on the machine-id side, arriving here.
-    # So boot1 states, out of the hash it has just watched being applied:
-    # there WAS a credential, it was the seeded one, and this file holds a
-    # digest of it that reads back byte for byte.
+    # The positive control for boot2: there was a credential, it was the
+    # seeded one, and the record holds a digest that reads back.
     printf '%s\n' "$CRED_LIVE_DIGEST" > "$CRED_RECORD" 2>/dev/null || true
     CRED_READBACK=$(tr -d '\n\r' < "$CRED_RECORD" 2>/dev/null)
     check credential-recorded-for-the-next-boot \
@@ -1091,72 +670,33 @@ if [ "$PHASE" = "boot1" ]; then
 fi
 
 if [ "$PHASE" = "boot2" ]; then
-    # THE UNSEEDED BRANCH, which is every boot a unit does after its first.
-    # The delete boot1's wizard made stuck, because the FAT partition is
-    # outside the overlay, so the condition is false here and the unit is
-    # skipped -- instantly, with no prompt.
-    #
-    # `enabled` is asserted in the same breath, and it is the half that is
-    # easy to lose. Masking or disabling the unit would also make it quiet,
-    # and it is the ONLY consumer of userconf.txt: a quiet-by-masking image
-    # ignores an operator's credentials in silence and leaves the tty2
-    # recovery getty with no knowable login. That is the trade
-    # device/install.sh's comment refuses, stated as a check.
-    #
-    # `condition=no` IS THE NAMED PROPERTY, and until run 19 nothing tested
-    # it: no boot2 fixture ever set the condition true, so deleting that
-    # clause left the suite green and this check went on being believed for
-    # the one thing its name promises. What a true condition on boot2 means
-    # is that the seed OUTLIVED the boot that consumed it -- the delete
-    # failed, or the operator's file is still on the FAT partition -- so the
-    # wizard is armed on this boot and every boot after it, with an
-    # operator's credential line still readable on a partition any reader can
-    # mount. `skipped` and `enabled` do not imply each other and neither
-    # implies this; all three are asserted.
+    # Every boot after the first is unseeded: boot1's wizard deleted the
+    # seed from the FAT partition, so the condition is false and the unit
+    # is skipped. `enabled` is asserted too, because masking would also be
+    # quiet and the unit is the only consumer of userconf.txt. A true
+    # condition here means the seed outlived the boot that consumed it.
+    # The three clauses do not imply each other.
     check userconf-unseeded-boot-skips-the-wizard \
           "$(if [ "$UC_COND" = no ] && [ -n "$UC_COND_TS" ] \
                 && [ "$UC_ACTIVE" = inactive ] && [ "$UC_ENABLED" = enabled ]; \
              then echo yes; else echo no; fi)" \
           "condition=${UC_COND:-?} checked-at='${UC_COND_TS:-never}' is-active=$UC_ACTIVE is-enabled=$UC_ENABLED"
 
-    # StandardInput=null, read back off the running machine rather than out
-    # of the file install.sh wrote. It is the whole of the fail-fast: with a
-    # tty a malformed seed becomes a whiptail nobody can answer, which is how
-    # run 12's boot was held open. This says the drop-in reached the image,
-    # parsed, and is in effect on the unit.
+    # StandardInput=null, read off the running machine: with a tty a
+    # malformed seed becomes a whiptail nobody can answer.
     check userconf-wizard-cannot-prompt \
           "$(if [ "$UC_STDIN" = null ]; then echo yes; else echo no; fi)" \
           "StandardInput=${UC_STDIN:-unset}"
 
     # --- and the operator can still log in ---------------------------------
     #
-    # THE PROPERTY THE WHOLE CHANGE IS FOR, and before it there was nothing
-    # here to check: boot1 applied the seed, boot2 came up with pi-gen's
-    # random FIRST_USER_PASS, and the file that could have reapplied it was
-    # deleted by the boot that consumed it. This device can be connected to a
-    # keyboard and a screen, so that is the difference between a recoverable
-    # unit and one nobody can get into.
-    #
-    # BEFORE THE MALFORMED-SEED EXPERIMENT BELOW, deliberately: that block
-    # writes a userconf.txt of its own onto the card, and one of the clauses
-    # here is that there is no seed on this boot for the password to have come
-    # from. Run them the other way round and the check reads its own fixture.
-    #
-    # FOUR CLAUSES AGAIN, and the same reasons:
-    #
-    #   - the salt marker, which is ATTRIBUTION. $USERCONF_SALT can only have
-    #     come from the seed boot1 consumed; pi-gen hashes FIRST_USER_PASS
-    #     with a random salt, so a machine that reverted cannot carry it.
-    #   - the digest matches boot1's record, which is INTEGRITY: a restore
-    #     that wrote a truncated or mangled hash would still start with the
-    #     salt.
-    #   - both digests are 64 characters, so this cannot be satisfied by two
-    #     absences. `credential-recorded-for-the-next-boot` in boot1 is what
-    #     rules out the recorded side with the same file and the same
-    #     variable.
-    #   - no seed is on the card, so the credential in force cannot be one
-    #     this boot was handed. That is the clause that makes it a statement
-    #     about a POWER CYCLE rather than about a wizard.
+    # Must run before the malformed-seed experiment below, which writes its
+    # own userconf.txt. Four clauses:
+    #   - the salt marker: the hash is the one boot1's seed applied.
+    #   - the digest matches boot1's record: the restore did not mangle it.
+    #   - both digests are 64 characters, so two absences cannot agree.
+    #   - no seed is on the card, so this boot was not handed the
+    #     credential.
     UC_SHADOW=$(awk -F: -v u="$USERCONF_USER" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
     CRED_FROM_SEED=no
     if [ -n "$UC_SHADOW" ] && [ "${UC_SHADOW#"$USERCONF_SALT"}" != "$UC_SHADOW" ]; then
@@ -1176,50 +716,22 @@ if [ "$PHASE" = "boot2" ]; then
 
     # --- and a store that names the account the seed RENAMED ---------------
     #
-    # THE ONE ARRANGEMENT THE SEEDED PATH ABOVE CANNOT PRODUCE, run as an
-    # experiment for exactly that reason.
-    #
-    # img-boot.sh seeds `otp`, which is image/build.sh's own FIRST_USER_NAME,
-    # and that is deliberate: it keeps userconf-pi's rename branch out of a
-    # boot whose subject is the apply. But an operator is told to write
-    # `username:hash` and is told nothing about which username, and
-    # /usr/lib/userconf-pi/userconf takes `getent passwd 1000`, RENAMES that
-    # account when the seed names another, and only then runs `chpasswd -e`.
-    # `rename_user` touches /etc/{passwd,shadow,group,gshadow,subuid,subgid,
-    # sudoers.d} and /home -- every one of them inside the read-only overlay
-    # -- so the rename dies with the power while the store on the FAT
-    # partition does not, and the next boot meets a store naming an account
-    # that no longer exists. Refusing it took the unit's only login away.
-    #
-    # WHAT IS SYNTHESISED AND WHAT IS NOT. The state after that power cycle
-    # is synthesised here -- the store is relabelled by hand -- because the
-    # alternative is seeding a different name in boot1, which would take the
-    # only end-to-end observation of the plain documented apply out of this
-    # tier to get it. Everything the state is then handed to is real: the
-    # shipped script this unit boots with, the real `chpasswd`, the real
-    # /etc/shadow, and the real store on the real FAT partition.
-    #
-    # NO HASH IS INVENTED AND NONE IS PRINTED. The "before" password is this
-    # unit's own hash with its last character changed, so the probe carries no
-    # credential of its own and the account is never given a password anyone
-    # holds; the mangled string is never printed, because it is the kept hash
-    # to within one byte. What travels to the console is sha256 digests, the
-    # way every other check in this block reports.
-    #
-    # AND THE EXPERIMENT PUTS THE CARD BACK BY ITSELF. Only the NAME in the
-    # store is changed, so a working restore rewrites it to the live account
-    # and re-applies the kept hash: both files end byte-for-byte as they were
-    # found. Nothing here needs undoing, and boot2's host-side
-    # credential-kept-on-the-card is looking at the same file afterwards.
-    # /etc/passwd read directly, and by UID, for the two reasons
-    # device/persist-identity.sh reads it that way: this appliance has no
-    # network and no NSS source but the file, and the account under discussion
-    # is the one holding UID 1000 whatever it is called.
+    # userconf-pi renames the UID-1000 account when a seed names another
+    # user. The rename lives in the overlay and dies with the power; the
+    # store on the FAT partition does not, so the next boot meets a store
+    # naming an account that no longer exists. That state is synthesised
+    # here by relabelling the store; the shipped script, chpasswd, shadow
+    # file and store it is handed to are real.
+
+    # The "before" password is this unit's own hash with its last character
+    # changed, never printed. Only the name in the store changes, so a
+    # working restore leaves both files as they were found.
+
+    # /etc/passwd by UID: the account in question holds UID 1000 whatever
+    # it is called, and there is no other NSS source.
     CRED_LIVE_USER=$(awk -F: '$3 == 1000 { print $1; exit }' /etc/passwd 2>/dev/null)
-    # The name an operator following the Raspberry Pi documentation reaches
-    # for. This image is built with FIRST_USER_NAME='otp', so it is not an
-    # account here -- asserted below rather than assumed, because a fixture
-    # that names a real account is testing something else entirely.
+    # Must not be an account on this image (FIRST_USER_NAME='otp');
+    # asserted below.
     CRED_OTHER_USER=pi
     CRED_OTHER_EXISTS=$(awk -F: -v u="$CRED_OTHER_USER" \
                         '$1 == u { print "yes"; exit }' /etc/passwd 2>/dev/null)
@@ -1233,20 +745,13 @@ if [ "$PHASE" = "boot2" ]; then
     /opt/otp-unit/persist-identity.sh; CRED_RELABEL_RC=$?
     CRED_AFTER=$(awk -F: -v u="$CRED_LIVE_USER" '$1 == u {print $2}' /etc/shadow 2>/dev/null)
     CRED_STORE_USER=$(cut -d: -f1 < "$CRED_STORE" 2>/dev/null | tr -d '\n\r')
-    #
-    # SIX CLAUSES, and the first three are about the fixture rather than the
-    # property -- without them "the password is the kept one" is satisfied by
-    # an experiment that never disturbed it:
-    #
-    #   - the name planted in the store is NOT an account on this machine, and
-    #     is not the UID-1000 account either, so this really is the mismatch;
-    #   - the password was DIFFERENT before the script ran, so the script is
-    #     what put it back and not the state it started in;
-    #   - the script exited 0, which is the half the refusal used to fail;
-    #   - the live UID-1000 account carries the kept hash, digest for digest
-    #     and 64 characters of it, which is the WORKING LOGIN;
-    #   - the store now names the live account, so the stale label does not
-    #     come back on every boot for the rest of the unit's life.
+    # The first three clauses are about the fixture:
+    #   - the planted name is not an account here, nor the UID-1000 one;
+    #   - the password differed before the script ran;
+    #   - the script exited 0;
+    #   - the live UID-1000 account carries the kept hash, 64 digest
+    #     characters of it;
+    #   - the store now names the live account.
     check credential-recovers-a-store-naming-another-account \
           "$(if [ -n "$CRED_LIVE_USER" ] \
                 && [ -z "$CRED_OTHER_EXISTS" ] \
@@ -1259,36 +764,15 @@ if [ "$PHASE" = "boot2" ]; then
              then echo yes; else echo no; fi)" \
           "store named $CRED_OTHER_USER (an account here: ${CRED_OTHER_EXISTS:-no}), uid-1000 is ${CRED_LIVE_USER:-none} | before: $(cred_short "$(cred_digest "$CRED_BEFORE")") | after: $(cred_short "$(cred_digest "$CRED_AFTER")") | kept: $(cred_short "$CRED_LIVE_DIGEST") | rc=$CRED_RELABEL_RC | store now names ${CRED_STORE_USER:-none}"
 
-    # THE MALFORMED SEED, run by hand and not left on the card for the unit
-    # to find at boot. Stock userconfig.service carries Restart=on-failure,
-    # so a boot that met one prints "Failed with result" and "Scheduled
-    # restart job" -- two of the strings harness/img-boot.sh fails a release
-    # on -- and relaxing a release gate to accommodate a fault the harness
-    # injected itself is the wrong way round. The conditions the unit would
-    # supply are supplied here instead: stdin closed, and no TERM, which is
-    # what a unit with no tty is given. The drop-in's own half is the check
-    # directly above.
-    #
-    # WHAT IS GATED is what matters on a device: the thing TERMINATED, and it
-    # left the operator the evidence under the failed_ name. The exit status
-    # is reported and NOT gated -- the failure mode that hurts is a script
-    # that never returns, and whether the return is 0 or 1 is upstream's
-    # business.
-    #
-    # "TERMINATED" IS rc < 124, NOT rc != 124, and the difference is the exact
-    # failure this experiment exists to catch. The `timeout` below answers 124
-    # only when the child took the SIGTERM and died of it; a child that IGNORES
-    # SIGTERM -- which is the interesting hang, a whiptail with a handler or a
-    # shell with `trap "" TERM` -- has to be SIGKILLed by the -k escalation,
-    # and then timeout answers 128+9 = 137. Measured: a fixture that
-    # quarantines the seed and then ignores TERM scored `rc=137` and PASSED
-    # this check while it read `!= 124`. Everything at or above 124 is
-    # `timeout` reporting that it could not get a clean status out of the
-    # child -- 124 timed out, 125 timeout itself failed, 126/127 could not
-    # execute, 128+n died on a signal -- and none of those is "the script
-    # returned". A clean return is a small number, so that is what is
-    # required. The `2>/dev/null` covers rc=none: the clause left of it
-    # short-circuits, but `[ none -lt 124 ]` would otherwise be free to print.
+    # The malformed seed, run by hand rather than left for the unit: stock
+    # userconfig.service has Restart=on-failure, and its failure lines are
+    # ones harness/img-boot.sh fails a release on. Stdin is closed and TERM
+    # unset, as for a unit with no tty.
+
+    # Gated: the script terminated and quarantined the seed under the
+    # failed_ name. The exit status is reported only. Terminated is
+    # rc < 124, not rc != 124: a child that ignores SIGTERM is SIGKILLed by
+    # -k and timeout answers 137. The `2>/dev/null` covers rc=none.
     UC_BAD='NOT A VALID NAME:'
     UC_SAID="the probe never ran it: $USERCONF_SERVICE is not executable here"
     UC_RC=none
@@ -1311,8 +795,7 @@ echo "--- otp-unit journal ($PHASE) ---"
 journalctl -u otp-unit.service --no-pager -n 30 2>/dev/null || true
 echo "--- end journal ---"
 
-# DONE before RESULT, and both before the host is allowed to believe either.
-# Results with no DONE line is a guest that died part way through a phase,
-# and its counts agree with themselves right up to the axe.
+# DONE before RESULT: results with no DONE line are from a guest that died
+# part way through a phase.
 printf 'OTP-GUEST-DONE %s\n' "$PHASE"
 printf 'OTP-RESULT %s %s/%s\n' "$PHASE" "$PASS" "$TOTAL"

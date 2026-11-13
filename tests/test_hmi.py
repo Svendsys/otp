@@ -1,10 +1,6 @@
-"""Choosing an interface from whatever hardware turned up.
-
-The rule this file protects: display and input are chosen independently,
-so an OLED with a USB keyboard and a monitor with three buttons are both
-perfectly good front panels. Anything that collapses that back into "the
-intended panel or nothing" puts the unit back to being useless without
-parts that may not exist.
+"""Choosing an interface from whatever hardware turned up. Display and input are
+chosen independently, so an OLED with a USB keyboard or a monitor with three
+buttons is a usable front panel.
 """
 import sys
 from pathlib import Path
@@ -45,8 +41,16 @@ class TestTheLadder:
         assert interface.display == "CONSOLE"
         assert interface.display_kind == "HDMI console"
 
-    def test_gpio_buttons_win_when_they_are_there(self, monkeypatch):
+    def test_buttons_and_keyboard_are_both_heard(self, monkeypatch):
+        """GPIO pins open on any Pi, wired or not, so they must not shut a
+        keyboard out."""
         force(monkeypatch, gpio=True, keyboard=True)
+        interface = hmi.detect()
+        assert interface.buttons.sources == ["BUTTONS", "KEYBOARD"]
+        assert interface.input_kind == "GPIO buttons and USB keyboard"
+
+    def test_buttons_alone_are_used_directly(self, monkeypatch):
+        force(monkeypatch, gpio=True)
         assert hmi.detect().buttons == "BUTTONS"
 
     def test_a_keyboard_is_used_when_there_are_no_buttons(self, monkeypatch):
@@ -85,17 +89,14 @@ class TestFallingBackToPaper:
         assert not hmi.detect().interactive
 
     def test_an_input_with_no_display_is_not_a_menu(self, monkeypatch):
-        # Buttons with nothing to read are worse than none: every press
-        # would be blind.
+        # Buttons with nothing to read would make every press blind.
         force(monkeypatch, gpio=True)
         assert not hmi.detect().interactive
 
     def test_a_tty_alone_does_not_count_as_a_screen(self, monkeypatch):
-        """
-        The service binds to tty1, so stdin is a terminal whether or not
-        anything is plugged into the HDMI socket. Trusting isatty() would
-        make every unit think it had a monitor and sit at a menu nobody
-        can see, instead of printing.
+        """isatty() is not evidence of a monitor: the service binds to tty1
+        whether or not anything is plugged in, and a unit trusting it would sit
+        at a menu nobody can see.
         """
         force(monkeypatch, screen=False, keyboard=True, console=True)
         assert hmi.detect().display is None
@@ -133,9 +134,8 @@ class TestProbesAreHonestAboutTheRealSystem:
         assert hmi.keyboard_connected() is False
 
     def test_detection_never_raises(self, monkeypatch):
-        """
-        This runs before anything else on a cold unit. A probe that throws
-        takes the whole device down with no panel to say why.
+        """Detection swallows probe errors: it runs first on a cold unit, where an
+        exception takes the device down with no panel to say why.
         """
         def explode(*args, **kwargs):
             raise OSError(5, "I/O error")
@@ -160,15 +160,9 @@ class TestClosingUp:
 
 
 class TestAnInterfaceNobodyAnswersIsNotAnInterface:
-    """
-    Opening GpioButtons proves only that a pin could be reserved. gpiozero
-    has no presence detection, so on any Pi with lgpio the constructor
-    always succeeds -- tests/test_hardware.py builds one against a mock
-    factory with nothing wired and asserts exactly that.
-
-    Without a liveness check, attaching a monitor to a working headless
-    unit made `interactive` True and sent it into a menu whose first
-    wait() blocks forever. No pad, no log line, no fallback.
+    """An interface counts as drivable only once something answers. gpiozero has
+    no presence detection, so GpioButtons opens with nothing wired, and a menu
+    whose first wait() never returns prints no pad.
     """
 
     class Silent:
@@ -207,7 +201,7 @@ class TestAnInterfaceNobodyAnswersIsNotAnInterface:
             clock=lambda: clock[0]) is True
 
     def test_it_gives_up_rather_than_waiting_forever(self):
-        # The bug was an unbounded wait. Pin that this returns.
+        # The liveness wait must be bounded.
         clock = [0.0]
 
         def tick(_):

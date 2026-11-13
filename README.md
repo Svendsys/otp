@@ -33,7 +33,7 @@ Suggested classroom flow:
 
 1. Work through the **Example transmission** section together, by hand, with the numbers.
 2. Introduce the **tabula recta** (Tools section) and repeat the exercise letters-only.
-3. Set the **Exercises** appendix — three graded problems with an answer key,
+3. Set the **Exercises** appendix — four graded problems with an answer key,
    including a garbled-decrypt repair. Print worksheets for them (`--worksheets`).
 4. Generate a small training set (`--pages 20 --training`), pair students up, and
    run full two-way exchanges: encrypt, transmit by voice, authenticate, decrypt,
@@ -93,7 +93,7 @@ are A5: two per A4 sheet, one cut.
 | `--a4` | off | Four A6 pad pages per A4 sheet with crop marks, imposed **cut-and-stack** — see [Printing on A4](#printing-on-a4) |
 | `--letter` | off | The same, on US Letter |
 | `--tabula` | 0 | Also generate N tabula recta cards as `TABULA_RECTA.pdf` — the manual's 26×26 table, pocket-sized to go in the envelope with the pad. No key material. |
-| `--auth-size` | 5 | Letters in the AUTH group. The letters are always CSPRNG output; only the length is adjustable. |
+| `--auth-size` | 5 | Letters in the AUTH group. The letters are drawn from the same source as the key body; only the length is adjustable. |
 | `--random-codewords` | 0 | Generate N random `<MODIFIER>-<NOUN>` codewords instead of reading a file |
 | `--stdout` | off | Write the single generated PDF to stdout instead of a file: `otp_generator.py --random-codewords 1 --pages 100 --a4 --stdout \| lp -n 2 -o Collate=True`. Note the `-n 2`: a pad set is two identical copies, and once the bytes are down the pipe they are gone — re-running makes a *different* pad, not the twin. `Collate=True` is not optional: without it the copies come out interleaved (page 1, page 1, page 2, page 2), which is one stack to deal out by hand rather than two pads. See the caveat below; this keeps key material out of *this program's* output, not out of your spooler. |
 
@@ -189,8 +189,8 @@ follow with a laptop and easy to follow with a dedicated box:
 - **No swap**, so nothing holding key material can be paged to disk.
 - **Volatile logs**, no core dumps, and job metadata only.
 - **Read-only root with a RAM overlay** — see [docs/IMAGE.md](docs/IMAGE.md).
-  On from the first boot: `install.sh` enables it, so the image ships with
-  it. It was a manual step nobody had ever tested until issue #9.
+  On from the first boot, and checked by the unit itself: it refuses to make
+  a live pad if the overlay is missing or swap is on.
 
 Be clear about what is *not* claimed. Key material is not scrubbed from RAM
 when a job ends: the working buffer is zeroed, but reportlab's intermediates
@@ -209,6 +209,9 @@ sudo ./device/install.sh  # or convert a Pi you already have
 python3 -m otpunit --sim  # or just try the interface in a terminal
 ```
 
+Testing on a real Pi for the first time? Start with
+[docs/FIRST-TEST.md](docs/FIRST-TEST.md).
+
 See [docs/HARDWARE.md](docs/HARDWARE.md) for parts and wiring,
 [docs/IMAGE.md](docs/IMAGE.md) for building and flashing, and
 [docs/PRINTERS.md](docs/PRINTERS.md) for what works and what does not.
@@ -221,10 +224,16 @@ good stream cipher, so the generator is explicit about it.
 It draws from the machine's **hardware random number generator** when there is
 one — `/dev/hwrng`, which every Raspberry Pi has — **XORed with the OS CSPRNG**
 (`os.urandom`), and maps the result to letters with rejection sampling so every
-letter is exactly equally likely. The XOR is deliberate: if *either* source is
-good the output is good, and neither can spoil the other. That matters at both
-ends, because a raw ring oscillator can be biased and a board that has just
-booted can have a barely-seeded OS pool.
+letter is exactly equally likely. The XOR is deliberate: the output is never
+weaker than the stronger of the two, so a biased ring oscillator cannot make
+it worse than the CSPRNG alone, and a barely-seeded OS pool on a board that
+has just booted is covered by the hardware.
+
+That is a floor, not a proof. A pad is *information-theoretically* secure
+only to the extent the hardware source delivers full entropy per output bit,
+and the Pi's generator is undocumented and unmeasured here. What the unit
+guarantees is "never weaker than the CSPRNG"; the one-time pad's proof holds
+exactly as far as the chip's TRNG is as good as it is believed to be.
 
 With no hardware source the generator falls back to the CSPRNG alone and
 **says so** rather than letting it pass. An OS CSPRNG is continuously
@@ -232,8 +241,9 @@ re-seeded with physical noise and is not practically attackable, but it is
 still an algorithm expanding a seed — which makes those pads *computationally*
 secure rather than *information-theoretically* secure. For teaching and hobby
 use the distinction is academic; if your threat model disagrees, use a machine
-with a TRNG, or the manual's hand-generation methods (dice with rejection
-sampling, shake-and-draw), which keep the proof intact.
+with a TRNG, or -- for the proof itself rather than a hardware vendor's word
+-- the manual's hand-generation methods (dice with rejection sampling,
+shake-and-draw).
 
 ```bash
 python3 otp_generator.py --entropy     # which source this machine will use

@@ -1,12 +1,6 @@
-"""Where key material actually comes from.
-
-A one-time pad is only a one-time pad if its key came from a physical
-process. Anything expanded algorithmically from a seed -- however good the
-algorithm, and os.urandom's ChaCha20 is very good -- is a stream cipher by
-definition. Every Pi has a hardware TRNG, so the unit uses it.
-
-These tests are about the failure modes that are silent: a TRNG that is
-absent, short, or stuck, and a mix that quietly drops one of its inputs.
+"""Where key material comes from: the hardware TRNG mixed with the CSPRNG. These
+tests cover the silent failure modes: a TRNG that is absent, short, slow or
+stuck, and a mix that drops one of its inputs.
 """
 import os
 import sys
@@ -42,11 +36,8 @@ class TestTheHardwareSourceIsUsed:
         assert gen.entropy_source("/nonexistent/hwrng") == "urandom"
 
     def test_output_mixes_both_sources(self, hwrng, monkeypatch):
-        # Pin both inputs and check the output is exactly their XOR, so a
-        # refactor that drops one of them fails here rather than silently
-        # halving where the key comes from. Note the hardware side has to
-        # VARY -- constant bytes are rejected as a stuck TRNG, which is
-        # the health check doing its job.
+        # Pin both inputs and check the output is exactly their XOR. The
+        # hardware side must vary: constant bytes are rejected as a stuck TRNG.
         hardware = bytes(range(32))
         system = bytes([0x33] * 32)
         monkeypatch.setattr(gen, "HWRNG_PATH", hwrng(hardware))
@@ -55,9 +46,8 @@ class TestTheHardwareSourceIsUsed:
 
     def test_length_is_exact_even_when_the_xor_has_leading_zeros(self, hwrng,
                                                                 monkeypatch):
-        # int.from_bytes/to_bytes round-trips lose leading zero bytes if
-        # the width is not pinned. Identical inputs XOR to all zeros,
-        # which is the worst case for that bug.
+        # Identical inputs XOR to all zeros, the worst case for losing leading
+        # zero bytes in an int round-trip.
         same = bytes(range(64))
         monkeypatch.setattr(gen, "HWRNG_PATH", hwrng(same))
         monkeypatch.setattr(gen.os, "urandom", lambda n: same[:n])
@@ -74,14 +64,13 @@ class TestItFailsSafeRatherThanQuietly:
         assert len(set(data)) > 1
 
     def test_a_short_read_is_refused_rather_than_padded(self, hwrng):
-        # Returning fewer bytes than asked would leave the caller filling
-        # key material from somewhere else without knowing.
+        # A short return would leave the caller filling key material from
+        # elsewhere without knowing.
         path = hwrng(b"only-eight")
         assert gen._hwrng_bytes(4096, path) is None
 
     def test_a_stuck_trng_is_not_trusted(self, hwrng):
-        # The failure that matters: constant output, silently accepted,
-        # produces a pad that is not a pad.
+        # Constant output silently accepted produces a pad that is not a pad.
         assert gen._hwrng_bytes(256, hwrng(bytes(256))) is None
         assert gen._hwrng_bytes(256, hwrng(b"\xff" * 256)) is None
 
@@ -93,20 +82,9 @@ class TestItFailsSafeRatherThanQuietly:
         assert len(set(data)) > 16, "must fall back, not emit zeros"
 
     def test_a_slow_trng_gives_up_instead_of_blocking(self, monkeypatch):
-        """
-        The deadline has to bound the WAIT, not be checked around it.
-
-        Three versions of this failed. Checking after the read let a single
-        blocking read sit in the kernel indefinitely -- 73 seconds against a
-        1-second budget. Chunking helped but the check read `if got < n`, so
-        a request satisfied in one chunk never evaluated it, and every
-        request this program makes is one chunk (an A6 page is 1340 bytes
-        against a 4096 chunk) -- so it never ran in production at all.
-
-        Note the fake returns EXACTLY n bytes. An earlier version of this
-        test over-delivered, so `len(data) == n` rejected the result no
-        matter what the deadline did, and the test passed with the deadline
-        deleted.
+        """A multi-chunk read from a slow device stops at the deadline and returns
+        None. The fake returns exactly n bytes, so only the deadline can reject
+        the result.
         """
         class SlowFile:
             def read(self, n):
@@ -128,15 +106,9 @@ class TestItFailsSafeRatherThanQuietly:
 
     def test_the_deadline_bounds_a_device_that_stops_answering(self, tmp_path,
                                                                monkeypatch):
-        """
-        A FIFO with no data is exactly a TRNG that has stopped: open-able,
-        readable in principle, never ready.
-
-        With a blocking fd this sleeps in the kernel forever and no
-        deadline can fire. select() does NOT help -- /dev/hwrng's chardev
-        implements no .poll, so the VFS returns DEFAULT_POLLMASK and
-        select reports ready unconditionally; measured, a 0.001s budget
-        still took 0.614s. O_NONBLOCK is what makes the deadline decide.
+        """A device that opens but never has data (a FIFO here) is abandoned at
+        the deadline. Only O_NONBLOCK makes that possible: a blocking read
+        never returns, and select() reports /dev/hwrng ready unconditionally.
         """
         import os as real_os
         import time as real_time
@@ -157,11 +129,9 @@ class TestItFailsSafeRatherThanQuietly:
 
     def test_the_deadline_is_checked_for_a_single_chunk_request(self,
                                                                 monkeypatch):
-        """
-        Every request this program makes is ONE chunk -- an A6 page is
-        1340 bytes against a 4096 chunk -- and the previous deadline was
-        written `if got < n`, so it was skipped entirely for exactly the
-        sizes that occur. Pin the real size, not a synthetic large one.
+        """The deadline applies to a request that fits in one chunk, which is
+        every request this program makes (an A6 page is 1340 bytes against a
+        4096 chunk).
         """
         seen = []
         real_monotonic = gen.time.monotonic
@@ -175,9 +145,7 @@ class TestItFailsSafeRatherThanQuietly:
         assert seen, "the deadline must be evaluated for a 1340-byte request"
 
     def test_a_fast_trng_is_not_cut_off_early(self, hwrng, monkeypatch):
-        # The converse of the test above: a device that keeps up must be
-        # read in full, or the deadline would be quietly costing every
-        # unit its hardware entropy.
+        # The converse: a device that keeps up must be read in full.
         size = gen._HWRNG_CHUNK * 4
         monkeypatch.setattr(gen, "HWRNG_PATH", hwrng(os.urandom(size)))
         data = gen._hwrng_bytes(size)
@@ -189,8 +157,8 @@ class TestItFailsSafeRatherThanQuietly:
         assert not gen._looks_alive(bytes(256))
 
     def test_an_unreadable_device_is_not_fatal(self, tmp_path, monkeypatch):
-        # /dev/hwrng exists but the unit lacks permission -- common when
-        # something is run as a non-root user.
+        # /dev/hwrng exists but the process lacks permission, as when run as
+        # non-root.
         path = tmp_path / "hwrng"
         path.write_bytes(os.urandom(64))
         path.chmod(0o000)
@@ -202,9 +170,8 @@ class TestItFailsSafeRatherThanQuietly:
 
 
 class TestTheLettersStayUnbiased:
-    """
-    Mixing sources must not disturb the rejection sampling that keeps A-Z
-    uniform -- the property the whole scheme rests on.
+    """Mixing sources must not disturb the rejection sampling that keeps A-Z
+    uniform.
     """
 
     def test_letters_are_still_uniform_over_a_large_sample(self, hwrng,
@@ -213,8 +180,7 @@ class TestTheLettersStayUnbiased:
         text = gen.generate_random_letters(26_000)
         counts = {chr(65 + i): text.count(chr(65 + i)) for i in range(26)}
         expected = 26_000 / 26
-        # Generous band; this is a smoke test for gross bias, not a
-        # statistical proof.
+        # Generous band: a smoke test for gross bias, not a statistical proof.
         assert all(abs(n - expected) < expected * 0.25 for n in counts.values()), counts
         assert set(text) <= set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 

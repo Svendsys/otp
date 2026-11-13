@@ -1,12 +1,9 @@
 [Unit]
 Description=Report the overlay root to the tier-3 image boot
 Documentation=https://github.com/Svendsys/otp/issues/9
-# The whole unit hinges on this line. Nothing but harness/img-boot.sh puts
-# otp.imgcheck on the kernel command line, so on a flashed appliance the
-# condition is false, systemd skips the unit, and none of this runs. It ships
-# anyway rather than being injected into a special build, because a check
-# against a specially prepared image proves nothing about the artifact people
-# flash to a card.
+# Only harness/img-boot.sh puts otp.imgcheck on the kernel command line, so
+# on a flashed appliance this unit is skipped. It ships anyway so tier 3
+# tests the image people flash.
 ConditionKernelCommandLine=otp.imgcheck
 
 # After, not Requires. A unit that failed to start is one of the things this
@@ -16,41 +13,13 @@ After=otp-unit.service cups.service otp-unit-etc-cups.service
 [Service]
 Type=oneshot
 ExecStart=/opt/otp-unit/img-guest-check.sh
-# EXPLICIT, because systemd's default is 90s and the probe's bounded waits
-# are several times that. img-guest-check.sh polls `systemctl is-active
-# otp-unit` 45 times at 2s intervals -- 90s exactly -- before it has even
-# reached the CUPS checks; it waits up to 15s for journald to index the
-# marker that proves the journal reaches the console, and up to 60s for the
-# unit to finish deciding it has no panel (Type=simple calls it active at
-# spawn, before the interpreter has imported anything); it waits up to 120s
-# for systemd to be done with userconfig.service; and it bounds two
-# experiments, the diagnostic sheet at 90s in boot1 and the malformed seed
-# at 60s in boot2. No single boot pays all of them: boot1's worst case is
-# 375s and boot2's is 345s. Around those come `cupsd -t`, three Python
-# interpreters -- two importing otpunit.config and one importing reportlab
-# -- and everything else, all under TCG emulation at roughly the speed of
-# the Pi being emulated. On the default, a slow-but-healthy boot has its
-# probe killed mid-poll and reports nothing, which is a phase the harness
-# fails for having no OTP-GUEST-DONE line. 480s clears either worst case
-# with room to spare, and still lands inside the 600s per-boot backstop CI
-# gives the emulator, so a probe that really is wedged is killed and
-# reported rather than eating the whole run.
-#
-# THOSE SUMS ARE OF THE SLEEPS, and each iteration also pays for the
-# systemctl or journalctl it ran -- run 31972140190 spent its whole 120s
-# wizard poll and finished boot1 at 307s of guest time, which is the shape
-# of that overhead. It is not budgeted for, deliberately: a boot that
-# consumes a poll to the end has already failed the check the poll was
-# waiting on, and the useful guarantee is that a HEALTHY boot, where every
-# poll exits on its first or second pass, is nowhere near this number.
-# tests/test_overlay_root.py re-derives the sum from the shipped probe on
-# every run -- pessimistically, over the whole file rather than per phase --
-# so a wait that changes size fails the arithmetic rather than this
-# paragraph.
+# systemd's default 90s is less than the probe's bounded waits add up to
+# under emulation. 480s clears the worst case and stays inside the 600s
+# per-boot backstop CI gives the emulator; tests/test_overlay_root.py
+# re-derives the sum from the shipped probe.
 TimeoutStartSec=480
-# The console, because that is the only channel out of the emulator. The
-# harness reads a serial port; the journal is volatile by design and dies
-# with the guest.
+# The console is the only channel out of the emulator; the journal is
+# volatile.
 StandardOutput=journal+console
 StandardError=journal+console
 

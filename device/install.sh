@@ -46,10 +46,8 @@ CONFIG_TXT="$BOOT_DIR/config.txt"
 
 if [ "$SKIP_APT" -eq 0 ]; then
     log "Installing packages"
-    # Process substitution hides grep's exit status from both `set -e` and
-    # pipefail, so an unreadable manifest would leave PACKAGES empty and
-    # turn the install below into a bare `apt-get install` that exits 0
-    # having installed nothing.
+    # Process substitution hides grep's exit status, so an unreadable manifest
+    # would leave PACKAGES empty and apt-get would install nothing.
     mapfile -t PACKAGES < <(grep -vE '^\s*(#|$)' "$REPO_DIR/device/packages.txt")
     if [ "${#PACKAGES[@]}" -eq 0 ]; then
         echo "ERROR: no packages read from device/packages.txt" >&2
@@ -65,13 +63,9 @@ fi
 
 log "Installing the unit to $PREFIX"
 install -d "$PREFIX" "$PREFIX/assets"
-# Replace, do not merge. `cp -a src dest/` onto an existing directory leaves
-# whatever was there before, so a module deleted upstream stays installed
-# and importable -- which on the edit-rerun-reboot loop is exactly the case
-# that misleads.
-#
-# Guarded: if the clone itself lives at $PREFIX, this would delete the
-# source it is about to copy from and abort the install half-done.
+# Replace, do not merge: a module deleted upstream must not stay installed
+# and importable. Guarded because a clone living at $PREFIX would delete its
+# own source.
 if [ "$REPO_DIR" = "$PREFIX" ]; then
     echo "ERROR: the repository is checked out at $PREFIX, which this script" >&2
     echo "       installs into. Move it elsewhere and rerun." >&2
@@ -95,12 +89,28 @@ fi
 # --- hardware -----------------------------------------------------------
 
 log "Enabling I2C and disabling the radios"
+# config.txt sections after a `[pi4]`-style header apply to that model only,
+# so a setting counts only where it applies to every model, and an append is
+# preceded by `[all]` unless the file already ends in one.
+config_applies_to_all() {
+    awk -v want="$1" '
+        /^[[:space:]]*\[/ { all = ($0 ~ /^[[:space:]]*\[all\][[:space:]]*$/); seen = 1; next }
+        (!seen || all) && $0 == want { found = 1 }
+        END { exit found ? 0 : 1 }' "$CONFIG_TXT"
+}
+config_ends_unconditional() {
+    awk '
+        /^[[:space:]]*\[/ { all = ($0 ~ /^[[:space:]]*\[all\][[:space:]]*$/); seen = 1 }
+        END { exit (!seen || all) ? 0 : 1 }' "$CONFIG_TXT"
+}
 set_config() {
     local key="$1"
-    grep -qxF "$key" "$CONFIG_TXT" || printf '%s\n' "$key" >> "$CONFIG_TXT"
+    config_applies_to_all "$key" && return 0
+    config_ends_unconditional || printf '[all]\n' >> "$CONFIG_TXT"
+    printf '%s\n' "$key" >> "$CONFIG_TXT"
 }
-# The unit is offline by design: an OTP generator has no business holding a
-# network interface, and the radios are the easiest thing to switch off.
+# The unit is offline by design; the radios are the easiest thing to switch
+# off.
 set_config "dtparam=i2c_arm=on"
 set_config "dtoverlay=disable-wifi"
 set_config "dtoverlay=disable-bt"
@@ -110,12 +120,17 @@ grep -qxF "i2c-dev" /etc/modules || echo "i2c-dev" >> /etc/modules
 # --- no swap ------------------------------------------------------------
 
 log "Removing swap"
-# Non-negotiable. Key material lives in a bytearray that is zeroed after
-# printing; with swap enabled the kernel could page that buffer to the SD
-# card first, and zeroing RAM would not touch the copy on disk.
+# Key material lives in a bytearray zeroed after printing; with swap the
+# kernel could page it to the SD card, where zeroing RAM does not reach.
 systemctl disable --now dphys-swapfile 2>/dev/null || true
 apt-get purge -y dphys-swapfile 2>/dev/null || true
 rm -f /var/swap
+# dphys-swapfile is the bookworm mechanism; trixie uses zram swap. Masking
+# swap.target stops systemd activating any swap unit, whatever generated it.
+# The packages stay: purging them could take raspberrypi-sys-mods along.
+# otp-unit.service also runs `swapoff -a` before every start.
+systemctl mask swap.target
+swapoff -a 2>/dev/null || true
 
 
 # --- logging ------------------------------------------------------------
@@ -132,23 +147,9 @@ RuntimeMaxUse=16M
 EOF
 
 log "Ensuring the groups the service runs with exist"
-# otp-unit.service has SupplementaryGroups=lp gpio i2c input, and systemd
-# REFUSES to start a unit naming a group that does not exist:
-#
-#   otp-unit.service: Failed to determine supplementary groups: No such process
-#   otp-unit.service: Failed at step GROUP spawning /usr/bin/python3
-#   otp-unit.service: Main process exited, code=exited, status=216/GROUP
-#
-# With Restart=on-failure that is a restart loop, on a device whose journal
-# is deliberately volatile -- so the evidence dies with the power and the
-# operator gets a dark panel and nothing to read. Measured in a booted VM;
-# no chroot or container can see it, because neither starts the unit.
-#
-# Raspberry Pi OS happens to ship gpio and i2c, so the intended platform
-# was fine. But this script claims to be the single source of truth for
-# what the unit is, and it creates every other precondition it needs. A
-# group that must exist for the service to start at all is one of those.
-# Existing groups keep their GID; this only fills in what is missing.
+# systemd refuses to start a unit whose SupplementaryGroups= names a missing
+# group (status=216/GROUP), and Restart=on-failure makes that a restart loop
+# on a device whose journal is volatile. Existing groups keep their GID.
 for group in lp gpio i2c input; do
     if ! getent group "$group" >/dev/null 2>&1; then
         groupadd --system "$group"
@@ -157,10 +158,9 @@ for group in lp gpio i2c input; do
 done
 
 log "Disabling core dumps"
-# The process holds several megabytes of key material while a job runs. A
-# segfault would hand the whole address space to systemd-coredump, which has
-# its own storage path (/var/lib/systemd/coredump) and does not care that
-# the journal is volatile -- a compressed copy of the pad, on the SD card.
+# A segfault would hand the address space, key material included, to
+# systemd-coredump, which stores under /var/lib/systemd/coredump whether or
+# not the journal is volatile.
 install -d /etc/systemd/coredump.conf.d
 cat > /etc/systemd/coredump.conf.d/otp-unit.conf <<'EOF'
 [Coredump]
@@ -171,20 +171,14 @@ EOF
 
 # --- CUPS ---------------------------------------------------------------
 
-# On a rerun of a provisioned unit -- the documented edit/rerun/reboot loop
-# -- otp-unit-etc-cups.service has already laid a tmpfs over /etc/cups.
-# Everything below would then write to, read from and delete through that
-# tmpfs: the hardening would vanish at reboot, the template would be
-# snapshotted from the live queue, and the on-card printers.conf would
-# survive masked and unreachable. Unmount first and let the service remount
-# it at next boot.
+# On a rerun, otp-unit-etc-cups.service has already laid a tmpfs over
+# /etc/cups: edits below would land in the tmpfs and vanish at reboot, and
+# the template would be snapshotted from the live queue. Unmount first.
 if mountpoint -q /etc/cups 2>/dev/null; then
     log "Unmounting the /etc/cups tmpfs so the real directory is what we edit"
     systemctl stop otp-unit-etc-cups.service 2>/dev/null || true
-    # Stopping the service may already have taken the mount down, so this is
-    # a genuine recheck rather than a redundant one. A umount that still
-    # fails is not reported here: the guard below turns it into an
-    # actionable message instead of a bare "umount: target is busy".
+    # Stopping the service may already have unmounted it. A umount that still
+    # fails is reported by the guard below.
     if mountpoint -q /etc/cups 2>/dev/null; then
         umount /etc/cups || true
     fi
@@ -196,14 +190,9 @@ if mountpoint -q /etc/cups 2>/dev/null; then
 fi
 
 log "Hardening CUPS"
-# CUPS always spools a job to disk; that is unavoidable short of writing raw
-# to /dev/usb/lp0, which only PostScript and PCL printers accept. So every
-# directory it writes to is moved to tmpfs, where it lives in RAM, never
-# reaches the SD card, and vanishes on power-off.
-#
-# CacheDir matters as much as the spool: job.cache records a job's name for
-# every job in history. PageLog and AccessLog are blanked outright -- page
-# logging records one line per printed page.
+# CUPS always spools to disk, so every directory it writes to is moved to
+# tmpfs. CacheDir matters as much as the spool: job.cache records every
+# job's name. PageLog and AccessLog are disabled outright.
 install -d /etc/cups
 set_cups_file() {
     local key="$1" value="$2" file=/etc/cups/cups-files.conf
@@ -217,33 +206,25 @@ set_cups_file() {
 set_cups_file RequestRoot /run/cups/spool
 set_cups_file TempDir /run/cups/tmp
 set_cups_file CacheDir /run/cups/cache
-# /dev/null, NOT an empty value. cups-files.conf(5) says a blank filename
-# disables the log, but CUPS 2.4's parser yields NULL rather than "" for a
-# valueless directive, logs "Missing value for PageLog", and -- because
-# FatalErrors defaults to config -- cupsd then refuses to start at all.
-# CUPS special-cases /dev/ paths to skip rotation, so this is the safe form.
+# /dev/null, not an empty value: CUPS 2.4 treats a valueless directive as a
+# config error and cupsd refuses to start. /dev/ paths skip rotation.
 set_cups_file PageLog /dev/null
 set_cups_file AccessLog /dev/null
-# ErrorLog defaults to /var/log/cups/error_log, which is NOT covered by
-# making the journal volatile -- cupsd is a separate unit writing its own
-# file handle. Send it to syslog so it lands in the RAM-backed journal.
+# ErrorLog defaults to a file under /var/log/cups; syslog lands it in the
+# RAM-backed journal.
 set_cups_file ErrorLog syslog
 
-# ipp-usb keeps its own per-device logs keyed by manufacturer, model and
-# serial. That is the same artifact printers.conf is excluded for, arriving
-# by a different door, so point its directory at tmpfs too.
+# ipp-usb keeps per-device logs keyed by manufacturer, model and serial, so
+# its directory goes to tmpfs too.
 install -d /etc/systemd/system/ipp-usb.service.d
 cat > /etc/systemd/system/ipp-usb.service.d/otp-unit.conf <<'EOF'
 [Service]
 LogsDirectory=ipp-usb
 EOF
 
-# These go in cupsd.conf itself. CUPS has no Include directive and no
-# cupsd.conf.d mechanism -- cupsdReadConfiguration() opens exactly
-# cups-files.conf and cupsd.conf -- so a drop-in file is read by nothing and
-# the defaults stand. The defaults are the opposite of what is wanted here:
-# PreserveJobHistory is Yes and PreserveJobFiles is 86400, meaning the
-# spooled document, i.e. the entire pad, is kept for a day after printing.
+# CUPS has no Include or cupsd.conf.d mechanism, so these go in cupsd.conf
+# itself. The defaults keep the spooled document -- the whole pad -- for a
+# day after printing.
 set_cupsd() {
     local key="$1" value="$2" file=/etc/cups/cupsd.conf
     [ -f "$file" ] || touch "$file"
@@ -255,33 +236,17 @@ set_cupsd() {
 }
 set_cupsd PreserveJobHistory No
 set_cupsd PreserveJobFiles No
-# NOT 1. cupsd does not queue past MaxJobs, it REFUSES: `lp: Too many
-# active jobs.` The unattended sequence submits seven jobs, and measured
-# against a real cupsd with MaxJobs 1 the status sheet and the manual went
-# through and every one after them was rejected -- no tabula, no pad, and
-# no sheet to say why. The unit now drains the queue before each submit so
-# in practice only one is ever live; this is the headroom that keeps a
-# timing race from costing the whole run rather than one poll.
+# MaxJobs must exceed 1: cupsd rejects rather than queues past it, and the
+# unattended sequence submits seven jobs. The unit drains the queue before
+# each submit; this is headroom against a timing race.
 set_cupsd MaxJobs 4
-# CUPS defaults ErrorPolicy to retry-job, which never gives up. With a
-# bounded MaxJobs that is a permanent wedge: a job to a printer that is
-# off, jammed or unplugged stays active forever, so active_jobs() returns
-# nonzero forever, cups_busy() is true forever, copy B can never be
-# submitted, and the UI holds key material until someone pulls the power --
-# the one thing the whole design is trying to avoid. abort-job lets the job
-# die so the queue drains and the panel can say something. Verified with a
-# real cupsd: a job to an unreachable printer was still active after 20s
-# under retry-job, with lpstat cheerfully reporting "now printing".
-#
-# The cost, which the code has to carry: a job that FAILED leaves the queue
-# exactly as empty as one that printed, so an empty `lpstat -o` is not
-# proof anything reached paper. Cups.printer_fault() asks the queue's own
-# state instead, and unattended.run believes that over the drain.
+# The default retry-job never gives up, so a job to a dead printer would
+# stay active forever and the UI would hold key material waiting on it.
+# abort-job lets the queue drain. The cost: a failed job leaves the queue as
+# empty as a printed one, so Cups.printer_fault() asks the queue's own state.
 set_cupsd ErrorPolicy abort-job
 
-# A stock CUPS creates none of these: there is no /usr/lib/tmpfiles.d/cups*
-# and no RuntimeDirectory= in cups.service, so the directories the hardening
-# points at exist only because this file makes them.
+# Stock CUPS creates none of these directories.
 cat > /etc/tmpfiles.d/otp-unit-cups.conf <<'EOF'
 d /run/cups 0710 root lp -
 d /run/cups/spool 0710 root lp -
@@ -291,31 +256,23 @@ d /run/ipp-usb 0750 root root -
 L+ /var/log/ipp-usb - - - - /run/ipp-usb
 EOF
 
-# Create them NOW as well, not just at next boot. Two reasons, and the
-# ordering against the cupsd -t gate below is the whole point: cupsd -t
-# checks that every directory named in cups-files.conf exists, so running
-# the gate first aborted provisioning on any unit where /run/cups did not
-# happen to be there already -- "the generated CUPS configuration is
-# invalid" when the configuration was fine. And systemd-tmpfiles is not
-# usable in pi-gen's chroot, so install -d is what actually works there.
+# Create them now as well: cupsd -t below checks that every directory named
+# in cups-files.conf exists, and systemd-tmpfiles does not work in pi-gen's
+# chroot.
 install -d -m 0710 -o root -g lp /run/cups /run/cups/spool
 install -d -m 1770 -o root -g lp /run/cups/tmp
 install -d -m 0770 -o root -g lp /run/cups/cache
 install -d -m 0750 -o root -g root /run/ipp-usb
-# Best effort on top, and only that: the directories already exist by here,
-# and in a chroot this cannot work. Failure is not fatal, but it is not
-# hidden either -- silencing it hid the one step whose failure stops cupsd
-# from starting at all, with the reason going only to the journal.
+# Best effort on top: this cannot work in a chroot, so failure is reported
+# but not fatal.
 if command -v systemd-tmpfiles >/dev/null; then
     systemd-tmpfiles --create /etc/tmpfiles.d/otp-unit-cups.conf \
         || log "systemd-tmpfiles declined; the directories above are already in place"
 fi
 
-# Prove the daemon will actually load what we just wrote. cupsd only reports
-# a bad directive at startup, and otp-unit.service only Wants= cups, so
-# without this the unit boots looking healthy and fails at print time.
-# This runs after the directories exist, so it now checks the config rather
-# than the order the script happens to do things in.
+# cupsd only reports a bad directive at startup, and otp-unit.service only
+# Wants= cups, so without this the unit would boot looking healthy and fail
+# at print time. Must run after the directories exist.
 if command -v cupsd >/dev/null; then
     if ! cupsd -t -c /etc/cups/cupsd.conf -s /etc/cups/cups-files.conf >/dev/null 2>&1; then
         echo "ERROR: the generated CUPS configuration is invalid:" >&2
@@ -333,26 +290,17 @@ install -m 0644 "$REPO_DIR/device/systemd/otp-unit.service" \
 install -m 0644 "$REPO_DIR/device/systemd/otp-unit-etc-cups.service" \
     /etc/systemd/system/otp-unit-etc-cups.service
 
-# The tier-3 image boot's eyes inside the guest. Inert on a real unit: the
-# service runs only when the kernel command line carries otp.imgcheck, which
-# nothing but harness/img-boot.sh puts there. Installed unconditionally
-# anyway, so the image tier 3 boots is the image that ships rather than a
-# variant built for testing -- an overlay check that ran against a specially
-# prepared image would prove nothing about the artifact people flash.
+# The tier-3 guest probe. Inert on a real unit: it runs only when the kernel
+# command line carries otp.imgcheck. Installed unconditionally so the image
+# tier 3 boots is the image that ships.
 if [ -f "$REPO_DIR/harness/img-guest-check.sh" ]; then
     install -m 0755 "$REPO_DIR/harness/img-guest-check.sh" \
         "$PREFIX/img-guest-check.sh"
     install -m 0644 "$REPO_DIR/device/systemd/otp-unit-imgcheck.service" \
         /etc/systemd/system/otp-unit-imgcheck.service
 elif [ "$IMAGE_BUILD" -eq 1 ]; then
-    # EXIT, like every other overlay precondition in this file. This one
-    # printed a NOTE and carried on, which is how a build ships an image
-    # whose overlay nothing can probe -- and the miss does not surface for
-    # about seven minutes of pi-gen plus two emulated boots, arriving then
-    # as "the guest never reported", which reads as a boot failure rather
-    # than as the packaging error it is. The only way the file goes missing
-    # in a chroot is the copy list in image/stage-otpunit/01-otpunit, which
-    # now fails on the same absence at the other end.
+    # Fatal in an image build: without the probe nothing can check the overlay,
+    # and tier 3 would see it only as a guest that never reported.
     echo "ERROR: harness/img-guest-check.sh is not in $REPO_DIR, so the" >&2
     echo "       image being built would have nothing to report on the" >&2
     echo "       read-only overlay and tier 3 could not observe it." >&2
@@ -367,17 +315,10 @@ if [ ! -f "$BOOT_DIR/otp-unit.conf" ]; then
         "$BOOT_DIR/otp-unit.conf"
 fi
 
-# A template of /etc/cups is kept aside: otp-unit-etc-cups.service lays a
-# tmpfs over /etc/cups at boot and repopulates it, so the print queue is
-# rebuilt fresh every power-on.
-#
-# The template is built by WHITELIST, not blacklist. Everything that names
-# a printer has to stay out of it, and a blacklist kept missing things:
-# cupsd renames the old printers.conf to printers.conf.O on every save, and
-# writes a per-queue PPD to ppd/<queue>.ppd whose NickName is the model. A
-# snapshot taken on a rerun would bake those into the read-only root and lay
-# them back over /etc/cups on every boot -- making the one artifact this
-# mechanism exists to forget the one that survives longest.
+# otp-unit-etc-cups.service lays a tmpfs over /etc/cups at boot and
+# repopulates it from this template, so the queue is rebuilt every power-on.
+# Built by whitelist: anything naming a printer (printers.conf, its .O
+# backup, ppd/<queue>.ppd) must stay out of the read-only root.
 install -d "$PREFIX/cups-etc"
 rm -rf "${PREFIX:?}/cups-etc"
 install -d "$PREFIX/cups-etc"
@@ -402,208 +343,48 @@ if [ -f /etc/systemd/system/otp-unit-imgcheck.service ]; then
 fi
 systemctl enable cups.service 2>/dev/null || true
 
-# otp-unit takes tty1 to use as its front panel, so the login prompt that
-# normally lives there is gone. Put one on tty2 instead: with no network
-# and no SSH, Alt+F2 is the only way into a unit that will not come up.
-# This costs nothing in exposure -- anyone at the keyboard already has the
-# SD card, and the SD card is the whole device.
+# otp-unit takes tty1 as its front panel, so the login prompt goes on tty2:
+# with no network and no SSH, Alt+F2 is the only way into a unit that will
+# not come up.
 systemctl enable getty@tty2.service 2>/dev/null || true
 
-# --- the boot has to be able to FINISH ------------------------------------
+# --- the boot has to be able to finish ------------------------------------
 #
-# MEASURED, on the built image, in run 31968966879. Both emulated boots ran
-# for three minutes and NEITHER reached multi-user.target. Both consoles end
-# on the same line:
+# systemd-networkd-wait-online has TimeoutStartSec=infinity and this
+# appliance has no networkd configuration (NetworkManager owns the link), so
+# the wait never returns and everything ordered after network-online.target
+# stays queued for the whole boot -- including, via cloud-init's
+# cloud-config.service, the userconfig wizard (issue #20). Hence the mask.
 #
-#   Job systemd-networkd-wait-online.service/start running (2min 37s / no limit)
-#
-# "no limit" is that unit's own TimeoutStartSec=infinity. This appliance has
-# no networkd configuration -- NetworkManager owns the link, and its own
-# wait-online finished in seconds -- so networkd's wait never returns,
-# network-online.target is never reached, and every job ordered after it
-# stays queued for the life of the boot.
-#
-# WHAT THAT COSTS is not just a slow boot. cloud-init's cloud-config.service
-# is ordered after network-online.target, and stock userconfig.service is
-# `After=cloud-config.service`, so the wizard's start job sat in the queue
-# for the whole of both boots -- the guest read `jobs=1` with the condition
-# never evaluated -- and the valid /boot/firmware/userconf.txt seeded onto
-# the card came back off it untouched. An operator's credentials IGNORED IN
-# SILENCE is the exact outcome the drop-in below replaced a mask to avoid,
-# arriving from a direction nobody had looked at. See issue #20.
-#
-# TWO LOCKS, because either alone leaves half the trap armed:
-#
-#   - The wait is masked. An unbounded wait for a network this appliance
-#     does not have must not be able to hold a boot open, whatever pulls
-#     network-online.target in next.
-#   - cloud-init is switched off with its own documented kill switch. The
-#     packages are GONE from the built image now -- image/stage-otpunit
-#     purges cloud-init and rpi-cloud-init-mods, which is the decision
-#     issue #34 records -- and this line stays anyway, because there are two
-#     machines a purge cannot reach and on both of them it is the whole of
-#     the defence:
-#       * a unit that gets cloud-init BACK, as a dependency of something
-#         installed later or by somebody's `apt-get install`. A purge
-#         happens once, at build time; a marker file in /etc is read on
-#         every boot after that one.
-#       * the documented path this script is mostly run on -- "run this on
-#         a Pi you already have" -- where no pi-gen stage has ever run and
-#         the packages are exactly where Raspberry Pi OS put them.
-#     WHAT IT COSTS WHEN IT DOES FIRE: cloud-init is what pulls
-#     network-online.target in here, it cost 57 seconds of every boot doing
-#     nothing, and rpi-cloud-init-mods configures its NoCloud datasource
-#     with `seedfrom: file:///boot/firmware` -- so it is a provisioning
-#     agent reading user-data off the one partition an operator is told to
-#     write files on, on a device that prints one-time pads.
-#     /usr/lib/cloud-init/ds-identify is the thing that reads this file, not
-#     the generator directly: `is_disabled()` returns 0 on
-#     `[ -f /etc/cloud/cloud-init.disabled ]` before any datasource search,
-#     `_main` returns 2 at that, and the generator's rc=2 branch is what
-#     leaves cloud-init.target out of multi-user.target's wants -- so
-#     cloud-config.service is not in the transaction at all and the wizard's
-#     `After=` on it is void rather than waiting. Quoted from cloud-init
-#     25.2-1~bpo13+1+rpt20, the build the Raspberry Pi archive would put on
-#     this image.
-#
-# WHAT IS MEASURED HERE AND WHAT IS NOT, because the difference is worth
-# knowing before anyone trusts a green tier 3.
-#
-#   - The mask IS measured on the booted image:
-#     harness/img-guest-check.sh reads is-enabled back off the running
-#     machine and asks the job queue for its job
-#     (network-wait-cannot-hold-the-boot-open).
-#   - The PURGE is measured on the booted image, as
-#     cloud-init-is-not-installed: dpkg is asked for both packages, systemd
-#     for three cloud-init units and /usr/lib for the generator, each with a
-#     positive control beside it. An absence read through a tool that has
-#     stopped answering is the failure that check is written around, and on
-#     a machine whose /usr the purge has just edited it is not a theoretical
-#     one.
-#   - THE FILE REACHING AN IMAGE is measured, as
-#     cloud-init-kill-switch-survives-the-purge, in both boots, requiring a
-#     regular file because `[ -f ]` is the test ds-identify makes. Until
-#     issue #34 the only coverage this line had was
-#     tests/test_overlay_root.py running this block into a fake /etc, which
-#     says the script writes a file and never that a file reached a card.
-#   - ITS RUNTIME BEHAVIOUR IS STILL NOT MEASURED, and cannot be from here:
-#     the machine that would honour the marker no longer carries the code
-#     that reads it. Nothing in this repository runs ds-identify or the
-#     generator on any tier, so what is quoted above is upstream's source
-#     and not a measurement. An earlier version of this comment claimed the
-#     kill switch was "measured by what it unblocks, which is the wizard's
-#     job count in the same probe"; that was false then and would be false
-#     now -- with the wait above masked, network-online.target is satisfied
-#     by NetworkManager-wait-online in about thirty seconds, so a cloud-init
-#     that came back would let every guest check pass, just more slowly.
+# cloud-init is also switched off with its own kill switch: ds-identify stops
+# at /etc/cloud/cloud-init.disabled before any datasource search. The image
+# build purges the packages (issue #34); the marker covers a Pi provisioned
+# in place and a unit that gets cloud-init back as a dependency. Its NoCloud
+# datasource would otherwise read user-data off the boot partition.
 systemctl mask systemd-networkd-wait-online.service
 install -d /etc/cloud
 : > /etc/cloud/cloud-init.disabled
 
-# Raspberry Pi OS's first-boot user wizard (userconf-pi) decides whether
-# to prompt from get_boot_cli alone: on a console-boot image it goes
-# INTERACTIVE on every boot until someone answers a whiptail on tty8,
-# holding multi-user.target open forever ("no limit"). pi-gen's
-# DISABLE_FIRST_BOOT_USER_RENAME=1 only deletes the DESKTOP wizard's
-# autostart file; it never touches this service, so tier 3 caught the
-# built image parked on it -- and a flashed device would boot the same
-# way, a dialog nobody can see holding the boot open.
+# Raspberry Pi OS's first-boot user wizard (userconf-pi) goes interactive on
+# every console boot until someone answers a whiptail on tty8, holding
+# multi-user.target open. It is not masked, because it is also the only
+# consumer of the documented credential file userconf.txt. The drop-in:
 #
-# NOT masked, though an earlier fix did -- the review panel caught what
-# that broke: userconf-service is also the ONLY consumer of the
-# documented headless credential file /boot/firmware/userconf.txt, and
-# masking it silently ignored operator-provided credentials, leaving
-# the tty2 recovery getty below with no knowable login. The drop-in
-# keeps both properties instead:
+#   - the ConditionPathExists |= pair: the service runs only when an
+#     operator seeded userconf(.txt); an unseeded boot skips it.
+#   - StandardInput=null: a malformed seed fails fast instead of prompting;
+#     the boot completes and the file is left as failed_userconf.txt.
 #
-#   - the ConditionPathExists |= pair: the service runs ONLY when an
-#     operator actually seeded userconf(.txt), so an unseeded boot
-#     skips it instantly instead of prompting, and a seeded one gets
-#     the stock non-interactive apply-and-delete path.
-#   - StandardInput=null: a MALFORMED seed file would fall back to the
-#     interactive prompt; with no tty it fails fast instead, the boot
-#     completes (wanted-by, not required-by), and the file is left
-#     renamed failed_userconf.txt on the boot partition as evidence.
+# The applied hash goes to /etc/shadow, inside the overlay, and the wizard
+# deletes the seed, so device/persist-identity.sh keeps the credential on the
+# boot partition (see the ExecStartPost drop-in below). That partition is vfat
+# mounted `defaults`, readable by every local account, so the hash is exposed
+# exactly as the operator's own userconf.txt was -- but deleting userconf.txt
+# no longer removes it (docs/IMAGE.md gives the `rm`).
 #
-# All three branches are asserted on the real image now rather than argued
-# here (issue #20): tier 3 plants a valid seed before boot1 and requires it
-# consumed with the hash in /etc/shadow and no wizard job, requires boot2 to
-# skip the unit while leaving it enabled, and hands the shipped
-# userconf-service a malformed seed with stdin closed to see it end and
-# quarantine the file rather than hang. See harness/img-guest-check.sh.
-#
-# THE SEED USED TO LAST ONE BOOT. MEASURED, THEN DECIDED, AND THE DECISION IS
-# "PERSIST IT". The apply path is `chpasswd -e` into /etc/shadow. /etc is
-# inside the read-only root overlay this script installs below, so the new
-# hash lived in the tmpfs and died with the power. The seed itself is on the
-# FAT partition, which is OUTSIDE the overlay, and userconf-service deletes
-# it as the last step of a successful apply -- so the one file that could
-# reapply the credential was destroyed by the boot that consumed it, and the
-# account went back to the random FIRST_USER_PASS image/build.sh generates at
-# build time, which nobody has. The operator got a working password for
-# exactly one boot. Tier 3 measured both halves and neither read as a
-# contradiction: boot1 found the seeded hash in /etc/shadow, boot2 found the
-# seed gone from the card.
-#
-# THE THREE CANDIDATES WERE refuse the seed loudly, persist the credential,
-# and keep the seed file. The repository owner chose the second, on the
-# ground that this device can be connected to a keyboard and a screen -- so
-# the login is a real recovery path and not a nicety, and an appliance that
-# accepts a documented credential file and then throws the credential away is
-# worse than one that never accepted it.
-#
-# WHAT THAT COSTS, WRITTEN DOWN WHERE THE CODE IS RATHER THAN ARGUED
-# ELSEWHERE. The hash goes on the FAT partition, which is mounted `defaults`
-# and therefore 0755 root:root -- readable by every uid on this machine (the
-# `lp` uid CUPS runs filters as, and the operator's own account) as well as
-# by anyone who can mount the card. A password hash is offline-crackable at
-# leisure: measured on the build container, sha512crypt at the 5000 rounds
-# `openssl passwd -6` produces verifies in 2.111 ms, so 474 guesses per
-# second per core before any GPU is involved; yescrypt at $y$j9T$ took
-# 16.146 ms. Someone who can already read that partition can also either take
-# the card and edit the rootfs, or already has a shell here -- so the hash
-# buys them little on this device. What it can cost is a password the
-# operator uses somewhere else.
-#
-# AND IT IS THE SAME EXPOSURE THE REJECTED "KEEP THE SEED FILE" HAD, which is
-# worth stating plainly because the two options are not distinguishable on
-# this axis: userconf.txt IS `username:hash`, so keeping it leaves the same
-# crypt string on the same partition at the same 0755. What persisting buys
-# over keeping is not secrecy. It is that userconf-pi's apply path -- which
-# ends in cancel-rename enabling and starting a getty on the front panel's
-# tty, disabling this very unit, and reloading sshd -- runs once rather than
-# on every boot; that the store gets the marker, the validation and the
-# outside-the-overlay refusal in device/persist-identity.sh; and that a NEW
-# userconf.txt still works, because the wizard is still the front door.
-#
-# THE ONE THING THAT IS WORSE THAN KEEPING THE SEED: deleting userconf.txt
-# from the card no longer takes the operator's hash off the card, because
-# there is now a second copy under a name they did not write. docs/IMAGE.md
-# and the closing summary of this script both say so, and both give the `rm`.
-#
-# NOT NARROWED WITH fmask=0077, and the reason recorded further down this
-# file for that is WRONG and should be reconsidered: it says a root-only
-# partition "would break settings persistence" because otp-unit.service
-# carries ReadWritePaths=-/boot/firmware, but that unit has no `User=` and
-# runs as root, as do all four units in device/systemd. Root writes through
-# 0700 vfat. The real costs of fmask are different ones -- this script would
-# have to rewrite /etc/fstab, which it deliberately does not; a bad fstab
-# entry costs the boot partition mount and takes the settings, the machine-id
-# and this credential with it; and otpunit/config.py's `mount -o remount,rw`
-# path would need checking, because vfat re-parses options on remount. That
-# is a separate decision with its own blast radius and it is not the one
-# being implemented here.
-#
-# $BOOT_DIR, not a hardcoded /boot/firmware, and the heredoc is UNQUOTED so
-# that it expands. The condition has to name the directory the firmware
-# partition is actually mounted on, because that is where the operator's file
-# lands: userconf-service reads
-# `/usr/lib/raspberrypi-sys-mods/get_fw_loc`, which answers /boot on the
-# pre-bookworm layout, and BOOT_DIR above falls back to /boot for the same
-# reason. Written flat, the pair named a path that does not exist on such a
-# machine -- the condition is then false forever, the unit never runs, and a
-# seeded userconf.txt is ignored in exactly the silence this drop-in replaced
-# a mask to avoid. Nothing else in the block contains a `$`.
+# The heredoc is unquoted so $BOOT_DIR expands: the condition must name the
+# directory the firmware partition is actually mounted on, which is /boot on
+# the pre-bookworm layout. Nothing else in the block contains a `$`.
 systemctl unmask userconfig.service 2>/dev/null || true
 install -d /etc/systemd/system/userconfig.service.d
 cat > /etc/systemd/system/userconfig.service.d/otp-appliance.conf <<DROPIN
@@ -615,105 +396,25 @@ ConditionPathExists=|$BOOT_DIR/userconf.txt
 StandardInput=null
 DROPIN
 
-# AND ENABLED, IN THE IMAGE, which until now nothing did.
-#
-# MEASURED, in run 32020772161 -- the first boot pair with the machine-id
-# persisted. boot2 reported
-#
-#   OTP-CHECK boot2 userconf-unseeded-boot-skips-the-wizard FAIL
-#     condition=no checked-at='never' is-active=inactive is-enabled=disabled
-#
-# `is-enabled=disabled`, on a boot where nothing had disabled anything: /etc
-# is the overlay, so boot1's `systemctl disable userconfig` -- cancel-rename's
-# own last-but-one act -- died with the power. That reading is the IMAGE's
-# state, and it always was. What had been hiding it is that every boot used to
-# be a first boot, so systemd ran `preset-all` every time and re-enabled the
-# unit every time. Persisting the machine-id stopped that, and the accident
-# stopped with it. The same run shows the change directly: boot1's targets
-# include first-boot-complete.target and boot2's do not.
-#
-# WHAT IT COSTS IF LEFT, and it is the exact trade the comment above refuses
-# to make by masking: userconfig.service is the ONLY consumer of the
-# documented headless credential file, so a disabled unit means a
-# userconf.txt an operator writes to the card is ignored, in silence, on
-# every boot after the first. Arriving by preset-all instead of by `mask`
-# does not make it a different outcome.
-#
-# ENABLING IT IS WHAT THE DROP-IN ABOVE WAS WRITTEN FOR. The condition pair
-# exists so that a unit which IS pulled into every boot costs nothing on the
-# boots with no seed: systemd evaluates two ConditionPathExists, finds
-# neither, and skips the unit before its ExecStart -- no prompt, no job, no
-# time. Enabled plus that condition is the design; enabled by accident of a
-# machine-id bug was not.
-#
-# `|| true`, unlike the masks in this file, because this one is not load
-# bearing for the boot: an image whose userconfig.service cannot be enabled
-# still boots and still prints pads. Tier 3's
-# userconf-unseeded-boot-skips-the-wizard is what fails if it does not land.
+# Enabled explicitly in the image: with the machine-id persisted only a
+# unit's first boot runs preset-all, and a disabled userconfig.service would
+# silently ignore a userconf.txt on every later boot. The condition pair
+# above makes it free on unseeded boots. `|| true` because this is not load
+# bearing for the boot.
 systemctl enable userconfig.service 2>/dev/null || true
 
-# AND THE LAST THING THAT APPLY PATH DOES, which is where it bites. Applying
-# a seed ends in /usr/lib/userconf-pi/userconf, whose final act is
-# `cancel-rename`, and cancel-rename ends -- on every machine that boots to a
-# console, which is this one -- with
+# Applying a seed ends in cancel-rename, which enables and starts getty@tty1
+# -- the front panel's tty. Masking the getty would make that start fail, so
+# userconf-service (sh -e) would die before deleting the seed and
+# restart-loop; Conflicts= on otp-unit would let the getty stop the panel. A
+# condition-skipped start does neither.
 #
-#   systemctl --quiet enable getty@tty1
-#   systemctl --quiet --no-block start getty@tty1
+# Both conditions are `|`-prefixed, i.e. triggering and ORed: tty1 gets a
+# login if the panel is not enabled or its unit is masked or absent.
 #
-# So the documented credential file, used as documented, puts a login prompt
-# on the front panel's tty. otp-unit.service used to answer that with
-# Conflicts=getty@tty1.service, and Conflicts is symmetric: starting the
-# getty STOPS the unit. An operator who set their password the supported way
-# lost the panel until the next power-cycle.
-#
-# A CONDITION, and not either of the two obvious alternatives:
-#
-#   - Masked, and that start FAILS. cancel-rename's exit status is that
-#     command's, `userconf` passes it up, and userconf-service runs under
-#     `sh -e` -- so it dies BEFORE deleting the applied seed, and stock
-#     userconfig.service's Restart=on-failure turns that into a restart
-#     loop printing two of the strings tier 3 fails a release on.
-#   - Left to Conflicts=, and the panel dies as described.
-#
-# A condition-skipped start does neither: systemd reports the job done, no
-# getty ever runs on tty1, the seed is deleted and the unit succeeds. The
-# machine without a front panel still gets its login prompt -- including one
-# where provisioning failed half way, which is when it is wanted most.
-#
-# WHAT THE CONDITION KEYS ON: the panel BEING GOING TO RUN, not its unit file
-# being on disk. The single `ConditionPathExists=!/etc/systemd/system/otp-\
-# unit.service` that used to be here got that wrong in the direction that
-# costs a login. `systemctl mask otp-unit` REPLACES that path with a symlink
-# to /dev/null, and ConditionPathExists follows symlinks -- /dev/null exists
-# -- so the condition stayed false and no getty ever started, on a machine
-# whose panel was masked and therefore never started either. `systemctl
-# disable otp-unit` is the same story from the other end: it removes the
-# multi-user.target.wants symlink and leaves the unit file exactly where it
-# was. Either one left tty1 dark and login-less forever, which is precisely
-# the half-provisioned state the paragraph above says the prompt is for.
-#
-# Evaluated by systemd itself (`systemd-analyze condition`), over the four
-# states a machine can be in:
-#
-#                    old: PathExists=!unit     new: the pair below
-#   healthy            getty skipped             getty skipped
-#   panel masked       getty skipped   <-- bug   getty starts
-#   panel disabled     getty skipped   <-- bug   getty starts
-#   panel absent       getty starts              getty starts
-#
-# TWO conditions, both `|`-prefixed so they are TRIGGERING: systemd starts
-# the unit when at least one triggering condition holds, so this reads "give
-# tty1 a login if the panel is not enabled OR its unit is masked/gone",
-# which is the OR the property needs. Un-prefixed they would be ANDed, and
-# the getty would come back only on a machine that was both disabled and
-# masked.
-#
-#   - the .wants symlink is what `enable` creates and `disable` removes, so
-#     it answers "is the panel going to be pulled into the boot".
-#   - ConditionFileNotEmpty, not PathExists, on the unit file: it requires a
-#     REGULAR file of non-zero size, and a mask is a symlink to a
-#     zero-length character device. That is the whole reason this line is
-#     spelled differently from the one it replaces.
+#   - the .wants symlink is what `enable` creates and `disable` removes.
+#   - ConditionFileNotEmpty, not PathExists, on the unit file: a mask is a
+#     symlink to /dev/null, which exists but is not a non-empty regular file.
 install -d /etc/systemd/system/getty@tty1.service.d
 cat > /etc/systemd/system/getty@tty1.service.d/otp-appliance.conf <<'GETTY'
 [Unit]
@@ -721,203 +422,50 @@ ConditionPathExists=|!/etc/systemd/system/multi-user.target.wants/otp-unit.servi
 ConditionFileNotEmpty=|!/etc/systemd/system/otp-unit.service
 GETTY
 
-# AND THE ONE ALREADY RUNNING, because a condition only stops a getty
-# STARTING. On the documented "run this on a Pi you already have" path there
-# is one running: Raspberry Pi OS Lite started it at boot, before this file
-# existed. Conflicts= used to stop it as a side effect of starting the unit,
-# and tier 2 measured what dropping that costs on a live machine, in the run
-# that arrived without this line:
-#
-#   OTP-CHECK provision getty1-stopped FAIL getty@tty1=active
-#   OTP-CHECK provision service-active FAIL is-active=inactive
-#   systemd[1]: Started otp-unit.service - OTP pad print unit.
-#   systemd[1]: otp-unit.service: Deactivated successfully.      (1s later)
-#
-# -- the panel takes /dev/tty1 with tty-force, the getty is hung up, its
-# Restart=always brings it straight back, and its TTYVHangup takes the tty
-# off the panel, whose Python then exits. The two boots after that reboot
-# were 14/14 and 13/13, because by then the condition was in force and no
-# getty ran at all.
-#
-# Stopped ONCE, explicitly, after the reload that puts the condition in
-# force -- not a standing rule that anything starting a getty takes the unit
-# down with it, which is the trade Conflicts= made. In pi-gen's chroot
-# systemctl ignores start/stop requests, which is exactly right there: no
-# getty is running, and the condition ships for the first boot.
+# A condition only stops a getty starting. On a Pi provisioned in place one
+# is already running and would take the tty back off the panel
+# (Restart=always, TTYVHangup), so it is stopped once, after the reload that
+# puts the condition in force. In pi-gen's chroot systemctl ignores this.
 systemctl daemon-reload
 systemctl stop getty@tty1.service 2>/dev/null || true
 
 # --- AND THE RELOAD AT THE END OF THAT SAME SCRIPT ------------------------
+# cancel-rename's last act is to reload ssh if it is active. With ssh.socket
+# enabled (Accept=no) the socket owns :22, so sshd's SIGHUP re-exec cannot
+# bind, exits 255, and RestartPreventExitStatus=255 keeps it down. With the
+# socket masked, ssh.service binds :22 itself and a reload works.
 #
-# cancel-rename's last act, after the getty, is
+# Masked, not disabled: `disable` only removes symlinks, and preset-all would
+# put them back. The image ships ssh.service disabled (ENABLE_SSH=0), but
+# preset-all still starts it on a unit's first boot, so the mask is needed.
+# ssh.service itself is not masked: that would take SSH off the machine as a
+# side effect.
 #
-#   if systemctl --quiet is-active ssh; then
-#       systemctl --quiet reload ssh
-#   fi
-#
-# -- read out of userconf-pi 0.19's /usr/bin/cancel-rename, the version in
-# archive.raspberrypi.com/debian trixie. On the image as it stood that
-# reload killed sshd for the rest of the boot. Run 72's tier-3 console,
-# boot 1:
-#
-#   systemd[1]: Reloading ssh.service - OpenBSD Secure Shell server...
-#   sshd[744]: Received SIGHUP; restarting.
-#   sshd[744]: fatal: Cannot bind any address.
-#   systemd[1]: ssh.service: Failed with result 'exit-code'.
-#
-# ssh.service carries RestartPreventExitStatus=255, so nothing brings it
-# back. The ONE boot an operator expects to be able to SSH into -- the boot
-# that applies their seeded credentials -- ends with no SSH, in silence.
-#
-# WHY IT DIES, which is what decides which line fixes it. Debian's
-# openssh-server 1:10.0p1-7+deb13u4 ships ssh.socket next to ssh.service:
-#
-#   [Socket]
-#   ListenStream=22
-#   Accept=no
-#
-# Accept=no with no Service= means the socket's implied service is
-# ssh.service, so when both are enabled ssh.socket binds :22 first and
-# systemd hands sshd the listening descriptor instead of letting it bind.
-# sshd's SIGHUP handler closes its listeners and re-execs; the re-exec has
-# no LISTEN_FDS left to adopt, ssh.socket still owns :22, and there is
-# nothing it can bind. Both units are enabled because systemd runs
-# `preset-all` on a FIRST boot -- and until the machine-id below is
-# persisted, every boot of this appliance is a first boot.
-#
-# THE SOCKET IS WHAT IS MASKED, and not either alternative:
-#
-#   - mask ssh.service, and `is-active ssh` above is false so no reload
-#     happens at all -- but that leaves ssh.socket listening on :22 for a
-#     service that can never start, and takes SSH off the machine as a
-#     side effect of a bug fix.
-#   - a drop-in ExecReload that does nothing hides the fault instead of
-#     fixing it, and a reload that silently does not reload is the shape of
-#     defect this repository exists to refuse.
-#
-# With the socket masked, ssh.service starts standalone, sshd binds :22
-# itself, and the SIGHUP re-exec rebinds it -- which is the ordinary path on
-# every machine that is not socket-activated.
-#
-# MASKED, NOT DISABLED, for the reason the growfs mask below is: `disable`
-# removes symlinks under /etc/systemd/system, which is inside the overlay,
-# so it would last one boot and the next preset-all would put the socket
-# back. A mask is a symlink to /dev/null written into the image.
-#
-# AND IT STAYS, now that this appliance has decided not to run sshd at all.
-# That decision could be read as making the mask pointless, and it is the
-# other way round. image/build.sh sets ENABLE_SSH=0, so pi-gen leaves
-# ssh.service DISABLED -- but the ONE boot that is genuinely a machine's
-# first still runs `preset-all`, and preset-all enables ssh.service and
-# ssh.socket together. Measured, in run 32020772161: boot1 starts
-# ssh.service at 130s; boot2 does not contain the string ssh.service,
-# ssh.socket or OpenBSD anywhere and still reaches multi-user.target.
-# Persisting the machine-id is what ended it after the first boot; on the
-# first boot itself the socket is still what turns cancel-rename's reload
-# into `fatal: Cannot bind any address` and a `Failed with result` line on
-# the console of a key printer.
-#
-# NOT ALSO MASKING ssh.service, and that is a deliberate omission rather
-# than an oversight. It would take SSH off the machine as a side effect of a
-# bug fix -- the alternative refused above -- and it would leave ssh.socket
-# enabled on that first boot with nothing behind it. What the appliance does
-# NOT do is keep anything for sshd across the power cycle: no host keys go
-# outside the overlay (see device/persist-identity.sh), so the fingerprint of
-# that one first boot's sshd dies with it.
-#
-# Bare, with no `|| true`, like the networkd-wait-online mask above: this
-# runs in the pi-gen chroot against an image that has openssh-server in it,
-# and a mask that silently failed to apply is the defect it exists to stop.
+# No `|| true`: a mask that silently failed to apply must fail the build.
 systemctl mask ssh.socket
 
 # --- the read-only root overlay ------------------------------------------
 
-# This section used to be a paragraph of advice printed at the end telling
-# the operator to run raspi-config themselves. Nothing enabled the overlay:
-# not this script, not the pi-gen stage, not the image. So the property the
-# whole design rests on -- a power-cycle is a full reset -- existed only on
-# units whose owner had followed a printed instruction, and no tier of the
-# harness had ever booted a machine that had one. That is issue #9.
+# Hand-rolled rather than `raspi-config nonint enable_overlayfs`: on bookworm
+# and later that installs `overlayroot`, whose initramfs script needs
+# `mount --move`, which klibc's mount lacks -- a kernel panic unless busybox
+# happens to be in the initramfs (issue #9).
 #
-# NOT `raspi-config nonint enable_overlayfs`, and that is why this is
-# hand-rolled rather than a one-line call. On bookworm and later raspi-config
-# implements the overlay by installing Debian's `overlayroot` package and
-# putting `overlayroot=tmpfs` on the kernel command line. overlayroot's
-# initramfs script moves the root aside with `mount --move`, and the mount(8)
-# an initramfs-tools initrd actually contains is klibc's, which has no such
-# option:
+# Instead `boot=overlay` makes the initrd source /scripts/overlay, which
+# overrides local_mount_root to mount the card read-only under a tmpfs
+# overlay, using only mounts klibc accepts. If the initramfs is missing the
+# unit comes up on a writable root, which tier 3 fails on.
 #
-#     $ /usr/lib/klibc/bin/mount --move /a /b
-#     mount: invalid option --
-#
-# -- run against the klibc-utils 2.0.14-1 binary from trixie. That is the
-# string the tier-2 guest printed immediately before `Kernel panic - not
-# syncing: Attempted to kill init!` (issue #9's first comment), and it is not
-# a property of that guest: Raspberry Pi OS trixie installs the same
-# overlayroot and builds its initrd with the same initramfs-tools. It
-# survives only where busybox happens to have been packed into the initramfs,
-# because busybox's mount does accept --move. Whether this appliance boots is
-# not allowed to depend on that.
-#
-# What runs instead is what raspi-config itself did before that switch, and
-# it is initramfs-tools' own documented mechanism rather than anything
-# invented here: `boot=overlay` makes the initrd source /scripts/overlay
-# (mkinitramfs copies /etc/initramfs-tools/scripts into the image; init
-# sources /scripts/${BOOT} before calling mountroot), and that file overrides
-# local_mount_root to mount the card read-only and lay a tmpfs overlay over
-# it. Every mount it runs is one klibc's mount accepts -- measured, including
-# `-t overlay -o lowerdir=...,upperdir=...,workdir=...`.
-#
-# The failure modes are the right way round too. If the initramfs is missing
-# or unreadable the firmware boots the kernel without one, `boot=overlay` is
-# read by nothing, and the unit comes up on a writable root -- which tier 3
-# now fails on. overlayroot's failure mode is a kernel panic on a device with
-# no console.
-#
-# /etc/fstab is deliberately not touched. overlayroot rewrites it, which is
-# most of what its init-bottom script is doing by the time it panics; this
-# mechanism leaves the root entry alone and lets systemd-remount-fs remount
-# whatever is at / with the options fstab gives for /. That is untested here
-# and it is the first thing to look at if a tier-3 console ever shows
-# systemd-remount-fs failing.
-#
-# THE /boot/firmware LINE IS NOT TOUCHED EITHER, and that is a decision with
-# a cost worth naming. pi-gen mounts it `vfat ... defaults`, and vfat carries
-# no permission bits, so every file on the boot partition is 0755 root:root
-# -- readable by EVERY local account, the `otp` user and the `lp` uid CUPS
-# runs filters as included, not merely by someone who takes the card out.
-#
-# "IF THAT EVER CHANGES, THIS IS THE LINE THAT HAS TO CHANGE WITH IT" is what
-# this comment used to end on, about the claim that no password is written
-# here. IT HAS CHANGED. The owner's decision above persists the operator's
-# login, so a crypt string now lives at
-# /boot/firmware/otp-identity/credential. No pad byte does, and none ever
-# may.
-#
-# `fmask=0077,dmask=0077` WOULD NARROW IT, and the reason recorded here for
-# declining it was wrong. It said a root-only partition would break settings
-# persistence because otp-unit.service carries ReadWritePaths=-/boot/firmware
-# so otpunit/config.py can save there. But that unit has no `User=` -- it
-# runs as root, and ReadWritePaths is a mount-namespace grant rather than a
-# uid drop. All four units in device/systemd run as root, and no non-root
-# writer to this partition exists in this repository. Root writes through
-# 0700 vfat, so the stated cost is zero.
-#
-# It is still not applied, for costs that are real: this script would have to
-# rewrite /etc/fstab, which the paragraph above says it deliberately does
-# not; an fstab entry that is wrong costs the boot-partition mount and takes
-# the settings, the machine-id store and this credential down with it, on a
-# device with no network to recover over; and config.py's `mount -o
-# remount,rw` fallback would have to be checked, because vfat re-parses its
-# options on remount and may not carry fmask forward. That is a decision for
-# the repository, like the one above, and it is the obvious next narrowing
-# for whoever wants one.
+# /etc/fstab is not touched; systemd-remount-fs remounts / with the options
+# fstab gives. The /boot/firmware entry stays `vfat defaults` too, so every
+# file there is readable by every local account -- including the kept login
+# at /boot/firmware/otp-identity/credential. No pad byte is ever written
+# there. Narrowing it with fmask/dmask would mean rewriting fstab, where a
+# wrong entry costs the boot-partition mount on a device with no network.
 CMDLINE_TXT="$BOOT_DIR/cmdline.txt"
 if [ ! -f "$CMDLINE_TXT" ]; then
-    # The overlay is configured through the Raspberry Pi boot firmware, so
-    # there is nothing to configure on a machine that has no cmdline.txt --
-    # the tier-2 Debian guest, whose /boot/firmware is a bare FAT partition
-    # made to mirror the Pi's geometry, is exactly that machine.
+    # The overlay is configured through the Pi boot firmware; a machine with no
+    # cmdline.txt (the tier-2 Debian guest) has nothing to configure.
     if [ "$IMAGE_BUILD" -eq 1 ]; then
         echo "ERROR: no $CMDLINE_TXT in the image being built, so the" >&2
         echo "       read-only overlay cannot be enabled. An image without" >&2
@@ -931,92 +479,33 @@ if [ ! -f "$CMDLINE_TXT" ]; then
 else
     log "Enabling the read-only root overlay"
     install -d /etc/initramfs-tools/scripts
-    # A copy of initramfs-tools 0.148.4's own local_mount_root with the
-    # overlay steps inserted, rather than of raspi-config's older copy of the
-    # same function: the version in trixie grew a check for a missing root=
-    # and handles ROOTFSTYPE=auto, and a stale copy of a function this
-    # important is a bug waiting for a kernel bump.
+    # initramfs-tools' own local_mount_root (0.148.4) with the overlay steps
+    # inserted; keep it in step when that function changes.
     cat > /etc/initramfs-tools/scripts/overlay <<'OVERLAY'
 # Mount the root filesystem read-only under a RAM overlay.  -*- shell-script -*-
 #
-# initramfs-tools sources this file instead of nothing when the kernel
-# command line says boot=overlay, after /scripts/local and before mountroot.
-# Overriding local_mount_root is how mountroot reaches this code.
+# initramfs-tools sources this file when the kernel command line says
+# boot=overlay, after /scripts/local and before mountroot. Overriding
+# local_mount_root is how mountroot reaches this code.
 
 . /scripts/local
 
-# THE ONE THING ALLOWED THROUGH THE OVERLAY, AND WHY IT HAS TO BE HERE.
+# The one thing allowed through the overlay. /etc/machine-id ships as
+# `uninitialized`, which systemd reads as a first boot: it generates an ID
+# into the tmpfs and runs preset-all, on every boot. PID 1 reads the file
+# before any unit, so the initrd is the only place early enough to restore
+# it. One named file, not /etc, and no SSH host keys (see
+# device/persist-identity.sh).
 #
-# /etc is inside the overlay, so /etc/machine-id is whatever the card says
-# plus whatever this boot wrote to a tmpfs. pi-gen ships it holding the word
-# `uninitialized` -- read out of a stock Raspberry Pi OS Lite arm64 image --
-# and systemd's documented reading of that word is "this is a first boot":
-# PID 1 generates an ID, writes it to /etc (the tmpfs), creates
-# /run/systemd/first-boot, and runs preset-all. The write dies with the
-# power, so the NEXT boot is a first boot too, and the one after that.
-# Measured consequences on run 72's console: ssh.socket enabled again every
-# boot, regenerate_ssh_host_keys.service and sshd-keygen.service run again
-# every boot, and the host keys of a machine that prints one-time pads
-# change on every power cycle.
+# The source is the FAT boot partition, mounted read-only here; userspace
+# records the id there later. Only klibc-utils commands are used and vfat is
+# built into the -rpi-v8 kernels, so neither busybox nor a module is needed.
 #
-# IN THE INITRAMFS BECAUSE NOTHING LATER IS EARLY ENOUGH. PID 1 reads
-# /etc/machine-id before it looks at a single unit, so no service, drop-in
-# or generator can put the file there in time. The initrd is the last moment
-# that exists, and this file is already the thing that assembles the root --
-# so the exception rides with the mechanism it is an exception to, rather
-# than in some other file that has to be kept in step with it.
+# Never panics: a missing, unreadable or malformed stored id leaves
+# /etc/machine-id as the image shipped it.
 #
-# NARROW ON PURPOSE: one file, 33 bytes, named. Not /etc, and not a list.
-# The SSH host keys are not done here or anywhere else: this appliance ships
-# with ssh.service disabled (image/build.sh sets ENABLE_SSH=0) and does not
-# run sshd, so there is no fingerprint anybody could be shown and no reason
-# to put a private key on a partition every local account can read. See
-# device/persist-identity.sh.
-#
-# WHERE IT COMES FROM: the FAT boot partition, the same partition
-# otpunit/config.py already persists settings to and the only writable
-# storage this design has outside the overlay. It is mounted READ-ONLY
-# here; the copy that puts a machine-id there is made from userspace, on a
-# partition systemd has mounted read-write by then.
-#
-# EVERY COMMAND BELOW IS ONE THE INITRD REALLY HAS. `mount`, `mkdir`, `cat`
-# and `umount` are klibc-utils, which initramfs-tools depends on; nothing
-# here needs busybox, which is the trap the header of this section is
-# written around. And no module is needed either: in the kernel this image
-# installs (linux-image-6.12.47+rpt-rpi-v8, and every -rpi-v8 build) fat,
-# vfat, nls_cp437 and nls_ascii are all in modules.builtin, with
-# CONFIG_FAT_DEFAULT_IOCHARSET="ascii" -- so a bare `mount -t vfat` works
-# with an empty /lib/modules.
-#
-# IT NEVER PANICS. The overlay is boot-critical and panics on failure; an
-# identity is not. Everything here is best effort: a card with no stored
-# machine-id, an unreadable partition, or a stored value that is not 32 hex
-# characters all leave /etc/machine-id exactly as the image shipped it,
-# which is the behaviour this replaces rather than a new failure. What
-# notices is tier 3, not the boot.
-#
-# RUN IN A REAL INITRAMFS BEFORE IT WAS TRUSTED, because none of the above
-# is worth much as an argument. This function, sliced out of this file
-# unmodified, was packed into a stock Raspberry Pi OS Lite arm64 initramfs as
-# /scripts/otptest and booted under `-M raspi3b` with QEMU 8.2.2, on the real
-# kernel, with klibc's mount and no /lib/modules entry for vfat. Both cards:
-#
-#   with aabbccddeeff00112233445566778899 in ::otp-identity/machine-id
-#     OTP-INITRD rc=0 id=aabbccddeeff00112233445566778899
-#     and userspace read /etc/machine-id back as that, mode 444
-#   with nothing there at all (an unprovisioned card, which is every unit's
-#   first boot)
-#     OTP-INITRD rc=0 id=uninitialized
-#     the file left exactly as the image ships it, and the boot carried on
-#
-# So the vfat mount, the ${ROOT%p[0-9]}p1 derivation, the validation and the
-# write through ${rootmnt} are measured rather than reasoned about.
-#
-# THE MOUNTPOINT IS A VARIABLE for the same reason $BOOTDIR is one in the
-# guest probe: tests/test_overlay_root.py runs this function against a tree
-# it can build, with stub mount/umount on PATH. A hardcoded path would leave
-# the only exercise of it an emulated boot of an image nobody can build
-# locally, which is the one place a mistake here is expensive to find.
+# The mountpoint is a variable so tests/test_overlay_root.py can run this
+# function against a tree it builds.
 OTP_IDENTITY_MNT=/otp-boot
 
 otp_restore_machine_id()
@@ -1024,22 +513,17 @@ otp_restore_machine_id()
 	local dev id
 
 	mkdir -p "${OTP_IDENTITY_MNT}"
-	# CANDIDATES, AND A MARKER, rather than a guess. On the Pi the FAT
-	# partition is always partition 1 of the card the root came off, so the
-	# first candidate is ${ROOT} with its partition number replaced; the
-	# second is the literal device for the layout every image this project
-	# builds has. Nothing is trusted just for mounting: the file has to be
-	# under otp-identity/, a directory only device/install.sh's own
-	# persistence puts there, so mounting the wrong thing does nothing.
-	for dev in "${ROOT%p[0-9]}p1" /dev/mmcblk0p1; do
+	# The FAT partition is partition 1 of the card the root came off:
+	# ${ROOT%[0-9]}1 swaps the final partition digit for 1 (mmcblk0p2,
+	# nvme0n1p2, sda2), with the literal device as a fallback. The file must
+	# be under otp-identity/, so mounting the wrong thing does nothing.
+	for dev in "${ROOT%[0-9]}1" /dev/mmcblk0p1; do
 		[ -e "${dev}" ] || continue
 		mount -r -t vfat "${dev}" "${OTP_IDENTITY_MNT}" 2>/dev/null || continue
 		id=$(cat "${OTP_IDENTITY_MNT}/otp-identity/machine-id" 2>/dev/null)
 		umount "${OTP_IDENTITY_MNT}" 2>/dev/null || true
-		# 32 lower-case hex characters, which is the only thing systemd
-		# accepts. A short, empty or corrupt value is dropped rather than
-		# written: systemd would reject it and call the boot a first boot,
-		# which is the state this is trying to leave.
+		# systemd accepts only 32 lower-case hex characters; anything else is
+		# dropped rather than written.
 		case "${id}" in
 		*[!0-9a-f]*|"") continue ;;
 		esac
@@ -1071,9 +555,7 @@ local_mount_root()
 
 	mkdir -p /lower /upper
 
-	# -r, and this is the line that makes the card read-only for the whole
-	# life of the boot: the running system never has a writable handle on
-	# the filesystem it booted from.
+	# -r: the running system never has a writable handle on the card.
 	# shellcheck disable=SC2086
 	if ! mount -r ${FSTYPE:+-t "${FSTYPE}"} ${ROOTFLAGS} "${ROOT}" /lower; then
 		panic "Failed to mount ${ROOT} read-only as the overlay's lower layer."
@@ -1088,32 +570,24 @@ local_mount_root()
 	fi
 	mkdir -p /upper/data /upper/work
 
-	# PANIC rather than fall back to mounting the card read-write. A unit
-	# that quietly came up without the overlay would keep on the card
-	# everything the session wrote, which is the one thing this mechanism
-	# exists to prevent, and it would say nothing about it.
+	# Panic rather than fall back to read-write: a unit that came up without
+	# the overlay would silently keep the session on the card.
 	if ! mount -t overlay \
 	     -o lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work \
 	     overlay "${rootmnt?}"; then
 		panic "Failed to assemble the root overlay."
 	fi
 
-	# LAST, and only once the overlay is up: this writes THROUGH the
-	# overlay into its tmpfs upper layer, so it has to have somewhere to
-	# write to. See the comment on the function for why one file is
-	# allowed past a mechanism whose whole purpose is that nothing is.
+	# Last: this writes through the overlay into its tmpfs upper layer.
 	otp_restore_machine_id
 }
 OVERLAY
     grep -qxF overlay /etc/initramfs-tools/modules 2>/dev/null \
         || echo overlay >> /etc/initramfs-tools/modules
 
-    # Every installed kernel, read out of /lib/modules rather than from
-    # `uname -r`. In pi-gen's chroot uname reports the BUILD HOST's kernel,
-    # for which there are no modules and no initramfs can be built -- that is
-    # what raspi-config's enable_overlayfs does, and the reason it cannot be
-    # run at image-build time at all. The image also carries a second kernel
-    # for the Pi 5, so this is a loop rather than a single version.
+    # Every installed kernel, from /lib/modules rather than `uname -r`: in
+    # pi-gen's chroot uname reports the build host's kernel. The image also
+    # carries a second kernel for the Pi 5.
     KERNELS=""
     for moddir in /lib/modules/*; do
         [ -f "$moddir/modules.dep" ] || continue
@@ -1125,19 +599,14 @@ OVERLAY
         exit 1
     fi
     for kern in $KERNELS; do
-        # -c, not -u. pi-gen sets update_initramfs=no in
-        # update-initramfs.conf so kernel installs do not build one, and
-        # update-initramfs honours that setting on its update path only --
-        # `-u` would print "Not updating initramfs." and exit 0, leaving the
-        # overlay out of an initramfs that already existed.
+        # -c, not -u: pi-gen sets update_initramfs=no, which update-initramfs
+        # honours on its update path only -- `-u` would exit 0 having done
+        # nothing.
         update-initramfs -c -k "$kern"
     done
 
-    # The firmware is what loads it. auto_initramfs=1 makes it pick up
-    # /boot/firmware/initramfs8 next to kernel8.img without naming a file, and
-    # raspi-firmware's /etc/initramfs/post-update.d hook is what puts it
-    # there. pi-gen's stage1 config.txt already carries this line; set_config
-    # only adds it if some other config.txt does not.
+    # auto_initramfs=1 makes the firmware load /boot/firmware/initramfs8 next
+    # to kernel8.img; raspi-firmware's post-update hook puts it there.
     set_config "auto_initramfs=1"
 
     if ! grep -q "boot=overlay" "$CMDLINE_TXT"; then
@@ -1145,67 +614,37 @@ OVERLAY
     fi
 
     # pi-gen grows the root filesystem on first boot, keyed on this token and
-    # on rpi-resize.service. An online resize of a filesystem mounted
-    # read-only as the overlay's lower layer cannot work, and a first-boot
-    # service that fails and reboots is a loop rather than a message. The
-    # appliance has nothing to grow: what it writes is RAM, and the card is
-    # never written after provisioning.
+    # rpi-resize.service. A read-only lower layer cannot be resized online, and
+    # the failing service would reboot-loop.
     sed -i -E 's/(^| )resize( |$)/\1/g' "$CMDLINE_TXT"
-    # SYSTEMD HAS A SECOND GROWER, and until run 72 nothing here took it out.
-    # rpi-resize.service pulls systemd-growfs-root.service in with a Wants=,
-    # which makes disabling rpi-resize LOOK like it settles the matter --
-    # but systemd-fstab-generator hooks that unit onto the root mount as
-    # well, on every boot, with no symlink anywhere for `disable` to remove.
-    # It therefore ran on every boot of every image this project has built,
-    # and on an overlay root it cannot do anything but fail:
-    #
-    #   systemd-growfs[293]: File system "/" not backed by block device.
-    #   systemd[1]: systemd-growfs-root.service: Failed with result 'exit-code'.
-    #   [FAILED] Failed to start systemd-growfs-root.service - Grow Root File System.
-    #
-    # quoted from run 72's tier-3 console, both boots. `/` is an overlayfs
-    # here by construction, so there is no block device to grow and never
-    # will be. The `[FAILED]` line was always on the console -- run 68's
-    # carries it too -- and nothing gated on it; the `Failed with result`
-    # wording only reaches a console journald is forwarding to, which is
-    # what issue #21 turned on. A red line on the console of an appliance
-    # that prints key material teaches its operator to read past red.
-    #
-    # MASKED, not disabled, and that is the whole point: `disable` removes
-    # symlinks and there are none, so the generator would hook it up again
-    # on the next boot. A mask is a link to /dev/null in
-    # /etc/systemd/system -- in the image, not in the overlay's tmpfs -- and
-    # systemd refuses the unit whatever asks for it. Bare, with no
-    # `|| true`, for the reason the networkd-wait-online mask above is bare:
-    # this runs in the pi-gen chroot where that mask demonstrably lands, and
-    # a mask that silently failed to apply is the defect it exists to stop.
+    # tty1 is the front panel. Without `quiet` the kernel writes over it
+    # whenever a printer is plugged in.
+    grep -qE '(^| )quiet( |$)' "$CMDLINE_TXT" \
+        || sed -i -e 's|$| quiet|' "$CMDLINE_TXT"
+    # No console on the GPIO UART: it puts the kernel log and a login
+    # prompt on three header pins. For bring-up, add
+    # `console=serial0,115200` back to cmdline.txt on the card.
+    sed -i -E 's/(^| )console=(serial0|ttyAMA0|ttyS0)(,[^ ]*)?//g; s/^ +//' "$CMDLINE_TXT"
+    # systemd-fstab-generator also hooks systemd-growfs-root onto the root
+    # mount on every boot, and on an overlay root it can only fail. Masked, not
+    # disabled: there is no symlink for `disable` to remove. No `|| true`: a
+    # mask that silently failed to apply must fail the build.
     systemctl mask systemd-growfs-root.service
     systemctl disable rpi-resize.service 2>/dev/null || true
 
-    # PROVE it rather than trust the sequence above, because every way this
-    # can go wrong is silent. config.txt asking the firmware for an initramfs
-    # that was never written, an initramfs written before the overlay script
-    # existed, a boot= token that never reached the file -- each of them
-    # leaves a unit that boots read-write and says nothing at all about it.
-    #
-    # NOT `lsinitramfs "$candidate" | grep -q scripts/overlay`, which is how
-    # this was first written. This script runs under pipefail; `grep -q`
-    # closes the pipe on its first match, lsinitramfs dies of SIGPIPE, and
-    # the pipeline returns 141 -- so the condition is FALSE for exactly the
-    # initramfs that passes. Measured with a 300k-line producer: `NO MATCH
-    # (rc of pipeline was nonzero)`, rc=141. A real listing is thousands of
-    # lines and scripts/overlay sorts early in it, so this would have failed
-    # the build on a good image every time -- the sign-flipped version of
-    # issue #14's defect, aimed at the release gate.
+    # Verify, because every failure here is silent: the unit just boots
+    # read-write. Not `lsinitramfs | grep -q`: under pipefail grep's early exit
+    # SIGPIPEs lsinitramfs and the pipeline fails on a match. Every initramfs
+    # is checked: the firmware picks one per board (initramfs8 on a Pi 3 or 4,
+    # initramfs_2712 on a Pi 5).
     OVERLAY_INITRAMFS=""
+    STALE_INITRAMFS=""
     for candidate in "$BOOT_DIR"/initramfs*; do
         [ -f "$candidate" ] || continue
         LISTING=$(lsinitramfs "$candidate" 2>/dev/null || true)
         case "$LISTING" in
-            *scripts/overlay*)
-                OVERLAY_INITRAMFS="$candidate"
-                break
-                ;;
+            *scripts/overlay*) OVERLAY_INITRAMFS="$OVERLAY_INITRAMFS $candidate" ;;
+            *) STALE_INITRAMFS="$STALE_INITRAMFS $candidate" ;;
         esac
     done
     if [ -z "$OVERLAY_INITRAMFS" ]; then
@@ -1215,6 +654,13 @@ OVERLAY
         ls -la "$BOOT_DIR" >&2
         exit 1
     fi
+    if [ -n "$STALE_INITRAMFS" ]; then
+        echo "ERROR: these have no scripts/overlay:$STALE_INITRAMFS" >&2
+        echo "       A board that boots one of them comes up on a writable" >&2
+        echo "       root. Delete it if its kernel is gone, or reinstall" >&2
+        echo "       that kernel and rerun this script." >&2
+        exit 1
+    fi
     if ! grep -q "boot=overlay" "$CMDLINE_TXT"; then
         echo "ERROR: boot=overlay is not in $CMDLINE_TXT" >&2
         exit 1
@@ -1222,36 +668,11 @@ OVERLAY
     log "  overlay initramfs: $OVERLAY_INITRAMFS"
 
     # --- the identity the overlay would otherwise throw away --------------
-    #
-    # The userspace half of the exception the initramfs script above makes.
-    # One job on each side, and the split between them is about WHEN, not
-    # about taste:
-    #
-    #   - the initrd RESTORES /etc/machine-id, because PID 1 reads that file
-    #     before any unit exists;
-    #   - this unit RECORDS it, because writing to the store needs a mounted
-    #     boot partition and nothing has one that early.
-    #
-    # THE SSH HOST KEYS ARE NOT PERSISTED, and this is where that used to
-    # happen. image/build.sh sets ENABLE_SSH=0, so the image ships with
-    # ssh.service disabled and this appliance does not run sshd; the only
-    # thing that ever started it was the first-boot `preset-all` the
-    # machine-id above ends. A fingerprint nobody can be shown is not worth
-    # private keys on a partition every local account can read.
-    #
-    # ONLY ON AN OVERLAY MACHINE, which is why it is inside this branch. A
-    # writable root keeps /etc/machine-id by itself, so there is nothing here
-    # to do and nothing to put on the boot partition. The tier-2 Debian guest
-    # has no cmdline.txt, takes the other branch, and never gets this unit.
-    #
-    # ENABLED, not merely installed. WantedBy=sysinit.target in the unit is
-    # what the symlink comes from, and without the `enable` the file sits in
-    # /etc/systemd/system doing nothing -- an image that installs and enables
-    # nothing boots perfectly and loses its identity on every power cycle.
-    # tests/test_overlay_root.py drives these four lines with `install`
-    # shadowed and systemctl recording, for the reason the probe install
-    # above is driven that way: this block had no fast-tier coverage at all,
-    # and deleting it outright left the suite green.
+    # The userspace half of the initramfs exception above: the initrd restores
+    # /etc/machine-id because PID 1 reads it before any unit exists; this unit
+    # records it, because that needs a mounted boot partition. Only on an
+    # overlay machine: a writable root keeps /etc/machine-id by itself. SSH
+    # host keys are not persisted; the appliance does not run sshd.
     install -m 0755 "$REPO_DIR/device/persist-identity.sh" \
         "$PREFIX/persist-identity.sh"
     install -m 0644 "$REPO_DIR/device/systemd/otp-unit-identity.service" \
@@ -1260,58 +681,18 @@ OVERLAY
     systemctl enable otp-unit-identity.service
 
     # --- and the operator's login, recorded by the wizard that applies it --
+    # An ExecStartPost on userconfig.service rather than a unit of its own, so
+    # it fires only on a boot where an operator's userconf.txt was applied: the
+    # image's random build-time hash is never copied to the card, and a fresh
+    # seed replaces the store after it is applied. systemd skips ExecStartPost
+    # when ExecStart fails, so a malformed seed leaves the store alone.
     #
-    # The other half of the owner's "persist it", and the reason it is an
-    # ExecStartPost on userconfig.service rather than a unit of its own.
+    # The leading `-` keeps a failed record from failing the unit, whose
+    # Restart=on-failure would loop. It also makes failures silent, so tier 3
+    # reads the store after the apply and again across a power cycle.
     #
-    # WHEN IT HAS TO RUN is after the wizard, not before: a boot where the
-    # store is restored at sysinit AND a fresh userconf.txt is on the card is
-    # a boot where the operator has just changed their password, and the
-    # store has to end up holding the NEW one or the next power cycle
-    # silently reverts them. Ordering it here -- inside the unit that does
-    # the applying -- makes that exact, with no ordering edge to get wrong.
-    #
-    # WHY NOT A UNIT ORDERED After=userconfig.service, which was the obvious
-    # alternative: such a unit runs on EVERY boot, including the boots of a
-    # machine whose operator never seeded anything. It would then have to
-    # decide for itself whether the hash in /etc/shadow is worth keeping, and
-    # on a fresh card the only thing there is pi-gen's random
-    # FIRST_USER_PASS -- so the first unseeded boot would copy a password
-    # hash onto the card of every unit ever built, for a password nobody has
-    # and nobody asked to keep. As an ExecStartPost it fires only on a boot
-    # where an operator's own userconf.txt was applied, which means the only
-    # hash this ever writes to the FAT partition is one the operator had
-    # already written to that same partition themselves. That is the whole of
-    # why persisting adds no exposure over the seed file it replaces.
-    #
-    # A MALFORMED SEED REACHES NEITHER. systemd skips ExecStartPost when
-    # ExecStart fails, so a seed userconf-pi rejects leaves the store holding
-    # the previous credential -- and the restore at sysinit has already put
-    # that one back, so the operator can still log in and try again. Tier 3's
-    # userconf-malformed-seed-fails-fast covers the other half of that.
-    #
-    # THE LEADING `-`, WHICH IS THE THING TO ARGUE WITH. It makes a failing
-    # record not fail the unit. That is deliberate: losing the RECORD must
-    # not cost the operator the boot that APPLIED their password, and stock
-    # userconfig.service carries Restart=on-failure, so a hard failure here
-    # would turn a full boot partition into a restart loop printing two of
-    # the strings harness/img-boot.sh fails a release on.
-    #
-    # IT IS ALSO EXACTLY WHAT MAKES THIS SILENTLY PASS, so the check has to
-    # live somewhere the `-` cannot reach. A missing script, a
-    # non-executable one, an ExecStartPost that does not survive the
-    # daemon-reload cancel-rename runs mid-ExecStart -- every one of those
-    # ends with a successful unit, an applied password, and an empty store,
-    # and nothing on the machine complains. What catches it is tier 3:
-    # boot1's credential-recorded-outside-the-overlay reads the store off the
-    # card after the apply, and boot2's credential-survives-the-power-cycle
-    # requires the password to still be there after the power went off. Both
-    # are in img-boot.sh's named-check list, so deleting them fails the run.
-    #
-    # A SECOND DROP-IN FILE, not a line added to otp-appliance.conf above:
-    # that one is written on every machine this script provisions, and
-    # persist-identity.sh is installed only on an overlay machine. A
-    # writable root keeps /etc/shadow by itself and has nothing to record.
+    # A separate drop-in from otp-appliance.conf, which is written on every
+    # machine; persist-identity.sh is installed only on an overlay machine.
     install -d /etc/systemd/system/userconfig.service.d
     cat > /etc/systemd/system/userconfig.service.d/otp-credential.conf <<'CRED'
 [Service]
@@ -1320,11 +701,8 @@ CRED
     systemctl daemon-reload
 fi
 
-# WHAT THIS SCRIPT DID TO SOMEONE ELSE'S MACHINE, said out loud. The
-# documented path is "run this on a Pi you already have", and two of the
-# steps above are not confined to the unit: they change how the whole box
-# behaves and they do not come back on their own. A summary that lists only
-# the overlay reads as though nothing else was touched.
+# WHAT THIS SCRIPT DID TO SOMEONE ELSE'S MACHINE, said out loud: on a Pi
+# provisioned in place, several steps above change the whole box for good.
 if [ "$IMAGE_BUILD" -eq 0 ]; then
     log "Done. Reboot to start the unit."
     cat <<'EOF'
@@ -1335,11 +713,11 @@ power-cycle is a full reset and nothing a session touched survives it.
 Settings still persist -- they live on the boot partition, which is outside
 the overlay.
 
-Four machine-wide changes were made as well -- two because an unbounded
+Five machine-wide changes were made as well -- two because an unbounded
 network wait held this image's boot open for its whole length, one because
-the overlay made every boot look like a first boot, and one because an
-online resize of a read-only root cannot work (see the comments in this
-script):
+the overlay made every boot look like a first boot, one because an online
+resize of a read-only root cannot work, and one because key material must
+never be paged out (see the comments in this script):
 
   * systemd-networkd-wait-online.service is MASKED. Nothing on this machine
     can wait for network-online.target through networkd any more, including
@@ -1370,7 +748,12 @@ script):
     this machine can grow the root filesystem any more. Undo with
     `sudo systemctl unmask systemd-growfs-root.service`.
 
-All four are deliberate on an air-gapped key printer and all four outlive
+  * swap.target is MASKED, so systemd activates no swap of any kind on this
+    machine -- not a swap file, not zram. Key material lives in RAM and
+    must never be paged anywhere. Undo with
+    `sudo systemctl unmask swap.target`.
+
+All five are deliberate on an air-gapped key printer and all five outlive
 this script. tty1 is the front panel; the login prompt is on tty2 (Alt+F2).
 
 TWO THINGS ARE ON THE BOOT PARTITION, in /boot/firmware/otp-identity, and

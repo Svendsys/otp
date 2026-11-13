@@ -1,9 +1,5 @@
-"""Tests for the status sheet a panel-less unit prints.
-
-This sheet is the entire user interface of a unit with no OLED. If it
-raises, the operator gets a dead box and a blank tray with nothing to go
-on -- so the tests that matter most here are the ones that break the
-probes rather than the ones that run them on a healthy system.
+"""Tests for the status sheet a panel-less unit prints. The sheet is that unit's
+entire user interface, so the tests that matter most break the probes.
 """
 import re
 import sys
@@ -34,12 +30,8 @@ def text_of(sections) -> str:
 
 
 def drawn_at(sections, page_size=None):
-    """
-    [(y, text)] for every string the renderer actually put on paper.
-
-    Reading the drawing calls rather than the section list is the point:
-    the two used to disagree by 241 lines, and a test that walked the
-    sections could not see the difference.
+    """[(y, text)] for every string the renderer actually drew, read from the
+    drawing calls and not the section list.
     """
     import otp_generator as gen
 
@@ -131,10 +123,8 @@ def record(cups):
 
 
 class TestTheSheetSurvivesABrokenSystem:
-    """
-    Every probe reads a file or imports a module that may not be there.
-    The sheet has to come out anyway -- a diagnostic that dies while
-    diagnosing is worse than none.
+    """Every probe reads a file or imports a module that may be missing; the sheet
+    must come out anyway.
     """
 
     def test_collect_never_raises_when_nothing_is_readable(self, monkeypatch):
@@ -179,14 +169,9 @@ class TestTheSheetFitsAndSaysTheRightThings:
         assert page_count(diagnostics.render_bytes(sections)) == 1
 
     def test_nothing_is_dropped_when_every_value_is_long(self):
-        """
-        Probe failures produce long strings, and they have to survive.
-
-        This used to assert the sheet stayed on one page -- which it did,
-        by counting the lines that would not fit and throwing them away
-        behind a one-line footnote. The content that gets discarded first
-        is the content at the bottom, which is the SECURITY POSTURE and
-        SETTINGS sections: exactly what a long probe failure is about.
+        """Long probe-failure strings all reach paper. Truncating to one page
+        would discard the bottom sections, SECURITY POSTURE and SETTINGS,
+        first.
         """
         sections = diagnostics.collect(settings=config.Settings(),
                                        printer=DEVICE, queue="OTP")
@@ -201,12 +186,9 @@ class TestTheSheetFitsAndSaysTheRightThings:
         assert not [line for line in drawn if "did not fit" in line]
 
     def test_a6_gets_the_whole_sheet_not_a_fortieth_of_it(self):
-        """
-        A6 is 105mm wide. Two columns there leave 13pt of width for a value
-        beside a 30mm label, so every value wrapped one word to a line and
-        the sheet shed 241 of its 282 lines -- silently, apart from a
-        footnote giving the count. An A6 unit is exactly the unit least
-        likely to have any other way of being read.
+        """An A6 sheet carries every word the A4 one does. A6 is too narrow for
+        two columns, and an A6 unit is the least likely to have another way of
+        being read.
         """
         from reportlab.lib.pagesizes import A6
 
@@ -215,17 +197,14 @@ class TestTheSheetFitsAndSaysTheRightThings:
                                        queue="OTP")
         on_a4 = drawn_lines(sections, page_size=diagnostics.A4)
         on_a6 = drawn_lines(sections, page_size=A6)
-        # Wrapping differs with the column width, so compare the words that
-        # reached paper rather than the lines they were broken into.
+        # Wrapping differs with column width, so compare words, not lines.
         assert words(on_a6) >= words(on_a4)
         for section in sections:
             assert section.title in on_a6
 
     def test_no_line_is_drawn_below_the_bottom_margin(self):
-        """
-        Pagination that runs off the foot of the sheet is the same defect
-        in a different costume: a laser printer's unprintable band eats it
-        and nothing says so.
+        """Nothing is drawn below the bottom margin, where a laser printer's
+        unprintable band would silently eat it.
         """
         from reportlab.lib.pagesizes import A6
 
@@ -242,8 +221,7 @@ class TestTheSheetFitsAndSaysTheRightThings:
         assert "0x3C" in text
 
     def test_it_says_what_is_about_to_happen(self):
-        # The countdown notice is the part someone with no hardware
-        # actually needs: what is coming, and how to stop it.
+        # The countdown notice: what is coming, and how to stop it.
         plan = ["THIS UNIT WILL PRINT A ONE-TIME PAD PAIR IN 5 MINUTES.",
                 "TO STOP IT: unplug the printer."]
         text = text_of(diagnostics.collect(settings=config.Settings(),
@@ -268,10 +246,8 @@ class TestTheSheetFitsAndSaysTheRightThings:
         assert "KEY MATERIAL" in diagnostics._swap()
 
     def test_no_key_material_can_reach_the_sheet(self):
-        """
-        The sheet is meant to be photographed and sent to someone for
-        help, so it must never carry a codeword or key. collect() takes
-        no codeword at all -- this pins that.
+        """The sheet carries no codeword or key: it is meant to be photographed
+        and sent to someone for help.
         """
         import inspect
 
@@ -302,12 +278,9 @@ class TestTheHeadlessLoop:
         assert len(cups.submitted) == 2
 
     def test_one_bad_poll_does_not_start_a_second_pad_pair(self):
-        """
-        The real Cups.devices() returns [] for a busy cupsd or a timed-out
-        lpinfo exactly as it does for an unplugged cable. Re-arming on one
-        of those printed a whole second pair -- 68 more sheets and a fresh
-        codeword -- with the first still in the tray. One bad poll in five
-        produced twelve pad-pair starts in sixty polls.
+        """One empty poll does not re-arm the loop. Cups.devices() returns [] for
+        a busy cupsd or a timed-out lpinfo just as for an unplugged cable, and
+        re-arming prints a second pair.
         """
         cups = Cups(script=[[DEVICE], [], [DEVICE], [], [DEVICE], []])
         drive(cups, rounds=8)
@@ -319,15 +292,14 @@ class TestTheHeadlessLoop:
         assert cups.submitted == []
 
     def test_a_failed_queue_setup_still_runs_the_sequence(self):
-        # The setup error is the single most useful line on the page, so
-        # failing to create a queue must not suppress the report.
+        # Failing to create a queue must not suppress the report that carries
+        # the setup error.
         cups = Cups(fail_setup=True)
         drive(cups)
         assert len(cups.submitted) == 1
 
     def test_a_sequence_that_raises_does_not_restart_the_pair(self):
-        # Re-running would print copy A of a second pair on top of the
-        # first, which is how a tray ends up holding two half-pairs.
+        # Re-running would print copy A of a second pair on top of the first.
         cups = Cups(script=[[DEVICE]] * 8)
 
         def explode(*args, **kwargs):
@@ -348,12 +320,8 @@ class TestTheHeadlessLoop:
         assert cups.polls >= 3, "it must keep trying"
 
     def test_the_queue_setup_error_reaches_the_sequence(self):
-        """
-        The setup error is the most useful line on the sheet a mute unit
-        prints. Moving collect() into unattended.run left `driver`
-        computed here and passed nowhere, so the sheet always said
-        "Driver unknown" -- and the test that covered it only counted
-        sheets, so it stayed green.
+        """The queue setup error is passed to the sequence, since it is the most
+        useful line on the sheet a mute unit prints.
         """
         cups = Cups(fail_setup=True)
         drive(cups)
