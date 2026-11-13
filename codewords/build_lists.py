@@ -1,8 +1,10 @@
 """Curate the codeword vocabulary into codewords/.
 
 A codeword is read aloud over a noisy channel and carried in someone's head, so
-words are concrete and picturable, phonetically distinct (no shared Soundex,
-edit distance >= 2) and free of NATO alphabet collisions.
+words are concrete and picturable, and no two in a list can be mistaken for
+each other by ear: no shared Soundex, no single-letter difference, no rhyme, no
+word that is the start or end of another, and nothing that sounds like a NATO
+word, a spelled-out letter, or a remark about the traffic.
 
 Rules for the raw lists:
 
@@ -54,7 +56,23 @@ PROCEDURAL = {
     "MESSAGE", "GROUP", "PAGE", "KEY", "PAD", "CODE", "AUTH", "DUMMY", "NUMBER",
     "RUSH", "HOLD", "NEGATIVE", "STANDBY", "COPY", "CHECK", "COUNT", "ABANDON",
     "POWER", "DOCUMENT", "BATTERY", "PRINTER", "PAPER", "SESSION",
+    # States and ordinals. On an envelope or over the air they read as a
+    # remark about the pad or the traffic: "SECRET", "the BROKEN one",
+    # "use the SECOND", "FINAL".
+    "SECRET", "HIDDEN", "BROKEN", "LOST", "EMPTY", "LOADED", "OPEN", "CLOSED",
+    "LOCKED", "SEALED", "CHECKED", "FIRST", "SECOND", "LAST", "FINAL",
+    "SINGLE", "DOUBLE", "TRIPLE",
 }
+
+# Words that sound like a letter being spelled out.
+LETTER_NAMES = {
+    "BEE", "CUE", "DEE", "EWE", "EYE", "GEE", "JAY", "KAY", "PEA", "SEA",
+    "TEA", "VEE", "WHY", "YEW", "YOU", "ZED",
+}
+
+# A word that begins or ends this many other words is dropped itself: FIRE
+# would otherwise cost BONFIRE, CAMPFIRE, FIREWORK, FIREMAN and FIREFLY.
+HUB = 3
 
 # Tier 1: a person sees the thing the instant they hear the word.
 # Tier 2: well known, still no dictionary needed.
@@ -335,10 +353,11 @@ RAW = {
 }
 
 # Modifiers follow the same rule: sensory and physical words a Nordic speaker
-# reads without a dictionary. Every modifier is eventually printed against
-# every noun, people included, so one is disqualified if a pair it makes with a
-# person is one an operator would not read aloud to a stranger.
+# reads without a dictionary. Every modifier is printed against every noun,
+# people included, and nothing is held back for taste: a vivid or macabre
+# picture (SMOKED-BABY) is the one that is still remembered a month later.
 MODIFIERS = """
+SMOKED
 RED GREEN YELLOW PURPLE WHITE BLACK BROWN GOLDEN SILVERY BRONZED COPPERY
 CRIMSON SCARLET ROSY RUDDY PALE DARK BRIGHT INKY MILKY PEARLY SOOTY DUSTY
 RUSTY ASHEN TAWNY REDDISH GLASSY BRASSY GRAY DUSKY SMOKY MUTED FADED
@@ -434,12 +453,133 @@ def edit_distance(a: str, b: str) -> int:
     return prev[-1]
 
 
+VOWELS = "AEIOUY"
+
+
+def _vowel_groups(word: str) -> list[tuple[int, int]]:
+    """(start, end) of each run of vowels; a final silent E is not one."""
+    stem = word[:-1] if (word.endswith("E") and len(word) > 2
+                         and word[-2] not in VOWELS + "L") else word
+    groups, i = [], 0
+    while i < len(stem):
+        if stem[i] in VOWELS and not (i == 0 and stem[i] == "Y"):
+            j = i
+            while j < len(stem) and stem[j] in VOWELS:
+                j += 1
+            groups.append((i, j))
+            i = j
+        else:
+            i += 1
+    return groups
+
+
+# Vowel pairs that spell one long vowel, so a final syllable carrying one
+# is stressed and rhymes from there: BALLOON, TYPHOON, RACCOON.
+LONG_VOWELS = {"OO", "EE", "EA", "AI", "OA", "OU", "AU", "OI", "AY", "OY"}
+
+
+def rhyme_key(word: str) -> tuple[int, str] | None:
+    """
+    (syllables, rhyming part), from spelling alone, or None if too weak.
+
+    Two words with the same key rhyme and scan alike, which is what a noisy
+    voice channel confuses: TROLL and DOLL, LAGOON and BALLOON, WAGON and
+    DRAGON. A one-syllable word, or one whose last syllable has a long
+    vowel, rhymes from its last vowel; anything else from the vowel before
+    that, where English usually puts the stress. A shared ending shorter
+    than half the word (-ERY, -ELY) is not a rhyme anyone would mishear.
+    """
+    groups = _vowel_groups(word)
+    if not groups:
+        return None
+    last_start, last_end = groups[-1]
+    heavy = word[last_start:last_end] in LONG_VOWELS and last_end < len(word)
+    if len(groups) == 1 or heavy:
+        # The final E is kept: it is what tells CRANE from SWAN.
+        return len(groups), word[last_start:]
+    rime = word[groups[-2][0]:]
+    return (len(groups), rime) if 2 * len(rime) >= len(word) else None
+
+
+def shared_affix(a: str, b: str) -> int:
+    """Length of the longer of the common prefix and the common suffix."""
+    prefix = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y),
+                  min(len(a), len(b)))
+    suffix = next((i for i, (x, y) in enumerate(zip(a[::-1], b[::-1]))
+                   if x != y), min(len(a), len(b)))
+    return max(prefix, suffix)
+
+
+def levenshtein(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def contains(a: str, b: str, pool=frozenset()) -> bool:
+    """
+    Whether one word is the start or end of the other as a word in its own
+    right: a clipped FIREFLY is FLY, and POLARBEAR is BEAR. The rest has to
+    be a syllable or more, so MONK is not held against MONKEY, and for a
+    three-letter word it has to be a word itself, so CAT is not held
+    against CATHEDRAL.
+    """
+    short, long_ = sorted((a, b), key=len)
+    if long_.startswith(short):
+        rest = long_[len(short):]
+    elif long_.endswith(short):
+        rest = long_[:-len(short)]
+    else:
+        return False
+    if len(short) >= 4:
+        return len(rest) >= 3
+    return rest in pool
+
+
+def confusable(a: str, b: str, pool=frozenset()) -> str | None:
+    """Why two words could be mistaken for each other by ear, or None."""
+    if edit_distance(a, b) < 2:
+        return "editdist"
+    if contains(a, b, pool):
+        return "contains"
+    if rhyme_key(a) is not None and rhyme_key(a) == rhyme_key(b):
+        return "rhyme"
+    # Two edits apart but mostly the same word: ANGRY and HUNGRY.
+    if shared_affix(a, b) >= 4 and levenshtein(a, b) <= 2:
+        return "near"
+    return None
+
+
+def hubs(words) -> set[str]:
+    """Words that begin or end at least HUB of the others."""
+    pool = frozenset(words)
+    return {w for w in pool
+            if sum(1 for o in pool if o != w and contains(w, o, pool)) >= HUB}
+
+
+def compounds(pool, hub_words) -> set[str]:
+    """
+    Words built on a shorter word in the pool, which lose to it: the generic
+    picture (BEAR) is seated before the specific one (POLARBEAR). A hub is
+    the exception, since it goes instead of its compounds.
+    """
+    bases = [w for w in pool if len(w) >= 3 and w not in hub_words
+             and w not in NATO | PROCEDURAL | LETTER_NAMES]
+    return {w for w in pool
+            if any(len(b) < len(w) and contains(b, w, pool) for b in bases)}
+
+
 def clean(raw: str) -> list[str]:
     return [w for w in raw.split() if w]
 
 
 def filter_list(words, taken_soundex, taken_words, maxlen, all_kept=None,
-                forbidden=frozenset()):
+                forbidden=frozenset(), hub_words=frozenset(),
+                compound_words=frozenset(), pool=frozenset()):
     # all_kept spans every category, since a noun can come from any: CIVET and
     # RIVET must not both survive.
     kept, dropped = [], []
@@ -454,8 +594,14 @@ def filter_list(words, taken_soundex, taken_words, maxlen, all_kept=None,
             dropped.append((w, f"too long (>{maxlen})" if len(w) > maxlen
                             else "too short (<3)"))
             continue
-        if w in NATO or w in PROCEDURAL:
+        if w in NATO or w in PROCEDURAL or w in LETTER_NAMES:
             dropped.append((w, "reserved"))
+            continue
+        if w in hub_words:
+            dropped.append((w, "hub"))
+            continue
+        if w in compound_words:
+            dropped.append((w, "compound"))
             continue
         if w in forbidden:
             dropped.append((w, "already a noun"))
@@ -467,9 +613,10 @@ def filter_list(words, taken_soundex, taken_words, maxlen, all_kept=None,
         if sx in taken_soundex:
             dropped.append((w, f"soundex~{taken_soundex[sx]}"))
             continue
-        close = next((k for k in all_kept if edit_distance(w, k) < 2), None)
+        close = next(((k, why) for k in all_kept
+                      if (why := confusable(w, k, pool))), None)
         if close:
-            dropped.append((w, f"editdist~{close}"))
+            dropped.append((w, f"{close[1]}~{close[0]}"))
             continue
         kept.append(w)
         if all_kept is not kept:
@@ -482,6 +629,10 @@ def filter_list(words, taken_soundex, taken_words, maxlen, all_kept=None,
 def build_nouns():
     """Admit every category's tier 1, then every category's tier 2, and so on."""
     taken_soundex, taken_words, all_nouns = {}, set(), []
+    pool = frozenset(w for tiers in RAW.values() for t in tiers
+                     for w in clean(t))
+    hub_words = hubs(pool)
+    compound_words = compounds(pool, hub_words)
     kept = {name: [] for name in RAW}
     dropped = {name: [] for name in RAW}
     for tier in range(max(len(tiers) for tiers in RAW.values())):
@@ -489,7 +640,8 @@ def build_nouns():
             if tier >= len(tiers):
                 continue
             k, d = filter_list(clean(tiers[tier]), taken_soundex, taken_words,
-                               NOUN_MAX, all_nouns)
+                               NOUN_MAX, all_nouns, hub_words=hub_words,
+                               compound_words=compound_words, pool=pool)
             kept[name] += k
             dropped[name] += [(w, why, tier + 1) for w, why in d]
     return kept, dropped, taken_words, all_nouns
@@ -509,8 +661,11 @@ def main():
     # Modifiers and nouns keep separate phonetic namespaces, since position
     # tells them apart, but a word in both would allow SCARLET-SCARLET, so the
     # noun keeps it.
+    mod_pool = frozenset(clean(MODIFIERS))
     mods, mod_drops = filter_list(clean(MODIFIERS), {}, set(), MODIFIER_MAX,
-                                  forbidden=noun_words)
+                                  forbidden=noun_words,
+                                  compound_words=compounds(mod_pool, set()),
+                                  pool=mod_pool)
     (OUT / "modifiers.txt").write_text("\n".join(sorted(mods)) + "\n")
 
     report = [(name, kept[name], dropped[name]) for name in RAW]
