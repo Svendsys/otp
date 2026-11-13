@@ -186,6 +186,16 @@ def _entropy_source():
             "not true one-time pads.")
 
 
+def _live_pads(settings):
+    """Whether this machine will make live key material; see posture."""
+    from otpunit import posture
+
+    refused = posture.refusal(settings)
+    if not refused:
+        return "allowed (swap off, root is a RAM overlay or opted out)"
+    return f"REFUSED: {refused}. Only training pads will print."
+
+
 def _disk():
     usage = shutil.disk_usage("/")
     return (f"{usage.used / 2**30:.1f} / {usage.total / 2**30:.1f} GiB used, "
@@ -352,6 +362,7 @@ def collect(settings=None, printer=None, queue=None, driver=None,
     sections.append(Section("SECURITY POSTURE", [
         # First, because it is the one that decides whether what comes out
         # of this unit is a one-time pad at all.
+        ("Live pads", _try(lambda: _live_pads(settings))),
         ("Key source", _try(_entropy_source)),
         ("Swap", _try(_swap)),
         ("Root filesystem", _try(_root_filesystem)),

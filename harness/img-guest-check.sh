@@ -147,6 +147,21 @@ check unit-not-restart-looping \
       "$(if [ "${RESTARTS:-9}" -le 1 ] 2>/dev/null; then echo yes; else echo no; fi)" \
       "NRestarts=$RESTARTS"
 
+# Read through the unit's own mount namespace, since that is the view its
+# refusal is decided on. A unit that refuses live pads on the shipped image
+# is an appliance that prints nothing.
+UNIT_PID=$(systemctl show otp-unit.service -p MainPID --value 2>/dev/null || echo 0)
+POSTURE=$(python3 - "$UNIT_PID" <<'PY' 2>&1
+import sys
+sys.path.insert(0, "/opt/otp-unit")
+from otpunit import posture
+print(",".join(posture.problems(mounts=f"/proc/{sys.argv[1]}/mounts")) or "none")
+PY
+)
+check unit-will-make-live-pads \
+      "$(if [ "$POSTURE" = "none" ]; then echo yes; else echo no; fi)" \
+      "problems=$POSTURE pid=$UNIT_PID swaps=$(tail -n +2 /proc/swaps | wc -l)"
+
 # --- the journal, now that the console carries it -------------------------
 
 # The kernel command line carries systemd.journald.forward_to_console=1

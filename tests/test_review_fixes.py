@@ -33,6 +33,7 @@ def test_arrow_keys_and_fast_typing_survive_a_real_tty():
             if press is None:
                 break
             got.append(press.name)
+        print("a\\nb", flush=True)
         kb.close()
         print(" ".join(got), file=sys.stderr)
     """)
@@ -44,8 +45,12 @@ def test_arrow_keys_and_fast_typing_survive_a_real_tty():
     os.write(master, b"\x1b[A\x1b[B\rud")
     out = proc.stderr.read().decode().strip()
     proc.wait(timeout=20)
+    shown = os.read(master, 64)
     os.close(master)
     assert out == "UP DOWN OK UP DOWN", out
+    # The console display writes to this same terminal while raw mode is
+    # held, so output processing has to stay on.
+    assert b"a\r\nb" in shown, shown
 
 
 @pytest.mark.parametrize("word, ok", [
@@ -174,3 +179,23 @@ def test_the_display_is_reopened_after_repeated_failures():
     for _ in range(ui.REOPEN_AFTER * 2):
         app.render(ui.WaitForPrinter())
     assert app.display.reopened == 2
+
+
+def test_a_keyboard_is_heard_even_though_the_gpio_pins_always_open():
+    from otpunit.hw.buttons import AnyButtons, FakeButtons, Press
+
+    silent, typed = FakeButtons([]), FakeButtons([Press.OK])
+    both = AnyButtons([silent, typed])
+    assert both.wait(timeout=0.5) is Press.OK
+    assert both.wait(timeout=0.05) is None
+
+
+def test_both_inputs_are_opened_when_both_exist(monkeypatch):
+    from otpunit import hmi
+
+    monkeypatch.setattr(hmi, "GpioButtons", lambda: object())
+    monkeypatch.setattr(hmi, "keyboard_connected", lambda: True)
+    monkeypatch.setattr(hmi, "console_usable", lambda: True)
+    buttons, kind = hmi.open_buttons()
+    assert isinstance(buttons, hmi.AnyButtons) and len(buttons.sources) == 2
+    assert kind == "GPIO buttons and USB keyboard"

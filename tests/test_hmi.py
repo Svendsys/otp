@@ -41,8 +41,16 @@ class TestTheLadder:
         assert interface.display == "CONSOLE"
         assert interface.display_kind == "HDMI console"
 
-    def test_gpio_buttons_win_when_they_are_there(self, monkeypatch):
+    def test_buttons_and_keyboard_are_both_heard(self, monkeypatch):
+        """GPIO pins open on any Pi, wired or not, so they must not shut a
+        keyboard out."""
         force(monkeypatch, gpio=True, keyboard=True)
+        interface = hmi.detect()
+        assert interface.buttons.sources == ["BUTTONS", "KEYBOARD"]
+        assert interface.input_kind == "GPIO buttons and USB keyboard"
+
+    def test_buttons_alone_are_used_directly(self, monkeypatch):
+        force(monkeypatch, gpio=True)
         assert hmi.detect().buttons == "BUTTONS"
 
     def test_a_keyboard_is_used_when_there_are_no_buttons(self, monkeypatch):

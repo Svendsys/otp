@@ -189,8 +189,8 @@ follow with a laptop and easy to follow with a dedicated box:
 - **No swap**, so nothing holding key material can be paged to disk.
 - **Volatile logs**, no core dumps, and job metadata only.
 - **Read-only root with a RAM overlay** — see [docs/IMAGE.md](docs/IMAGE.md).
-  On from the first boot: `install.sh` enables it, so the image ships with
-  it. It was a manual step nobody had ever tested until issue #9.
+  On from the first boot, and checked by the unit itself: it refuses to make
+  a live pad if the overlay is missing or swap is on.
 
 Be clear about what is *not* claimed. Key material is not scrubbed from RAM
 when a job ends: the working buffer is zeroed, but reportlab's intermediates
@@ -208,6 +208,9 @@ Everything needed is in this repository:
 sudo ./device/install.sh  # or convert a Pi you already have
 python3 -m otpunit --sim  # or just try the interface in a terminal
 ```
+
+Testing on a real Pi for the first time? Start with
+[docs/FIRST-TEST.md](docs/FIRST-TEST.md).
 
 See [docs/HARDWARE.md](docs/HARDWARE.md) for parts and wiring,
 [docs/IMAGE.md](docs/IMAGE.md) for building and flashing, and

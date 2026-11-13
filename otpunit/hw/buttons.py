@@ -264,6 +264,12 @@ class KeyboardButtons(Buttons):
             # TCSANOW, not setraw's TCSAFLUSH default, which would discard
             # keys typed before the first wait().
             tty.setraw(fd, termios.TCSANOW)
+            # Raw mode also turns off output processing, and the console
+            # display shares this terminal: without it every "\n" drops a
+            # line without returning to column one.
+            attrs = termios.tcgetattr(fd)
+            attrs[1] |= termios.OPOST | termios.ONLCR
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
         # os.read on the descriptor, never sys.stdin.read: the buffered
         # text layer swallows an arrow key's three bytes in one read and
         # select() then sees an empty descriptor.
@@ -280,6 +286,34 @@ class KeyboardButtons(Buttons):
                     break
                 ch += os.read(fd, 1).decode("latin-1")
         return self._map(ch)
+
+
+class AnyButtons(Buttons):
+    """Several inputs read as one: the first to report a press wins."""
+
+    # Short enough that a press feels immediate, long enough to idle.
+    POLL = 0.02
+
+    def __init__(self, sources):
+        self.sources = list(sources)
+
+    def wait(self, timeout: float | None = None) -> Press | None:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            for source in self.sources:
+                press = source.wait(timeout=0)
+                if press is not None:
+                    return press
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            time.sleep(self.POLL)
+
+    def close(self) -> None:
+        for source in self.sources:
+            try:
+                source.close()
+            except Exception:                    # noqa: BLE001
+                pass
 
 
 class GpioButtons(Buttons):

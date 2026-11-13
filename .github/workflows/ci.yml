@@ -13,7 +13,10 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest. The mutation gate's verdicts depend on the
+    # runner's tools: on 26.04, bash accepts a trailing CR in `-eq` and
+    # cat exits 0 on a closed pipe, and two guards stop being observable.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +50,7 @@ jobs:
     # Per PR, not nightly: a gate that reports on the commit that broke the
     # guard is worth more than one that reports the next morning. A separate
     # job so the ordinary suite's wall clock does not move.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -78,7 +81,7 @@ jobs:
         run: git diff --exit-code
 
   shellcheck:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -109,7 +112,7 @@ jobs:
   hardware:
     # Tier 1 of the harness: the real code against real kernel interfaces
     # and a real cupsd. See harness/README.md.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The cap must exceed setup (8) plus both inner `timeout 600`s (10 + 10)
     # plus the failure() diagnostics, so the inner timeouts always fire
     # first: a job killed by GitHub's timeout is cancelled, failure() is
@@ -273,7 +276,7 @@ jobs:
     # Tier 2: boot a real system, run device/install.sh on it, and check
     # the unit comes up. The only place otp-unit.service taking tty1 from
     # getty is observed.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The outer backstop only. The script's own 600s timeout must fire
     # first: a job killed by GitHub's timeout skips the console dump and
     # the verdict. Setup is capped separately below.
@@ -323,7 +326,7 @@ jobs:
     # The unit's whole interface runs without hardware, so CI can drive a
     # pad pair end to end: roll a codeword, confirm, generate, print copy A,
     # swap, print copy B, wipe.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

@@ -797,7 +797,8 @@ per_boot_verdict() {
 # tests/test_img_verdict.py holds these lists against
 # harness/img-guest-check.sh.
 GUEST_CHECKS_COMMON="root-is-overlay root-write-lands-and-is-readable \
-unit-active unit-not-restart-looping journal-marker-accepted \
+unit-active unit-not-restart-looping unit-will-make-live-pads \
+journal-marker-accepted \
 unit-detects-no-panel etc-cups-is-its-own-tmpfs cups-running \
 cupsd-config-valid boot-partition-separate setting-saved-to-the-boot-partition \
 cloud-init-is-not-installed cloud-init-kill-switch-survives-the-purge \

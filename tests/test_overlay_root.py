@@ -219,7 +219,11 @@ def run_verification(tmp_path, *, initramfs_names=("initramfs8",),
     bin_dir.mkdir(exist_ok=True)
     # The listing is the stub: what matters is what install.sh does with it.
     (bin_dir / "lsinitramfs").write_text(
-        "#!/bin/sh\ncat %s\n" % (tmp_path / "listing.txt"))
+        # Not `cat`: whether cat fails on a closed pipe varies by
+        # implementation, and that failure is what the pipefail case needs.
+        "#!/bin/sh\nwhile IFS= read -r line; do\n"
+        "    printf '%%s\\n' \"$line\" || exit 141\n"
+        "done < %s\n" % (tmp_path / "listing.txt"))
     (bin_dir / "lsinitramfs").chmod(0o755)
     (tmp_path / "listing.txt").write_text(listing)
     block = slice_between(INSTALL.read_text(), *VERIFY_BLOCK)

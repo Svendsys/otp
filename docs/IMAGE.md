@@ -41,7 +41,17 @@ Flash it:
 xzcat image/deploy/*.img.xz | sudo dd of=/dev/sdX bs=4M status=progress
 ```
 
-or point Raspberry Pi Imager at the file.
+or point Raspberry Pi Imager at the file. CI also builds the image: the
+`otp-print-unit-image` artifact of any green *Build image* run is the same
+file.
+
+To ship an image-wide login, set `OTP_USER_PASS_HASH` to a crypt(3) string
+(`openssl passwd -6`) before building. It is applied to the `otp` account
+and is readable by anyone who holds the image. Without it the account has a
+random password nobody knows, and each unit's owner sets their own (below).
+
+**For the first run on real hardware, follow
+[FIRST-TEST.md](FIRST-TEST.md).**
 
 ## Route 2: provision a Pi you already have
 
@@ -88,11 +98,9 @@ the boot partition, which is outside the overlay.
 **Two other things live there, and they are the only exceptions to the
 sentence above.** Both are in `/boot/firmware/otp-identity`.
 
-`machine-id`. Without it `/etc/machine-id` reverted to `uninitialized` on
-every power-cycle and systemd read every boot as a *first* boot — re-running
-`preset-all`, re-enabling `ssh.socket`, and regenerating the host keys each
-time. The machine-id is put back by the initramfs, because systemd reads that
-file before any service exists.
+`machine-id`. systemd treats a missing machine-id as a first boot and
+re-runs its first-boot setup every time, so this one identifier is kept and
+put back by the initramfs before systemd starts.
 
 `credential`, **but only if you set a password yourself.** See the next
 section: it is the one thing here that is not merely an identifier, and it is
@@ -117,15 +125,10 @@ holds UID 1000, and rewrites the store to match, saying so in the journal.
 So a seed naming `pi` costs you the name and never the login — from the
 second boot on, **log in as `otp`**.
 
-**Until recently that password worked for exactly one boot.** The apply is
-`chpasswd -e` into `/etc/shadow`, `/etc` is inside the RAM overlay, and the
-seed file that could have reapplied it is deleted by the boot that consumes
-it. The account then reverted to the random password the image was built with,
-which nobody has — on a device you can plug a keyboard and a screen into,
-where that login is the only way in that does not involve taking the card out.
-
-**It is now kept**, in `/boot/firmware/otp-identity/credential`, and restored
-early in every boot before any login prompt exists. The precedence, if you
+**The password is kept across power cycles**, in
+`/boot/firmware/otp-identity/credential`, and restored early in every boot
+before any login prompt exists. It has to live there: `/etc/shadow` is
+inside the RAM overlay. The precedence, if you
 ever write a new `userconf.txt` onto a unit that already has a kept password:
 
 | what is there | what wins this boot | what the next boot uses |
@@ -181,7 +184,7 @@ lives in RAM anyway. Take the card out and read that file; it names the
 reason and never contains a hash. It is removed by the first boot that
 restores the login successfully.
 
-**Deleting `userconf.txt` no longer takes it off the card.** This does:
+**Deleting `userconf.txt` does not take the hash off the card.** This does:
 
 ```
 sudo rm -f /boot/firmware/otp-identity/credential
@@ -200,14 +203,9 @@ the comments in `device/install.sh`; it is not done, because it means
 rewriting `/etc/fstab`, and an `/etc/fstab` that is wrong costs you the boot
 partition and everything on it.
 
-**The SSH host keys are deliberately not kept.** They were, briefly, so that
-the fingerprint of a machine that prints one-time pads stopped changing —
-but the image is built with `ENABLE_SSH=0`, so `ssh.service` is disabled and
-this unit does not run `sshd`. The only boot it ever ran on was a machine's
-very first, where systemd's own `preset-all` switched it on; persisting the
-machine-id ended that, and from the second boot onwards there is no `sshd`
-here at all. A fingerprint nobody can be shown is not worth a private key
-outside the overlay.
+**The SSH host keys are not kept.** The image is built with SSH disabled
+and the unit does not run `sshd` after its first boot, so there is no
+fingerprint worth a private key outside the overlay.
 
 The boot partition is vfat mounted with `defaults`, so every file on it is
 `0755 root:root` — readable by **every account on the unit**, not only by
@@ -216,13 +214,12 @@ settings are the operator's own; the one thing there that is neither is the
 kept login hash, which is why it has a section of its own above. No pad byte
 is ever written to that partition.
 
-This used to be a manual step, printed as advice at the end of `install.sh`.
-It was a manual step nowhere else in this project: the image did not do it,
-the pi-gen stage did not do it, and no tier of the harness had ever booted a
-machine that had it. That is [issue
-#9](https://github.com/Svendsys/otp/issues/9). Tier 3 now boots the built
-image twice and asserts the overlay from inside it — see
-[harness/README.md](../harness/README.md).
+CI boots the built image twice under emulation and asserts the overlay
+from inside it; see [harness/README.md](../harness/README.md). The unit
+also checks for itself: **it refuses to make a live pad unless the root is
+this overlay and swap is off**, and says so on the panel and the status
+sheet. Training pads still print. A machine that deliberately has no
+overlay can set `allow_writable_root = yes` in `otp-unit.conf`.
 
 **Not `raspi-config nonint enable_overlayfs`, and do not run it.** On
 bookworm and later that command installs Debian's `overlayroot` package and
@@ -236,10 +233,8 @@ $ /usr/lib/klibc/bin/mount --move /a /b
 mount: invalid option --
 ```
 
-That is the exact message the tier-2 guest printed immediately before
-`Kernel panic - not syncing: Attempted to kill init!`. It survives only where
-busybox happens to have been packed into the initramfs, because busybox's
-`mount` does accept `--move`.
+The result is a kernel panic at boot unless busybox happens to be in the
+initramfs.
 
 What `install.sh` sets up instead is initramfs-tools' own `boot=` hook, which
 is what raspi-config itself used before the switch: `boot=overlay` on the
@@ -257,13 +252,13 @@ rerun `install.sh` to put it back.
 All of it is in [`device/install.sh`](../device/install.sh), which is meant
 to be read:
 
-- Installs the packages in `device/packages.txt`, all from Debian Trixie, so
-  first boot needs no network.
+- Installs the packages in `device/packages.txt` without their Recommends,
+  so first boot needs no network and nothing unnamed comes along.
 - Deploys the unit to `/opt/otp-unit` and enables `otp-unit.service`.
 - Enables I²C; disables Wi-Fi and Bluetooth.
-- **Purges swap.** Key material lives in a buffer that gets zeroed after
-  printing; with swap enabled the kernel could page that buffer to the SD
-  card first, and zeroing RAM would not touch the copy on disk.
+- **Turns swap off, whatever provides it.** `swap.target` is masked and the
+  service runs `swapoff -a` before every start. With swap on, the kernel
+  could page key material out, and zeroing RAM would not touch that copy.
 - Makes the journal volatile and disables core dumps — a crash mid-job would
   otherwise write the whole pad to `/var/lib/systemd/coredump`.
 - Moves everything CUPS writes to tmpfs: spool, temp **and cache**, plus
@@ -274,18 +269,12 @@ to be read:
   `cupsd.conf.d`, so a drop-in file would be silently ignored — and the
   defaults are the opposite of what is wanted here: history is kept forever
   and the spooled document, the entire pad, is kept for 24 hours.
-- Sets `MaxJobs 4` and `ErrorPolicy abort-job`. Both numbers have a
-  history. `MaxJobs 1` looks right — one job's key material in the spool
-  at a time — but cupsd does not *queue* past `MaxJobs`, it **refuses**:
-  `lp: Too many active jobs.` Against a real cupsd that meant the status
-  sheet and the manual printed and every job after them was rejected, so
-  the unit promised a pad pair and then produced nothing. The unit waits
-  for the queue to drain before each submit, so only one job is live in
-  practice; the headroom is what stops a timing race costing the whole
-  run. `abort-job` then means a failed job is discarded as promptly as a
-  successful one — so an empty queue is *not* proof anything printed, and
-  the unit asks `lpstat -p` for the printer's own state before it tells
-  anyone they are holding a pair.
+- Sets `MaxJobs 4` and `ErrorPolicy abort-job`. cupsd refuses jobs past
+  `MaxJobs` rather than queueing them, so the unit waits for the queue to
+  drain before each submit and the headroom covers a timing race.
+  `abort-job` means a failed job leaves the queue as promptly as a printed
+  one, so an empty queue is not proof anything printed: the unit asks the
+  printer's own state before telling anyone they hold a pair.
 - Mounts a tmpfs over `/etc/cups` at boot from a baked-in template, so the
   print queue is rebuilt from whatever is plugged in. The template excludes
   `printers.conf`, which holds the last printer's make, model and serial.
@@ -294,6 +283,12 @@ to be read:
   the command line has to carry `boot=overlay`. Every way this can go wrong
   is otherwise silent — a unit that boots read-write looks exactly like one
   that does not.
+- Adds `quiet` to the kernel command line and removes the serial console,
+  so the kernel does not write over the front panel on tty1 or expose a
+  login on the GPIO UART. Put `console=serial0,115200` back in
+  `cmdline.txt` if you want one for debugging.
+- Writes its `config.txt` settings under `[all]`, so they apply to every
+  board the card is put in.
 - Drops the `resize` token from `cmdline.txt` and disables `rpi-resize`. An
   online resize cannot grow a filesystem mounted read-only as the overlay's
   lower layer, and there is nothing to grow: what the unit writes is RAM.
@@ -312,7 +307,7 @@ more here than the newer tooling does.
   would run first against an empty rootfs.
 - `stage2/SKIP_IMAGES` is touched so the build does not also export a plain
   Raspberry Pi OS Lite image.
-- The stage's `00-packages` is generated from `device/packages.txt` — do not
+- The stage's `00-packages-nr` is generated from `device/packages.txt` — do not
   edit it directly, it is overwritten on every build.
 - `install.sh --skip-apt` runs in the chroot, because the packages are
   already installed by pi-gen and the chroot has no network.

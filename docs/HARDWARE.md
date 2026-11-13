@@ -3,6 +3,9 @@
 A Raspberry Pi, a small OLED, three buttons and a USB laser printer. About
 £30 plus the printer.
 
+For the first run on real hardware, follow [FIRST-TEST.md](FIRST-TEST.md);
+this page is the reference it points into.
+
 ## Parts
 
 | Part | Notes |
@@ -72,7 +75,8 @@ of each, so these all work:
 **A monitor and a keyboard are the easy answer.** Almost every house has
 both, they need no soldering, and the menu they give you is the same one
 the OLED shows — the unit binds itself to `tty1`, so plug an HDMI screen
-and a USB keyboard into a Pi and it just appears. Arrow keys move,
+and a USB keyboard into a Pi and it just appears. The keyboard is heard
+alongside any buttons, so both can be fitted at once. Arrow keys move,
 Enter selects, and **SHIFT+K** is back or cancel. There is no
 hold-to-go-back on a keyboard: `KeyboardButtons` maps single keys, so
 the long press that the three-button panel uses has its own key here.
@@ -153,7 +157,14 @@ auto_manual   = yes          # print the manual before the pads
 pages         = 100          # A6 pad pages per copy
 paper         = A4           # A4, LETTER or A6
 auto_codeword =              # leave empty to have one rolled
+training      = no           # yes watermarks every page TRAINING
+allow_writable_root = no     # see below
 ```
+
+The unit refuses to make a **live** pad unless swap is off and the root
+filesystem is the RAM overlay; the status sheet's *Live pads* row says which
+it is. Training pads print either way. `allow_writable_root = yes` lifts the
+overlay requirement for a machine that deliberately has none.
 
 The unit **reads** `auto_codeword` but never writes one. A codeword is not
 key material, but it names a live pad, and the SD card is the part most
@@ -228,7 +239,7 @@ need `sh1106` instead of `ssd1306` in `otpunit/hw/display.py`.
 
 Run through this once before trusting the unit with anything:
 
-- [ ] `i2cdetect` finds the display, and the splash screen appears at boot
+- [ ] `i2cdetect` finds the display, and `PRESS ANY BUTTON` appears at boot
 - [ ] Each of the three buttons moves the menu; holding OK goes back
 - [ ] With no printer plugged in, the panel says `PLUG IN A USB PRINTER`
 - [ ] Plugging the printer in advances to the main menu within a few seconds
@@ -241,8 +252,8 @@ Run through this once before trusting the unit with anything:
 - [ ] The confirm screen says `LIVE KEY MATERIAL` or `*** TRAINING ***` —
       never neither
 - [ ] `swapon --show` prints nothing
-- [ ] After a job, `ls /var/spool/cups` is empty and `findmnt /var/spool/cups`
-      or `/run/cups` shows tmpfs
+- [ ] After a job, `sudo ls -A /run/cups/spool /run/cups/tmp` lists no job
+      files, and `findmnt -T /run/cups/spool` shows tmpfs
 - [ ] **`findmnt /` reports `overlay`.** `install.sh` enables it, so this is
       a confirmation rather than a step you have to remember — but it is
       still the single most load-bearing property in the design, and the

@@ -5153,8 +5153,8 @@ tests = [
 ]
 [[mutation.edit]]
 file = "harness/README.md"
-find = "**23 guest checks in boot 1 and 23 in boot 2**"
-replace = "**21 guest checks in boot 1 and 21 in boot 2**"
+find = "**24 guest checks in boot 1 and 24 in boot 2**"
+replace = "**22 guest checks in boot 1 and 22 in boot 2**"
 
 
 [[mutation]]

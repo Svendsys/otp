@@ -30,7 +30,7 @@ import os
 import sys
 from dataclasses import dataclass
 
-from otpunit.hw.buttons import GpioButtons, KeyboardButtons
+from otpunit.hw.buttons import AnyButtons, GpioButtons, KeyboardButtons
 from otpunit.hw.display import ConsoleDisplay, Ssd1306Display
 
 
@@ -172,15 +172,25 @@ def open_display(rotate: int = 0, log=None):
 
 def open_buttons(log=None):
     """The best input available, and what it is."""
+    # Both, when both are there. Opening the GPIO pins succeeds on any Pi
+    # whether or not a switch is wired to them, so preferring them outright
+    # would mean a keyboard is never listened to.
+    sources, kinds = [], []
     try:
-        return GpioButtons(), "GPIO buttons"
+        sources.append(GpioButtons())
+        kinds.append("GPIO buttons")
     except Exception as exc:                     # noqa: BLE001
         if log:
             log(f"no GPIO buttons ({exc})")
 
     if keyboard_connected() and console_usable():
-        return KeyboardButtons(allow_quit=False), "USB keyboard"
-    return None, "none"
+        sources.append(KeyboardButtons(allow_quit=False))
+        kinds.append("USB keyboard")
+    if not sources:
+        return None, "none"
+    if len(sources) == 1:
+        return sources[0], kinds[0]
+    return AnyButtons(sources), " and ".join(kinds)
 
 
 def detect(rotate: int = 0, log=None) -> Interface:
