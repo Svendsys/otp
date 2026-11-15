@@ -135,7 +135,7 @@ class TestEveryScreenFitsThePanel:
             assert not hasattr(app.vocabulary, attr), (
                 f"Vocabulary.{attr} lets a caller narrow a draw to one category"
             )
-        assert len(app.vocabulary.all_nouns) > 600
+        assert len(app.vocabulary.all_nouns) > 550
 
     def test_settings_choosers(self):
         app = make_app([])

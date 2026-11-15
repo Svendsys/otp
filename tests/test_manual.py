@@ -131,11 +131,15 @@ class TestExercises:
         plain = decrypt(ct, key)
         assert plain == printed, "the printed answer must be the real decrypt"
         assert plain[:5] == auth, "the auth group must actually verify"
-        assert plain[5:].rstrip("A") == "MOVEATZEROFIVEZEROZERO"
+        # The text is exactly what lies between the two auth groups.
+        body, closing, padding = plain[5:].partition(auth)
+        assert closing == auth, "the closing group must be there"
+        assert body == "MOVEATZEROFIVEZEROZERO"
+        assert padding and set(padding) == {"A"}
         # Digits spelled out, per the manual's own convention.
         assert not any(c.isdigit() for c in plain)
         # The A-padding tail is raw key, the Exercise 1 lesson again.
-        pad = len(plain) - len(plain.rstrip("A"))
+        pad = len(padding)
         assert pad >= 5 and ct[-pad:] == key[-pad:]
 
     def test_the_manual_does_not_still_teach_the_broken_rule(self):

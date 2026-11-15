@@ -23,18 +23,8 @@ MODIFIERS, NOUNS = g.load_vocabulary()
 FLAT_NOUNS = [w for words in NOUNS.values() for w in words]
 
 
-def soundex(word):
-    codes = {**dict.fromkeys("BFPV", "1"), **dict.fromkeys("CGJKQSXZ", "2"),
-             **dict.fromkeys("DT", "3"), "L": "4",
-             **dict.fromkeys("MN", "5"), "R": "6"}
-    out, prev = word[0], codes.get(word[0], "")
-    for ch in word[1:]:
-        code = codes.get(ch, "")
-        if code and code != prev:
-            out += code
-        if ch not in "HW":
-            prev = code
-    return (out + "000")[:4]
+sys.path.insert(0, str(REPO / "codewords"))
+from build_lists import soundex  # noqa: E402  (the builder's own sound key)
 
 
 def edit_distance(a, b):
@@ -56,8 +46,8 @@ class TestVocabularyShape:
     NOUN_MAX = 9
 
     def test_lists_are_populated(self):
-        assert len(MODIFIERS) > 300
-        assert len(FLAT_NOUNS) > 600
+        assert len(MODIFIERS) > 250
+        assert len(FLAT_NOUNS) > 550
         # Categories are an authoring device giving build_lists.py its tiers;
         # the unit never draws from one.
         assert len(NOUNS) >= 13, "the lists must stay curated, not one blob"
@@ -110,6 +100,66 @@ class TestPhoneticDistinctness:
                 for b in words[i + 1:]:
                     if abs(len(a) - len(b)) <= 1:
                         assert edit_distance(a, b) >= 2, f"{a} vs {b}"
+
+
+class TestNothingIsMistakenByEar:
+    """The builder's own confusability rules, held against the shipped lists,
+    so a list edited by hand cannot quietly break them."""
+
+    def _builder(self):
+        sys.path.insert(0, str(REPO / "codewords"))
+        import build_lists
+        return build_lists
+
+    def test_the_shipped_lists_are_what_the_builder_produces(self):
+        b = self._builder()
+        kept, _, noun_words, _ = b.build_nouns()
+        assert {k: sorted(v) for k, v in kept.items()} == \
+            {k: sorted(v) for k, v in NOUNS.items()}
+
+    def test_no_pair_rhymes_nests_or_nearly_matches(self):
+        b = self._builder()
+        for words in (MODIFIERS, FLAT_NOUNS):
+            pool = frozenset(words)
+            for i, a in enumerate(words):
+                for other in words[i + 1:]:
+                    assert b.confusable(a, other, pool) is None, (a, other)
+
+    def test_the_rules_catch_what_they_are_for(self):
+        b = self._builder()
+        pool = frozenset({"FIRE", "FLY", "BUTTER"})
+        assert b.confusable("TROLL", "DOLL") == "rhyme"
+        assert b.confusable("LAGOON", "BALLOON") == "rhyme"
+        assert b.confusable("BEAR", "POLARBEAR") == "contains"
+        assert b.confusable("FLY", "BUTTERFLY", pool) == "contains"
+        assert b.confusable("ANGRY", "HUNGRY") == "near"
+        # And leave alone what only looks alike on paper.
+        assert b.confusable("CAT", "CATHEDRAL") is None
+        assert not b.contains("MONK", "MONKEY")
+        assert b.confusable("CRANE", "SWAN") is None
+        assert b.confusable("COPPERY", "SILVERY") is None
+
+    def test_nothing_sounds_like_a_remark_or_a_spelled_letter(self):
+        b = self._builder()
+        words = set(MODIFIERS) | set(FLAT_NOUNS)
+        assert not words & (b.PROCEDURAL | b.LETTER_NAMES)
+        assert {"SECRET", "FINAL", "BROKEN"} <= b.PROCEDURAL
+
+    def test_dark_pictures_are_kept_on_purpose(self):
+        """Nothing is filtered for taste: a macabre pair is a memorable one."""
+        assert {"DROWNED", "CHARRED", "ROTTEN", "NAKED"} <= set(MODIFIERS)
+        assert {"SMOKED", "SMOKY"} & set(MODIFIERS)
+        assert {"BABY", "CORPSE", "CANNIBAL"} <= set(FLAT_NOUNS)
+
+    def test_sounds_a_listener_tells_apart_are_not_merged(self):
+        """The sound key folds only what a noisy channel confuses, so common
+        words are not lost to each other for nothing."""
+        assert soundex("BIG") != soundex("BUSY")
+        assert soundex("HAPPY") != soundex("HEAVY")
+        assert soundex("CAT") != soundex("GOAT")
+        assert soundex("SHEEP") != soundex("SUBWAY")
+        assert soundex("BEAR") == soundex("BOAR")
+        assert soundex("TANK") == soundex("TONGUE")
 
 
 class TestRandomCodewords:

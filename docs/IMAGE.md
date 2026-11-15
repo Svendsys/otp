@@ -31,9 +31,12 @@ Requirements:
 - On **Apple Silicon**, nothing extra — the build is native.
 - Roughly 10GB of free disk and half an hour.
 
-The build uses pi-gen's **`arm64` branch**, not `master`. pi-gen hardcodes
-`export ARCH=armhf` after sourcing its config, so setting `ARCH` in the
-config has no effect and `master` only ever produces 32-bit images.
+The build uses one pinned commit of pi-gen's **`arm64` branch**, named in
+`image/build.sh` as `PI_GEN_REF`, so the same checkout of this repository
+always builds from the same pi-gen. Move it deliberately, and let the image
+workflow boot the result. It is the `arm64` branch because pi-gen hardcodes
+`export ARCH=armhf` after sourcing its config, so `master` only ever
+produces 32-bit images.
 
 Flash it:
 

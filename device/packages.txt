@@ -47,9 +47,6 @@ printer-driver-min12xxw
 foomatic-db-compressed-ppds
 foomatic-db-engine
 
-# Needed by raspi-config's enable_overlayfs, which it would otherwise try to
-# apt-get at the exact moment the unit has no network by design.
-overlayroot
 
 # Entropy. The Pi's TRNG driver (bcm2835-rng) is built into the kernel and
 # seeds the CRNG before userspace exists; rngd only keeps feeding /dev/hwrng
